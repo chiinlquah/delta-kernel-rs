@@ -19,7 +19,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
 #[derive(Parser)]
@@ -123,7 +123,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> DeltaResult<Arc<Snapshot>> {
+) -> DeltaResult<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -171,7 +171,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
-    Ok(Arc::new(StructType::new(fields)))
+    Ok(Arc::new(StructType::try_new(fields)?))
 }
 
 /// Create a new Delta table with the given schema.

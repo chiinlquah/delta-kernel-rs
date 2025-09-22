@@ -10,6 +10,7 @@
 //! Log compaction creates files with the naming pattern `{start_version}.{end_version}.compacted.json`
 //! that contain the reconciled actions from all commit files in the specified version range.
 //! Only commit/compaction files that intersect with [start_version, end_version] are processed.
+//! Note that `end_version` must be greater than `start_version` (equal versions are not allowed).
 //! This is similar to checkpoints but operates on a subset of versions rather than the entire table.
 //!
 //! ## Usage
@@ -75,8 +76,9 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, ADD_NAME,
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
 };
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 
@@ -90,12 +92,13 @@ mod tests;
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
 static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });
