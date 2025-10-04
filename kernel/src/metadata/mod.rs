@@ -1,6 +1,9 @@
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
+use crate::schema::{derive_macro_utils::ToDataType, DataType};
 use crate::{DeltaResult, Error};
+use delta_kernel_derive::ToSchema;
+use serde_bytes::ByteBuf;
 use std::str::FromStr;
 
 /// Type of content stored by the manifest entry
@@ -14,6 +17,13 @@ pub(crate) enum DataContentType {
     DataManifest = 3,
     DeleteManifest = 4,
     ManifestDV = 5,
+}
+
+// ToDataType implementations for enums
+impl ToDataType for DataContentType {
+    fn to_data_type() -> DataType {
+        DataType::INTEGER
+    }
 }
 
 /// Format of this data.
@@ -50,6 +60,12 @@ impl std::fmt::Display for DataFileFormat {
     }
 }
 
+impl ToDataType for DataFileFormat {
+    fn to_data_type() -> DataType {
+        DataType::STRING
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) enum TrackingStatus {
     Existed = 0,
@@ -57,7 +73,14 @@ pub(crate) enum TrackingStatus {
     Deleted = 2,
 }
 
+impl ToDataType for TrackingStatus {
+    fn to_data_type() -> DataType {
+        DataType::INTEGER
+    }
+}
+
 #[allow(dead_code)]
+#[derive(ToSchema)]
 pub(crate) struct TrackingInfo {
     status: TrackingStatus,
 
@@ -78,41 +101,45 @@ pub(crate) struct TrackingInfo {
 }
 
 #[allow(dead_code)]
+#[derive(ToSchema)]
 pub(crate) struct DelectionVector {
     /// The offset in the file where the content starts.
-    offset: Option<u64>,
+    offset: Option<i64>,
 
     /// The length of a referenced content stored in the file; required if content_offset is present.
     /// The number of 32-bit Roaring bitmaps, serialized as 8 bytes, little-endian
     ///  - For each 32-bit Roaring bitmap, ordered by unsigned comparison of the 32-bit keys:
     ///     - The key stored as 4 bytes, little-endian
     ///     - A 32-bit Roaring bitmap
-    size_in_bytes: Option<u64>,
+    size_in_bytes: Option<i64>,
 
     /// Serialized bitmap for inline DVs.
-    inline_content: Option<Vec<u8>>,
+    inline_content: Option<ByteBuf>,
 }
 
 #[allow(dead_code)]
+#[derive(ToSchema)]
 pub(crate) struct ContentStats {
     // https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
     // Today this is static and still empty. In the future to be generated based on the schema
 }
 
 #[allow(dead_code)]
+#[derive(ToSchema)]
 pub(crate) struct ManifestStats {
-    added_files_count: u64,
-    existing_files_count: u64,
-    deletes_files_count: u64,
+    added_files_count: i64,
+    existing_files_count: i64,
+    deletes_files_count: i64,
 
-    added_rows_count: u64,
-    existing_rows_count: u64,
-    delete_rows_count: u64,
+    added_rows_count: i64,
+    existing_rows_count: i64,
+    delete_rows_count: i64,
 
-    min_sequence_number: u64,
+    min_sequence_number: i64,
 }
 
 #[allow(dead_code)]
+#[derive(ToSchema)]
 pub(crate) struct MetadataEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
@@ -136,10 +163,10 @@ pub(crate) struct MetadataEntry {
     sort_order_id: i64,
 
     /// Number of records in this file, or the cardinality of a deletion vector
-    record_count: u64,
+    record_count: i64,
 
     /// Total file size in bytes. Must be defined if location is defined
-    file_size_in_bytes: u64,
+    file_size_in_bytes: i64,
 
     /// The column metrics
     /// https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
@@ -153,11 +180,11 @@ pub(crate) struct MetadataEntry {
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
-    key_metadata: Option<Vec<u8>>,
+    key_metadata: Option<ByteBuf>,
 
     /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
-    split_offsets: Option<Vec<u64>>,
+    split_offsets: Option<Vec<i64>>,
 
     /// Not used by Delta today
     /// Field ids used to determine row equality in equality delete files.
