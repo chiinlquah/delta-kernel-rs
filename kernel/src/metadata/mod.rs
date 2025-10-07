@@ -1,3 +1,6 @@
+mod builder;
+mod tests;
+
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::schema::{derive_macro_utils::ToDataType, DataType};
@@ -67,6 +70,7 @@ impl ToDataType for DataFileFormat {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum TrackingStatus {
     Existed = 0,
     Added = 1,
@@ -80,7 +84,7 @@ impl ToDataType for TrackingStatus {
 }
 
 #[allow(dead_code)]
-#[derive(ToSchema)]
+#[derive(Debug, ToSchema)]
 pub(crate) struct TrackingInfo {
     status: TrackingStatus,
 
@@ -101,8 +105,8 @@ pub(crate) struct TrackingInfo {
 }
 
 #[allow(dead_code)]
-#[derive(ToSchema)]
-pub(crate) struct DelectionVector {
+#[derive(Debug, ToSchema)]
+pub(crate) struct DeletionVector {
     /// The offset in the file where the content starts.
     offset: Option<i64>,
 
@@ -118,14 +122,14 @@ pub(crate) struct DelectionVector {
 }
 
 #[allow(dead_code)]
-#[derive(ToSchema)]
+#[derive(Debug, ToSchema)]
 pub(crate) struct ContentStats {
     // https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
     // Today this is static and still empty. In the future to be generated based on the schema
 }
 
 #[allow(dead_code)]
-#[derive(ToSchema)]
+#[derive(Debug, ToSchema)]
 pub(crate) struct ManifestStats {
     added_files_count: i64,
     existing_files_count: i64,
@@ -139,7 +143,7 @@ pub(crate) struct ManifestStats {
 }
 
 #[allow(dead_code)]
-#[derive(ToSchema)]
+#[derive(Debug, ToSchema)]
 pub(crate) struct MetadataEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
@@ -154,7 +158,7 @@ pub(crate) struct MetadataEntry {
     tracking_info: TrackingInfo,
 
     /// Must be defined if content_type is Positional Deletes or ManifestDV.
-    deletion_vector: Option<DelectionVector>,
+    deletion_vector: Option<DeletionVector>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     partition_spec_id: i64,
