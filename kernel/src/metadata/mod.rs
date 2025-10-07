@@ -2,8 +2,8 @@
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::schema::{derive_macro_utils::ToDataType, DataType};
 use crate::{DeltaResult, Error};
+use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
-use serde_bytes::ByteBuf;
 use std::str::FromStr;
 
 /// Type of content stored by the manifest entry
@@ -114,7 +114,7 @@ pub(crate) struct DelectionVector {
     size_in_bytes: Option<i64>,
 
     /// Serialized bitmap for inline DVs.
-    inline_content: Option<ByteBuf>,
+    inline_content: Option<Bytes>,
 }
 
 #[allow(dead_code)]
@@ -180,7 +180,7 @@ pub(crate) struct MetadataEntry {
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
-    key_metadata: Option<ByteBuf>,
+    key_metadata: Option<Bytes>,
 
     /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
