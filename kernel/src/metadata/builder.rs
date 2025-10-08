@@ -74,13 +74,13 @@ impl MetadataBuilder {
         });
 
         let content_type = if deletion_vector.is_some() {
-            unreachable!("DVs not yet implemented");
+            todo!("DVs not yet implemented");
             DataContentType::PositionDeletes
         } else {
             DataContentType::Data
         };
 
-        let entry = MetadataEntry {
+        let data_file_entry = MetadataEntry {
             content_type,
             location: Some(self.path_to_absolute(&add.path).unwrap()),
             file_format: DataFileFormat::Parquet,
@@ -99,12 +99,12 @@ impl MetadataBuilder {
             },
             deletion_vector,
 
-            // Check how to set these
+            // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
             sort_order_id: 0,
 
             // TODO: Should we get these from the stats as well?
-            // The stats are optional
+            // TODO: Check how to set these based on uniform as a first iteration.
             record_count: 0,
 
             file_size_in_bytes: add.size,
@@ -128,7 +128,7 @@ impl MetadataBuilder {
             equality_ids: None,
         };
 
-        self.pending_entries.push(entry)
+        self.pending_entries.push(data_file_entry)
     }
 }
 
