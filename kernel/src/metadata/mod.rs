@@ -1,13 +1,60 @@
 mod builder;
+mod reader;
 
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::expressions::Scalar;
 use crate::schema::{derive_macro_utils::ToDataType, DataType};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::str::FromStr;
+use url::Url;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct Metadata {
+    entries: Vec<MetadataEntry>,
+
+    version: Option<Version>,
+    table_root: Url,
+}
+
+impl Metadata {
+    #[allow(dead_code)]
+    pub(crate) fn read(engine: &dyn Engine, path: &Url) -> DeltaResult<Self> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ToSchema;
+        use std::sync::Arc;
+
+        let file = FileMeta {
+            location: path.clone(),
+            last_modified: 0,
+            size: 0,
+        };
+
+        let read_result_iter = engine.parquet_handler().read_parquet_files(
+            &[file],
+            Arc::new(MetadataEntry::to_schema()),
+            None,
+        )?;
+
+        let mut all_entries = Vec::new();
+
+        for batch_result in read_result_iter {
+            let batch = batch_result?;
+            let mut visitor = reader::MetadataEntryVisitor::default();
+            visitor.visit_rows_of(batch.as_ref())?;
+            all_entries.extend(visitor.entries);
+        }
+
+        Ok(Self {
+            entries: all_entries,
+            version: None,
+            table_root: path.clone(),
+        })
+    }
+}
 
 /// Type of content stored by the manifest entry
 #[allow(dead_code)]
