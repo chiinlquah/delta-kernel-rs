@@ -207,6 +207,21 @@ impl StructData {
         Ok(Self { fields, values })
     }
 
+    /// Create a new struct data without validation.
+    ///
+    /// # Safety
+    /// The caller must ensure that:
+    /// - The number of fields matches the number of values
+    /// - The data types of the values match the data types of the fields
+    /// - No null values are assigned to non-nullable fields
+    ///
+    /// This is intended for use in code generation or other contexts where the invariants
+    /// are guaranteed by construction (e.g., derive macros).
+    #[allow(dead_code)]
+    pub(crate) const fn new_unchecked(fields: Vec<StructField>, values: Vec<Scalar>) -> Self {
+        Self { fields, values }
+    }
+
     pub fn fields(&self) -> &[StructField] {
         &self.fields
     }

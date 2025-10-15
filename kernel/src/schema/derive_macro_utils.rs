@@ -1,9 +1,9 @@
 //! Utility traits that support the [`delta_kernel_derive::ToSchema`] macro.
+use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
+use bytes::Bytes;
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
-
-use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
 use delta_kernel_derive::internal_api;
 
@@ -36,6 +36,7 @@ macro_rules! impl_to_data_type {
 
 impl_to_data_type!(
     (String, DataType::STRING),
+    (Bytes, DataType::BINARY),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
     (i16, DataType::SHORT),
@@ -114,5 +115,42 @@ pub(crate) trait GetNullableContainerStructField {
 impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
     fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
         StructField::not_null(name, T::to_nullable_container_type())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use delta_kernel_derive::ToSchema;
+
+    #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+    pub(crate) struct TestFieldId {
+        #[field_id = 123]
+        pub(crate) valid_id: Option<String>,
+
+        pub(crate) no_field_id: Option<String>,
+    }
+
+    #[test]
+    fn test_field_id_schema() {
+        let schema = TestFieldId::to_schema();
+        let fields: Vec<_> = schema.fields().collect();
+
+        // Test field with valid field_id
+        let field_valid_id = fields[0];
+        assert_eq!(field_valid_id.name(), "validId");
+
+        let metadata = field_valid_id.metadata();
+        assert!(metadata.contains_key("parquet.field.id"));
+
+        match metadata.get("parquet.field.id") {
+            Some(crate::schema::MetadataValue::Number(n)) => assert_eq!(*n, 123),
+            _ => panic!("Expected number parquet.field.id"),
+        }
+
+        // Test field without field_id
+        let field_no_id = fields[1];
+        assert_eq!(field_no_id.name(), "noFieldId");
+        assert!(!field_no_id.metadata().contains_key("parquet.field.id"));
     }
 }
