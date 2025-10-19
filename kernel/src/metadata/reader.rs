@@ -38,20 +38,20 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<MetadataEntry> {
-    // The getters are in order of flattened leaf fields:
+    // The getters are in order of flattened leaf fields (22 total):
     // 0: content_type
     // 1: location
     // 2: file_format
     // 3-7: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id)
-    // 8-9: deletion_vector fields (offset, size_in_bytes) - inline_content is not supported yet
+    // 8-9: deletion_vector fields (offset, size_in_bytes) - inline_content excluded (binary not supported)
     // 10: partition_spec_id
     // 11: sort_order_id
     // 12: record_count
     // 13: file_size_in_bytes
-    // (content_stats has no fields)
+    // (content_stats excluded from schema)
     // 14-20: manifest_stats fields (7 fields)
     // 21: referenced_file
-    // key_metadata, split_offsets, equality_ids are not currently used by Delta and skipped
+    // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
 
     // Extract content_type
     let content_type_int: i32 = getters[0].get(row_index, "content_type")?;
@@ -177,7 +177,6 @@ fn visit_metadata_entry_at<'a>(
         sort_order_id,
         record_count,
         file_size_in_bytes,
-        content_stats: None, // ContentStats is currently empty
         manifest_stats,
         referenced_file,
         key_metadata: None,  // Not currently used by Delta

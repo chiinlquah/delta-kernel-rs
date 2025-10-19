@@ -78,6 +78,17 @@ impl HasSelectionVector for FilteredEngineData {
     }
 }
 
+impl From<Box<dyn EngineData>> for FilteredEngineData {
+    /// Converts `EngineData` into `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience conversion that wraps the engine data without any filtering,
+    /// marking all rows as selected. This is equivalent to calling
+    /// [`FilteredEngineData::with_all_rows_selected`].
+    fn from(data: Box<dyn EngineData>) -> Self {
+        Self::with_all_rows_selected(data)
+    }
+}
+
 /// a trait that an engine exposes to give access to a list
 pub trait EngineList {
     /// Return the length of the list at the specified row_index in the raw data

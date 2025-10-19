@@ -112,7 +112,6 @@ impl MetadataBuilder {
             // TODO: add.stats contains a JSON blob:
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
             // Which we need to convert from name-based to field-id-based
-            content_stats: None,
             manifest_stats: None,
 
             // Needs to be set in case of a DeleteManifest
