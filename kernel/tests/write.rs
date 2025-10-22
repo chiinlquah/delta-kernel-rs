@@ -1565,3 +1565,172 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .transaction()?
+            .with_engine_info("batch commit test")
+            .with_batch_commit();
+
+        // Commit without adding any add files
+        // Note: batch_commit flag is currently a placeholder for future metadata tree writing
+        assert!(txn.commit(&engine)?.is_committed());
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_actions: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        // Verify that there only is a commit info action (no add actions)
+        assert_eq!(parsed_actions.len(), 1, "Expected only commit info action");
+        assert!(parsed_actions[0].get("commitInfo").is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("batch commit test")
+            .with_batch_commit()
+            .with_data_change(true);
+
+        // create two new arrow record batches to append
+        let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
+            let data = RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(data.to_vec()))],
+            )?;
+            Ok(Box::new(ArrowEngineData::new(data)))
+        });
+
+        // write data out by spawning async tasks to simulate executors
+        let engine = Arc::new(engine);
+        let write_context = Arc::new(txn.get_write_context());
+        let tasks = append_data.into_iter().map(|data| {
+            let engine = engine.clone();
+            let write_context = write_context.clone();
+            tokio::task::spawn(async move {
+                engine
+                    .write_parquet(
+                        data.as_ref().unwrap(),
+                        write_context.as_ref(),
+                        HashMap::new(),
+                    )
+                    .await
+            })
+        });
+
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
+        }
+
+        // commit!
+        // With batch_commit, add actions are written to metadata tree (parquet file)
+        let result = txn.commit(engine.as_ref())?;
+        assert!(result.is_committed(), "Batch commit should succeed");
+
+        // Verify the commit was written
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_actions: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        // With batch_commit, JSON log should contain: commit_info + contentRoot
+        // No add actions should be in the JSON log
+        assert_eq!(
+            parsed_actions.len(),
+            2,
+            "Expected commit info and contentRoot actions, got {}. Actions: {:?}",
+            parsed_actions.len(),
+            parsed_actions
+        );
+        assert!(parsed_actions[0].get("commitInfo").is_some());
+        assert!(
+            parsed_actions[1].get("contentRoot").is_some(),
+            "Second action should be contentRoot, but got: {:?}",
+            parsed_actions[1]
+        );
+
+        // Verify no add actions in JSON log
+        let has_add_actions = parsed_actions
+            .iter()
+            .any(|action| action.get("add").is_some());
+        assert!(
+            !has_add_actions,
+            "Batch commit should not write add actions to JSON log"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        // Test that with_batch_commit can be chained with other builder methods
+        // This test verifies that the fluent API works correctly - if any method
+        // returns the wrong type, this won't compile
+        let txn = snapshot
+            .transaction()?
+            .with_batch_commit()
+            .with_engine_info("test engine")
+            .with_data_change(false)
+            .with_operation("TEST_OPERATION".to_string());
+
+        // Test that the transaction can be committed successfully
+        assert!(txn.commit(&engine)?.is_committed());
+    }
+    Ok(())
+}

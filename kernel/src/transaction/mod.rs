@@ -2,16 +2,17 @@ use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
-
 use url::Url;
 
 use crate::actions::{
-    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
+    as_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
+    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
+    SetTransaction,
 };
-use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
+use crate::metadata::writer::MetadataWriter;
+use crate::metadata::Metadata;
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
@@ -133,6 +134,8 @@ pub struct Transaction {
     domain_metadatas: Vec<DomainMetadata>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // Whether this transaction should batch commit to the metadata tree
+    batch_commit: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -171,6 +174,7 @@ impl Transaction {
             commit_timestamp,
             domain_metadatas: vec![],
             data_change: true,
+            batch_commit: false,
         })
     }
 
@@ -222,30 +226,28 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+        // Step 3: Generate add actions and collect all actions for JSON log
+        // We need to fully process add_actions before we can move self
         let commit_version = self.read_snapshot.version() + 1;
-        let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
 
-        // Step 4: Generate all domain metadata actions (user and system domains)
-        let domain_metadata_actions =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        let json_actions: Vec<DeltaResult<Box<dyn EngineData>>> = self.generate_json_actions(
+            engine,
+            commit_version,
+            commit_info_action,
+            set_transaction_actions,
+        )?;
 
-        // Step 5: Commit the actions as a JSON file to the Delta log
+        // Step 6: Commit the actions as a JSON file to the Delta log
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
-        let actions = iter::once(commit_info_action)
-            .chain(add_actions)
-            .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
-
-        // Convert EngineData to FilteredEngineData with all rows selected
-        let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+        let actions = json_actions.into_iter();
 
         let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
-        {
+        match json_handler.write_json_file(
+            &commit_path.location,
+            Box::new(actions.map(|result| result.map(|data| data.into()))),
+            false,
+        ) {
             Ok(()) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(commit_version),
             )),
@@ -261,6 +263,56 @@ impl Transaction {
         }
     }
 
+    /// Generate all JSON actions for the commit, including commit info, set transactions,
+    /// domain metadata, and add actions (or content root for batch commits).
+    fn generate_json_actions(
+        &self,
+        engine: &dyn Engine,
+        commit_version: u64,
+        commit_info_action: DeltaResult<Box<dyn EngineData>>,
+        set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
+    ) -> DeltaResult<Vec<DeltaResult<Box<dyn EngineData>>>> {
+        let (add_actions, row_tracking_domain_metadata) =
+            self.generate_adds(engine, commit_version)?;
+
+        // Step 4: Generate all domain metadata actions (user and system domains)
+        let domain_metadata_actions =
+            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+
+        let mut actions_vec = vec![commit_info_action];
+        actions_vec.extend(set_transaction_actions);
+        actions_vec.extend(domain_metadata_actions);
+
+        // Handle batch commit - either write to metadata tree or include in JSON log
+        if self.batch_commit && !self.add_files_metadata.is_empty() {
+            // TODO: Create from existing metadata to update it in an incremental fashion
+            let metadata = Metadata::new_from_snapshot(self.read_snapshot.clone(), engine)?;
+            let mut metadata_builder = metadata.to_builder();
+            for add_metadata_result in self.add_files_metadata.iter() {
+                metadata_builder.add_from_engine_data_write(add_metadata_result.as_ref())?;
+            }
+
+            let new_metadata = metadata_builder.build(commit_version);
+            let file_meta = MetadataWriter::try_new(new_metadata)?.write(engine)?;
+
+            let content_root_action = ContentRoot {
+                path: file_meta.location.to_string(),
+                size_in_bytes: file_meta.size as i64,
+            };
+
+            // Use the log schema to wrap ContentRoot in a "contentRoot" field
+            let content_root_data =
+                content_root_action.into_engine_data(get_log_content_root_schema().clone(), engine);
+
+            actions_vec.push(content_root_data)
+        } else {
+            // Normal mode: add actions go in the JSON log
+            actions_vec.extend(add_actions);
+        }
+
+        Ok(actions_vec)
+    }
+
     /// Set the data change flag.
     ///
     /// True indicates this commit is a "data changing" commit. False indicates table data was
@@ -272,6 +324,20 @@ impl Transaction {
     ///    from old files to new ones.  OPTIMIZE commands is one example of this type of optimizaton).
     pub fn with_data_change(mut self, data_change: bool) -> Self {
         self.data_change = data_change;
+        self
+    }
+
+    /// Set whether the transaction should use batch commit mode (commit directly to the metadata tree).
+    /// When not set, the transaction writes incremental commits to the log.
+    ///
+    /// Any incremental actions accumulated since the last batch commit will automatically
+    /// be added to the tree root on commit.
+    ///
+    /// Requires preview feature preview-adaptive-metadata-tree be turned on for the table.
+    /// TODO: add the feature option.
+    /// TODO: Add option to replay incremental actions and add them to leaves.
+    pub fn with_batch_commit(mut self) -> Self {
+        self.batch_commit = true;
         self
     }
 
@@ -737,7 +803,6 @@ mod tests {
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
@@ -767,6 +832,45 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+
+        // Test that with_batch_commit returns self correctly
+        let txn = snapshot
+            .transaction()?
+            .with_batch_commit()
+            .with_engine_info("test engine");
+
+        // Verify batch_commit flag is set
+        assert!(txn.batch_commit);
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_commit_default_false() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+
+        // Test that batch_commit defaults to false
+        let txn = snapshot.transaction()?;
+        assert!(!txn.batch_commit);
         Ok(())
     }
 }

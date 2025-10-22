@@ -114,7 +114,6 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-#[allow(dead_code)]
 static LOG_CONTENT_ROOT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         CONTENT_ROOT_NAME,

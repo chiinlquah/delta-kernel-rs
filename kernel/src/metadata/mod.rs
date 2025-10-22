@@ -1,27 +1,99 @@
-mod builder;
+pub(crate) mod builder;
 mod reader;
-mod writer;
+pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::expressions::Scalar;
+use crate::metadata::builder::MetadataBuilder;
+use crate::path::ParsedLogPath;
+use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType};
-use crate::{DeltaResult, Engine, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, Error, FileMeta, SnapshotRef, Version};
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::str::FromStr;
 use url::Url;
 
+/// Represents table metadata in Adaptive Metadata Tree (AMT) format.
+///
+/// This structure contains metadata entries that describe the files in a Delta table
+/// at a specific version. It is used for interoperability with Apache Iceberg's
+/// metadata tree format.
+///
+/// Each `Metadata` instance contains:
+/// - A collection of `MetadataEntry` records (one per file)
+/// - The Delta table version this metadata represents
+/// - The table root URL for resolving relative file paths
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct Metadata {
     entries: Vec<MetadataEntry>,
 
-    version: Option<Version>,
+    version: Version,
     table_root: Url,
 }
 
 impl Metadata {
+    /// Creates a new empty Metadata instance for the specified table version.
+    ///
+    /// # Parameters
+    /// - `version`: The Delta table version this metadata represents
+    /// - `table_root`: The root URL of the Delta table
+    #[allow(dead_code)]
+    pub(crate) fn new(version: Version, table_root: Url) -> Self {
+        Self {
+            entries: vec![],
+            version,
+            table_root,
+        }
+    }
+
+    /// Creates Metadata from a Delta table snapshot by replaying add actions from the transaction log.
+    ///
+    /// This method internally uses log replay to:
+    /// - Read actions from the log in reverse chronological order
+    /// - Deduplicate add/remove actions to get the current table state
+    /// - Convert Add actions to MetadataEntry format (Adaptive Metadata Tree)
+    ///
+    /// # Parameters
+    /// - `snapshot`: The Delta table snapshot to build metadata from
+    /// - `engine`: The engine to use for reading log files and processing actions
+    ///
+    /// # Returns
+    /// A `Metadata` instance containing all active files in the table at the snapshot version.
+    #[allow(dead_code)]
+    pub(crate) fn new_from_snapshot(
+        snapshot: SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Self> {
+        let table_root = snapshot.table_root().clone();
+        let version = snapshot.version();
+        let scan = ScanBuilder::new(snapshot).build()?;
+        let scan_metadata_iter = scan.scan_metadata(engine)?;
+
+        let mut metadata_builder = MetadataBuilder::new_for(table_root);
+
+        for scan_metadata_result in scan_metadata_iter {
+            let scan_metadata = scan_metadata_result?;
+            let engine_data = scan_metadata.scan_files.data();
+
+            metadata_builder.add_from_engine_data_add(engine_data)?;
+        }
+
+        Ok(metadata_builder.build(version))
+    }
+
+    /// Reads Metadata from a parquet file at the specified path.
+    ///
+    /// This is used to read previously written Adaptive Metadata Tree (AMT) metadata files.
+    ///
+    /// # Parameters
+    /// - `engine`: The engine to use for reading the parquet file
+    /// - `path`: The URL path to the metadata parquet file
+    ///
+    /// # Returns
+    /// A `Metadata` instance deserialized from the parquet file.
     #[allow(dead_code)]
     pub(crate) fn read(engine: &dyn Engine, path: &Url) -> DeltaResult<Self> {
         use crate::engine_data::RowVisitor;
@@ -33,6 +105,9 @@ impl Metadata {
             last_modified: 0,
             size: 0,
         };
+
+        let parsed =
+            ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
         let read_result_iter = engine.parquet_handler().read_parquet_files(
             &[file],
@@ -51,9 +126,21 @@ impl Metadata {
 
         Ok(Self {
             entries: all_entries,
-            version: None,
+            version: parsed.version,
             table_root: path.clone(),
         })
+    }
+
+    /// Converts this Metadata into a MetadataBuilder for further modifications.
+    ///
+    /// This creates a new builder initialized with the table root, allowing additional
+    /// metadata entries to be added before building a new Metadata instance.
+    ///
+    /// # Returns
+    /// A `MetadataBuilder` that can be used to add more entries or build a new Metadata.
+    #[allow(dead_code)]
+    pub(crate) fn to_builder(&self) -> MetadataBuilder {
+        MetadataBuilder::new_for(self.table_root.clone())
     }
 }
 
@@ -760,16 +847,16 @@ mod tests {
         let original_entry = create_simple_metadata_entry();
         let metadata = Metadata {
             entries: vec![original_entry.clone()],
-            version: Some(0),
+            version: 0,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 1);
@@ -788,16 +875,16 @@ mod tests {
         let original_entry = create_metadata_entry_with_dv();
         let metadata = Metadata {
             entries: vec![original_entry.clone()],
-            version: Some(1),
+            version: 1,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 1);
@@ -816,16 +903,16 @@ mod tests {
         let original_entry = create_metadata_entry_with_manifest_stats();
         let metadata = Metadata {
             entries: vec![original_entry.clone()],
-            version: Some(2),
+            version: 2,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 1);
@@ -847,16 +934,16 @@ mod tests {
 
         let metadata = Metadata {
             entries: vec![entry1.clone(), entry2.clone(), entry3.clone()],
-            version: Some(3),
+            version: 3,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 3);
@@ -912,16 +999,16 @@ mod tests {
 
         let metadata = Metadata {
             entries: entries.clone(),
-            version: Some(4),
+            version: 4,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), entries.len());
@@ -974,16 +1061,16 @@ mod tests {
 
         let metadata = Metadata {
             entries: entries.clone(),
-            version: Some(5),
+            version: 5,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), entries.len());
@@ -1026,16 +1113,16 @@ mod tests {
 
         let metadata = Metadata {
             entries: vec![entry.clone()],
-            version: Some(6),
+            version: 6,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 1);
@@ -1086,16 +1173,16 @@ mod tests {
 
         let metadata = Metadata {
             entries: vec![entry.clone()],
-            version: Some(7),
+            version: 7,
             table_root: table_root_url.clone(),
         };
 
         // Write metadata
         let writer = writer::MetadataWriter::try_new(metadata)?;
-        let written_path = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_path)?;
+        let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
         assert_eq!(read_metadata.entries.len(), 1);

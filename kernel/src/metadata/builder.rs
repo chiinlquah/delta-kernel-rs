@@ -1,23 +1,31 @@
 use crate::actions::deletion_vector::DeletionVectorStorageType;
+use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::metadata::{
-    DataContentType, DataFileFormat, DeletionVector, MetadataEntry, TrackingInfo, TrackingStatus,
+    DataContentType, DataFileFormat, DeletionVector, Metadata, MetadataEntry, TrackingInfo,
+    TrackingStatus,
 };
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::utils::try_parse_uri;
+use crate::{DeltaResult, EngineData, Version};
 use bytes::Bytes;
-use delta_kernel::try_parse_uri;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use url::Url;
 
 /// Builder for creating [`Metadata`] instances based on V4 Metadata
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(super) struct MetadataBuilder {
-    table_root: String,
+pub(crate) struct MetadataBuilder {
+    table_root: Url,
     pending_entries: Vec<MetadataEntry>,
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
 impl MetadataBuilder {
     #[allow(dead_code)]
-    pub(crate) fn new_for(table_root: String) -> Self {
+    pub(crate) fn new_for(table_root: Url) -> Self {
         Self {
             table_root,
             pending_entries: Vec::new(),
@@ -129,6 +137,161 @@ impl MetadataBuilder {
 
         self.pending_entries.push(data_file_entry)
     }
+
+    /// Adds multiple `Add` records from `EngineData` to the metadata.
+    ///
+    /// This method uses the `AddVisitor` to extract all `Add` records from the provided
+    /// `EngineData` and adds each one to the metadata builder.
+    ///
+    /// # Arguments
+    /// * `engine_data` - The engine data containing Add records to extract and add
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if there was an error visiting the engine data
+    #[allow(dead_code)]
+    pub(crate) fn add_from_engine_data_add(
+        &mut self,
+        engine_data: &dyn EngineData,
+    ) -> Result<(), crate::Error> {
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(engine_data)?;
+
+        for add in visitor.adds {
+            self.add(add);
+        }
+
+        Ok(())
+    }
+
+    /// Adds write metadata from `EngineData` to the metadata.
+    ///
+    /// This method is designed for batch commit scenarios where the data contains simple
+    /// write metadata (path, partitionValues, size, modificationTime, stats) rather than
+    /// full Add actions.
+    ///
+    /// # Arguments
+    /// * `engine_data` - The engine data containing write metadata records to extract and add
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if there was an error visiting the engine data
+    #[allow(dead_code)]
+    pub(crate) fn add_from_engine_data_write(
+        &mut self,
+        engine_data: &dyn EngineData,
+    ) -> Result<(), crate::Error> {
+        let mut visitor = WriteMetadataVisitor::default();
+        visitor.visit_rows_of(engine_data)?;
+
+        for add in visitor.adds {
+            self.add(add);
+        }
+
+        Ok(())
+    }
+
+    /// Adds multiple `Add` records from an iterator of `EngineData` results to the metadata.
+    ///
+    /// This method processes an iterator of `EngineData` results, extracting all `Add` records
+    /// from each batch and adding them to the metadata builder.
+    ///
+    /// # Arguments
+    /// * `engine_data_iter` - An iterator yielding Results containing EngineData batches with Add records
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if there was an error processing any batch or visiting the engine data
+    #[allow(dead_code)]
+    pub(crate) fn add_from_engine_data_iter<'a>(
+        &mut self,
+        engine_data_iter: impl Iterator<Item = Result<Box<dyn EngineData>, crate::Error>> + 'a,
+    ) -> Result<(), crate::Error> {
+        for engine_data_result in engine_data_iter {
+            let engine_data = engine_data_result?;
+            self.add_from_engine_data_add(engine_data.as_ref())?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn build(&self, version: Version) -> Metadata {
+        Metadata {
+            table_root: self.table_root.clone(),
+            entries: self.pending_entries.clone(),
+            version,
+        }
+    }
+}
+
+/// Visitor that extracts write metadata and converts to Add structs
+///
+/// This visitor reads the simpler write metadata format (path, partitionValues, size,
+/// modificationTime, stats) and constructs Add structs with minimal fields set.
+#[derive(Default)]
+struct WriteMetadataVisitor {
+    pub adds: Vec<Add>,
+}
+
+impl RowVisitor for WriteMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::{column_name, MapType};
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("path"),
+                column_name!("partitionValues"),
+                column_name!("size"),
+                column_name!("modificationTime"),
+                column_name!("stats.numRecords"),
+            ];
+            let types = vec![
+                DataType::STRING,
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+                DataType::LONG,
+                DataType::LONG,
+                DataType::LONG,
+            ];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(path) = getters[0].get_opt(i, "path")? {
+                let partition_values: HashMap<String, String> =
+                    getters[1].get(i, "partitionValues")?;
+                let size: i64 = getters[2].get(i, "size")?;
+                let modification_time: i64 = getters[3].get(i, "modificationTime")?;
+                // stats.numRecords is at index 4, but we'll just use an empty stats for now
+                // since the metadata builder doesn't use it
+
+                let add = Add {
+                    path,
+                    partition_values,
+                    size,
+                    modification_time,
+                    data_change: true, // will be overridden by transaction
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                    base_row_id: None,
+                    default_row_commit_version: None,
+                    clustering_provider: None,
+                    data_manifest_path: None,
+                    data_manifest_position: None,
+                    delete_manifest_path: None,
+                    delete_manifest_position: None,
+                };
+                self.adds.push(add);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -155,8 +318,8 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
         // Test with s3:// URL as table root
-        let table_root = "s3://my-bucket/my-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let relative_path = "part-00000-123.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -175,8 +338,8 @@ mod tests {
 
     #[test]
     fn test_path_to_absolute_with_absolute_s3_path() -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "s3://my-bucket/my-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let absolute_path = "s3://another-bucket/external/data.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -186,8 +349,8 @@ mod tests {
 
     #[test]
     fn test_path_to_absolute_with_absolute_https_path() -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "s3://my-bucket/my-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let absolute_path = "https://example.com/data/file.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -198,8 +361,8 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_gs_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Google Cloud Storage URL
-        let table_root = "gs://my-gcs-bucket/delta-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("gs://my-gcs-bucket/delta-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let relative_path = "data/part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -218,8 +381,8 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_azure_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Azure Blob Storage URL
-        let table_root = "abfss://container@account.dfs.core.windows.net/delta-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("abfss://container@account.dfs.core.windows.net/delta-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -234,7 +397,7 @@ mod tests {
     fn test_path_to_absolute_with_file_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with file:// URL - use a temp directory that exists
         let temp_dir = std::env::temp_dir();
-        let table_root = format!("file://{}/", temp_dir.to_str().unwrap());
+        let table_root = Url::parse(&format!("file://{}/", temp_dir.to_str().unwrap()))?;
         let builder = MetadataBuilder::new_for(table_root.clone());
 
         let relative_path = "part-00000.parquet";
@@ -253,8 +416,8 @@ mod tests {
     fn test_path_to_absolute_preserves_special_characters() -> Result<(), Box<dyn std::error::Error>>
     {
         // Test that special characters in paths are preserved
-        let table_root = "s3://my-bucket/my-table/";
-        let builder = MetadataBuilder::new_for(table_root.to_string());
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let builder = MetadataBuilder::new_for(table_root);
 
         let relative_path = "partition=value%20with%20spaces/file.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -262,6 +425,99 @@ mod tests {
             result,
             "s3://my-bucket/my-table/partition=value%20with%20spaces/file.parquet"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_from_engine_data() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::StringArray;
+        use crate::utils::test_utils::parse_json_batch;
+
+        // Create test data with Add actions
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
+            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        // Create builder and add from engine data
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone());
+        builder.add_from_engine_data_add(batch.as_ref())?;
+
+        // Build metadata and verify
+        let metadata = builder.build(0);
+        assert_eq!(metadata.entries.len(), 2);
+
+        // Verify first entry
+        assert_eq!(
+            metadata.entries[0].location,
+            Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
+        );
+        assert_eq!(metadata.entries[0].file_size_in_bytes, 1024);
+
+        // Verify second entry
+        assert_eq!(
+            metadata.entries[1].location,
+            Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
+        );
+        assert_eq!(metadata.entries[1].file_size_in_bytes, 2048);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_from_engine_data_iter() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::StringArray;
+        use crate::utils::test_utils::parse_json_batch;
+
+        // Create multiple batches of test data with Add actions
+        let json_strings1: StringArray = vec![
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
+            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
+        ]
+        .into();
+        let batch1 = parse_json_batch(json_strings1);
+
+        let json_strings2: StringArray = vec![
+            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
+        ]
+        .into();
+        let batch2 = parse_json_batch(json_strings2);
+
+        // Create iterator of engine data results
+        let batches: Vec<Result<Box<dyn crate::EngineData>, crate::Error>> =
+            vec![Ok(batch1), Ok(batch2)];
+
+        // Create builder and add from engine data iterator
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone());
+        builder.add_from_engine_data_iter(batches.into_iter())?;
+
+        // Build metadata and verify
+        let metadata = builder.build(0);
+        assert_eq!(metadata.entries.len(), 3);
+
+        // Verify entries
+        assert_eq!(
+            metadata.entries[0].location,
+            Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
+        );
+        assert_eq!(metadata.entries[0].file_size_in_bytes, 1024);
+
+        assert_eq!(
+            metadata.entries[1].location,
+            Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
+        );
+        assert_eq!(metadata.entries[1].file_size_in_bytes, 2048);
+
+        assert_eq!(
+            metadata.entries[2].location,
+            Some("s3://my-bucket/my-table/part-00002.parquet".to_string())
+        );
+        assert_eq!(metadata.entries[2].file_size_in_bytes, 3072);
+
         Ok(())
     }
 }
