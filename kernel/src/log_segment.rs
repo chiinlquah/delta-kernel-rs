@@ -61,6 +61,19 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// The latest content root file.
+    pub latest_content_root_file: Option<ParsedLogPath>,
+}
+
+/// A partial commit cover is a set of files that cover is a set of files that is a
+/// subset (possibly the complete set) of files needed to cover a commit a range.
+/// It is used for chunking together files that should be read together with the
+/// same schema and the same predicate. A commit range can have multiple PartialCommitCovers
+/// to accomodate special case logic for content metadata trees.
+struct PartialCommitCover {
+    files: Vec<FileMeta>,
+    meta_predicate: Option<PredicateRef>,
+    read_schema: SchemaRef,
 }
 
 impl LogSegment {
@@ -132,6 +145,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            latest_content_root_file: None,
         })
     }
 
@@ -291,22 +305,40 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
-                commit_read_schema,
-                meta_predicate.clone(),
-            )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+        let commits_and_compactions =
+            self.find_commit_cover(commit_read_schema, meta_predicate.clone())?;
+        let commit_reads = commits_and_compactions
+            .into_iter()
+            .map(|partial_commit_cover| {
+                engine.json_handler().read_json_files(
+                    &partial_commit_cover.files,
+                    partial_commit_cover.read_schema.clone(),
+                    partial_commit_cover.meta_predicate.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let commit_stream = commit_reads.into_iter().flat_map(|result| match result {
+            Ok(iter) => Box::new(iter.map_ok(|batch| ActionsBatch::new(batch, true)))
+                as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+            Err(e) => Box::new(std::iter::once(Err(e)))
+                as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+        });
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
+        Ok(Box::new(commit_stream.chain(checkpoint_stream)))
+    }
 
-        Ok(commit_stream.chain(checkpoint_stream))
+    fn remove_file_actions_from_schema(schema: SchemaRef) -> DeltaResult<SchemaRef> {
+        let file_action_names = [ADD_NAME, REMOVE_NAME, SIDECAR_NAME];
+        let non_file_action_names = schema
+            .field_names()
+            .filter(|name| !file_action_names.contains(&name.as_ref()))
+            .collect::<Vec<_>>();
+        schema.project(&non_file_action_names)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -314,19 +346,46 @@ impl LogSegment {
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
-    fn find_commit_cover(&self) -> Vec<FileMeta> {
+    fn find_commit_cover(
+        &self,
+        commit_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Vec<PartialCommitCover>> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.ascending_commit_files.iter(),
-            self.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        );
+        let mut all_files: Box<dyn Iterator<Item = &ParsedLogPath>> =
+            Box::new(itertools::Itertools::merge_by(
+                self.ascending_commit_files.iter(),
+                self.ascending_compaction_files.iter(),
+                |path_a, path_b| path_a.version <= path_b.version,
+            ));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
+        let mut commit_covers = vec![];
         let mut selected_files = vec![];
+        let mut content_root_version = None;
+        // Only be careful with content root version if we are reading add/remove actions since that is all it contains.
+        let mut read_schema = commit_read_schema.clone();
+
+        if self.latest_content_root_file.is_some()
+            && (commit_read_schema.contains(ADD_NAME) || commit_read_schema.contains(REMOVE_NAME))
+        {
+            content_root_version = self
+                .latest_content_root_file
+                .as_ref()
+                .map(|file| file.version);
+            read_schema = Self::remove_file_actions_from_schema(commit_read_schema.clone())?;
+            // TODO: Adapt the meta_predicate also if it references file actions. Today this isn't the case.
+
+            // If the read schema is empty, we can skip all files before the root content version because there are no add/remove files
+            // actions that relevant before a root content version, and no other action types were requested.
+            if read_schema.fields().len() == 0 {
+                all_files =
+                    Box::new(all_files.filter(|f| f.version > content_root_version.unwrap_or(0)));
+            }
+        }
         for next in all_files {
             match last_pushed {
                 // Resolve version number ties in favor of the later file (it covers a wider range)
@@ -344,12 +403,77 @@ impl LogSegment {
                 }
                 _ => {} // just fall through
             }
+            if let Some(root_version) = content_root_version {
+                if let LogPathFileType::CompactedCommit { hi } = next.file_type {
+                    if root_version >= next.version && root_version <= hi {
+                        // For now skip over compactions that include the root to avoid having to deal
+                        // with edge cases of mixed add/remove file actions.
+                        debug!("Skipping log file {next:?}, it overlaps with the latest content root file.");
+                        continue;
+                    }
+                }
+                // Since overlapping compactions are skipped above, the only overlapping file
+                // will be a commit.
+                if let LogPathFileType::Commit = next.file_type {
+                    if root_version == next.version {
+                        require!(
+                            commit_covers.is_empty(),
+                            Error::generic("Expected no commit covers before adding a new one")
+                        );
+                        selected_files.reverse();
+                        let copied_files = selected_files.clone();
+                        selected_files = vec![];
+                        commit_covers.push(PartialCommitCover {
+                            files: copied_files,
+                            meta_predicate: meta_predicate.clone(),
+                            read_schema: read_schema.clone(),
+                        });
+                    }
+                    // Reset back to the full schema for any commits after the root to ensure no
+                    // file actions are lost.
+                    read_schema = commit_read_schema.clone();
+                }
+            }
             debug!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
             selected_files.push(next.location.clone());
         }
+
         selected_files.reverse();
-        selected_files
+        commit_covers.push(PartialCommitCover {
+            files: selected_files,
+            meta_predicate: meta_predicate.clone(),
+            read_schema: commit_read_schema.clone(),
+        });
+        commit_covers.reverse();
+        Ok(commit_covers)
+    }
+
+    fn create_content_root_reader(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_read_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // TODO: Provide ta real implementation of this method.
+        // Create a FileMeta pointing to an in-memory mock content root file
+        // Tests should populate memory:///_mock_content_root.json with content like:
+        // {"add":{"path":"part-00000-test.snappy.parquet","partitionValues":{},"size":1024,...}}
+        // {"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},...}}
+        let mock_file_path = Url::parse("memory:///_mock_content_root.json")?;
+        let file_meta = FileMeta {
+            location: mock_file_path,
+            last_modified: 0,
+            size: 0, // Size will be determined by the actual file if it exists
+        };
+
+        // Use read_json_files to parse the mock data from the in-memory location
+        let json_handler = engine.json_handler();
+        let batches = json_handler.read_json_files(&[file_meta], checkpoint_read_schema, None)?;
+
+        // Convert to ActionsBatch iterator
+        Ok(Box::new(
+            batches.map_ok(|batch| ActionsBatch::new(batch, false)),
+        ))
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
@@ -368,9 +492,29 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
+
+        // Read the content root file it exists and file actions are necessary.
+        // The content root serves the same point as a checkpoint file for file actions,
+        // so remove file actions from the schema if they are present for actually reading
+        // the checkpoint files.
+        let (content_root_stream, read_schema): (
+            Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+            SchemaRef,
+        ) = if self.latest_content_root_file.is_some() && need_file_actions {
+            (
+                self.create_content_root_reader(engine, checkpoint_read_schema.clone())?,
+                Self::remove_file_actions_from_schema(checkpoint_read_schema.clone())?,
+            )
+        } else {
+            (Box::new(std::iter::empty()), checkpoint_read_schema.clone())
+        };
+
+        if read_schema.fields().len() == 0 {
+            return Ok(Box::new(content_root_stream));
+        }
 
         // Only validate sidecar requirement if we actually have checkpoint files
         if !self.checkpoint_parts.is_empty() {
@@ -398,14 +542,14 @@ impl LogSegment {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    read_schema.clone(),
                     meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    read_schema.clone(),
                     meta_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
@@ -437,7 +581,7 @@ impl LogSegment {
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
-                        checkpoint_read_schema.clone(),
+                        read_schema.clone(),
                         meta_predicate.clone(),
                     )?
                 } else {
@@ -455,7 +599,7 @@ impl LogSegment {
             .flatten_ok()
             .map(|result| result?); // result-result to result
 
-        Ok(actions_iter)
+        Ok(Box::new(content_root_stream.chain(actions_iter)))
     }
 
     /// Processes sidecar files for the given checkpoint batch.

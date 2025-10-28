@@ -1690,4 +1690,389 @@ mod tests {
             _ => panic!("Expected MetadataDerivedColumn transform"),
         }
     }
+
+    #[test]
+    fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+        use crate::engine::default::DefaultEngine;
+        use crate::path::{LogPathFileType, ParsedLogPath};
+        use crate::RowVisitor;
+        use futures::executor::block_on;
+        use object_store::{memory::InMemory, path::Path, ObjectStore};
+
+        // Setup: Create an in-memory store
+        let store = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let log_root = table_root.join("_delta_log/").unwrap();
+
+        // Create initial commit with protocol and metadata
+        let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}
+{"add":{"path":"part-v00000.parquet","partitionValues":{},"size":1024,"modificationTime":1677811178336,"dataChange":true}}"#;
+        let path0 = Path::from("_delta_log/00000000000000000000.json");
+        block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
+
+        // Create commit files: versions 1, 2, 3, 4, 5
+        // Content root is at version 3, so we should only read commits 4 and 5
+        for version in 1..=5 {
+            let commit_content = format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
+                version
+            );
+            let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
+            block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
+        }
+
+        let content_root_data = r#"{"add":{"path":"part-content-root.parquet","partitionValues":{},"size":2048,"modificationTime":1677811178336,"dataChange":true}}
+{"remove":{"path":"part-removed.parquet","partitionValues":{},"size":1024,"deletionTimestamp":1677811178336,"dataChange":true}}"#;
+        let content_root_path = Path::from("/_mock_content_root.json");
+        block_on(async {
+            store
+                .put(&content_root_path, content_root_data.into())
+                .await
+        })
+        .unwrap();
+
+        // Create engine
+        let engine = Arc::new(DefaultEngine::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create ParsedLogPath objects for commits
+        let mut commit_files = vec![];
+        for version in 0..=5 {
+            let location = log_root.join(&format!("{:020}.json", version)).unwrap();
+            commit_files.push(ParsedLogPath {
+                location: FileMeta {
+                    location,
+                    last_modified: 0,
+                    size: 100,
+                },
+                filename: format!("{:020}.json", version),
+                extension: "json".to_string(),
+                version,
+                file_type: LogPathFileType::Commit,
+            });
+        }
+
+        // Create a LogSegment with content_root at version 3
+        let content_root_location = log_root.join("_content_root_v3.json").unwrap();
+        let content_root_file = ParsedLogPath {
+            location: FileMeta {
+                location: content_root_location,
+                last_modified: 0,
+                size: 100,
+            },
+            filename: "_content_root_v3.json".to_string(),
+            extension: "json".to_string(),
+            version: 3,
+            file_type: LogPathFileType::Commit,
+        };
+
+        let latest_commit_file = commit_files.last().cloned();
+        let log_segment = crate::log_segment::LogSegment {
+            end_version: 5,
+            checkpoint_version: None,
+            log_root: log_root.clone(),
+            ascending_commit_files: commit_files,
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file,
+            latest_content_root_file: Some(content_root_file),
+        };
+
+        // Create a Snapshot from the log_segment
+        let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment(
+            table_root.clone(),
+            log_segment,
+            engine.as_ref(),
+        )?);
+
+        let scan = snapshot.scan_builder().build()?;
+
+        // Call replay_for_scan_metadata and collect all actions
+        let action_batches: Vec<_> = scan
+            .replay_for_scan_metadata(engine.as_ref())?
+            .try_collect()?;
+
+        // Extract all add action paths and track which came from log batches vs content root
+        let mut add_paths = vec![];
+        let mut log_batch_paths = vec![];
+        let mut content_root_paths = vec![];
+
+        for batch in action_batches {
+            let mut visitor = AddVisitor::default();
+            visitor.visit_rows_of(batch.actions.as_ref())?;
+            for add in visitor.adds {
+                add_paths.push(add.path.clone());
+                if batch.is_log_batch {
+                    log_batch_paths.push(add.path);
+                } else {
+                    content_root_paths.push(add.path);
+                }
+            }
+        }
+
+        // Verify we got:
+        // 1. Actions from commits 4 and 5 (after content root) with is_log_batch=true
+        // 2. Action from content root itself with is_log_batch=false
+        // 3. NO actions from commits 0, 1, 2, 3 (at or before content root version)
+        assert!(
+            add_paths.contains(&"part-v00004.parquet".to_string()),
+            "Should have action from commit 4"
+        );
+        assert!(
+            add_paths.contains(&"part-v00005.parquet".to_string()),
+            "Should have action from commit 5"
+        );
+        assert!(
+            add_paths.contains(&"part-content-root.parquet".to_string()),
+            "Should have action from content root"
+        );
+
+        // Verify old commits are NOT included
+        assert!(
+            !add_paths.contains(&"part-v00000.parquet".to_string()),
+            "Should NOT have action from commit 0"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00001.parquet".to_string()),
+            "Should NOT have action from commit 1"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00002.parquet".to_string()),
+            "Should NOT have action from commit 2"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00003.parquet".to_string()),
+            "Should NOT have action from commit 3"
+        );
+
+        // Verify is_log_batch flags are correct
+        assert!(
+            log_batch_paths.contains(&"part-v00004.parquet".to_string()),
+            "Commit 4 should have is_log_batch=true"
+        );
+        assert!(
+            log_batch_paths.contains(&"part-v00005.parquet".to_string()),
+            "Commit 5 should have is_log_batch=true"
+        );
+        assert!(
+            content_root_paths.contains(&"part-content-root.parquet".to_string()),
+            "Content root should have is_log_batch=false"
+        );
+        assert_eq!(
+            log_batch_paths.len(),
+            2,
+            "Should have exactly 2 actions from log batches"
+        );
+        assert_eq!(
+            content_root_paths.len(),
+            1,
+            "Should have exactly 1 action from content root"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+        use crate::engine::default::DefaultEngine;
+        use crate::path::{LogPathFileType, ParsedLogPath};
+        use crate::RowVisitor;
+        use futures::executor::block_on;
+        use object_store::{memory::InMemory, path::Path, ObjectStore};
+
+        // Setup: Create an in-memory store
+        let store = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let log_root = table_root.join("_delta_log/").unwrap();
+
+        // Create initial commit with protocol and metadata
+        let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}
+{"add":{"path":"part-v00000.parquet","partitionValues":{},"size":1024,"modificationTime":1677811178336,"dataChange":true}}"#;
+        let path0 = Path::from("_delta_log/00000000000000000000.json");
+        block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
+
+        // Create commit files: versions 1, 2, 5, 10, 15, 20
+        // Content root is at version 10
+        // Commits before version 10 should be ignored (0, 1, 2, 5, 10)
+        // Only commits 15 and 20 should be included
+        let versions = vec![1, 2, 5, 10, 15, 20];
+        for version in &versions {
+            let commit_content = format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
+                version
+            );
+            let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
+            block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
+        }
+
+        // Create mock content root file with distinct path
+        let content_root_data = r#"{"add":{"path":"part-gap-content-root.parquet","partitionValues":{},"size":2048,"modificationTime":1677811178336,"dataChange":true}}
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#;
+        let content_root_path = Path::from("/_mock_content_root.json");
+        block_on(async {
+            store
+                .put(&content_root_path, content_root_data.into())
+                .await
+        })
+        .unwrap();
+
+        // Create engine
+        let engine = Arc::new(DefaultEngine::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create ParsedLogPath objects for commits (including version 0)
+        let all_versions = vec![0, 1, 2, 5, 10, 15, 20];
+        let mut commit_files = vec![];
+        for version in &all_versions {
+            let location = log_root.join(&format!("{:020}.json", version)).unwrap();
+            commit_files.push(ParsedLogPath {
+                location: FileMeta {
+                    location,
+                    last_modified: 0,
+                    size: 100,
+                },
+                filename: format!("{:020}.json", version),
+                extension: "json".to_string(),
+                version: *version,
+                file_type: LogPathFileType::Commit,
+            });
+        }
+
+        // Create a LogSegment with content_root at version 10
+        let content_root_location = log_root.join("_content_root_v10.json").unwrap();
+        let content_root_file = ParsedLogPath {
+            location: FileMeta {
+                location: content_root_location,
+                last_modified: 0,
+                size: 100,
+            },
+            filename: "_content_root_v10.json".to_string(),
+            extension: "json".to_string(),
+            version: 10,
+            file_type: LogPathFileType::Commit,
+        };
+
+        let log_segment = crate::log_segment::LogSegment {
+            end_version: 20,
+            checkpoint_version: None,
+            log_root: log_root.clone(),
+            ascending_commit_files: commit_files,
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            latest_content_root_file: Some(content_root_file),
+        };
+
+        // Create a Snapshot from the log_segment
+        let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment(
+            table_root.clone(),
+            log_segment,
+            engine.as_ref(),
+        )?);
+
+        let scan = snapshot.scan_builder().build()?;
+
+        // Call replay_for_scan_metadata and collect all actions
+        let action_batches: Vec<_> = scan
+            .replay_for_scan_metadata(engine.as_ref())?
+            .try_collect()?;
+
+        // Extract all add action paths and track which came from log batches vs content root
+        let mut add_paths = vec![];
+        let mut log_batch_paths = vec![];
+        let mut content_root_paths = vec![];
+
+        for batch in action_batches {
+            let mut visitor = AddVisitor::default();
+            visitor.visit_rows_of(batch.actions.as_ref())?;
+            for add in visitor.adds {
+                add_paths.push(add.path.clone());
+                if batch.is_log_batch {
+                    log_batch_paths.push(add.path);
+                } else {
+                    content_root_paths.push(add.path);
+                }
+            }
+        }
+
+        // Verify we got:
+        // 1. Actions from commits 15 and 20 (after content root, with gaps) with is_log_batch=true
+        // 2. Action from content root itself with is_log_batch=false
+        // 3. NO actions from commits 0, 1, 2, 5, 10 (at or before content root version)
+        assert!(
+            add_paths.contains(&"part-v00015.parquet".to_string()),
+            "Should have action from commit 15"
+        );
+        assert!(
+            add_paths.contains(&"part-v00020.parquet".to_string()),
+            "Should have action from commit 20"
+        );
+        assert!(
+            add_paths.contains(&"part-gap-content-root.parquet".to_string()),
+            "Should have action from content root"
+        );
+
+        // Verify old commits are NOT included, even though there are version gaps
+        assert!(
+            !add_paths.contains(&"part-v00000.parquet".to_string()),
+            "Should NOT have action from commit 0"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00001.parquet".to_string()),
+            "Should NOT have action from commit 1"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00002.parquet".to_string()),
+            "Should NOT have action from commit 2"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00005.parquet".to_string()),
+            "Should NOT have action from commit 5"
+        );
+        assert!(
+            !add_paths.contains(&"part-v00010.parquet".to_string()),
+            "Should NOT have action from commit 10 (the content root version itself)"
+        );
+
+        // Verify we got exactly 3 actions (2 from later commits + 1 from content root)
+        assert_eq!(add_paths.len(), 3, "Should have exactly 3 add actions");
+
+        // Verify is_log_batch flags are correct
+        assert!(
+            log_batch_paths.contains(&"part-v00015.parquet".to_string()),
+            "Commit 15 should have is_log_batch=true"
+        );
+        assert!(
+            log_batch_paths.contains(&"part-v00020.parquet".to_string()),
+            "Commit 20 should have is_log_batch=true"
+        );
+        assert!(
+            content_root_paths.contains(&"part-gap-content-root.parquet".to_string()),
+            "Content root should have is_log_batch=false"
+        );
+        assert_eq!(
+            log_batch_paths.len(),
+            2,
+            "Should have exactly 2 actions from log batches"
+        );
+        assert_eq!(
+            content_root_paths.len(),
+            1,
+            "Should have exactly 1 action from content root"
+        );
+
+        Ok(())
+    }
 }

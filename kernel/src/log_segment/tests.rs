@@ -1644,7 +1644,9 @@ fn test_commit_cover(
         checkpoint_version,
         version_to_load,
     );
-    let cover = log_segment.find_commit_cover();
+    let cover = log_segment
+        .find_commit_cover(get_log_schema().clone(), None)
+        .unwrap();
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this
     let expected_locations = expected_files.iter().map(|ef| match ef {
@@ -1657,8 +1659,13 @@ fn test_commit_cover(
             .join(&format!("{lo:020}.{hi:020}.compacted.json"))
             .expect("Couldn't join"),
     });
-    assert_eq!(cover.len(), expected_locations.len());
-    for (location, expected_location) in cover.iter().zip(expected_locations) {
+    let total_files: usize = cover.iter().map(|c| c.files.len()).sum();
+    assert_eq!(total_files, expected_locations.len());
+    for (location, expected_location) in cover
+        .into_iter()
+        .flat_map(|c| c.files.into_iter())
+        .zip(expected_locations)
+    {
         assert_eq!(location.location, expected_location);
     }
 }
@@ -2305,6 +2312,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        latest_content_root_file: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2322,6 +2330,7 @@ fn test_publish_validation() {
         checkpoint_parts: vec![],
         checkpoint_version: None,
         log_root: Url::parse("file:///path/").unwrap(),
+        latest_content_root_file: None,
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
