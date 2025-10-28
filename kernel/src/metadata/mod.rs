@@ -72,16 +72,17 @@ impl Metadata {
         let scan = ScanBuilder::new(snapshot).build()?;
         let scan_metadata_iter = scan.scan_metadata(engine)?;
 
-        let mut metadata_builder = MetadataBuilder::new_for(table_root);
+        let mut metadata_builder = MetadataBuilder::new_for(table_root, version);
 
         for scan_metadata_result in scan_metadata_iter {
             let scan_metadata = scan_metadata_result?;
             let engine_data = scan_metadata.scan_files.data();
 
-            metadata_builder.add_from_engine_data_add(engine_data)?;
+            // TODO: Should we store the version on when it was added as a tag on the Add action?
+            metadata_builder.add_from_engine_data_add(engine_data, version)?;
         }
 
-        Ok(metadata_builder.build(version))
+        Ok(metadata_builder.build())
     }
 
     /// Reads Metadata from a parquet file at the specified path.
@@ -140,7 +141,7 @@ impl Metadata {
     /// A `MetadataBuilder` that can be used to add more entries or build a new Metadata.
     #[allow(dead_code)]
     pub(crate) fn to_builder(&self) -> MetadataBuilder {
-        MetadataBuilder::new_for(self.table_root.clone())
+        MetadataBuilder::new_for(self.table_root.clone(), self.version)
     }
 }
 

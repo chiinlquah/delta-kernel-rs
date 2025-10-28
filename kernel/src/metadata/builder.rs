@@ -20,15 +20,17 @@ use url::Url;
 pub(crate) struct MetadataBuilder {
     table_root: Url,
     pending_entries: Vec<MetadataEntry>,
+    version: Version,
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
 impl MetadataBuilder {
     #[allow(dead_code)]
-    pub(crate) fn new_for(table_root: Url) -> Self {
+    pub(crate) fn new_for(table_root: Url, version: Version) -> Self {
         Self {
             table_root,
             pending_entries: Vec::new(),
+            version,
         }
     }
 
@@ -62,7 +64,7 @@ impl MetadataBuilder {
     #[allow(unreachable_code)]
     #[allow(dead_code)]
     #[allow(clippy::unwrap_used)]
-    pub(crate) fn add(&mut self, add: Add) {
+    pub(crate) fn add(&mut self, add: Add, version: Version) {
         let deletion_vector = add.deletion_vector.map(|dv| {
             match dv.storage_type {
                 DeletionVectorStorageType::PersistedRelative
@@ -88,18 +90,24 @@ impl MetadataBuilder {
             DataContentType::Data
         };
 
+        let status = if version == self.version {
+            TrackingStatus::Added
+        } else {
+            TrackingStatus::Existed
+        };
+
         let data_file_entry = MetadataEntry {
             content_type,
             location: Some(self.path_to_absolute(&add.path).unwrap()),
             file_format: DataFileFormat::Parquet,
             tracking_info: TrackingInfo {
-                status: TrackingStatus::Added,
-                // Since the status is Added, we can leave the fields below null,
-                // but when we rewrite them as existing, we need this information
-                // from the snapshot
-                snapshot_id: None,
-                sequence_number: None,
-                file_sequence_number: None,
+                status,
+                // Set the snapshot-id, sequence-number and file-sequence-number explicitly,
+                // which requires rewriting the metadata in the case of a conflict
+                // TODO: Should we generate a snapshot-ID and store it in a tag on the Add action?
+                snapshot_id: Some(version as i64),
+                sequence_number: Some(version as i64),
+                file_sequence_number: Some(version as i64),
 
                 // We could set it, but then we can't do fast-retries
                 // first_row_id: add.base_row_id,
@@ -153,12 +161,13 @@ impl MetadataBuilder {
     pub(crate) fn add_from_engine_data_add(
         &mut self,
         engine_data: &dyn EngineData,
+        version: Version,
     ) -> Result<(), crate::Error> {
         let mut visitor = AddVisitor::default();
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add);
+            self.add(add, version);
         }
 
         Ok(())
@@ -180,12 +189,13 @@ impl MetadataBuilder {
     pub(crate) fn add_from_engine_data_write(
         &mut self,
         engine_data: &dyn EngineData,
+        version: Version,
     ) -> Result<(), crate::Error> {
         let mut visitor = WriteMetadataVisitor::default();
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add);
+            self.add(add, version);
         }
 
         Ok(())
@@ -206,20 +216,21 @@ impl MetadataBuilder {
     pub(crate) fn add_from_engine_data_iter<'a>(
         &mut self,
         engine_data_iter: impl Iterator<Item = Result<Box<dyn EngineData>, crate::Error>> + 'a,
+        version: Version,
     ) -> Result<(), crate::Error> {
         for engine_data_result in engine_data_iter {
             let engine_data = engine_data_result?;
-            self.add_from_engine_data_add(engine_data.as_ref())?;
+            self.add_from_engine_data_add(engine_data.as_ref(), version)?;
         }
 
         Ok(())
     }
 
-    pub(crate) fn build(&self, version: Version) -> Metadata {
+    pub(crate) fn build(&self) -> Metadata {
         Metadata {
             table_root: self.table_root.clone(),
             entries: self.pending_entries.clone(),
-            version,
+            version: self.version,
         }
     }
 }
@@ -319,7 +330,7 @@ mod tests {
     fn test_path_to_absolute_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
         // Test with s3:// URL as table root
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let relative_path = "part-00000-123.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -339,7 +350,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_s3_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let absolute_path = "s3://another-bucket/external/data.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -350,7 +361,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_https_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let absolute_path = "https://example.com/data/file.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -362,7 +373,7 @@ mod tests {
     fn test_path_to_absolute_with_gs_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Google Cloud Storage URL
         let table_root = Url::parse("gs://my-gcs-bucket/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let relative_path = "data/part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -382,7 +393,7 @@ mod tests {
     fn test_path_to_absolute_with_azure_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Azure Blob Storage URL
         let table_root = Url::parse("abfss://container@account.dfs.core.windows.net/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -398,7 +409,7 @@ mod tests {
         // Test with file:// URL - use a temp directory that exists
         let temp_dir = std::env::temp_dir();
         let table_root = Url::parse(&format!("file://{}/", temp_dir.to_str().unwrap()))?;
-        let builder = MetadataBuilder::new_for(table_root.clone());
+        let builder = MetadataBuilder::new_for(table_root.clone(), 1);
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -417,7 +428,7 @@ mod tests {
     {
         // Test that special characters in paths are preserved
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root);
+        let builder = MetadataBuilder::new_for(table_root, 1);
 
         let relative_path = "partition=value%20with%20spaces/file.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -443,11 +454,11 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone());
-        builder.add_from_engine_data_add(batch.as_ref())?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        builder.add_from_engine_data_add(batch.as_ref(), 1)?;
 
         // Build metadata and verify
-        let metadata = builder.build(0);
+        let metadata = builder.build();
         assert_eq!(metadata.entries.len(), 2);
 
         // Verify first entry
@@ -492,11 +503,11 @@ mod tests {
 
         // Create builder and add from engine data iterator
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone());
-        builder.add_from_engine_data_iter(batches.into_iter())?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        builder.add_from_engine_data_iter(batches.into_iter(), 1)?;
 
         // Build metadata and verify
-        let metadata = builder.build(0);
+        let metadata = builder.build();
         assert_eq!(metadata.entries.len(), 3);
 
         // Verify entries

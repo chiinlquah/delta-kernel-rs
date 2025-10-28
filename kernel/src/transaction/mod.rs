@@ -289,10 +289,11 @@ impl Transaction {
             let metadata = Metadata::new_from_snapshot(self.read_snapshot.clone(), engine)?;
             let mut metadata_builder = metadata.to_builder();
             for add_metadata_result in self.add_files_metadata.iter() {
-                metadata_builder.add_from_engine_data_write(add_metadata_result.as_ref())?;
+                metadata_builder
+                    .add_from_engine_data_write(add_metadata_result.as_ref(), commit_version)?;
             }
 
-            let new_metadata = metadata_builder.build(commit_version);
+            let new_metadata = metadata_builder.build();
             let file_meta = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
             let content_root_action = ContentRoot {
