@@ -1,7 +1,6 @@
-use crate::metadata::{Metadata, MetadataEntry};
+use crate::metadata::Metadata;
 use crate::path::ParsedLogPath;
-use crate::schema::ToSchema;
-use crate::IntoEngineData;
+use crate::FilteredEngineData;
 use crate::{DeltaResult, Engine, FileMeta};
 use url::Url;
 
@@ -37,31 +36,18 @@ impl MetadataWriter {
     pub(crate) fn write(&self, engine: &dyn Engine) -> DeltaResult<FileMeta> {
         let path = self.checkpoint_path()?;
 
-        // Create an iterator that converts each metadata entry to FilteredEngineData
-        let data_iter = self.metadata.entries.iter().map(|entry| {
-            let engine_data = entry
-                .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), engine)?;
-            Ok(engine_data.into())
+        // Create an iterator over the metadata data (already in EngineData format)
+        let empty_schema = std::sync::Arc::new(crate::schema::StructType::new_unchecked([]));
+        let data_iter = self.metadata.data.iter().map(|engine_data| {
+            // Hack to get a copy of engine_data which is not otherwise copyable.
+            let appended = engine_data.append_columns(empty_schema.clone(), vec![])?;
+            Ok(FilteredEngineData::with_all_rows_selected(appended))
         });
 
-        engine
+        let file_meta = engine
             .parquet_handler()
             .write_parquet_file(path.clone(), Box::new(data_iter))?;
 
-        // Try to get the file size from the file system
-        let size = path
-            .to_file_path()
-            .ok()
-            .and_then(|file_path| std::fs::metadata(file_path).ok())
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-
-        // Create FileMeta with size from file system or 0, and last_modified as 0
-        Ok(FileMeta {
-            location: path,
-            last_modified: 0,
-            size,
-        })
+        Ok(file_meta)
     }
 }

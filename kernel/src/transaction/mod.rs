@@ -293,7 +293,7 @@ impl Transaction {
                     .add_from_engine_data_write(add_metadata_result.as_ref(), commit_version)?;
             }
 
-            let new_metadata = metadata_builder.build();
+            let new_metadata = metadata_builder.build(engine)?;
             let file_meta = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
             let content_root_action = ContentRoot {

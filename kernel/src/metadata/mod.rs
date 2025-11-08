@@ -4,6 +4,7 @@ pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
+use crate::engine_data::EngineData;
 use crate::expressions::Scalar;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
@@ -26,10 +27,8 @@ use url::Url;
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
 #[allow(dead_code)]
-#[derive(Debug)]
 pub(crate) struct Metadata {
-    entries: Vec<MetadataEntry>,
-
+    data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
 }
@@ -43,10 +42,22 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn new(version: Version, table_root: Url) -> Self {
         Self {
-            entries: vec![],
+            data: vec![],
             version,
             table_root,
         }
+    }
+
+    #[allow(dead_code)]
+    fn entries(&self) -> DeltaResult<Vec<MetadataEntry>> {
+        let mut all_entries = Vec::new();
+        use crate::engine_data::RowVisitor;
+        for batch in self.data.iter() {
+            let mut visitor = reader::MetadataEntryVisitor::default();
+            visitor.visit_rows_of(batch.as_ref())?;
+            all_entries.extend(visitor.entries);
+        }
+        Ok(all_entries)
     }
 
     /// Creates Metadata from a Delta table snapshot by replaying add actions from the transaction log.
@@ -82,7 +93,7 @@ impl Metadata {
             metadata_builder.add_from_engine_data_add(engine_data, version)?;
         }
 
-        Ok(metadata_builder.build())
+        metadata_builder.build(engine)
     }
 
     /// Reads Metadata from a parquet file at the specified path.
@@ -97,7 +108,6 @@ impl Metadata {
     /// A `Metadata` instance deserialized from the parquet file.
     #[allow(dead_code)]
     pub(crate) fn read(engine: &dyn Engine, path: &Url) -> DeltaResult<Self> {
-        use crate::engine_data::RowVisitor;
         use crate::schema::ToSchema;
         use std::sync::Arc;
 
@@ -116,17 +126,10 @@ impl Metadata {
             None,
         )?;
 
-        let mut all_entries = Vec::new();
-
-        for batch_result in read_result_iter {
-            let batch = batch_result?;
-            let mut visitor = reader::MetadataEntryVisitor::default();
-            visitor.visit_rows_of(batch.as_ref())?;
-            all_entries.extend(visitor.entries);
-        }
+        let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Self {
-            entries: all_entries,
+            data,
             version: parsed.version,
             table_root: path.clone(),
         })
@@ -243,10 +246,12 @@ pub(crate) struct TrackingInfo {
     status: TrackingStatus,
 
     /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when null.
+    /// Must be written in the root file.
     snapshot_id: Option<i64>,
 
     /// Data sequence number of the file. Inherited in when null and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
+    /// Must be written in the root file.
     sequence_number: Option<i64>,
 
     /// File sequence number indicating when the file was added. Inherited when null and status is added.
@@ -422,7 +427,8 @@ pub(crate) struct MetadataEntry {
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
     manifest_stats: Option<ManifestStats>,
 
-    /// Location of affiliated data manifest if content_type is DeleteManifest or null if delete manifest is unaffiliated.
+    /// Location of the data file if the content_type is  PositionDeletes
+    /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
     referenced_file: Option<String>,
 
     /// Not used by Delta today
@@ -548,7 +554,8 @@ impl crate::IntoEngineData for MetadataEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::sync::SyncEngine;
+    use crate::schema::ToSchema;
+    use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
 
     // Note: Full integration test for MetadataEntry::into_engine_data is not included here
@@ -847,7 +854,9 @@ mod tests {
         // Create original metadata
         let original_entry = create_simple_metadata_entry();
         let metadata = Metadata {
-            entries: vec![original_entry.clone()],
+            data: vec![original_entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
         };
@@ -860,8 +869,9 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 1);
-        assert_metadata_entry_eq(&original_entry, &read_metadata.entries[0]);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&original_entry, &entries[0]);
 
         Ok(())
     }
@@ -875,7 +885,9 @@ mod tests {
         // Create metadata with deletion vector
         let original_entry = create_metadata_entry_with_dv();
         let metadata = Metadata {
-            entries: vec![original_entry.clone()],
+            data: vec![original_entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
         };
@@ -888,8 +900,9 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 1);
-        assert_metadata_entry_eq(&original_entry, &read_metadata.entries[0]);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&original_entry, &entries[0]);
 
         Ok(())
     }
@@ -903,7 +916,9 @@ mod tests {
         // Create metadata with manifest stats
         let original_entry = create_metadata_entry_with_manifest_stats();
         let metadata = Metadata {
-            entries: vec![original_entry.clone()],
+            data: vec![original_entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
         };
@@ -916,8 +931,9 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 1);
-        assert_metadata_entry_eq(&original_entry, &read_metadata.entries[0]);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&original_entry, &entries[0]);
 
         Ok(())
     }
@@ -934,7 +950,17 @@ mod tests {
         let entry3 = create_metadata_entry_with_manifest_stats();
 
         let metadata = Metadata {
-            entries: vec![entry1.clone(), entry2.clone(), entry3.clone()],
+            data: vec![
+                entry1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                entry2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                entry3
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
             version: 3,
             table_root: table_root_url.clone(),
         };
@@ -947,10 +973,11 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 3);
-        assert_metadata_entry_eq(&entry1, &read_metadata.entries[0]);
-        assert_metadata_entry_eq(&entry2, &read_metadata.entries[1]);
-        assert_metadata_entry_eq(&entry3, &read_metadata.entries[2]);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 3);
+        assert_metadata_entry_eq(&entry1, &entries[0]);
+        assert_metadata_entry_eq(&entry2, &entries[1]);
+        assert_metadata_entry_eq(&entry3, &entries[2]);
 
         Ok(())
     }
@@ -998,8 +1025,16 @@ mod tests {
             })
             .collect();
 
+        let data: Vec<Box<dyn EngineData>> = entries
+            .iter()
+            .map(|e| {
+                e.clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
         let metadata = Metadata {
-            entries: entries.clone(),
+            data,
             version: 4,
             table_root: table_root_url.clone(),
         };
@@ -1012,8 +1047,9 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), entries.len());
-        for (expected, actual) in entries.iter().zip(read_metadata.entries.iter()) {
+        let read_entries = read_metadata.entries()?;
+        assert_eq!(read_entries.len(), entries.len());
+        for (expected, actual) in entries.iter().zip(read_entries.iter()) {
             assert_metadata_entry_eq(expected, actual);
         }
 
@@ -1060,8 +1096,16 @@ mod tests {
             })
             .collect();
 
+        let data: Vec<Box<dyn EngineData>> = entries
+            .iter()
+            .map(|e| {
+                e.clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
         let metadata = Metadata {
-            entries: entries.clone(),
+            data,
             version: 5,
             table_root: table_root_url.clone(),
         };
@@ -1074,8 +1118,9 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), entries.len());
-        for (expected, actual) in entries.iter().zip(read_metadata.entries.iter()) {
+        let read_entries = read_metadata.entries()?;
+        assert_eq!(read_entries.len(), entries.len());
+        for (expected, actual) in entries.iter().zip(read_entries.iter()) {
             assert_metadata_entry_eq(expected, actual);
         }
 
@@ -1113,7 +1158,9 @@ mod tests {
         };
 
         let metadata = Metadata {
-            entries: vec![entry.clone()],
+            data: vec![entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
         };
@@ -1126,11 +1173,12 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 1);
-        assert_metadata_entry_eq(&entry, &read_metadata.entries[0]);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&entry, &entries[0]);
 
         // Specifically verify the None values
-        let actual = &read_metadata.entries[0];
+        let actual = &entries[0];
         assert!(actual.tracking_info.snapshot_id.is_none());
         assert!(actual.tracking_info.sequence_number.is_none());
         assert!(actual.tracking_info.file_sequence_number.is_none());
@@ -1173,7 +1221,9 @@ mod tests {
         };
 
         let metadata = Metadata {
-            entries: vec![entry.clone()],
+            data: vec![entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
         };
@@ -1186,9 +1236,10 @@ mod tests {
         let read_metadata = Metadata::read(&engine, &written_file.location)?;
 
         // Verify
-        assert_eq!(read_metadata.entries.len(), 1);
-        assert_metadata_entry_eq(&entry, &read_metadata.entries[0]);
-        assert_eq!(read_metadata.entries[0].file_format, DataFileFormat::Puffin);
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&entry, &entries[0]);
+        assert_eq!(entries[0].file_format, DataFileFormat::Puffin);
 
         Ok(())
     }

@@ -11,6 +11,7 @@ use super::{
 
 /// Visitor that extracts MetadataEntry structs from EngineData
 #[derive(Default)]
+#[allow(dead_code)]
 pub(super) struct MetadataEntryVisitor {
     pub(super) entries: Vec<MetadataEntry>,
 }
@@ -34,6 +35,7 @@ impl RowVisitor for MetadataEntryVisitor {
     }
 }
 
+#[allow(dead_code)]
 fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],

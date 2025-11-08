@@ -28,6 +28,7 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
+use crate::utils::current_time_ms;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
     ParquetHandler, PredicateRef,
@@ -247,7 +248,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         url: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileMeta> {
         // Collect all ArrowEngineData batches first, applying selection filters
         // and drop empty batches after filtering
         let batches: Vec<RecordBatch> = data
@@ -259,7 +260,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         // If there are no batches, return early
         if batches.is_empty() {
-            return Ok(());
+            return Ok(FileMeta::new(url, 0, 0));
         }
 
         // We buffer it in the application first, and then push everything to the object-store.
@@ -280,12 +281,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         let store = self.store.clone();
         let path = Path::from_url_path(url.path())?;
+        let size = buffer.len();
 
         // Block on the async put operation
         self.task_executor
             .block_on(async move { store.put(&path, buffer.into()).await })?;
 
-        Ok(())
+        Ok(FileMeta::new(url, current_time_ms()?, size as u64))
     }
 }
 

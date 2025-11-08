@@ -226,12 +226,24 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    pub(crate) fn build(&self) -> Metadata {
-        Metadata {
+    pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
+        use crate::schema::ToSchema;
+        use crate::IntoEngineData;
+
+        let data: Vec<Box<dyn EngineData>> = self
+            .pending_entries
+            .iter()
+            .map(|e| {
+                e.clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        Ok(Metadata {
             table_root: self.table_root.clone(),
-            entries: self.pending_entries.clone(),
+            data,
             version: self.version,
-        }
+        })
     }
 }
 
@@ -458,22 +470,24 @@ mod tests {
         builder.add_from_engine_data_add(batch.as_ref(), 1)?;
 
         // Build metadata and verify
-        let metadata = builder.build();
-        assert_eq!(metadata.entries.len(), 2);
+        let engine = crate::engine::sync::SyncEngine::new();
+        let metadata = builder.build(&engine)?;
+        let entries = metadata.entries()?;
+        assert_eq!(entries.len(), 2);
 
         // Verify first entry
         assert_eq!(
-            metadata.entries[0].location,
+            entries[0].location,
             Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
         );
-        assert_eq!(metadata.entries[0].file_size_in_bytes, 1024);
+        assert_eq!(entries[0].file_size_in_bytes, 1024);
 
         // Verify second entry
         assert_eq!(
-            metadata.entries[1].location,
+            entries[1].location,
             Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
         );
-        assert_eq!(metadata.entries[1].file_size_in_bytes, 2048);
+        assert_eq!(entries[1].file_size_in_bytes, 2048);
 
         Ok(())
     }
@@ -507,27 +521,29 @@ mod tests {
         builder.add_from_engine_data_iter(batches.into_iter(), 1)?;
 
         // Build metadata and verify
-        let metadata = builder.build();
-        assert_eq!(metadata.entries.len(), 3);
+        let engine = crate::engine::sync::SyncEngine::new();
+        let metadata = builder.build(&engine)?;
+        let entries = metadata.entries()?;
+        assert_eq!(entries.len(), 3);
 
         // Verify entries
         assert_eq!(
-            metadata.entries[0].location,
+            entries[0].location,
             Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
         );
-        assert_eq!(metadata.entries[0].file_size_in_bytes, 1024);
+        assert_eq!(entries[0].file_size_in_bytes, 1024);
 
         assert_eq!(
-            metadata.entries[1].location,
+            entries[1].location,
             Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
         );
-        assert_eq!(metadata.entries[1].file_size_in_bytes, 2048);
+        assert_eq!(entries[1].file_size_in_bytes, 2048);
 
         assert_eq!(
-            metadata.entries[2].location,
+            entries[2].location,
             Some("s3://my-bucket/my-table/part-00002.parquet".to_string())
         );
-        assert_eq!(metadata.entries[2].file_size_in_bytes, 3072);
+        assert_eq!(entries[2].file_size_in_bytes, 3072);
 
         Ok(())
     }

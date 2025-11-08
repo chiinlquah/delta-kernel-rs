@@ -13,6 +13,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
+use crate::utils::current_time_ms;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
 
 pub(crate) struct SyncParquetHandler;
@@ -59,7 +60,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         url: Url,
         data: Box<dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send + '_>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileMeta> {
         // Collect all ArrowEngineData batches first, applying selection filters
         // and drop empty batches after filtering
         let batches: Vec<RecordBatch> = data
@@ -69,9 +70,9 @@ impl ParquetHandler for SyncParquetHandler {
             .filter(|batch| batch.num_rows() > 0)
             .collect();
 
-        // If there are no batches, return early
+        // If there are no batches, return early with a FileMeta of size 0
         if batches.is_empty() {
-            return Ok(());
+            return Ok(FileMeta::new(url, current_time_ms()?, 0));
         }
 
         // Convert URL to file path
@@ -94,7 +95,9 @@ impl ParquetHandler for SyncParquetHandler {
 
         writer.close()?; // writer must be closed to write footer
 
-        Ok(())
+        // TODO: We should get the actual file size here
+        // Note modification time isn't important here as we are going to start ignoring it in V4.
+        Ok(FileMeta::new(url, current_time_ms()?, 0))
     }
 }
 
