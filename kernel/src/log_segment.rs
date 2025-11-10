@@ -5,13 +5,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SIDECAR_NAME,
+    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
+    PROTOCOL_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructField, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -237,7 +237,11 @@ impl LogSegment {
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
-                "Expected the first commit to have version {start_version}"
+                "Expected the first commit to have version {start_version}, got {:?}",
+                listed_files
+                    .ascending_commit_files
+                    .first()
+                    .map(|c| c.version)
             ))
         );
         LogSegment::try_new(listed_files, log_root, end_version)
@@ -294,12 +298,18 @@ impl LogSegment {
     ///
     /// `commit_read_schema` is the (physical) schema to read the commit files with, and
     /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
-    /// used to project the log files to a subset of the columns.
+    /// used to project the log files to a subset of the columns. Having two different
+    /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
+    /// (e.g. filtering out remove actions).
+    ///
+    ///  The engine data returned might have extra non-log actions (e.g. sidecar
+    ///  actions) that are not part of the schema but this is an implementation
+    ///  detail that should not be relied on and will likely change.
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
     #[internal_api]
-    pub(crate) fn read_actions(
+    pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
@@ -339,6 +349,22 @@ impl LogSegment {
             .filter(|name| !file_action_names.contains(&name.as_ref()))
             .collect::<Vec<_>>();
         schema.project(&non_file_action_names)
+    }
+
+    // Same as above, but uses the same schema for reading checkpoints and commits.
+    #[internal_api]
+    pub(crate) fn read_actions(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        self.read_actions_with_projected_checkpoint_actions(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            meta_predicate,
+        )
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -581,7 +607,7 @@ impl LogSegment {
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
-                        read_schema.clone(),
+                        checkpoint_read_schema.clone(),
                         meta_predicate.clone(),
                     )?
                 } else {
@@ -675,7 +701,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
             Some(Arc::new(Predicate::or(
@@ -684,7 +710,7 @@ impl LogSegment {
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
+        self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 
     /// How many commits since a checkpoint, according to this log segment
