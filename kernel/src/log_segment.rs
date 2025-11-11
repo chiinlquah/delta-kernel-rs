@@ -1,23 +1,23 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-use std::num::NonZero;
-use std::sync::{Arc, LazyLock};
-
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_commit_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SIDECAR_NAME,
+    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, ADD_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::SchemaRef;
+use crate::schema::ToSchema;
+use crate::schema::{SchemaRef, StructField};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
+use std::num::NonZero;
+use std::sync::{Arc, LazyLock};
 
 #[cfg(feature = "internal-api")]
 pub use crate::listed_log_files::ListedLogFiles;
@@ -516,41 +516,24 @@ impl LogSegment {
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
-        checkpoint_read_schema: SchemaRef,
+        action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            || checkpoint_read_schema.contains(REMOVE_NAME);
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Read the content root file it exists and file actions are necessary.
-        // The content root serves the same point as a checkpoint file for file actions,
-        // so remove file actions from the schema if they are present for actually reading
-        // the checkpoint files.
-        let (content_root_stream, read_schema): (
-            Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-            SchemaRef,
-        ) = if self.latest_content_root_file.is_some() && need_file_actions {
-            (
-                self.create_content_root_reader(engine, checkpoint_read_schema.clone())?,
-                Self::remove_file_actions_from_schema(checkpoint_read_schema.clone())?,
-            )
+        // Sidecars only contain file actions so don't add it to the schema if not needed
+        let checkpoint_read_schema = if !need_file_actions ||
+            // Don't duplicate the column if it exists
+            action_schema.contains(SIDECAR_NAME) ||
+            // With multiple parts the checkpoint can't be v2, so sidecars aren't needed
+            self.checkpoint_parts.len() > 1
+        {
+            action_schema.clone()
         } else {
-            (Box::new(std::iter::empty()), checkpoint_read_schema.clone())
+            Arc::new(
+                action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?,
+            )
         };
-
-        if read_schema.fields().len() == 0 {
-            return Ok(Box::new(content_root_stream));
-        }
-
-        // Only validate sidecar requirement if we actually have checkpoint files
-        if !self.checkpoint_parts.is_empty() {
-            require!(
-                !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
-                Error::invalid_checkpoint(
-                    "If the checkpoint read schema contains file actions, it must contain the sidecar column"
-                )
-            );
-        }
 
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
@@ -568,14 +551,14 @@ impl LogSegment {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
-                    read_schema.clone(),
+                    checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
-                    read_schema.clone(),
+                    checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
@@ -607,7 +590,7 @@ impl LogSegment {
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
-                        checkpoint_read_schema.clone(),
+                        action_schema.clone(),
                         meta_predicate.clone(),
                     )?
                 } else {
@@ -625,7 +608,7 @@ impl LogSegment {
             .flatten_ok()
             .map(|result| result?); // result-result to result
 
-        Ok(Box::new(content_root_stream.chain(actions_iter)))
+        Ok(actions_iter)
     }
 
     /// Processes sidecar files for the given checkpoint batch.
