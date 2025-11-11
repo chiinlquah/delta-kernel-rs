@@ -521,6 +521,26 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
+        // Read the content root file it exists and file actions are necessary.
+        // The content root serves the same point as a checkpoint file for file actions,
+        // so remove file actions from the schema if they are present for actually reading
+        // the checkpoint files.
+        let (content_root_stream, read_schema): (
+            Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+            SchemaRef,
+        ) = if self.latest_content_root_file.is_some() && need_file_actions {
+            (
+                self.create_content_root_reader(engine, action_schema.clone())?,
+                Self::remove_file_actions_from_schema(action_schema.clone())?,
+            )
+        } else {
+            (Box::new(std::iter::empty()), action_schema.clone())
+        };
+
+        if read_schema.fields().len() == 0 {
+            return Ok(Box::new(content_root_stream));
+        }
+
         // Sidecars only contain file actions so don't add it to the schema if not needed
         let checkpoint_read_schema = if !need_file_actions ||
             // Don't duplicate the column if it exists
@@ -608,7 +628,7 @@ impl LogSegment {
             .flatten_ok()
             .map(|result| result?); // result-result to result
 
-        Ok(actions_iter)
+        Ok(Box::new(Box::new(content_root_stream.chain(actions_iter))))
     }
 
     /// Processes sidecar files for the given checkpoint batch.
