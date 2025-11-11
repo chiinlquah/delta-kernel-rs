@@ -142,7 +142,8 @@ impl TableFeature {
             | TableFeature::VacuumProtocolCheck
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
+            | TableFeature::VariantShreddingPreview
+            | TableFeature::MetadataTreeExperimental => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -281,15 +282,11 @@ mod tests {
             (TableFeature::VariantType, "variantType"),
             (TableFeature::VariantTypePreview, "variantType-preview"),
             (
-<<<<<<< HEAD
-                ReaderFeature::MetadataTreeExperimental,
+                TableFeature::MetadataTreeExperimental,
                 "metadataTree-experimental",
             ),
             (
-                ReaderFeature::VariantShreddingPreview,
-=======
                 TableFeature::VariantShreddingPreview,
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
                 "variantShredding-preview",
             ),
             (TableFeature::unknown("something"), "something"),
@@ -335,15 +332,11 @@ mod tests {
             (TableFeature::VariantType, "variantType"),
             (TableFeature::VariantTypePreview, "variantType-preview"),
             (
-<<<<<<< HEAD
-                WriterFeature::MetadataTreeExperimental,
+                TableFeature::MetadataTreeExperimental,
                 "metadataTree-experimental",
             ),
             (
-                WriterFeature::VariantShreddingPreview,
-=======
                 TableFeature::VariantShreddingPreview,
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
                 "variantShredding-preview",
             ),
             (TableFeature::unknown("something"), "something"),

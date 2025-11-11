@@ -6,20 +6,9 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-<<<<<<< HEAD
-    as_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
-    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
-    SetTransaction,
-};
-use crate::error::Error;
-use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::metadata::writer::MetadataWriter;
-use crate::metadata::Metadata;
-use crate::path::ParsedLogPath;
-=======
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
-    INTERNAL_DOMAIN_PREFIX,
+    get_log_content_root_schema, get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo,
+    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -27,8 +16,9 @@ use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
+use crate::metadata::writer::MetadataWriter;
+use crate::metadata::Metadata;
 use crate::path::LogRoot;
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -276,26 +266,8 @@ impl Transaction {
             set_transaction_actions,
         )?;
 
-<<<<<<< HEAD
-        // Step 6: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
-        let actions = json_actions.into_iter();
-
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(
-            &commit_path.location,
-            Box::new(actions.map(|result| result.map(|data| data.into()))),
-            false,
-        ) {
-            Ok(()) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(commit_version),
-=======
         // Step 5: Chain all our actions to be handed off to the Committer
-        let actions = iter::once(commit_info_action)
-            .chain(add_actions)
-            .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
+        let actions = json_actions.into_iter();
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
@@ -319,7 +291,6 @@ impl Transaction {
         {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -1000,16 +971,11 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_with_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
-=======
-    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-<<<<<<< HEAD
         let snapshot = Snapshot::builder_for(url)
             .at_version(1)
             .build(&engine)
@@ -1017,7 +983,7 @@ mod tests {
 
         // Test that with_batch_commit returns self correctly
         let txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_batch_commit()
             .with_engine_info("test engine");
 
@@ -1038,9 +1004,17 @@ mod tests {
             .unwrap();
 
         // Test that batch_commit defaults to false
-        let txn = snapshot.transaction()?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
         assert!(!txn.batch_commit);
-=======
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url.clone())
             .at_version(1)
             .build(&engine)
@@ -1067,7 +1041,6 @@ mod tests {
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
 
->>>>>>> 7e367aa1cf997e2f43b42b391e817872f1e8c898
         Ok(())
     }
 }

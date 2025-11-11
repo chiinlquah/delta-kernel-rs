@@ -1146,7 +1146,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1316,7 +1316,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1595,7 +1595,7 @@ fn test_commit_cover(
         version_to_load,
     );
     let cover = log_segment
-        .find_commit_cover(get_log_schema().clone(), None)
+        .find_commit_cover(get_commit_schema().clone(), None)
         .unwrap();
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this

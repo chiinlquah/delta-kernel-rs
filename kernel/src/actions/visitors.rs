@@ -182,7 +182,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 18,
+            getters.len() == 19,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()

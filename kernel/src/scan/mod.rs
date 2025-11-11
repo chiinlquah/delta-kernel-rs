@@ -13,7 +13,9 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{
+    get_all_actions_schema, get_commit_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -44,10 +46,13 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         .project(&[ADD_NAME, REMOVE_NAME])
         .unwrap()
 });
-// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
+// safety: we define get_all_actions_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
-static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    get_all_actions_schema()
+        .project(&[ADD_NAME, SIDECAR_NAME])
+        .unwrap()
+});
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {

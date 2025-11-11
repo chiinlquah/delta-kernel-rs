@@ -5,13 +5,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
+    get_commit_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, ToSchema as _};
+use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,

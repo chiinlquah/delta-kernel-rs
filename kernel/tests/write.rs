@@ -1830,7 +1830,7 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("batch commit test")
             .with_batch_commit();
 
@@ -1871,7 +1871,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("batch commit test")
             .with_batch_commit()
             .with_data_change(true);
@@ -1971,7 +1971,7 @@ async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> 
         // This test verifies that the fluent API works correctly - if any method
         // returns the wrong type, this won't compile
         let txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_batch_commit()
             .with_engine_info("test engine")
             .with_data_change(false)
