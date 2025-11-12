@@ -744,6 +744,9 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// Whether this commit is a batch commit to the metadata tree.
+    /// Defaults to false when not specified.
+    pub(crate) batch_commit: Option<bool>,
 }
 
 impl CommitInfo {
@@ -752,6 +755,7 @@ impl CommitInfo {
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
+        batch_commit: bool,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
@@ -761,6 +765,7 @@ impl CommitInfo {
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            batch_commit: if batch_commit { Some(true) } else { None },
         }
     }
 }
@@ -780,6 +785,7 @@ impl IntoEngineData for CommitInfo {
             self.kernel_version.into(),
             self.engine_info.into(),
             self.txn_id.into(),
+            self.batch_commit.into(),
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -1441,6 +1447,7 @@ mod tests {
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
+                StructField::nullable("batchCommit", DataType::BOOLEAN),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1832,7 +1839,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None, false);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1858,6 +1865,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
             ],
         )
         .unwrap();

@@ -251,6 +251,7 @@ impl Transaction {
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
+            self.batch_commit,
         );
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
