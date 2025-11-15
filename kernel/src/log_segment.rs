@@ -480,26 +480,14 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // TODO: Provide ta real implementation of this method.
-        // Create a FileMeta pointing to an in-memory mock content root file
-        // Tests should populate memory:///_mock_content_root.json with content like:
-        // {"add":{"path":"part-00000-test.snappy.parquet","partitionValues":{},"size":1024,...}}
-        // {"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},...}}
-        let mock_file_path = Url::parse("memory:///_mock_content_root.json")?;
-        let file_meta = FileMeta {
-            location: mock_file_path,
-            last_modified: 0,
-            size: 0, // Size will be determined by the actual file if it exists
-        };
-
-        // Use read_json_files to parse the mock data from the in-memory location
-        let json_handler = engine.json_handler();
-        let batches = json_handler.read_json_files(&[file_meta], checkpoint_read_schema, None)?;
-
-        // Convert to ActionsBatch iterator
-        Ok(Box::new(
-            batches.map_ok(|batch| ActionsBatch::new(batch, false)),
-        ))
+        let content_root_file = self
+            .latest_content_root_file
+            .as_ref()
+            .ok_or_else(|| Error::generic("No content root file found"))?;
+        let metadata =
+            crate::metadata::Metadata::read(engine, &content_root_file.location.location)?;
+        // TODO: Provide partition keys
+        metadata.root_action_batches(engine, &checkpoint_read_schema, &[])
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.

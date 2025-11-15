@@ -4,17 +4,47 @@ pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector::DeletionVectorStorageType;
+use crate::actions::Add;
+use crate::actions::Remove;
 use crate::engine_data::EngineData;
 use crate::expressions::Scalar;
+use crate::expressions::Transform;
+use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{derive_macro_utils::ToDataType, DataType};
-use crate::{DeltaResult, Engine, Error, FileMeta, SnapshotRef, Version};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType, ToSchema};
+use crate::{
+    DeltaResult, Engine, Error, EvaluationHandler, Expression, FileMeta, SchemaRef, SnapshotRef,
+    Version,
+};
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 use url::Url;
+
+/// Lazy static schema for MetadataEntry with an additional "sourceFile" field.
+/// This extends the base MetadataEntry schema with a string column to track the source file location.
+static METADATA_ENTRY_WITH_LOCATION_SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+
+/// Returns a schema that extends MetadataEntry with a "sourceFile" string column.
+/// The schema is computed once and cached for subsequent calls.
+fn metadata_entry_with_location_schema() -> &'static SchemaRef {
+    METADATA_ENTRY_WITH_LOCATION_SCHEMA.get_or_init(|| {
+        let base_schema = MetadataEntry::to_schema();
+        let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
+        fields.push(StructField::new(
+            "sourceFile",
+            DataType::STRING,
+            /*nullable*/ true,
+        ));
+        StructType::new_unchecked(fields).into()
+    })
+}
 
 /// Represents table metadata in Adaptive Metadata Tree (AMT) format.
 ///
@@ -31,6 +61,11 @@ pub(crate) struct Metadata {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
+}
+
+enum AddRemove {
+    Add(Add),
+    Remove(Remove),
 }
 
 impl Metadata {
@@ -58,6 +93,79 @@ impl Metadata {
             all_entries.extend(visitor.entries);
         }
         Ok(all_entries)
+    }
+
+    pub(crate) fn root_action_batches(
+        &self,
+        engine: &dyn Engine,
+        schema: &SchemaRef,
+        _partition_keys: &[String],
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        use std::collections::HashMap;
+
+        // Get all metadata entries
+        let entries = self.entries()?;
+
+        // Build a map of deletion vectors from PositionDeletes entries
+        // Key: referenced_file path, Value: DeletionVectorInfo
+        let mut deletion_vector_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
+
+        // Separate entries into data files and deletion vectors
+        let (data_entries, dv_entries): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.content_type != DataContentType::PositionDeletes);
+
+        // Process deletion vector entries
+        for (i, dv_entry) in dv_entries.into_iter().enumerate() {
+            // Only include deletion vectors that are not marked as deleted
+            if dv_entry.tracking_info.status != TrackingStatus::Deleted
+                && dv_entry.content_type == DataContentType::PositionDeletes
+            {
+                let referenced_file = dv_entry
+                    .referenced_file
+                    .clone()
+                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
+                let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i)?;
+
+                // Only insert if this DV has a higher sequence number than any existing one for this file
+                deletion_vector_map
+                    .entry(referenced_file)
+                    .and_modify(|existing| {
+                        if dv_info.sequence_number > existing.sequence_number {
+                            *existing = dv_info.clone();
+                        }
+                    })
+                    .or_insert(dv_info);
+            }
+        }
+
+        // Convert each MetadataEntry to AddRemove
+        let add_removes: Vec<AddRemove> = data_entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                entry_to_add_remove(entry, &deletion_vector_map, i, self.table_root.to_string())
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Return empty iterator if no add_removes
+        if add_removes.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        // Clone the schema for use in the closure
+        let schema_clone = schema.clone();
+
+        // Create an evaluation handler reference that we can use in the iterator
+        // We need to get it from the engine and keep it alive
+        let evaluation_handler = engine.evaluation_handler();
+
+        // Convert to iterator of single-row ActionsBatch
+        let iter = add_removes.into_iter().map(move |add_remove| {
+            add_remove_to_action_batch(add_remove, evaluation_handler.as_ref(), &schema_clone)
+        });
+
+        Ok(Box::new(iter))
     }
 
     /// Creates Metadata from a Delta table snapshot by replaying add actions from the transaction log.
@@ -108,9 +216,6 @@ impl Metadata {
     /// A `Metadata` instance deserialized from the parquet file.
     #[allow(dead_code)]
     pub(crate) fn read(engine: &dyn Engine, path: &Url) -> DeltaResult<Self> {
-        use crate::schema::ToSchema;
-        use std::sync::Arc;
-
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -120,11 +225,22 @@ impl Metadata {
         let parsed =
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
-        let read_result_iter = engine.parquet_handler().read_parquet_files(
-            &[file],
+        let evaluation_handler = engine.evaluation_handler();
+        let expression = Arc::new(Expression::transform(
+            Transform::new_top_level().with_inserted_field(
+                /*insert after*/ Some("referencedFile"),
+                Expression::literal(file.location.as_str()).into(),
+            ),
+        ));
+        let evaluator = evaluation_handler.new_expression_evaluator(
             Arc::new(MetadataEntry::to_schema()),
-            None,
+            expression,
+            metadata_entry_with_location_schema().clone().into(),
         )?;
+        let read_result_iter = engine
+            .parquet_handler()
+            .read_parquet_files(&[file], Arc::new(MetadataEntry::to_schema()), None)?
+            .map(|result| evaluator.evaluate(result?.as_ref()));
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -145,6 +261,507 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn to_builder(&self) -> MetadataBuilder {
         MetadataBuilder::new_for(self.table_root.clone(), self.version)
+    }
+}
+
+/// Information about a deletion vector associated with a data file.
+#[derive(Clone)]
+struct DeletionVectorInfo {
+    /// The deletion vector descriptor
+    descriptor: DeletionVectorDescriptor,
+    /// Sequence number for versioning
+    sequence_number: i64,
+    /// Index of this entry in the metadata tree
+    entry_index: i64,
+}
+
+/// Result of processing deletion vector information for a file entry.
+struct ProcessedDeletionVector {
+    /// The deletion vector descriptor, if applicable
+    descriptor: Option<DeletionVectorDescriptor>,
+    /// Path to the delete manifest
+    delete_manifest_path: Option<String>,
+    /// Position in the delete manifest
+    delete_manifest_position: Option<i64>,
+}
+
+/// Converts a MetadataEntry representing a deletion vector into a DeletionVectorInfo entry.
+///
+/// Extracts and validates all required fields from the deletion vector entry and creates
+/// a DeletionVectorDescriptor with proper type conversions.
+///
+/// # Returns
+/// A DeletionVectorInfo struct containing the deletion vector descriptor and metadata.
+fn metadata_entry_to_deletion_vector_info(
+    dv_entry: MetadataEntry,
+    entry_index: usize,
+) -> DeltaResult<DeletionVectorInfo> {
+    let deletion_vector = dv_entry
+        .deletion_vector
+        .ok_or_else(|| Error::generic("Deletion vector must have a deletion vector"))?;
+    let sequence_number = dv_entry
+        .tracking_info
+        .sequence_number
+        .ok_or_else(|| Error::generic("Deletion vector must have a sequence number"))?;
+    let location = dv_entry
+        .location
+        .ok_or_else(|| Error::generic("Deletion vector must have a location"))?;
+
+    // Convert offset from Option<i64> to Option<i32>
+    let offset_i32 = deletion_vector
+        .offset
+        .map(|offset| {
+            offset
+                .try_into()
+                .map_err(|_| Error::generic("Offset is too large to convert to i32"))
+        })
+        .transpose()?;
+
+    // Convert size_in_bytes from Option<i64> to i32
+    // Subtract 8 because metadata tree includes CRC and the size (i32) in the total size of the DV.
+    // Delta actions only include magic number and the actual serialized roaring bitmap in its size figure.
+    let size_in_bytes_i32 = deletion_vector
+        .size_in_bytes
+        .ok_or_else(|| Error::generic(format!("{} missing size in bytes", location)))?
+        .checked_sub(8)
+        .ok_or_else(|| Error::generic(format!("Size in bytes for {} is too small", location)))?
+        .try_into()
+        .map_err(|_| {
+            Error::generic(format!(
+                "Size in bytes for {} is too large to convert to i32",
+                location
+            ))
+        })?;
+
+    // Convert entry_index from usize to i64
+    let entry_index_i64: i64 = entry_index
+        .try_into()
+        .map_err(|_| Error::generic("Entry index is too large to convert to i64"))?;
+
+    Ok(DeletionVectorInfo {
+        descriptor: DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv: location,
+            offset: offset_i32,
+            size_in_bytes: size_in_bytes_i32,
+            cardinality: dv_entry.record_count,
+        },
+        sequence_number,
+        entry_index: entry_index_i64,
+    })
+}
+
+/// Processes deletion vector information and returns the DeletionVectorDescriptor if applicable.
+///
+/// Returns a ProcessedDeletionVector struct containing the deletion vector descriptor,
+/// delete_manifest_path, and delete_manifest_position if a deletion vector is found with a
+/// sequence number greater than the entry's sequence number.
+fn process_deletion_vector(
+    deletion_vector_map: &std::collections::HashMap<String, DeletionVectorInfo>,
+    full_path: &str,
+    entry_sequence_number: Option<i64>,
+    root_path: &str,
+) -> DeltaResult<ProcessedDeletionVector> {
+    let dv_info = deletion_vector_map.get(full_path);
+    match dv_info {
+        Some(info) if info.sequence_number > entry_sequence_number.unwrap_or(0) => {
+            Ok(ProcessedDeletionVector {
+                descriptor: Some(info.descriptor.clone()),
+                delete_manifest_path: Some(root_path.to_string()),
+                delete_manifest_position: Some(info.entry_index),
+            })
+        }
+        _ => Ok(ProcessedDeletionVector {
+            descriptor: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
+        }),
+    }
+}
+
+/// Converts an absolute URL path to a relative path by stripping the table root prefix.
+///
+/// This function handles the conversion from absolute file URLs (stored in metadata entries)
+/// to relative paths (expected in Delta Add actions).
+///
+/// # Arguments
+/// * `absolute_path` - The full URL path (e.g., "memory:///part-file.parquet")
+/// * `table_root` - The table root URL (e.g., "memory:///")
+///
+/// # Returns
+/// A relative path string (e.g., "part-file.parquet"), or the original path if conversion fails.
+///
+/// # Examples
+/// ```ignore
+/// let relative = absolute_to_relative_path(
+///     "s3://bucket/table/data/file.parquet",
+///     "s3://bucket/table/"
+/// );
+/// assert_eq!(relative, "data/file.parquet");
+/// ```
+fn absolute_to_relative_path(absolute_path: &str, table_root: &str) -> String {
+    // Try to parse both paths as URLs
+    if let (Ok(full_url), Ok(root_url)) = (Url::parse(absolute_path), Url::parse(table_root)) {
+        // Get the path components
+        let full_path_str = full_url.path();
+        let root_path_str = root_url.path();
+
+        // Remove the root prefix to get the relative path
+        full_path_str
+            .strip_prefix(root_path_str)
+            .unwrap_or(full_path_str)
+            .trim_start_matches('/')
+            .to_string()
+    } else {
+        // If URL parsing fails, return the original path
+        absolute_path.to_string()
+    }
+}
+
+/// Converts a MetadataEntry to an AddRemove enum.
+///
+/// Based on the tracking_info.status:
+/// - TrackingStatus::Added or TrackingStatus::Existed -> creates an Add action
+/// - TrackingStatus::Deleted -> creates a Remove action
+///
+/// The deletion_vector_map is used to look up deletion vectors for the entry by its location path.
+fn entry_to_add_remove(
+    entry: MetadataEntry,
+    deletion_vector_map: &std::collections::HashMap<String, DeletionVectorInfo>,
+    entry_index: usize,
+    root_path: String,
+) -> DeltaResult<AddRemove> {
+    use std::collections::HashMap;
+
+    let full_path = entry
+        .location
+        .ok_or_else(|| Error::generic("Action requires location"))?;
+
+    // Convert absolute path to relative path by removing the table root prefix
+    // The path in entry.location is an absolute URL, but Add actions expect relative paths
+    let path = absolute_to_relative_path(&full_path, &root_path);
+    let processed_dv = process_deletion_vector(
+        deletion_vector_map,
+        &full_path,
+        entry.tracking_info.sequence_number,
+        &root_path,
+    )?;
+
+    match entry.tracking_info.status {
+        TrackingStatus::Added | TrackingStatus::Existed => {
+            let add =
+                Add {
+                    path,
+                    partition_values: HashMap::new(), // TODO: Extract from partition_keys
+                    size: entry.file_size_in_bytes,
+                    modification_time: i64::MIN,
+                    data_change: true,
+                    stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
+                    tags: None,
+                    deletion_vector: processed_dv.descriptor,
+                    base_row_id: entry.tracking_info.first_row_id,
+                    default_row_commit_version: entry.tracking_info.snapshot_id,
+                    clustering_provider: None, // TODO: Set from when final decision is made.
+                    data_manifest_path: Some(root_path),
+                    data_manifest_position: Some(entry_index.try_into().map_err(|_| {
+                        Error::generic("Entry index is too large to convert to i64")
+                    })?),
+                    delete_manifest_path: processed_dv.delete_manifest_path,
+                    delete_manifest_position: processed_dv.delete_manifest_position,
+                };
+            Ok(AddRemove::Add(add))
+        }
+        TrackingStatus::Deleted => {
+            let remove =
+                Remove {
+                    path,
+                    deletion_timestamp: Some(i64::MIN),
+                    data_change: true,
+                    extended_file_metadata: Some(true),
+                    partition_values: Some(HashMap::new()), // TODO: Extract from partition_keys
+                    size: Some(entry.file_size_in_bytes),
+                    stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
+                    tags: None, // TODO: Finalize once we set this from tags
+                    deletion_vector: processed_dv.descriptor,
+                    base_row_id: entry.tracking_info.first_row_id,
+                    default_row_commit_version: entry.tracking_info.snapshot_id,
+                    data_manifest_path: Some(root_path),
+                    data_manifest_position: Some(entry_index.try_into().map_err(|_| {
+                        Error::generic("Entry index is too large to convert to i64")
+                    })?),
+                    delete_manifest_path: processed_dv.delete_manifest_path,
+                    delete_manifest_position: processed_dv.delete_manifest_position,
+                };
+            Ok(AddRemove::Remove(remove))
+        }
+    }
+}
+
+/// Converts a DeletionVectorDescriptor to a Scalar representation
+fn deletion_vector_descriptor_to_scalar(
+    dv: &crate::actions::deletion_vector::DeletionVectorDescriptor,
+) -> Scalar {
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::expressions::StructData;
+    use crate::schema::ToSchema;
+
+    let fields = DeletionVectorDescriptor::to_schema()
+        .into_fields()
+        .collect();
+    let values = vec![
+        Scalar::from(dv.storage_type.to_string()), // Convert enum to string
+        Scalar::from(dv.path_or_inline_dv.clone()),
+        Scalar::from(dv.offset),
+        Scalar::from(dv.size_in_bytes),
+        Scalar::from(dv.cardinality),
+    ];
+
+    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
+    // to match exactly in count, order, type, and nullability.
+    Scalar::Struct(StructData::new_unchecked(fields, values))
+}
+
+/// Helper function to convert HashMap<String, String> to Scalar matching the schema's map type
+fn hashmap_to_scalar_matching_schema(
+    map: HashMap<String, String>,
+    expected_type: &DataType,
+) -> DeltaResult<Scalar> {
+    use crate::expressions::MapData;
+
+    // Extract the MapType from the expected type
+    let map_type = if let DataType::Map(map_type_box) = expected_type {
+        map_type_box.as_ref().clone()
+    } else {
+        return Err(Error::generic(format!(
+            "Expected Map type, got {:?}",
+            expected_type
+        )));
+    };
+
+    let map_data = MapData::try_new(map_type, map)?;
+    Ok(map_data.into())
+}
+
+/// Helper function to convert HashMap<String, Option<String>> to Scalar matching the schema's map type
+fn hashmap_option_to_scalar_matching_schema(
+    map: HashMap<String, Option<String>>,
+    expected_type: &DataType,
+) -> DeltaResult<Scalar> {
+    use crate::expressions::MapData;
+
+    // Extract the MapType from the expected type
+    let map_type = if let DataType::Map(map_type_box) = expected_type {
+        map_type_box.as_ref().clone()
+    } else {
+        return Err(Error::generic(format!(
+            "Expected Map type, got {:?}",
+            expected_type
+        )));
+    };
+
+    let map_data = MapData::try_new(map_type, map)?;
+    Ok(map_data.into())
+}
+
+/// Converts an Add action to a Scalar representation
+fn add_to_scalar(add: &Add) -> DeltaResult<Scalar> {
+    use crate::expressions::StructData;
+    use crate::schema::ToSchema;
+
+    let schema = Add::to_schema();
+
+    // Get field types from schema to ensure correct map nullability
+    let partition_values_type = schema
+        .field("partitionValues")
+        .ok_or_else(|| Error::generic("Missing partitionValues field"))?
+        .data_type();
+    let tags_type = schema
+        .field("tags")
+        .ok_or_else(|| Error::generic("Missing tags field"))?
+        .data_type();
+
+    // Convert HashMap fields using schema types
+    let partition_values_scalar: Scalar =
+        hashmap_to_scalar_matching_schema(add.partition_values.clone(), partition_values_type)?;
+    let tags_scalar = match &add.tags {
+        Some(tags) => hashmap_option_to_scalar_matching_schema(tags.clone(), tags_type)?,
+        None => Scalar::Null(tags_type.clone()),
+    };
+
+    let fields = schema.into_fields().collect();
+
+    // Convert DeletionVectorDescriptor
+    let deletion_vector_scalar = match &add.deletion_vector {
+        Some(dv) => deletion_vector_descriptor_to_scalar(dv),
+        None => {
+            use crate::actions::deletion_vector::DeletionVectorDescriptor;
+            Scalar::Null(DataType::Struct(Box::new(
+                DeletionVectorDescriptor::to_schema(),
+            )))
+        }
+    };
+
+    let values = vec![
+        Scalar::from(add.path.clone()),
+        partition_values_scalar,
+        Scalar::from(add.size),
+        Scalar::from(add.modification_time),
+        Scalar::from(add.data_change),
+        Scalar::from(add.stats.clone()),
+        tags_scalar,
+        deletion_vector_scalar,
+        Scalar::from(add.base_row_id),
+        Scalar::from(add.default_row_commit_version),
+        Scalar::from(add.clustering_provider.clone()),
+        Scalar::from(add.data_manifest_path.clone()),
+        Scalar::from(add.data_manifest_position),
+        Scalar::from(add.delete_manifest_path.clone()),
+        Scalar::from(add.delete_manifest_position),
+    ];
+
+    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
+    // to match exactly in count, order, type, and nullability.
+    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
+}
+
+/// Converts a Remove action to a Scalar representation
+fn remove_to_scalar(remove: &Remove) -> DeltaResult<Scalar> {
+    use crate::expressions::StructData;
+    use crate::schema::ToSchema;
+
+    let schema = Remove::to_schema();
+
+    // Get field types from schema to ensure correct map nullability
+    let partition_values_type = schema
+        .field("partitionValues")
+        .ok_or_else(|| Error::generic("Missing partitionValues field"))?
+        .data_type();
+    let tags_type = schema
+        .field("tags")
+        .ok_or_else(|| Error::generic("Missing tags field"))?
+        .data_type();
+
+    // Convert HashMap fields using schema types
+    let partition_values_scalar = match &remove.partition_values {
+        Some(pv) => hashmap_to_scalar_matching_schema(pv.clone(), partition_values_type)?,
+        None => Scalar::Null(partition_values_type.clone()),
+    };
+    let tags_scalar = match &remove.tags {
+        Some(tags) => hashmap_to_scalar_matching_schema(tags.clone(), tags_type)?,
+        None => Scalar::Null(tags_type.clone()),
+    };
+
+    let fields = schema.into_fields().collect();
+
+    // Convert DeletionVectorDescriptor
+    let deletion_vector_scalar = match &remove.deletion_vector {
+        Some(dv) => deletion_vector_descriptor_to_scalar(dv),
+        None => {
+            use crate::actions::deletion_vector::DeletionVectorDescriptor;
+            Scalar::Null(DataType::Struct(Box::new(
+                DeletionVectorDescriptor::to_schema(),
+            )))
+        }
+    };
+
+    let values = vec![
+        Scalar::from(remove.path.clone()),
+        Scalar::from(remove.deletion_timestamp),
+        Scalar::from(remove.data_change),
+        Scalar::from(remove.extended_file_metadata),
+        partition_values_scalar,
+        Scalar::from(remove.size),
+        tags_scalar,
+        deletion_vector_scalar,
+        Scalar::from(remove.base_row_id),
+        Scalar::from(remove.default_row_commit_version),
+        Scalar::from(remove.data_manifest_path.clone()),
+        Scalar::from(remove.data_manifest_position),
+        Scalar::from(remove.delete_manifest_path.clone()),
+        Scalar::from(remove.delete_manifest_position),
+    ];
+
+    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
+    // to match exactly in count, order, type, and nullability.
+    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
+}
+
+/// Converts a single AddRemove to a single-row ActionsBatch.
+///
+/// This function:
+/// - Checks which action fields (add/remove) are present in the schema
+/// - Creates a single row with the appropriate action fields
+/// - Wraps the result in an ActionsBatch
+fn add_remove_to_action_batch(
+    add_remove: AddRemove,
+    evaluation_handler: &dyn EvaluationHandler,
+    schema: &SchemaRef,
+) -> DeltaResult<ActionsBatch> {
+    use crate::actions::{ADD_NAME, REMOVE_NAME};
+    use crate::expressions::Scalar;
+
+    // Build a vector of leaf scalars for the schema
+    let mut scalars = Vec::new();
+
+    for field in schema.fields() {
+        let scalar = match field.name() {
+            name if name == ADD_NAME => {
+                // Convert Add to Scalar if present, otherwise null
+                match &add_remove {
+                    AddRemove::Add(add) => add_to_scalar(add)?,
+                    AddRemove::Remove(_) => Scalar::Null(field.data_type().clone()),
+                }
+            }
+            name if name == REMOVE_NAME => {
+                // Convert Remove to Scalar if present, otherwise null
+                match &add_remove {
+                    AddRemove::Remove(remove) => remove_to_scalar(remove)?,
+                    AddRemove::Add(_) => Scalar::Null(field.data_type().clone()),
+                }
+            }
+            _ => {
+                // For any other field not matching add/remove, use null
+                Scalar::Null(field.data_type().clone())
+            }
+        };
+
+        // Flatten the scalar into leaf values
+        flatten_scalar(&scalar, &mut scalars);
+    }
+
+    // Use the create_one API to create a single-row EngineData
+    use crate::EvaluationHandlerExtension;
+    let engine_data = evaluation_handler.create_one(schema.clone(), &scalars)?;
+
+    Ok(ActionsBatch::new(engine_data, false))
+}
+
+/// Flattens a scalar into leaf values, recursively handling nested structs.
+fn flatten_scalar(scalar: &Scalar, output: &mut Vec<Scalar>) {
+    match scalar {
+        Scalar::Struct(struct_data) => {
+            // Recursively flatten each field in the struct
+            for value in struct_data.values() {
+                flatten_scalar(value, output);
+            }
+        }
+        Scalar::Null(data_type) => {
+            // If this is a null struct, we need to expand it into null values for each leaf field
+            if let DataType::Struct(struct_type) = data_type {
+                let leaves = struct_type.as_ref().leaves(None::<&str>);
+                let (_, leaf_types) = leaves.as_ref();
+                for leaf_type in leaf_types {
+                    output.push(Scalar::Null(leaf_type.clone()));
+                }
+            } else {
+                // Simple null leaf value
+                output.push(scalar.clone());
+            }
+        }
+        _ => {
+            // Leaf value - add it to the output
+            output.push(scalar.clone());
+        }
     }
 }
 
@@ -600,6 +1217,50 @@ mod tests {
         result?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_absolute_to_relative_path() {
+        // Test with memory:// URLs
+        let result = absolute_to_relative_path("memory:///part-content-root.parquet", "memory:///");
+        assert_eq!(result, "part-content-root.parquet");
+
+        // Test with s3:// URLs
+        let result = absolute_to_relative_path(
+            "s3://my-bucket/my-table/data/part-00000.parquet",
+            "s3://my-bucket/my-table/",
+        );
+        assert_eq!(result, "data/part-00000.parquet");
+
+        // Test with nested paths
+        let result = absolute_to_relative_path(
+            "s3://bucket/table/year=2023/month=10/part.parquet",
+            "s3://bucket/table/",
+        );
+        assert_eq!(result, "year=2023/month=10/part.parquet");
+
+        // Test with file:// URLs
+        let result = absolute_to_relative_path(
+            "file:///path/to/table/data/file.parquet",
+            "file:///path/to/table/",
+        );
+        assert_eq!(result, "data/file.parquet");
+
+        // Test when path is already relative (URL parsing fails)
+        let result = absolute_to_relative_path("part-00000.parquet", "s3://bucket/table/");
+        assert_eq!(result, "part-00000.parquet");
+
+        // Test when both URL parsing fails
+        let result = absolute_to_relative_path("not-a-url", "also-not-a-url");
+        assert_eq!(result, "not-a-url");
+
+        // Test when root doesn't match (no common prefix)
+        let result = absolute_to_relative_path(
+            "s3://bucket-a/table-a/file.parquet",
+            "s3://bucket-b/table-b/",
+        );
+        // Since there's no common prefix in the path part, it returns the path without leading slash
+        assert_eq!(result, "table-a/file.parquet");
     }
 
     #[test]
@@ -1240,6 +1901,325 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_metadata_entry_eq(&entry, &entries[0]);
         assert_eq!(entries[0].file_format, DataFileFormat::Puffin);
+
+        Ok(())
+    }
+
+    /// Helper to create a data file entry
+    fn create_data_entry(location: &str, sequence_number: i64) -> MetadataEntry {
+        MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(location.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(sequence_number),
+                file_sequence_number: Some(sequence_number),
+                first_row_id: Some(0),
+            },
+            deletion_vector: None,
+            partition_spec_id: 0,
+            sort_order_id: 0,
+            record_count: 100,
+            file_size_in_bytes: 1024,
+            manifest_stats: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        }
+    }
+
+    /// Helper to create a deletion vector entry
+    fn create_dv_entry(
+        location: &str,
+        referenced_file: &str,
+        sequence_number: i64,
+    ) -> MetadataEntry {
+        MetadataEntry {
+            content_type: DataContentType::PositionDeletes,
+            location: Some(location.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(sequence_number),
+                file_sequence_number: Some(sequence_number),
+                first_row_id: Some(0),
+            },
+            deletion_vector: Some(DeletionVector {
+                offset: Some(0),
+                size_in_bytes: Some(100),
+                inline_content: None,
+            }),
+            partition_spec_id: 0,
+            sort_order_id: 0,
+            record_count: 10,
+            file_size_in_bytes: 512,
+            manifest_stats: None,
+            referenced_file: Some(referenced_file.to_string()),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_dv_with_earlier_sequence_number_not_included() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file with sequence number 100
+        let data_entry = create_data_entry("memory:///data.parquet", 100);
+
+        // Create a DV for the data file with sequence number 50 (earlier)
+        let dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 50);
+
+        // Create metadata with both entries
+        let metadata = Metadata {
+            data: vec![
+                data_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get action batches
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify DV is NOT included (sequence number too early)
+        assert!(
+            add.deletion_vector.is_none(),
+            "DV with earlier sequence number should not be included"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dv_with_later_sequence_number_included() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file with sequence number 50
+        let data_entry = create_data_entry("memory:///data.parquet", 50);
+
+        // Create a DV for the data file with sequence number 100 (later)
+        let dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 100);
+
+        // Create metadata with both entries
+        let metadata = Metadata {
+            data: vec![
+                data_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get action batches
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify DV IS included (sequence number is later)
+        assert!(
+            add.deletion_vector.is_some(),
+            "DV with later sequence number should be included"
+        );
+        let dv = add.deletion_vector.as_ref().unwrap();
+        assert_eq!(dv.cardinality, 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dv_not_present() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file without any corresponding DV
+        let data_entry = create_data_entry("memory:///data.parquet", 50);
+
+        // Create metadata with only the data entry (no DV)
+        let metadata = Metadata {
+            data: vec![data_entry
+                .clone()
+                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get action batches
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify DV is NOT included (doesn't exist)
+        assert!(
+            add.deletion_vector.is_none(),
+            "DV should not be included when it doesn't exist"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_dvs_keeps_latest_by_sequence_number() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file with sequence number 50
+        let data_entry = create_data_entry("memory:///data.parquet", 50);
+
+        // Create multiple DVs for the same data file with different sequence numbers
+        // Note: the one with seq 200 should win regardless of order
+        let dv_entry_1 = create_dv_entry("memory:///dv1.parquet", "memory:///data.parquet", 100);
+        let mut dv_entry_2 =
+            create_dv_entry("memory:///dv2.parquet", "memory:///data.parquet", 200);
+        dv_entry_2.record_count = 20; // Different cardinality to distinguish
+
+        let mut dv_entry_3 =
+            create_dv_entry("memory:///dv3.parquet", "memory:///data.parquet", 150);
+        dv_entry_3.record_count = 15; // Different cardinality to distinguish
+
+        // Create metadata with all entries
+        let metadata = Metadata {
+            data: vec![
+                data_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry_3
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get action batches
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify the DV with highest sequence number (200) is used
+        assert!(
+            add.deletion_vector.is_some(),
+            "DV should be included when sequence number is later"
+        );
+        let dv = add.deletion_vector.as_ref().unwrap();
+        assert_eq!(
+            dv.cardinality, 20,
+            "Should use DV with highest sequence number (200), which has cardinality 20"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dv_with_deleted_status_not_included() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file with sequence number 50
+        let data_entry = create_data_entry("memory:///data.parquet", 50);
+
+        // Create a DV with Deleted status
+        let mut dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 100);
+        dv_entry.tracking_info.status = TrackingStatus::Deleted;
+
+        // Create metadata with both entries
+        let metadata = Metadata {
+            data: vec![
+                data_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get action batches
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify DV is NOT included (status is Deleted)
+        assert!(
+            add.deletion_vector.is_none(),
+            "DV with Deleted status should not be included"
+        );
 
         Ok(())
     }
