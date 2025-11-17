@@ -8,13 +8,9 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-<<<<<<< HEAD
-    get_log_content_root_schema, get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo,
-    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
-=======
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
->>>>>>> 1c29adf454ed4d05dd3f890634ed2f6f245b5b16
+    get_log_content_root_schema, get_log_domain_metadata_schema, get_log_remove_schema,
+    get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata, SetTransaction,
+    INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -271,17 +267,18 @@ impl Transaction {
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         // Step 4: Generate all domain metadata actions (user and system domains)
-        let actions = self.generate_add_actions(
+        let add_actions = self.generate_add_actions(
             engine,
             commit_version,
             commit_info_action,
-            set_transaction_actions
-        );
+            set_transaction_actions,
+        )?;
 
         // Step 5: Generate remove actions
         let remove_actions = self.generate_remove_actions(engine)?;
 
-        let filtered_actions = actions
+        let filtered_actions = add_actions
+            .into_iter()
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
             .chain(remove_actions);
 
@@ -890,6 +887,22 @@ impl Transaction {
                         DEFAULT_ROW_COMMIT_VERSION_NAME,
                     ])
                     .into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::null_literal(DataType::STRING).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::null_literal(DataType::LONG).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::null_literal(DataType::STRING).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::null_literal(DataType::LONG).into(),
                 )
                 .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
                 .with_dropped_field("modificationTime"),

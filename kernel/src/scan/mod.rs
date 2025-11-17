@@ -1396,7 +1396,6 @@ mod tests {
     #[test]
     fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
-        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
         use crate::engine::default::DefaultEngine;
         use crate::path::{LogPathFileType, ParsedLogPath};
         use crate::RowVisitor;
@@ -1427,10 +1426,7 @@ mod tests {
         }
 
         // Create engine
-        let engine = Arc::new(DefaultEngine::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
 
         // Create metadata for content_root using MetadataBuilder
         {
@@ -1608,7 +1604,6 @@ mod tests {
     #[test]
     fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
-        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
         use crate::engine::default::DefaultEngine;
         use crate::path::{LogPathFileType, ParsedLogPath};
         use crate::RowVisitor;
@@ -1642,10 +1637,7 @@ mod tests {
         }
 
         // Create engine
-        let engine = Arc::new(DefaultEngine::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
 
         // Create metadata for content_root using MetadataBuilder
         {

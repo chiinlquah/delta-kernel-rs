@@ -1950,9 +1950,9 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     }
     Ok(())
 }
-    
-    #[tokio::test]
-    async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
+
+#[tokio::test]
+async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that Remove actions generated from scan metadata contain all expected fields
     // from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
@@ -2125,7 +2125,6 @@ async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> 
         "number",
         DataType::INTEGER,
     )])?);
-
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?

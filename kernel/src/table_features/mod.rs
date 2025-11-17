@@ -598,6 +598,18 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
+static METADATA_TREE_EXPERIMENTAL_INFO: FeatureInfo = FeatureInfo {
+    name: "metadataTree-experimental",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::ReaderWriter,
+    feature_requirements: &[],
+    read_support: KernelSupport::Supported,
+    write_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 impl TableFeature {
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
@@ -662,6 +674,7 @@ impl TableFeature {
             TableFeature::VariantType => Some(&VARIANT_TYPE_INFO),
             TableFeature::VariantTypePreview => Some(&VARIANT_TYPE_PREVIEW_INFO),
             TableFeature::VariantShreddingPreview => Some(&VARIANT_SHREDDING_PREVIEW_INFO),
+            TableFeature::MetadataTreeExperimental => Some(&METADATA_TREE_EXPERIMENTAL_INFO),
 
             // Unknown features have no metadata
             TableFeature::Unknown(_) => None,
