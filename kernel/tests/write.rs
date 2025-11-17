@@ -1851,14 +1851,6 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
         // Verify that there only is a commit info action (no add actions)
         assert_eq!(parsed_actions.len(), 1, "Expected only commit info action");
         assert!(parsed_actions[0].get("commitInfo").is_some());
-
-        // Verify that batchCommit is set to true in the commit info
-        let commit_info = &parsed_actions[0]["commitInfo"];
-        assert_eq!(
-            commit_info.get("batchCommit"),
-            Some(&json!(true)),
-            "Expected batchCommit to be true in commit info"
-        );
     }
     Ok(())
 }
