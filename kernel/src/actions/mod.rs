@@ -100,6 +100,13 @@ static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        REMOVE_NAME,
+        Remove::to_schema(),
+    )]))
+});
+
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
@@ -145,6 +152,10 @@ pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
 #[internal_api]
 pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
+}
+
+pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
+    &LOG_REMOVE_SCHEMA
 }
 
 pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
@@ -1157,14 +1168,17 @@ impl DomainMetadata {
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
+    #[internal_api]
     pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
     }
 
+    #[internal_api]
     pub(crate) fn domain(&self) -> &str {
         &self.domain
     }
 
+    #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
