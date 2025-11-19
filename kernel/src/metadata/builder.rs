@@ -6,6 +6,7 @@ use crate::metadata::{
     DataContentType, DataFileFormat, DeletionVector, Metadata, MetadataEntry, TrackingInfo,
     TrackingStatus,
 };
+use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Version};
@@ -96,6 +97,18 @@ impl MetadataBuilder {
             TrackingStatus::Existed
         };
 
+        // Parse stats to extract record_count
+        // TODO: This might evolve based on https://github.com/delta-io/delta-kernel-rs/pull/1464
+        let record_count = add
+            .stats
+            .as_ref()
+            .and_then(|stats_json| {
+                serde_json::from_str::<Stats>(stats_json)
+                    .ok()
+                    .map(|stats| stats.num_records as i64)
+            })
+            .unwrap_or(0);
+
         let data_file_entry = MetadataEntry {
             content_type,
             location: Some(self.path_to_absolute(&add.path).unwrap()),
@@ -116,9 +129,7 @@ impl MetadataBuilder {
             partition_spec_id: 0,
             sort_order_id: 0,
 
-            // TODO: Should we get these from the stats as well?
-            // TODO: Check how to set these based on uniform as a first iteration.
-            record_count: 0,
+            record_count,
 
             file_size_in_bytes: add.size,
 
@@ -296,8 +307,11 @@ impl RowVisitor for WriteMetadataVisitor {
                     getters[1].get(i, "partitionValues")?;
                 let size: i64 = getters[2].get(i, "size")?;
                 let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-                // stats.numRecords is at index 4, but we'll just use an empty stats for now
-                // since the metadata builder doesn't use it
+
+                // Extract stats.numRecords and create a stats JSON string
+                let stats: Option<String> = getters[4]
+                    .get_opt(i, "stats.numRecords")?
+                    .map(|num_records: i64| format!(r#"{{"numRecords":{}}}"#, num_records));
 
                 let add = Add {
                     path,
@@ -305,7 +319,7 @@ impl RowVisitor for WriteMetadataVisitor {
                     size,
                     modification_time,
                     data_change: true, // will be overridden by transaction
-                    stats: None,
+                    stats,
                     tags: None,
                     deletion_vector: None,
                     base_row_id: None,
@@ -550,6 +564,43 @@ mod tests {
             Some("s3://my-bucket/my-table/part-00002.parquet".to_string())
         );
         assert_eq!(entries[2].file_size_in_bytes, 3072);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_count_from_stats() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::StringArray;
+        use crate::utils::test_utils::parse_json_batch;
+
+        // Create test data with Add actions that have stats with numRecords
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":"{\"numRecords\":100}"}}"#,
+            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":"{\"numRecords\":250}"}}"#,
+            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        // Create builder and add from engine data
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
+
+        // Build metadata and verify record counts
+        let engine = crate::engine::sync::SyncEngine::new();
+        let metadata = builder.build(&engine)?;
+        let entries = metadata.entries()?;
+        assert_eq!(entries.len(), 3);
+
+        // Verify first entry has record_count from stats
+        assert_eq!(entries[0].record_count, 100);
+
+        // Verify second entry has record_count from stats
+        assert_eq!(entries[1].record_count, 250);
+
+        // Verify third entry has record_count of 0 when stats is null
+        assert_eq!(entries[2].record_count, 0);
 
         Ok(())
     }
