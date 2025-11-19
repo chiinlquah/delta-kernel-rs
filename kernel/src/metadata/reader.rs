@@ -1,6 +1,7 @@
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
 use crate::{DeltaResult, Error};
+use bytes::Bytes;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -40,19 +41,19 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<MetadataEntry> {
-    // The getters are in order of flattened leaf fields (22 total):
+    // The getters are in order of flattened leaf fields (23 total):
     // 0: content_type
     // 1: location
     // 2: file_format
     // 3-7: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id)
-    // 8-9: deletion_vector fields (offset, size_in_bytes) - inline_content excluded (binary not supported)
-    // 10: partition_spec_id
-    // 11: sort_order_id
-    // 12: record_count
-    // 13: file_size_in_bytes
+    // 8-10: deletion_vector fields (offset, size_in_bytes, inline_content)
+    // 11: partition_spec_id
+    // 12: sort_order_id
+    // 13: record_count
+    // 14: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 14-20: manifest_stats fields (7 fields)
-    // 21: referenced_file
+    // 15-21: manifest_stats fields (7 fields)
+    // 22: referenced_file
     // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
 
     // Extract content_type
@@ -111,45 +112,47 @@ fn visit_metadata_entry_at<'a>(
     };
 
     // Extract deletion_vector fields
-    // TODO: inline_content (binary) is not supported in visitor pattern yet, so we skip it
-    // Tracking issue: https://github.com/delta-io/delta-kernel-rs/issues/1382
     let dv_offset: Option<i64> = getters[8].get_opt(row_index, "deletion_vector.offset")?;
     let dv_size_in_bytes: Option<i64> =
         getters[9].get_opt(row_index, "deletion_vector.size_in_bytes")?;
+    let dv_inline_content_bytes: Option<&[u8]> =
+        getters[10].get_opt(row_index, "deletion_vector.inline_content")?;
+    let dv_inline_content = dv_inline_content_bytes.map(Bytes::copy_from_slice);
 
-    let deletion_vector = if dv_offset.is_some() || dv_size_in_bytes.is_some() {
-        Some(DeletionVector {
-            offset: dv_offset,
-            size_in_bytes: dv_size_in_bytes,
-            inline_content: None, // Binary data not supported in visitor pattern yet
-        })
-    } else {
-        None
-    };
+    let deletion_vector =
+        if dv_offset.is_some() || dv_size_in_bytes.is_some() || dv_inline_content.is_some() {
+            Some(DeletionVector {
+                offset: dv_offset,
+                size_in_bytes: dv_size_in_bytes,
+                inline_content: dv_inline_content,
+            })
+        } else {
+            None
+        };
 
     // Extract scalar fields
-    let partition_spec_id: i64 = getters[10].get(row_index, "partition_spec_id")?;
-    let sort_order_id: i64 = getters[11].get(row_index, "sort_order_id")?;
-    let record_count: i64 = getters[12].get(row_index, "record_count")?;
-    let file_size_in_bytes: i64 = getters[13].get(row_index, "file_size_in_bytes")?;
+    let partition_spec_id: i64 = getters[11].get(row_index, "partition_spec_id")?;
+    let sort_order_id: i64 = getters[12].get(row_index, "sort_order_id")?;
+    let record_count: i64 = getters[13].get(row_index, "record_count")?;
+    let file_size_in_bytes: i64 = getters[14].get(row_index, "file_size_in_bytes")?;
 
     // content_stats has no fields, so no getters
 
     // Extract manifest_stats fields
     let ms_added_files_count: Option<i64> =
-        getters[14].get_opt(row_index, "manifest_stats.added_files_count")?;
+        getters[15].get_opt(row_index, "manifest_stats.added_files_count")?;
     let ms_existing_files_count: Option<i64> =
-        getters[15].get_opt(row_index, "manifest_stats.existing_files_count")?;
+        getters[16].get_opt(row_index, "manifest_stats.existing_files_count")?;
     let ms_deletes_files_count: Option<i64> =
-        getters[16].get_opt(row_index, "manifest_stats.deletes_files_count")?;
+        getters[17].get_opt(row_index, "manifest_stats.deletes_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[17].get_opt(row_index, "manifest_stats.added_rows_count")?;
+        getters[18].get_opt(row_index, "manifest_stats.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[18].get_opt(row_index, "manifest_stats.existing_rows_count")?;
+        getters[19].get_opt(row_index, "manifest_stats.existing_rows_count")?;
     let ms_delete_rows_count: Option<i64> =
-        getters[19].get_opt(row_index, "manifest_stats.delete_rows_count")?;
+        getters[20].get_opt(row_index, "manifest_stats.delete_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_stats.min_sequence_number")?;
+        getters[21].get_opt(row_index, "manifest_stats.min_sequence_number")?;
 
     let manifest_stats = ms_added_files_count.map(|added_files_count| ManifestStats {
         added_files_count,
@@ -162,7 +165,7 @@ fn visit_metadata_entry_at<'a>(
     });
 
     // Extract referenced_file
-    let referenced_file: Option<String> = getters[21].get_opt(row_index, "referenced_file")?;
+    let referenced_file: Option<String> = getters[22].get_opt(row_index, "referenced_file")?;
 
     // Note: The following fields are not currently used by Delta and are not extracted:
     // - key_metadata (binary data not supported in visitor pattern)
