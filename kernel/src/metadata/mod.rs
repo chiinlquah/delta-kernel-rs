@@ -197,8 +197,8 @@ impl Metadata {
             let scan_metadata = scan_metadata_result?;
             let engine_data = scan_metadata.scan_files.data();
 
-            // TODO: Should we store the version on when it was added as a tag on the Add action?
-            metadata_builder.add_from_engine_data_add(engine_data, version)?;
+            // When building from snapshot, we don't have a CommitInfo snapshot_id, so pass None
+            metadata_builder.add_from_engine_data_add(engine_data, version, None)?;
         }
 
         metadata_builder.build(engine)

@@ -86,6 +86,12 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
 
         set_json_value(&mut parsed_commit, "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commit, "commitInfo.txnId", json!(ZERO_UUID))?;
+        // Remove snapshotId since it's randomly generated
+        if let Some(commit_info) = parsed_commit.get_mut("commitInfo") {
+            if let Some(obj) = commit_info.as_object_mut() {
+                obj.remove("snapshotId");
+            }
+        }
 
         let expected_commit = json!({
             "commitInfo": {
@@ -241,6 +247,12 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        // Remove snapshotId since it's randomly generated
+        if let Some(commit_info) = parsed_commits[0].get_mut("commitInfo") {
+            if let Some(obj) = commit_info.as_object_mut() {
+                obj.remove("snapshotId");
+            }
+        }
 
         let expected_commit = vec![json!({
             "commitInfo": {
@@ -299,6 +311,12 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        // Remove snapshotId since it's randomly generated
+        if let Some(commit_info) = parsed_commits[0].get_mut("commitInfo") {
+            if let Some(obj) = commit_info.as_object_mut() {
+                obj.remove("snapshotId");
+            }
+        }
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -510,6 +528,12 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        // Remove snapshotId since it's randomly generated
+        if let Some(commit_info) = parsed_commits[0].get_mut("commitInfo") {
+            if let Some(obj) = commit_info.as_object_mut() {
+                obj.remove("snapshotId");
+            }
+        }
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -734,6 +758,12 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        // Remove snapshotId since it's randomly generated
+        if let Some(commit_info) = parsed_commits[0].get_mut("commitInfo") {
+            if let Some(obj) = commit_info.as_object_mut() {
+                obj.remove("snapshotId");
+            }
+        }
 
         let expected_commit = vec![
             json!({

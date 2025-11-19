@@ -371,6 +371,12 @@ mod tests {
             // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
             set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+            // Remove snapshotId since it's randomly generated
+            if let Some(commit_info) = parsed_commits[0].get_mut("commitInfo") {
+                if let Some(obj) = commit_info.as_object_mut() {
+                    obj.remove("snapshotId");
+                }
+            }
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
 

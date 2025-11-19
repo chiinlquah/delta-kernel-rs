@@ -1454,7 +1454,7 @@ mod tests {
                 delete_manifest_path: None,
                 delete_manifest_position: None,
             };
-            builder.add(add, 3);
+            builder.add(add, 3, None);
 
             let metadata = builder.build(engine.as_ref()).unwrap();
             let writer = MetadataWriter::try_new(metadata).unwrap();
@@ -1665,7 +1665,7 @@ mod tests {
                 delete_manifest_path: None,
                 delete_manifest_position: None,
             };
-            builder.add(add, 10);
+            builder.add(add, 10, None);
 
             let metadata = builder.build(engine.as_ref()).unwrap();
             let writer = MetadataWriter::try_new(metadata).unwrap();

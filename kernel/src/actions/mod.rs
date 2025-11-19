@@ -755,6 +755,26 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// A unique identifier for the snapshot created by this commit.
+    /// Used for Iceberg compatibility to track snapshot lineage.
+    pub(crate) snapshot_id: Option<i64>,
+}
+
+/// Generate a unique snapshot ID using UUID-based randomization.
+/// The snapshot ID is derived from a UUID to ensure uniqueness and is always positive.
+/// TODO: Ensure that the snapshot is globally unique in the log
+/// Inspired from:
+/// https://github.com/apache/iceberg-rust/blob/75be9c6a3b970079fdccc3d638b673aaaec68cb8/crates/iceberg/src/transaction/snapshot.rs#L164
+/// Which comes from Iceberg (Java):
+/// https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/SnapshotIdGeneratorUtil.java
+fn generate_snapshot_id() -> i64 {
+    let (lhs, rhs) = uuid::Uuid::new_v4().as_u64_pair();
+    let snapshot_id = (lhs ^ rhs) as i64;
+    if snapshot_id < 0 {
+        -snapshot_id
+    } else {
+        snapshot_id
+    }
 }
 
 impl CommitInfo {
@@ -772,7 +792,13 @@ impl CommitInfo {
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            snapshot_id: Some(generate_snapshot_id()),
         }
+    }
+
+    /// Get the snapshot ID for this commit
+    pub(crate) fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
     }
 }
 
@@ -791,6 +817,7 @@ impl IntoEngineData for CommitInfo {
             self.kernel_version.into(),
             self.engine_info.into(),
             self.txn_id.into(),
+            self.snapshot_id.into(),
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -1200,6 +1227,7 @@ mod tests {
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
+    use std::collections::HashSet;
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
@@ -1245,6 +1273,27 @@ mod tests {
             ArrowDataType::Utf8,
             nullable_values,
         ))
+    }
+
+    #[test]
+    fn test_generate_snapshot_id_produces_unique_positive_values() {
+        let sample_size = 128;
+        let mut ids = HashSet::with_capacity(sample_size);
+
+        for _ in 0..sample_size {
+            let snapshot_id = super::generate_snapshot_id();
+            assert!(
+                snapshot_id > 0,
+                "snapshot IDs must be positive, got {snapshot_id}"
+            );
+            ids.insert(snapshot_id);
+        }
+
+        assert_eq!(
+            ids.len(),
+            sample_size,
+            "expected {sample_size} unique snapshot IDs"
+        );
     }
 
     #[test]
@@ -1455,6 +1504,7 @@ mod tests {
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
+                StructField::nullable("snapshotId", DataType::LONG),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1848,6 +1898,7 @@ mod tests {
 
         let commit_info = CommitInfo::new(0, None, None, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
+        let commit_info_snapshot_id = commit_info.snapshot_id;
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 
@@ -1872,6 +1923,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                Arc::new(Int64Array::from(vec![commit_info_snapshot_id])),
             ],
         )
         .unwrap();

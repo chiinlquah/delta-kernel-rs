@@ -285,6 +285,8 @@ impl Transaction {
             self.operation.clone(),
             self.engine_info.clone(),
         );
+        // Extract snapshot_id before converting commit_info to engine data
+        let snapshot_id = commit_info.snapshot_id();
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
@@ -295,6 +297,7 @@ impl Transaction {
         let add_actions = self.generate_add_actions(
             engine,
             commit_version,
+            snapshot_id,
             commit_info_action,
             set_transaction_actions,
         )?;
@@ -345,6 +348,7 @@ impl Transaction {
         &self,
         engine: &dyn Engine,
         commit_version: u64,
+        snapshot_id: Option<i64>,
         commit_info_action: DeltaResult<Box<dyn EngineData>>,
         set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
     ) -> DeltaResult<Vec<DeltaResult<Box<dyn EngineData>>>> {
@@ -365,8 +369,11 @@ impl Transaction {
             let metadata = Metadata::new_from_snapshot(self.read_snapshot.clone(), engine)?;
             let mut metadata_builder = metadata.to_builder();
             for add_metadata_result in self.add_files_metadata.iter() {
-                metadata_builder
-                    .add_from_engine_data_write(add_metadata_result.as_ref(), commit_version)?;
+                metadata_builder.add_from_engine_data_write(
+                    add_metadata_result.as_ref(),
+                    commit_version,
+                    snapshot_id,
+                )?;
             }
 
             let new_metadata = metadata_builder.build(engine)?;

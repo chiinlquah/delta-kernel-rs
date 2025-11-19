@@ -64,7 +64,7 @@ impl MetadataBuilder {
     #[allow(unreachable_code)]
     #[allow(dead_code)]
     #[allow(clippy::unwrap_used)]
-    pub(crate) fn add(&mut self, add: Add, version: Version) {
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: Option<i64>) {
         let deletion_vector = add.deletion_vector.map(|dv| {
             match dv.storage_type {
                 DeletionVectorStorageType::PersistedRelative
@@ -102,10 +102,7 @@ impl MetadataBuilder {
             file_format: DataFileFormat::Parquet,
             tracking_info: TrackingInfo {
                 status,
-                // Set the snapshot-id, sequence-number and file-sequence-number explicitly,
-                // which requires rewriting the metadata in the case of a conflict
-                // TODO: Should we generate a snapshot-ID and store it in a tag on the Add action?
-                snapshot_id: Some(version as i64),
+                snapshot_id,
                 sequence_number: Some(version as i64),
                 file_sequence_number: Some(version as i64),
 
@@ -153,6 +150,8 @@ impl MetadataBuilder {
     ///
     /// # Arguments
     /// * `engine_data` - The engine data containing Add records to extract and add
+    /// * `version` - The version at which these files are being added
+    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -162,12 +161,13 @@ impl MetadataBuilder {
         &mut self,
         engine_data: &dyn EngineData,
         version: Version,
+        snapshot_id: Option<i64>,
     ) -> Result<(), crate::Error> {
         let mut visitor = AddVisitor::default();
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add, version);
+            self.add(add, version, snapshot_id);
         }
 
         Ok(())
@@ -181,6 +181,8 @@ impl MetadataBuilder {
     ///
     /// # Arguments
     /// * `engine_data` - The engine data containing write metadata records to extract and add
+    /// * `version` - The version at which these files are being added
+    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -190,12 +192,13 @@ impl MetadataBuilder {
         &mut self,
         engine_data: &dyn EngineData,
         version: Version,
+        snapshot_id: Option<i64>,
     ) -> Result<(), crate::Error> {
         let mut visitor = WriteMetadataVisitor::default();
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add, version);
+            self.add(add, version, snapshot_id);
         }
 
         Ok(())
@@ -208,6 +211,8 @@ impl MetadataBuilder {
     ///
     /// # Arguments
     /// * `engine_data_iter` - An iterator yielding Results containing EngineData batches with Add records
+    /// * `version` - The version at which these files are being added
+    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -217,10 +222,11 @@ impl MetadataBuilder {
         &mut self,
         engine_data_iter: impl Iterator<Item = Result<Box<dyn EngineData>, crate::Error>> + 'a,
         version: Version,
+        snapshot_id: Option<i64>,
     ) -> Result<(), crate::Error> {
         for engine_data_result in engine_data_iter {
             let engine_data = engine_data_result?;
-            self.add_from_engine_data_add(engine_data.as_ref(), version)?;
+            self.add_from_engine_data_add(engine_data.as_ref(), version, snapshot_id)?;
         }
 
         Ok(())
@@ -467,7 +473,7 @@ mod tests {
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
-        builder.add_from_engine_data_add(batch.as_ref(), 1)?;
+        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify
         let engine = crate::engine::sync::SyncEngine::new();
@@ -518,7 +524,7 @@ mod tests {
         // Create builder and add from engine data iterator
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
-        builder.add_from_engine_data_iter(batches.into_iter(), 1)?;
+        builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
 
         // Build metadata and verify
         let engine = crate::engine::sync::SyncEngine::new();
