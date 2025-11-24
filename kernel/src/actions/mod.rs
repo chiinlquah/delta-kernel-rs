@@ -2298,6 +2298,7 @@ mod tests {
     #[test]
     fn test_content_root_into_engine_data_with_log_schema() {
         use crate::arrow::array::AsArray;
+        use crate::engine::arrow_data::ArrowEngineData;
 
         let engine = ExprEngine::new();
 
@@ -2339,6 +2340,8 @@ mod tests {
 
     #[test]
     fn test_content_root_with_log_schema() {
+        use crate::engine::arrow_data::ArrowEngineData;
+
         let engine = ExprEngine::new();
 
         let content_root = ContentRoot {
