@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -122,13 +120,11 @@ pub(crate) enum TableFeature {
 
 /// ReaderWriter features that can be supported by legacy readers (min_reader_version < 3).
 /// Only ColumnMapping qualifies with min_reader_version = 2.
-#[allow(dead_code)]
-static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
+pub(crate) static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
 
 /// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version < 7).
 /// These are features with min_writer_version in range [1, 6].
-#[allow(dead_code)]
-static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
+pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
     // Writer-only features (min_writer < 7)
     TableFeature::AppendOnly,       // min_writer = 2
     TableFeature::Invariants,       // min_writer = 2
@@ -271,17 +267,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Custom(|_protocol, properties, _operation| {
-        // Kernel supports writing to CDF-enabled tables only if AppendOnly is also enabled
-        // because we don't yet support writing .cdc files for DML operations
-        if properties.enable_change_data_feed == Some(true) && properties.append_only != Some(true)
-        {
-            return Err(Error::unsupported(
-                "Writing to table with Change Data Feed is only supported if append only mode is enabled",
-            ));
-        }
-        Ok(())
-    }),
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -454,6 +440,9 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -469,6 +458,9 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -496,7 +488,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    // We support writing to tables with DeletionVectors enabled, but we never write DV files
+    // ourselves (no DML). The kernel only performs append operations.
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
@@ -558,7 +552,7 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -700,55 +694,6 @@ impl TableFeature {
         TableFeature::Unknown(s.to_string())
     }
 }
-
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogManaged,
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogOwnedPreview,
-        TableFeature::ColumnMapping,
-        TableFeature::DeletionVectors,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::TypeWidening,
-        TableFeature::TypeWideningPreview,
-        TableFeature::VacuumProtocolCheck,
-        TableFeature::V2Checkpoint,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        // The default engine currently DOES NOT support shredded Variant reads and the parquet
-        // reader will reject the read if it sees a shredded schema in the parquet file. That being
-        // said, kernel does permit reconstructing shredded variants into the
-        // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
-        // third-party engines support it.
-        TableFeature::VariantShreddingPreview,
-        TableFeature::MetadataTreeExperimental,
-    ]
-});
-
-/// The writer features have the following limitations:
-/// - We 'support' Invariants only insofar as we check that they are not present.
-/// - We support writing to tables that have Invariants enabled but not used.
-/// - We only support DeletionVectors in that we never write them (no DML).
-/// - We support writing to existing tables with row tracking, but we don't support creating
-///   tables with row tracking yet.
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        TableFeature::AppendOnly,
-        TableFeature::ChangeDataFeed,
-        TableFeature::CheckConstraints,
-        TableFeature::DeletionVectors,
-        TableFeature::DomainMetadata,
-        TableFeature::InCommitTimestamp,
-        TableFeature::Invariants,
-        TableFeature::RowTracking,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        TableFeature::VariantShreddingPreview,
-        TableFeature::MetadataTreeExperimental,
-    ]
-});
 
 #[cfg(test)]
 mod tests {
