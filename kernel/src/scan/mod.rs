@@ -1520,7 +1520,7 @@ mod tests {
             table_root.clone(),
             log_segment,
             engine.as_ref(),
-            None
+            None,
         )?);
 
         let scan = snapshot.scan_builder().build()?;
@@ -1732,7 +1732,7 @@ mod tests {
             table_root.clone(),
             log_segment,
             engine.as_ref(),
-            None
+            None,
         )?);
 
         let scan = snapshot.scan_builder().build()?;
