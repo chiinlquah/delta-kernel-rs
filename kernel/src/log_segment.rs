@@ -1,7 +1,5 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-use std::num::NonZero;
-use std::sync::{Arc, LazyLock};
 
 use std::time::Instant;
 
