@@ -114,7 +114,8 @@ fn build_log_with_paths_and_checkpoint(
         }
     });
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage =
+        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -2116,7 +2117,8 @@ fn test_latest_commit_file_field_is_captured() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 5
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 5);
@@ -2142,7 +2144,8 @@ fn test_latest_commit_file_with_checkpoint_filtering() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 4
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 4);
@@ -2162,7 +2165,8 @@ fn test_latest_commit_file_with_no_commits() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // latest_commit_file should be None when there are no commits
     assert!(log_segment.latest_commit_file.is_none());
@@ -2185,7 +2189,8 @@ fn test_latest_commit_file_with_checkpoint_at_same_version() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 1);
@@ -2210,7 +2215,8 @@ fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
     assert!(log_segment.latest_commit_file.is_none());
