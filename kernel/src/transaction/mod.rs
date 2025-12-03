@@ -380,7 +380,7 @@ impl Transaction {
 
             let content_root_action = ContentRoot {
                 path: file_meta.location.to_string(),
-                size_in_bytes: file_meta.size as i64,
+                size_in_bytes: file_meta.size,
             };
 
             // Use the log schema to wrap ContentRoot in a "contentRoot" field
