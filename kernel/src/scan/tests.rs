@@ -498,7 +498,6 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
     Ok(())
 }
 
-
 #[test]
 fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<()> {
     use crate::actions::visitors::AddVisitor;
@@ -926,4 +925,3 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
 
     Ok(())
 }
-
