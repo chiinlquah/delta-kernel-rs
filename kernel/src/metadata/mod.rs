@@ -6,8 +6,8 @@ pub(crate) mod writer;
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::deletion_vector::DeletionVectorStorageType;
-use crate::actions::Add;
 use crate::actions::Remove;
+use crate::actions::{Add, ContentRoot};
 use crate::engine_data::EngineData;
 use crate::expressions::Scalar;
 use crate::expressions::Transform;
@@ -183,8 +183,8 @@ impl Metadata {
     /// A `Metadata` instance containing all active files in the table at the snapshot version.
     #[allow(dead_code)]
     pub(crate) fn new_from_snapshot(
-        snapshot: SnapshotRef,
         engine: &dyn Engine,
+        snapshot: SnapshotRef,
     ) -> DeltaResult<Self> {
         let table_root = snapshot.table_root().clone();
         let version = snapshot.version();
@@ -261,6 +261,28 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn to_builder(&self) -> MetadataBuilder {
         MetadataBuilder::new_for(self.table_root.clone(), self.version)
+    }
+
+    /// Creates Metadata from a content root commit.
+    ///
+    /// This is an optimized path for batch commits that loads metadata directly from a
+    /// content root parquet file instead of replaying the entire log.
+    ///
+    /// # Parameters
+    /// - `engine`: The engine to use for reading the parquet file
+    /// - `content_root_commit`: The parsed log path of the commit containing the content root
+    ///
+    /// # Returns
+    /// A `Metadata` instance loaded from the content root file.
+    #[allow(dead_code)]
+    pub(crate) fn new_from_content_root(
+        engine: &dyn Engine,
+        content_root: &ContentRoot,
+    ) -> DeltaResult<Self> {
+        // Parse and read from the content root file referenced by the ContentRoot action
+        let content_root_url = Url::parse(&content_root.path)
+            .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
+        Self::read(engine, &content_root_url)
     }
 }
 

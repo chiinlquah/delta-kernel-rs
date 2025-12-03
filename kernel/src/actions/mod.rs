@@ -23,6 +23,7 @@ use crate::{
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
+use delta_kernel::actions::visitors::ContentRootVisitor;
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -983,6 +984,15 @@ pub(crate) struct ContentRoot {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
     pub(crate) size_in_bytes: FileSize,
+}
+
+impl ContentRoot {
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<ContentRoot>> {
+        let mut visitor = ContentRootVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.content_root)
+    }
 }
 
 impl IntoEngineData for ContentRoot {

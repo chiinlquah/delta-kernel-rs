@@ -189,7 +189,7 @@ fn test_physical_predicate() {
     }
 }
 
-fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
+pub(crate) fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(
         paths: &mut Vec<String>,

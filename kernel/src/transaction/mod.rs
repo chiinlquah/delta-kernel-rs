@@ -19,7 +19,6 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::metadata::writer::MetadataWriter;
-use crate::metadata::Metadata;
 use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
@@ -364,10 +363,20 @@ impl Transaction {
 
         // Handle batch commit - either write to metadata tree or include in JSON log
         if self.batch_commit && !self.add_files_metadata.is_empty() {
-            // TODO: Create from existing metadata to update it in an incremental fashion
-            let metadata = Metadata::new_from_snapshot(self.read_snapshot.clone(), engine)?;
+            // Find the latest content root in the log segment to avoid full replay
+            let latest_content_root = self.read_snapshot.log_segment().content_root(engine)?;
+
+            // Decide whether to load from content root or build from snapshot
+            let metadata = if let Some(content_root_action) = latest_content_root {
+                crate::metadata::Metadata::new_from_content_root(engine, &content_root_action)?
+            } else {
+                // No content root found, build from snapshot (full replay)
+                crate::metadata::Metadata::new_from_snapshot(engine, self.read_snapshot.clone())?
+            };
+
             let mut metadata_builder = metadata.to_builder();
             for add_metadata_result in self.add_files_metadata.iter() {
+                // TODO: files might be re-added
                 metadata_builder.add_from_engine_data_write(
                     add_metadata_result.as_ref(),
                     commit_version,

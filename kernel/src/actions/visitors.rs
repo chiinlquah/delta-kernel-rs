@@ -687,6 +687,65 @@ impl RowVisitor for InCommitTimestampVisitor {
     }
 }
 
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct ContentRootVisitor {
+    pub(crate) content_root: Option<ContentRoot>,
+}
+
+impl RowVisitor for ContentRootVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| ContentRoot::to_schema().leaves(CONTENT_ROOT_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 2,
+            Error::internal_error(format!(
+                "Wrong number of ContentRootVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            if let Some(content_root) = visit_content_root_at(i, getters)? {
+                self.content_root = Some(content_root);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[internal_api]
+pub(crate) fn visit_content_root_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<ContentRoot>> {
+    require!(
+        getters.len() == 2,
+        Error::InternalError(format!(
+            "Wrong number of ContentRoot getters: {}",
+            getters.len()
+        ))
+    );
+
+    // Chain if let when using Rust 2024 or later
+    let Some(path): Option<&str> = getters[0].get_opt(row_index, "contentRoot.path")? else {
+        return Ok(None);
+    };
+    let Some(size_in_bytes): Option<i64> =
+        getters[1].get_opt(row_index, "contentRoot.size_in_bytes")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ContentRoot {
+        path: path.into(),
+        size_in_bytes: size_in_bytes as u64,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

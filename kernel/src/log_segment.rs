@@ -1,12 +1,11 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-
 use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, ADD_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SIDECAR_NAME,
+    get_commit_schema, schema_contains_file_actions, ContentRoot, Metadata, Protocol, Sidecar,
+    ADD_NAME, CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
@@ -703,6 +702,30 @@ impl LogSegment {
             }
         }
         Ok((metadata_opt, protocol_opt))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn content_root(&self, engine: &dyn Engine) -> DeltaResult<Option<ContentRoot>> {
+        let schema = get_commit_schema().project(&[CONTENT_ROOT_NAME])?;
+        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
+            Some(Arc::new(
+                Expression::column([CONTENT_ROOT_NAME, "path"]).is_not_null(),
+            ))
+        });
+        let actions_batches = self.read_actions(engine, schema, META_PREDICATE.clone())?;
+
+        for actions_batch in actions_batches {
+            let actions = actions_batch?.actions;
+            match ContentRoot::try_new_from_data(actions.as_ref()) {
+                Ok(Some(cr)) => {
+                    return Ok(Some(cr));
+                }
+                // Skip batches that don't have ContentRoot field
+                _ => continue,
+            }
+        }
+
+        Ok(None)
     }
 
     // Get the most up-to-date Protocol and Metadata actions
