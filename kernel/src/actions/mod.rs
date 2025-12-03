@@ -16,7 +16,7 @@ use crate::table_features::{FeatureType, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
     IntoEngineData, RowVisitor as _,
 };
 
@@ -982,7 +982,7 @@ pub(crate) struct ContentRoot {
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
-    pub(crate) size_in_bytes: i64,
+    pub(crate) size_in_bytes: FileSize,
 }
 
 impl IntoEngineData for ContentRoot {

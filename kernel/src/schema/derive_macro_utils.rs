@@ -38,6 +38,7 @@ impl_to_data_type!(
     (String, DataType::STRING),
     (Bytes, DataType::BINARY),
     (i64, DataType::LONG),
+    (u64, DataType::LONG),
     (i32, DataType::INTEGER),
     (i16, DataType::SHORT),
     (char, DataType::BYTE),
