@@ -85,7 +85,7 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
 
 // Utility method to build a log using a list of log paths and an optional checkpoint hint. The
 // LastCheckpointHint is written to `_delta_log/_last_checkpoint`.
-fn build_log_with_paths_and_checkpoint(
+async fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
 ) -> (Box<dyn StorageHandler>, Url) {
@@ -94,25 +94,23 @@ fn build_log_with_paths_and_checkpoint(
     let data = bytes::Bytes::from("kernel-data");
 
     // add log files to store
-    block_on(async {
-        for path in paths {
-            store
-                .put(path, data.clone().into())
-                .await
-                .expect("put log file in store");
-        }
-        if let Some(checkpoint_metadata) = checkpoint_metadata {
-            let checkpoint_str =
-                serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
-            store
-                .put(
-                    &Path::from("_delta_log/_last_checkpoint"),
-                    checkpoint_str.into(),
-                )
-                .await
-                .expect("Write _last_checkpoint");
-        }
-    });
+    for path in paths {
+        store
+            .put(path, data.clone().into())
+            .await
+            .expect("put log file in store");
+    }
+    if let Some(checkpoint_metadata) = checkpoint_metadata {
+        let checkpoint_str =
+            serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
+        store
+            .put(
+                &Path::from("_delta_log/_last_checkpoint"),
+                checkpoint_str.into(),
+            )
+            .await
+            .expect("Write _last_checkpoint");
+    }
 
     let storage =
         ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
@@ -134,7 +132,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 }
 
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
-fn write_parquet_to_store(
+async fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
@@ -147,36 +145,36 @@ fn write_parquet_to_store(
     writer.write(record_batch)?;
     writer.close()?;
 
-    block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
+    store.put(&Path::from(path), buffer.into()).await?;
 
     Ok(())
 }
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-pub(crate) fn add_checkpoint_to_store(
+pub(crate) async fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/{filename}");
-    write_parquet_to_store(store, path, data)
+    write_parquet_to_store(store, path, data).await
 }
 
 /// Writes all actions to a _delta_log/_sidecars file in the store.
 /// This function formats the provided filename into the _sidecars subdirectory.
-fn add_sidecar_to_store(
+async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/_sidecars/{filename}");
-    write_parquet_to_store(store, path, data)
+    write_parquet_to_store(store, path, data).await
 }
 
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-fn write_json_to_store(
+async fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
@@ -188,13 +186,9 @@ fn write_json_to_store(
     let content = json_lines.join("\n");
     let checkpoint_path = format!("_delta_log/{filename}");
 
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async {
-            store
-                .put(&Path::from(checkpoint_path), content.into())
-                .await
-        })?;
+    store
+        .put(&Path::from(checkpoint_path), content.into())
+        .await?;
 
     Ok(())
 }
@@ -209,8 +203,8 @@ fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
     .unwrap()
 }
 
-#[test]
-fn build_snapshot_with_uuid_checkpoint_parquet() {
+#[tokio::test]
+async fn build_snapshot_with_uuid_checkpoint_parquet() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -224,7 +218,8 @@ fn build_snapshot_with_uuid_checkpoint_parquet() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -245,8 +240,8 @@ fn build_snapshot_with_uuid_checkpoint_parquet() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_uuid_checkpoint_json() {
+#[tokio::test]
+async fn build_snapshot_with_uuid_checkpoint_json() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -260,7 +255,8 @@ fn build_snapshot_with_uuid_checkpoint_json() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -281,8 +277,8 @@ fn build_snapshot_with_uuid_checkpoint_json() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_correct_last_uuid_checkpoint() {
+#[tokio::test]
+async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -309,7 +305,8 @@ fn build_snapshot_with_correct_last_uuid_checkpoint() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -328,8 +325,9 @@ fn build_snapshot_with_correct_last_uuid_checkpoint() {
     assert_eq!(commit_files[0].version, 6);
     assert_eq!(commit_files[1].version, 7);
 }
-#[test]
-fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
+
+#[tokio::test]
+async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -352,7 +350,8 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -373,8 +372,8 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_out_of_date_last_checkpoint() {
+#[tokio::test]
+async fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 3,
         size: 10,
@@ -398,7 +397,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -417,8 +417,9 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
     assert_eq!(commit_files[0].version, 6);
     assert_eq!(commit_files[1].version, 7);
 }
-#[test]
-fn build_snapshot_with_correct_last_multipart_checkpoint() {
+
+#[tokio::test]
+async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -447,7 +448,8 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -467,8 +469,8 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
     assert_eq!(commit_files[1].version, 7);
 }
 
-#[test]
-fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
+#[tokio::test]
+async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -497,7 +499,8 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -511,8 +514,9 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
     )
 }
-#[test]
-fn build_snapshot_with_bad_checkpoint_hint_fails() {
+
+#[tokio::test]
+async fn build_snapshot_with_bad_checkpoint_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -540,7 +544,8 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -556,8 +561,8 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
     )
 }
 
-#[test]
-fn build_snapshot_with_missing_checkpoint_part_no_hint() {
+#[tokio::test]
+async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     // Part 2 of 3 is missing from checkpoint 5. The Snapshot should be made of checkpoint
     // number 3 and commit files 4 to 7.
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -577,7 +582,8 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -599,8 +605,8 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpoint() {
+#[tokio::test]
+async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpoint() {
     // When the _last_checkpoint is out of date and the most recent checkpoint is incomplete, the
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
@@ -630,7 +636,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -651,8 +658,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_without_checkpoints() {
+#[tokio::test]
+async fn build_snapshot_without_checkpoints() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -668,7 +675,8 @@ fn build_snapshot_without_checkpoints() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     ///////// Specify no checkpoint or end version /////////
     let log_segment = LogSegment::for_snapshot_impl(
@@ -711,8 +719,8 @@ fn build_snapshot_without_checkpoints() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
+#[tokio::test]
+async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -738,7 +746,8 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -758,8 +767,8 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     assert_eq!(commit_files[0].version, 4);
 }
 
-#[test]
-fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
+#[tokio::test]
+async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 3,
         size: 10,
@@ -783,7 +792,8 @@ fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
             delta_path_for_version(7, "json"),
         ],
         Some(&checkpoint_metadata),
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -798,8 +808,9 @@ fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
     assert_eq!(log_segment.ascending_commit_files[0].version, 4);
 }
-#[test]
-fn build_table_changes_with_commit_versions() {
+
+#[tokio::test]
+async fn build_table_changes_with_commit_versions() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -815,7 +826,8 @@ fn build_table_changes_with_commit_versions() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     ///////// Specify start version and end version /////////
 
@@ -859,8 +871,8 @@ fn build_table_changes_with_commit_versions() {
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn test_non_contiguous_log() {
+#[tokio::test]
+async fn test_non_contiguous_log() {
     // Commit with version 1 is missing
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -868,7 +880,8 @@ fn test_non_contiguous_log() {
             delta_path_for_version(2, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
@@ -894,8 +907,8 @@ fn test_non_contiguous_log() {
     );
 }
 
-#[test]
-fn table_changes_fails_with_larger_start_version_than_end() {
+#[tokio::test]
+async fn table_changes_fails_with_larger_start_version_than_end() {
     // Commit with version 1 is missing
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -903,10 +916,12 @@ fn table_changes_fails_with_larger_start_version_than_end() {
             delta_path_for_version(1, "json"),
         ],
         None,
-    );
+    )
+    .await;
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
+
 #[test]
 fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
@@ -965,8 +980,8 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -975,12 +990,14 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
-    )?;
+    )
+    .await?;
     add_sidecar_to_store(
         &store,
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
-    )?;
+    )
+    .await?;
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1032,8 +1049,8 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     Ok(())
 }
 
-#[test]
-fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1046,7 +1063,8 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
-    )?;
+    )
+    .await?;
 
     // Filter out sidecar files that do not contain remove actions
     let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
@@ -1071,8 +1089,8 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
+#[tokio::test]
+async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
@@ -1081,7 +1099,8 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
-    )?;
+    )
+    .await?;
 
     let checkpoint_one_file = log_root
         .join("00000000000000000001.checkpoint.parquet")?
@@ -1118,8 +1137,8 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
+#[tokio::test]
+async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
@@ -1137,12 +1156,14 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         &store,
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_1,
-    )?;
+    )
+    .await?;
     add_checkpoint_to_store(
         &store,
         sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_2,
-    )?;
+    )
+    .await?;
 
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
@@ -1186,9 +1207,9 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars() -> DeltaResult<()>
-{
+#[tokio::test]
+async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -1196,7 +1217,8 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         &store,
         add_batch_simple(get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
-    )?;
+    )
+    .await?;
 
     let checkpoint_one_file = log_root
         .join("00000000000000000001.checkpoint.parquet")?
@@ -1230,8 +1252,9 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -1245,7 +1268,8 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
             ..Default::default()
         })],
         filename,
-    )?;
+    )
+    .await?;
 
     let checkpoint_one_file = log_root.join(filename)?.to_string();
 
@@ -1287,8 +1311,8 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 // - As sidecar references are present, the corresponding sidecar files are processed correctly.
 // - Batches from both the checkpoint file and sidecar files are returned.
 // - Each returned batch is correctly flagged with is_log_batch set to false
-#[test]
-fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
+#[tokio::test]
+async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
@@ -1300,18 +1324,21 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
             get_all_actions_schema().clone(),
         ),
         "00000000000000000001.checkpoint.parquet",
-    )?;
+    )
+    .await?;
 
     add_sidecar_to_store(
         &store,
         add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
-    )?;
+    )
+    .await?;
     add_sidecar_to_store(
         &store,
         add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
-    )?;
+    )
+    .await?;
 
     let checkpoint_file_path = log_root
         .join("00000000000000000001.checkpoint.parquet")?
@@ -1375,7 +1402,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     Ok(())
 }
 
-fn create_segment_for(
+async fn create_segment_for(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
     checkpoint_version: Option<u64>,
@@ -1396,7 +1423,7 @@ fn create_segment_for(
             "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
         ));
     }
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
@@ -1407,8 +1434,8 @@ fn create_segment_for(
     .unwrap()
 }
 
-#[test]
-fn test_list_log_files_with_version() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_list_log_files_with_version() -> DeltaResult<()> {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -1418,7 +1445,8 @@ fn test_list_log_files_with_version() -> DeltaResult<()> {
             delta_path_for_version(2, "json"),
         ],
         None,
-    );
+    )
+    .await;
     let result = ListedLogFiles::list(
         storage.as_ref(),
         &log_root,
@@ -1438,7 +1466,7 @@ fn test_list_log_files_with_version() -> DeltaResult<()> {
     Ok(())
 }
 
-fn test_compaction_listing(
+async fn test_compaction_listing(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
     checkpoint_version: Option<u64>,
@@ -1449,7 +1477,8 @@ fn test_compaction_listing(
         compaction_versions,
         checkpoint_version,
         version_to_load,
-    );
+    )
+    .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
     let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
     let expected_commit_versions: Vec<&u64> = commit_versions
@@ -1497,84 +1526,92 @@ fn test_compaction_listing(
     }
 }
 
-#[test]
-fn test_compaction_simple() {
+#[tokio::test]
+async fn test_compaction_simple() {
     test_compaction_listing(
         &[0, 1, 2],
         &[(1, 2)],
         None, // checkpoint version
         None, // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_compaction_in_version_range() {
+#[tokio::test]
+async fn test_compaction_in_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3],
         &[(1, 2)],
         None,    // checkpoint version
         Some(2), // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_compaction_out_of_version_range() {
+#[tokio::test]
+async fn test_compaction_out_of_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4],
         &[(1, 3)],
         None,    // checkpoint version
         Some(2), // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_multi_compaction() {
+#[tokio::test]
+async fn test_multi_compaction() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
         &[(1, 2), (3, 5)],
         None, // checkpoint version
         None, //version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_multi_compaction_one_out_of_range() {
+#[tokio::test]
+async fn test_multi_compaction_one_out_of_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
         &[(1, 2), (3, 5)],
         None,    // checkpoint version
         Some(4), // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_compaction_with_checkpoint() {
+#[tokio::test]
+async fn test_compaction_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
         &[(1, 2), (4, 5)],
         Some(3), // checkpoint version
         None,    // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_compaction_to_early_with_checkpoint() {
+#[tokio::test]
+async fn test_compaction_to_early_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
         &[(1, 2)],
         Some(3), // checkpoint version
         None,    // version to load
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_compaction_starts_at_checkpoint() {
+#[tokio::test]
+async fn test_compaction_starts_at_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
         &[(3, 5)],
         Some(3), // checkpoint version
         None,    // version to load
-    );
+    )
+    .await;
 }
 
 enum ExpectedFile {
@@ -1582,7 +1619,7 @@ enum ExpectedFile {
     Compaction(Version, Version),
 }
 
-fn test_commit_cover(
+async fn test_commit_cover(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
     checkpoint_version: Option<u64>,
@@ -1594,10 +1631,12 @@ fn test_commit_cover(
         compaction_versions,
         checkpoint_version,
         version_to_load,
-    );
+    )
+    .await;
     let cover = log_segment
         .find_commit_cover(get_commit_schema().clone(), None)
         .unwrap();
+    
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this
     let expected_locations = expected_files.iter().map(|ef| match ef {
@@ -1621,30 +1660,32 @@ fn test_commit_cover(
     }
 }
 
-#[test]
-fn test_commit_cover_one_compaction() {
+#[tokio::test]
+async fn test_commit_cover_one_compaction() {
     test_commit_cover(
         &[0, 1, 2],
         &[(1, 2)],
         None, // checkpoint version
         None, // version to load
         &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_in_version_range() {
+#[tokio::test]
+async fn test_commit_cover_in_version_range() {
     test_commit_cover(
         &[0, 1, 2, 3],
         &[(1, 2)],
         None,    // checkpoint version
         Some(2), // version to load
         &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_out_of_version_range() {
+#[tokio::test]
+async fn test_commit_cover_out_of_version_range() {
     test_commit_cover(
         &[0, 1, 2, 3, 4],
         &[(1, 3)],
@@ -1655,11 +1696,12 @@ fn test_commit_cover_out_of_version_range() {
             ExpectedFile::Commit(1),
             ExpectedFile::Commit(0),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_multi_compaction() {
+#[tokio::test]
+async fn test_commit_cover_multi_compaction() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
         &[(1, 2), (3, 5)],
@@ -1670,11 +1712,12 @@ fn test_commit_cover_multi_compaction() {
             ExpectedFile::Compaction(1, 2),
             ExpectedFile::Commit(0),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_multi_compaction_one_out_of_range() {
+#[tokio::test]
+async fn test_commit_cover_multi_compaction_one_out_of_range() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
         &[(1, 2), (3, 5)],
@@ -1686,44 +1729,48 @@ fn test_commit_cover_multi_compaction_one_out_of_range() {
             ExpectedFile::Compaction(1, 2),
             ExpectedFile::Commit(0),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_compaction_with_checkpoint() {
+#[tokio::test]
+async fn test_commit_cover_compaction_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
         &[(1, 2), (4, 5)],
         Some(3), // checkpoint version
         None,    // version to load
         &[ExpectedFile::Compaction(4, 5)],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_too_early_with_checkpoint() {
+#[tokio::test]
+async fn test_commit_cover_too_early_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
         &[(1, 2)],
         Some(3), // checkpoint version
         None,    // version to load
         &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_starts_at_checkpoint() {
+#[tokio::test]
+async fn test_commit_cover_starts_at_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
         &[(3, 5)],
         Some(3), // checkpoint version
         None,    // version to load
         &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_wider_range() {
+#[tokio::test]
+async fn test_commit_cover_wider_range() {
     test_commit_cover(
         &Vec::from_iter(0..20),
         &[(0, 5), (0, 10), (5, 10), (13, 19)],
@@ -1735,11 +1782,12 @@ fn test_commit_cover_wider_range() {
             ExpectedFile::Commit(11),
             ExpectedFile::Compaction(0, 10),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_no_compactions() {
+#[tokio::test]
+async fn test_commit_cover_no_compactions() {
     test_commit_cover(
         &Vec::from_iter(0..4),
         &[],
@@ -1751,11 +1799,12 @@ fn test_commit_cover_no_compactions() {
             ExpectedFile::Commit(1),
             ExpectedFile::Commit(0),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_commit_cover_minimal_overlap() {
+#[tokio::test]
+async fn test_commit_cover_minimal_overlap() {
     test_commit_cover(
         &Vec::from_iter(0..6),
         &[(0, 2), (2, 5)],
@@ -1767,7 +1816,8 @@ fn test_commit_cover_minimal_overlap() {
             ExpectedFile::Commit(3),
             ExpectedFile::Compaction(0, 2),
         ],
-    );
+    )
+    .await;
 }
 
 #[test]
@@ -1857,15 +1907,16 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
     );
 }
 
-#[test]
-fn commits_since() {
+#[tokio::test]
+async fn commits_since() {
     // simple
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=4),
         &[],
         None, // No checkpoint
         None, // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
@@ -1875,7 +1926,8 @@ fn commits_since() {
         &[(0, 2)],
         None, // No checkpoint
         None, // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
@@ -1885,7 +1937,8 @@ fn commits_since() {
         &[],
         Some(3), // Checkpoint @ 3
         None,    // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
@@ -1895,7 +1948,8 @@ fn commits_since() {
         &[(0, 2)],
         Some(3), // Checkpoint @ 3
         None,    // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
@@ -1905,7 +1959,8 @@ fn commits_since() {
         &[(3, 4)],
         Some(2), // Checkpoint @ 2
         None,    // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
@@ -1915,7 +1970,8 @@ fn commits_since() {
         &[(1, 2), (3, 4)],
         None, // No Checkpoint
         None, // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
@@ -1925,13 +1981,14 @@ fn commits_since() {
         &[(1, 2), (3, 9), (4, 6)],
         None, // No Checkpoint
         None, // Version to load
-    );
+    )
+    .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 10);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
 }
 
-#[test]
-fn for_timestamp_conversion_gets_commit_range() {
+#[tokio::test]
+async fn for_timestamp_conversion_gets_commit_range() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -1947,7 +2004,8 @@ fn for_timestamp_conversion_gets_commit_range() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
@@ -1960,8 +2018,8 @@ fn for_timestamp_conversion_gets_commit_range() {
     assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
 }
 
-#[test]
-fn for_timestamp_conversion_with_old_end_version() {
+#[tokio::test]
+async fn for_timestamp_conversion_with_old_end_version() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -1977,7 +2035,8 @@ fn for_timestamp_conversion_with_old_end_version() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
@@ -1990,8 +2049,8 @@ fn for_timestamp_conversion_with_old_end_version() {
     assert_eq!(vec![0, 1, 2, 3, 4, 5], versions);
 }
 
-#[test]
-fn for_timestamp_conversion_only_contiguous_ranges() {
+#[tokio::test]
+async fn for_timestamp_conversion_only_contiguous_ranges() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -2007,7 +2066,8 @@ fn for_timestamp_conversion_only_contiguous_ranges() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
@@ -2020,8 +2080,8 @@ fn for_timestamp_conversion_only_contiguous_ranges() {
     assert_eq!(vec![5, 6, 7], versions);
 }
 
-#[test]
-fn for_timestamp_conversion_with_limit() {
+#[tokio::test]
+async fn for_timestamp_conversion_with_limit() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -2037,7 +2097,8 @@ fn for_timestamp_conversion_with_limit() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
         storage.as_ref(),
@@ -2054,8 +2115,9 @@ fn for_timestamp_conversion_with_limit() {
     let versions = commit_files.iter().map(|x| x.version).collect_vec();
     assert_eq!(vec![5, 6, 7], versions);
 }
-#[test]
-fn for_timestamp_conversion_with_large_limit() {
+
+#[tokio::test]
+async fn for_timestamp_conversion_with_large_limit() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -2071,7 +2133,8 @@ fn for_timestamp_conversion_with_large_limit() {
             delta_path_for_version(7, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
         storage.as_ref(),
@@ -2089,19 +2152,20 @@ fn for_timestamp_conversion_with_large_limit() {
     assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
 }
 
-#[test]
-fn for_timestamp_conversion_no_commit_files() {
+#[tokio::test]
+async fn for_timestamp_conversion_no_commit_files() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[delta_path_for_version(5, "checkpoint.parquet")],
         None,
-    );
+    )
+    .await;
 
     let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
     assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
 }
 
-#[test]
-fn test_latest_commit_file_field_is_captured() {
+#[tokio::test]
+async fn test_latest_commit_file_field_is_captured() {
     // Test that the latest commit is preserved even after checkpoint filtering
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -2114,7 +2178,8 @@ fn test_latest_commit_file_field_is_captured() {
             delta_path_for_version(5, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
@@ -2129,8 +2194,8 @@ fn test_latest_commit_file_field_is_captured() {
     assert_eq!(log_segment.ascending_commit_files[2].version, 5);
 }
 
-#[test]
-fn test_latest_commit_file_with_checkpoint_filtering() {
+#[tokio::test]
+async fn test_latest_commit_file_with_checkpoint_filtering() {
     // Test when commits get filtered by checkpoint
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -2141,7 +2206,8 @@ fn test_latest_commit_file_with_checkpoint_filtering() {
             delta_path_for_version(4, "json"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
@@ -2155,14 +2221,15 @@ fn test_latest_commit_file_with_checkpoint_filtering() {
     assert_eq!(log_segment.ascending_commit_files[0].version, 4);
 }
 
-#[test]
-fn test_latest_commit_file_with_no_commits() {
+#[tokio::test]
+async fn test_latest_commit_file_with_no_commits() {
     // Test when there are only checkpoints and no commits at all
     // This should now succeed with latest_commit_file as None
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[delta_path_for_version(2, "checkpoint.parquet")],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
@@ -2175,8 +2242,8 @@ fn test_latest_commit_file_with_no_commits() {
     assert_eq!(log_segment.checkpoint_version, Some(2));
 }
 
-#[test]
-fn test_latest_commit_file_with_checkpoint_at_same_version() {
+#[tokio::test]
+async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     // Test when checkpoint is at the same version as the latest commit
     // This tests: 0.json, 1.json, 1.checkpoint.parquet
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -2186,7 +2253,8 @@ fn test_latest_commit_file_with_checkpoint_at_same_version() {
             delta_path_for_version(1, "checkpoint.parquet"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
@@ -2202,8 +2270,8 @@ fn test_latest_commit_file_with_checkpoint_at_same_version() {
     assert_eq!(log_segment.checkpoint_version, Some(1));
 }
 
-#[test]
-fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
+#[tokio::test]
+async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     // Test edge case: 0.json, 1.checkpoint.parquet
     // The latest_commit_file should NOT be set to version 0 since there's no commit at version 1
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -2212,7 +2280,8 @@ fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
             delta_path_for_version(1, "checkpoint.parquet"),
         ],
         None,
-    );
+    )
+    .await;
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
