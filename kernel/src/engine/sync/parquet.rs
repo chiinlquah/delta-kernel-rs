@@ -84,6 +84,13 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", location)))?;
 
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
         let mut file = File::create(&path)?;
 
         // Get first batch to initialize writer with schema
