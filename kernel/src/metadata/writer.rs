@@ -1,7 +1,6 @@
 use crate::metadata::Metadata;
 use crate::path::ParsedLogPath;
-use crate::FilteredEngineData;
-use crate::{DeltaResult, Engine, FileMeta};
+use crate::{DeltaResult, Engine};
 use url::Url;
 
 /// Orchestrates the process of creating a V3 checkpoint for a table.
@@ -33,21 +32,14 @@ impl MetadataWriter {
             .map(|parsed| parsed.location)
     }
 
-    pub(crate) fn write(&self, engine: &dyn Engine) -> DeltaResult<FileMeta> {
+    pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<Url> {
         let path = self.checkpoint_path()?;
+        let data_iter = self.metadata.data.into_iter().map(Ok);
 
-        // Create an iterator over the metadata data (already in EngineData format)
-        let empty_schema = std::sync::Arc::new(crate::schema::StructType::new_unchecked([]));
-        let data_iter = self.metadata.data.iter().map(|engine_data| {
-            // Hack to get a copy of engine_data which is not otherwise copyable.
-            let appended = engine_data.append_columns(empty_schema.clone(), vec![])?;
-            Ok(FilteredEngineData::with_all_rows_selected(appended))
-        });
-
-        let file_meta = engine
+        engine
             .parquet_handler()
             .write_parquet_file(path.clone(), Box::new(data_iter))?;
 
-        Ok(file_meta)
+        Ok(path)
     }
 }

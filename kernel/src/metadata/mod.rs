@@ -1589,7 +1589,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -1620,7 +1620,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -1651,7 +1651,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -1682,7 +1682,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -1759,7 +1759,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -1834,7 +1834,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -1905,7 +1905,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -1960,7 +1960,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2023,7 +2023,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file.location)?;
+        let read_metadata = Metadata::read(&engine, &written_file)?;
 
         // Verify
         let entries = read_metadata.entries()?;

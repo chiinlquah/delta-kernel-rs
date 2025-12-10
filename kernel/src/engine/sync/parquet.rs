@@ -1,14 +1,10 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use std::fs::File;
 use url::Url;
 
 use super::read_files;
-use crate::arrow::array::RecordBatch;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -16,16 +12,13 @@ use crate::engine::arrow_utils::{
     RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::schema::SchemaRef;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     PredicateRef,
 };
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
-
-use url::Url;
 
 pub(crate) struct SyncParquetHandler;
 
@@ -136,14 +129,11 @@ mod tests {
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::Arc;
-    use tempfile::tempdir;
     use tempfile::tempdir;
     use url::Url;
 

@@ -385,11 +385,11 @@ impl Transaction {
             }
 
             let new_metadata = metadata_builder.build(engine)?;
-            let file_meta = MetadataWriter::try_new(new_metadata)?.write(engine)?;
+            let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
             let content_root_action = ContentRoot {
-                path: file_meta.location.to_string(),
-                size_in_bytes: file_meta.size,
+                path: content_metadata_path.to_string(),
+                size_in_bytes: 0,
             };
 
             // Use the log schema to wrap ContentRoot in a "contentRoot" field

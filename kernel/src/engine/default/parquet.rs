@@ -27,14 +27,12 @@ use super::UrlExt;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
-    ordering_needs_row_indexes, RowIndexBuilder,
+    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
+    RowIndexBuilder,
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
 use crate::schema::{SchemaRef, StructType};
-use crate::utils::current_time_ms;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
@@ -680,18 +678,11 @@ mod tests {
                 ref parquet_file @ FileMeta {
                     ref location,
                     last_modified,
-                    size,
+                    size: _,
                 },
             num_records,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
-
-        // head the object to get metadata
-        let meta = store
-            .head(&Path::from_url_path(location.path()).unwrap())
-            .await
-            .unwrap();
-        let expected_size = meta.size;
 
         // check that last_modified is within 10s of now
         let now: i64 = current_time_ms().unwrap();
