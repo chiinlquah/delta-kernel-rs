@@ -1636,7 +1636,7 @@ async fn test_commit_cover(
     let cover = log_segment
         .find_commit_cover(get_commit_schema().clone(), None)
         .unwrap();
-    
+
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this
     let expected_locations = expected_files.iter().map(|ef| match ef {
