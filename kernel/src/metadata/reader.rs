@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use super::{
-    DataContentType, DataFileFormat, DeletionVector, ManifestStats, MetadataEntry, TrackingInfo,
+    ContentInfo, DataContentType, DataFileFormat, ManifestStats, MetadataEntry, TrackingInfo,
     TrackingStatus,
 };
 
@@ -46,13 +46,14 @@ fn visit_metadata_entry_at<'a>(
     // 1: location
     // 2: file_format
     // 3-7: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id)
-    // 8-10: deletion_vector fields (offset, size_in_bytes, inline_content)
+    // 8: inline_content
+    // 9-10: content_info fields (offset, size_in_bytes)
     // 11: partition_spec_id
     // 12: sort_order_id
     // 13: record_count
     // 14: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 15-21: manifest_stats fields (7 fields)
+    // 15-21: manifest_info fields (7 fields)
     // 22: referenced_file
     // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
 
@@ -103,58 +104,53 @@ fn visit_metadata_entry_at<'a>(
     let tracking_first_row_id: Option<i64> =
         getters[7].get_opt(row_index, "tracking_info.first_row_id")?;
 
-    let tracking_info = TrackingInfo {
+    let tracking_info = Some(TrackingInfo {
         status: tracking_status,
         snapshot_id: tracking_snapshot_id,
         sequence_number: tracking_sequence_number,
         file_sequence_number: tracking_file_sequence_number,
         first_row_id: tracking_first_row_id,
-    };
+    });
 
-    // Extract deletion_vector fields
-    let dv_offset: Option<i64> = getters[8].get_opt(row_index, "deletion_vector.offset")?;
-    let dv_size_in_bytes: Option<i64> =
-        getters[9].get_opt(row_index, "deletion_vector.size_in_bytes")?;
-    let dv_inline_content_bytes: Option<&[u8]> =
-        getters[10].get_opt(row_index, "deletion_vector.inline_content")?;
-    let dv_inline_content = dv_inline_content_bytes.map(Bytes::copy_from_slice);
+    // Extract inline_content
+    let inline_content_bytes: Option<&[u8]> = getters[8].get_opt(row_index, "inline_content")?;
+    let inline_content = inline_content_bytes.map(Bytes::copy_from_slice);
 
-    let deletion_vector =
-        if dv_offset.is_some() || dv_size_in_bytes.is_some() || dv_inline_content.is_some() {
-            Some(DeletionVector {
-                offset: dv_offset,
-                size_in_bytes: dv_size_in_bytes,
-                inline_content: dv_inline_content,
-            })
-        } else {
-            None
-        };
+    // Extract content_info fields
+    let ci_offset: Option<i64> = getters[9].get_opt(row_index, "content_info.offset")?;
+    let ci_size_in_bytes: Option<i64> =
+        getters[10].get_opt(row_index, "content_info.size_in_bytes")?;
+
+    let content_info = ci_offset.map(|offset| ContentInfo {
+        offset,
+        size_in_bytes: ci_size_in_bytes.unwrap_or(0),
+    });
 
     // Extract scalar fields
     let partition_spec_id: i64 = getters[11].get(row_index, "partition_spec_id")?;
-    let sort_order_id: i64 = getters[12].get(row_index, "sort_order_id")?;
+    let sort_order_id: Option<i64> = getters[12].get_opt(row_index, "sort_order_id")?;
     let record_count: i64 = getters[13].get(row_index, "record_count")?;
-    let file_size_in_bytes: i64 = getters[14].get(row_index, "file_size_in_bytes")?;
+    let file_size_in_bytes: Option<i64> = getters[14].get_opt(row_index, "file_size_in_bytes")?;
 
     // content_stats has no fields, so no getters
 
-    // Extract manifest_stats fields
+    // Extract manifest_info fields
     let ms_added_files_count: Option<i64> =
-        getters[15].get_opt(row_index, "manifest_stats.added_files_count")?;
+        getters[15].get_opt(row_index, "manifest_info.added_files_count")?;
     let ms_existing_files_count: Option<i64> =
-        getters[16].get_opt(row_index, "manifest_stats.existing_files_count")?;
+        getters[16].get_opt(row_index, "manifest_info.existing_files_count")?;
     let ms_deletes_files_count: Option<i64> =
-        getters[17].get_opt(row_index, "manifest_stats.deletes_files_count")?;
+        getters[17].get_opt(row_index, "manifest_info.deletes_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[18].get_opt(row_index, "manifest_stats.added_rows_count")?;
+        getters[18].get_opt(row_index, "manifest_info.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[19].get_opt(row_index, "manifest_stats.existing_rows_count")?;
+        getters[19].get_opt(row_index, "manifest_info.existing_rows_count")?;
     let ms_delete_rows_count: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_stats.delete_rows_count")?;
+        getters[20].get_opt(row_index, "manifest_info.delete_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_stats.min_sequence_number")?;
+        getters[21].get_opt(row_index, "manifest_info.min_sequence_number")?;
 
-    let manifest_stats = ms_added_files_count.map(|added_files_count| ManifestStats {
+    let manifest_info = ms_added_files_count.map(|added_files_count| ManifestStats {
         added_files_count,
         existing_files_count: ms_existing_files_count.unwrap_or(0),
         deletes_files_count: ms_deletes_files_count.unwrap_or(0),
@@ -177,12 +173,13 @@ fn visit_metadata_entry_at<'a>(
         location,
         file_format,
         tracking_info,
-        deletion_vector,
+        inline_content,
+        content_info,
         partition_spec_id,
         sort_order_id,
         record_count,
         file_size_in_bytes,
-        manifest_stats,
+        manifest_info,
         referenced_file,
         key_metadata: None,  // Not currently used by Delta
         split_offsets: None, // Not currently used by Delta

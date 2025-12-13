@@ -1,16 +1,13 @@
-use crate::actions::deletion_vector::DeletionVectorStorageType;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::metadata::{
-    DataContentType, DataFileFormat, DeletionVector, Metadata, MetadataEntry, TrackingInfo,
-    TrackingStatus,
+    DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo, TrackingStatus,
 };
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Version};
-use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use url::Url;
@@ -66,29 +63,8 @@ impl MetadataBuilder {
     #[allow(dead_code)]
     #[allow(clippy::unwrap_used)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: Option<i64>) {
-        let deletion_vector = add.deletion_vector.map(|dv| {
-            match dv.storage_type {
-                DeletionVectorStorageType::PersistedRelative
-                | DeletionVectorStorageType::PersistedAbsolute => DeletionVector {
-                    offset: dv.offset.map(|v| v as i64),
-                    size_in_bytes: Some(dv.size_in_bytes as i64),
-                    inline_content: None,
-                },
-                DeletionVectorStorageType::Inline => DeletionVector {
-                    offset: None,
-                    size_in_bytes: None,
-                    // Delta format: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
-                    // TODO: Align on the Iceberg side
-                    inline_content: { Some(Bytes::from(dv.path_or_inline_dv.as_bytes().to_vec())) },
-                },
-            }
-        });
-
-        let content_type = if deletion_vector.is_some() {
+        if add.deletion_vector.is_some() {
             todo!("DVs not yet implemented");
-            DataContentType::PositionDeletes
-        } else {
-            DataContentType::Data
         };
 
         let status = if version == self.version {
@@ -110,10 +86,10 @@ impl MetadataBuilder {
             .unwrap_or(0);
 
         let data_file_entry = MetadataEntry {
-            content_type,
+            content_type: DataContentType::Data,
             location: Some(self.path_to_absolute(&add.path).unwrap()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status,
                 snapshot_id,
                 sequence_number: Some(version as i64),
@@ -122,21 +98,22 @@ impl MetadataBuilder {
                 // We could set it, but then we can't do fast-retries
                 // first_row_id: add.base_row_id,
                 first_row_id: None,
-            },
-            deletion_vector,
+            }),
+            inline_content: None,
+            content_info: None,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
 
             record_count,
 
-            file_size_in_bytes: add.size,
+            file_size_in_bytes: Some(add.size),
 
             // TODO: add.stats contains a JSON blob:
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
             // Which we need to convert from name-based to field-id-based
-            manifest_stats: None,
+            manifest_info: None,
 
             // Needs to be set in case of a DeleteManifest
             referenced_file: None,
@@ -500,14 +477,14 @@ mod tests {
             entries[0].location,
             Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
         );
-        assert_eq!(entries[0].file_size_in_bytes, 1024);
+        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
 
         // Verify second entry
         assert_eq!(
             entries[1].location,
             Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
         );
-        assert_eq!(entries[1].file_size_in_bytes, 2048);
+        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
 
         Ok(())
     }
@@ -551,19 +528,19 @@ mod tests {
             entries[0].location,
             Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
         );
-        assert_eq!(entries[0].file_size_in_bytes, 1024);
+        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
 
         assert_eq!(
             entries[1].location,
             Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
         );
-        assert_eq!(entries[1].file_size_in_bytes, 2048);
+        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
 
         assert_eq!(
             entries[2].location,
             Some("s3://my-bucket/my-table/part-00002.parquet".to_string())
         );
-        assert_eq!(entries[2].file_size_in_bytes, 3072);
+        assert_eq!(entries[2].file_size_in_bytes, Some(3072));
 
         Ok(())
     }

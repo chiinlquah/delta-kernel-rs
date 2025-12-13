@@ -118,9 +118,12 @@ impl Metadata {
         // Process deletion vector entries
         for (i, dv_entry) in dv_entries.into_iter().enumerate() {
             // Only include deletion vectors that are not marked as deleted
-            if dv_entry.tracking_info.status != TrackingStatus::Deleted
-                && dv_entry.content_type == DataContentType::PositionDeletes
-            {
+            let is_deleted = dv_entry
+                .tracking_info
+                .as_ref()
+                .map(|ti| ti.status == TrackingStatus::Deleted)
+                .unwrap_or(false);
+            if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
                 let referenced_file = dv_entry
                     .referenced_file
                     .clone()
@@ -318,42 +321,35 @@ fn metadata_entry_to_deletion_vector_info(
     dv_entry: MetadataEntry,
     entry_index: usize,
 ) -> DeltaResult<DeletionVectorInfo> {
-    let deletion_vector = dv_entry
-        .deletion_vector
-        .ok_or_else(|| Error::generic("Deletion vector must have a deletion vector"))?;
     let sequence_number = dv_entry
         .tracking_info
-        .sequence_number
+        .as_ref()
+        .and_then(|ti| ti.sequence_number)
         .ok_or_else(|| Error::generic("Deletion vector must have a sequence number"))?;
     let location = dv_entry
         .location
         .ok_or_else(|| Error::generic("Deletion vector must have a location"))?;
 
-    // Convert offset from Option<i64> to Option<i32>
-    let offset_i32 = deletion_vector
-        .offset
-        .map(|offset| {
-            offset
-                .try_into()
-                .map_err(|_| Error::generic("Offset is too large to convert to i32"))
-        })
-        .transpose()?;
+    // Get offset and size from content_info
+    let content_info = dv_entry
+        .content_info
+        .ok_or_else(|| Error::generic(format!("{} missing content_info", location)))?;
 
-    // Convert size_in_bytes from Option<i64> to i32
-    // Subtract 8 because metadata tree includes CRC and the size (i32) in the total size of the DV.
-    // Delta actions only include magic number and the actual serialized roaring bitmap in its size figure.
-    let size_in_bytes_i32 = deletion_vector
-        .size_in_bytes
-        .ok_or_else(|| Error::generic(format!("{} missing size in bytes", location)))?
-        .checked_sub(8)
-        .ok_or_else(|| Error::generic(format!("Size in bytes for {} is too small", location)))?
-        .try_into()
-        .map_err(|_| {
-            Error::generic(format!(
-                "Size in bytes for {} is too large to convert to i32",
-                location
-            ))
-        })?;
+    // Convert offset from i64 to Option<i32>
+    let offset_i32: Option<i32> = Some(content_info.offset.try_into().map_err(|_| {
+        Error::generic(format!(
+            "Offset for {} is too large to convert to i32",
+            location
+        ))
+    })?);
+
+    // Convert size_in_bytes from i64 to i32
+    let size_in_bytes_i32: i32 = content_info.size_in_bytes.try_into().map_err(|_| {
+        Error::generic(format!(
+            "Size in bytes for {} is too large to convert to i32",
+            location
+        ))
+    })?;
 
     // Convert entry_index from usize to i64
     let entry_index_i64: i64 = entry_index
@@ -462,27 +458,35 @@ fn entry_to_add_remove(
     // Convert absolute path to relative path by removing the table root prefix
     // The path in entry.location is an absolute URL, but Add actions expect relative paths
     let path = absolute_to_relative_path(&full_path, &root_path);
-    let processed_dv = process_deletion_vector(
-        deletion_vector_map,
-        &full_path,
-        entry.tracking_info.sequence_number,
-        &root_path,
-    )?;
+    let sequence_number = entry
+        .tracking_info
+        .as_ref()
+        .and_then(|ti| ti.sequence_number);
+    let processed_dv =
+        process_deletion_vector(deletion_vector_map, &full_path, sequence_number, &root_path)?;
 
-    match entry.tracking_info.status {
+    let status = entry
+        .tracking_info
+        .as_ref()
+        .map(|ti| ti.status)
+        .unwrap_or(TrackingStatus::Added);
+    let first_row_id = entry.tracking_info.as_ref().and_then(|ti| ti.first_row_id);
+    let snapshot_id = entry.tracking_info.as_ref().and_then(|ti| ti.snapshot_id);
+
+    match status {
         TrackingStatus::Added | TrackingStatus::Existed => {
             let add =
                 Add {
                     path,
                     partition_values: HashMap::new(), // TODO: Extract from partition_keys
-                    size: entry.file_size_in_bytes,
+                    size: entry.file_size_in_bytes.unwrap_or(0),
                     modification_time: i64::MIN,
                     data_change: true,
                     stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
                     tags: None,
                     deletion_vector: processed_dv.descriptor,
-                    base_row_id: entry.tracking_info.first_row_id,
-                    default_row_commit_version: entry.tracking_info.snapshot_id,
+                    base_row_id: first_row_id,
+                    default_row_commit_version: snapshot_id,
                     clustering_provider: None, // TODO: Set from when final decision is made.
                     data_manifest_path: Some(root_path),
                     data_manifest_position: Some(entry_index.try_into().map_err(|_| {
@@ -501,12 +505,12 @@ fn entry_to_add_remove(
                     data_change: true,
                     extended_file_metadata: Some(true),
                     partition_values: Some(HashMap::new()), // TODO: Extract from partition_keys
-                    size: Some(entry.file_size_in_bytes),
+                    size: entry.file_size_in_bytes,
                     stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
                     tags: None, // TODO: Finalize once we set this from tags
                     deletion_vector: processed_dv.descriptor,
-                    base_row_id: entry.tracking_info.first_row_id,
-                    default_row_commit_version: entry.tracking_info.snapshot_id,
+                    base_row_id: first_row_id,
+                    default_row_commit_version: snapshot_id,
                     data_manifest_path: Some(root_path),
                     data_manifest_position: Some(entry_index.try_into().map_err(|_| {
                         Error::generic("Entry index is too large to convert to i64")
@@ -881,6 +885,17 @@ impl From<TrackingStatus> for Scalar {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
+pub(crate) struct ContentInfo {
+    /// The offset in the file where the content starts.
+    offset: i64,
+
+    /// The length of thea referenced content stored in the file;
+    /// required if content_offset is present.
+    size_in_bytes: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct TrackingInfo {
     status: TrackingStatus,
 
@@ -917,52 +932,6 @@ impl From<TrackingInfo> for Scalar {
         ];
 
         // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
-        // to match exactly in count, order, type, and nullability.
-        Scalar::Struct(StructData::new_unchecked(fields, values))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct DeletionVector {
-    /// The offset in the file where the content starts.
-    offset: Option<i64>,
-
-    /// The length of a referenced content stored in the file; required if content_offset is present.
-    /// The number of 32-bit Roaring bitmaps, serialized as 8 bytes, little-endian
-    ///  - For each 32-bit Roaring bitmap, ordered by unsigned comparison of the 32-bit keys:
-    ///     - The key stored as 4 bytes, little-endian
-    ///     - A 32-bit Roaring bitmap
-    size_in_bytes: Option<i64>,
-
-    /// Serialized bitmap for inline DVs.
-    inline_content: Option<Bytes>,
-}
-
-impl crate::schema::ToSchema for DeletionVector {
-    fn to_schema() -> crate::schema::StructType {
-        use crate::schema::{DataType, StructField, StructType};
-        StructType::new_unchecked([
-            StructField::new("offset", DataType::LONG, true),
-            StructField::new("sizeInBytes", DataType::LONG, true),
-            StructField::new("inlineContent", DataType::BINARY, true),
-        ])
-    }
-}
-
-impl From<DeletionVector> for Scalar {
-    fn from(value: DeletionVector) -> Self {
-        use crate::expressions::StructData;
-        use crate::schema::ToSchema;
-
-        let fields = DeletionVector::to_schema().into_fields().collect();
-        let values = vec![
-            value.offset.into(),
-            value.size_in_bytes.into(),
-            value.inline_content.into(),
-        ];
-
-        // SAFETY: Fields are generated by ToSchema implementation and values are constructed
         // to match exactly in count, order, type, and nullability.
         Scalar::Struct(StructData::new_unchecked(fields, values))
     }
@@ -1032,35 +1001,36 @@ pub(crate) struct MetadataEntry {
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
     content_type: DataContentType,
 
-    /// Optional if content_type is 5 and deletion_vector.inline_content is not null, required otherwise
+    /// Optional if content_type is 5 and inline_content is not null, required otherwise
     location: Option<String>,
 
     /// avro, orc, parquet or puffin
     file_format: DataFileFormat,
 
-    tracking_info: TrackingInfo,
+    tracking_info: Option<TrackingInfo>,
 
-    /// Must be defined if content_type is Positional Deletes or ManifestDV.
-    deletion_vector: Option<DeletionVector>,
+    inline_content: Option<Bytes>,
+
+    content_info: Option<ContentInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     partition_spec_id: i64,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
-    sort_order_id: i64,
+    sort_order_id: Option<i64>,
 
     /// Number of records in this file, or the cardinality of a deletion vector
     record_count: i64,
 
     /// Total file size in bytes. Must be defined if location is defined
-    file_size_in_bytes: i64,
+    file_size_in_bytes: Option<i64>,
 
     /// The column metrics, needs to be implemented, leave out for now
     /// https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
     // content_stats: Option<ContentStats>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
-    manifest_stats: Option<ManifestStats>,
+    manifest_info: Option<ManifestStats>,
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
@@ -1093,12 +1063,13 @@ impl crate::schema::ToSchema for MetadataEntry {
             DataContentType::get_struct_field("contentType"),
             Option::<String>::get_struct_field("location"),
             DataFileFormat::get_struct_field("fileFormat"),
-            TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<DeletionVector>::get_struct_field("deletionVector"),
+            Option::<TrackingInfo>::get_struct_field("trackingInfo"),
+            Option::<Bytes>::get_struct_field("inlineContent"),
+            Option::<ContentInfo>::get_struct_field("contentInfo"),
             i64::get_struct_field("partitionSpecId"),
-            i64::get_struct_field("sortOrderId"),
+            Option::<i64>::get_struct_field("sortOrderId"),
             i64::get_struct_field("recordCount"),
-            i64::get_struct_field("fileSizeInBytes"),
+            Option::<i64>::get_struct_field("fileSizeInBytes"),
             // content_stats intentionally excluded
             Option::<ManifestStats>::get_struct_field("manifestStats"),
             Option::<String>::get_struct_field("referencedFile"),
@@ -1131,26 +1102,30 @@ impl crate::IntoEngineData for MetadataEntry {
         ]);
 
         // Fields 3-7: tracking_info struct (5 fields)
-        flat_values.extend([
-            Scalar::from(self.tracking_info.status),
-            Scalar::from(self.tracking_info.snapshot_id),
-            Scalar::from(self.tracking_info.sequence_number),
-            Scalar::from(self.tracking_info.file_sequence_number),
-            Scalar::from(self.tracking_info.first_row_id),
-        ]);
-
-        // Fields 8-10: deletion_vector struct (3 fields)
-        flat_values.extend(match &self.deletion_vector {
-            Some(dv) => [
-                Scalar::from(dv.offset),
-                Scalar::from(dv.size_in_bytes),
-                Scalar::from(dv.inline_content.clone()),
+        flat_values.extend(match &self.tracking_info {
+            Some(ti) => [
+                Scalar::from(ti.status),
+                Scalar::from(ti.snapshot_id),
+                Scalar::from(ti.sequence_number),
+                Scalar::from(ti.file_sequence_number),
+                Scalar::from(ti.first_row_id),
             ],
             None => [
+                Scalar::Null(DataType::INTEGER),
                 Scalar::Null(DataType::LONG),
                 Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::BINARY),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
             ],
+        });
+
+        // Field 8: inline_content
+        flat_values.push(Scalar::from(self.inline_content.clone()));
+
+        // Fields 9-10: content_info struct (2 fields)
+        flat_values.extend(match &self.content_info {
+            Some(ci) => [Scalar::from(ci.offset), Scalar::from(ci.size_in_bytes)],
+            None => [Scalar::Null(DataType::LONG), Scalar::Null(DataType::LONG)],
         });
 
         // Fields 11-14: primitives
@@ -1163,8 +1138,8 @@ impl crate::IntoEngineData for MetadataEntry {
 
         // content_stats (STRUCT) - was commented out, not in schema
 
-        // Fields 15-21: manifest_stats struct (7 fields)
-        flat_values.extend(match &self.manifest_stats {
+        // Fields 15-21: manifest_info struct (7 fields)
+        flat_values.extend(match &self.manifest_info {
             Some(ms) => [
                 Scalar::from(ms.added_files_count),
                 Scalar::from(ms.existing_files_count),
@@ -1185,7 +1160,7 @@ impl crate::IntoEngineData for MetadataEntry {
             ],
         });
 
-        // Field 22: referenced_file
+        // Field 20: referenced_file
         flat_values.push(Scalar::from(self.referenced_file)); // referenced_file (STRING)
                                                               // key_metadata, split_offsets, equality_ids are intentionally excluded
 
@@ -1216,19 +1191,20 @@ mod tests {
             content_type: DataContentType::Data,
             location: Some("test.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-            },
-            deletion_vector: None,
+            }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 42,
-            file_size_in_bytes: 1024,
-            manifest_stats: None,
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -1296,13 +1272,13 @@ mod tests {
         let schema = MetadataEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
-        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.fields().len(), 12);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // Schema should have all the leaf fields (23 = flattened count, key_metadata, split_offsets, equality_ids)
+        // Schema should have all the leaf fields (23 = flattened count, excluding key_metadata, split_offsets, equality_ids)
         assert_eq!(leaf_names.len(), 23);
     }
 
@@ -1337,19 +1313,20 @@ mod tests {
             content_type: DataContentType::Data,
             location: Some("s3://bucket/path/to/file.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-            },
-            deletion_vector: None,
+            }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 42,
-            file_size_in_bytes: 1024,
-            manifest_stats: None,
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -1357,29 +1334,26 @@ mod tests {
         }
     }
 
-    // Helper function to create a MetadataEntry with deletion vector
+    // Helper function to create a MetadataEntry representing a PositionDeletes file
     fn create_metadata_entry_with_dv() -> MetadataEntry {
         MetadataEntry {
             content_type: DataContentType::PositionDeletes,
             location: Some("s3://bucket/path/to/deletes.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(5),
                 sequence_number: Some(500),
                 file_sequence_number: Some(600),
                 first_row_id: Some(5000),
-            },
-            deletion_vector: Some(DeletionVector {
-                offset: Some(100),
-                size_in_bytes: Some(256),
-                inline_content: None, // Using None for this test (not an inline DV)
             }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 1,
-            sort_order_id: 1,
+            sort_order_id: Some(1),
             record_count: 10,
-            file_size_in_bytes: 512,
-            manifest_stats: None,
+            file_size_in_bytes: Some(512),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -1387,32 +1361,29 @@ mod tests {
         }
     }
 
-    // Helper function to create a MetadataEntry with inline deletion vector
+    // Helper function to create a MetadataEntry with inline content
     fn create_metadata_entry_with_inline_dv() -> MetadataEntry {
-        // Create some sample inline deletion vector data
+        // Create some sample inline content data
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
 
         MetadataEntry {
             content_type: DataContentType::Data,
             location: Some("s3://bucket/path/to/data.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(3),
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
-            },
-            deletion_vector: Some(DeletionVector {
-                offset: None,
-                size_in_bytes: None,
-                inline_content: Some(Bytes::from(inline_data)),
             }),
+            inline_content: Some(Bytes::from(inline_data)),
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 100,
-            file_size_in_bytes: 2048,
-            manifest_stats: None,
+            file_size_in_bytes: Some(2048),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -1421,24 +1392,25 @@ mod tests {
     }
 
     // Helper function to create a MetadataEntry with manifest stats
-    fn create_metadata_entry_with_manifest_stats() -> MetadataEntry {
+    fn create_metadata_entry_with_manifest_info() -> MetadataEntry {
         MetadataEntry {
             content_type: DataContentType::DataManifest,
             location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
-            },
-            deletion_vector: None,
+            }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 2,
-            sort_order_id: 2,
+            sort_order_id: Some(2),
             record_count: 100,
-            file_size_in_bytes: 10240,
-            manifest_stats: Some(ManifestStats {
+            file_size_in_bytes: Some(10240),
+            manifest_info: Some(ManifestStats {
                 added_files_count: 5,
                 existing_files_count: 10,
                 deletes_files_count: 2,
@@ -1467,46 +1439,38 @@ mod tests {
         );
 
         // Compare tracking_info
-        assert_eq!(
-            expected.tracking_info.status, actual.tracking_info.status,
-            "tracking_info.status mismatch"
-        );
-        assert_eq!(
-            expected.tracking_info.snapshot_id, actual.tracking_info.snapshot_id,
-            "tracking_info.snapshot_id mismatch"
-        );
-        assert_eq!(
-            expected.tracking_info.sequence_number, actual.tracking_info.sequence_number,
-            "tracking_info.sequence_number mismatch"
-        );
-        assert_eq!(
-            expected.tracking_info.file_sequence_number, actual.tracking_info.file_sequence_number,
-            "tracking_info.file_sequence_number mismatch"
-        );
-        assert_eq!(
-            expected.tracking_info.first_row_id, actual.tracking_info.first_row_id,
-            "tracking_info.first_row_id mismatch"
-        );
-
-        // Compare deletion_vector
-        match (&expected.deletion_vector, &actual.deletion_vector) {
-            (Some(exp_dv), Some(act_dv)) => {
+        match (&expected.tracking_info, &actual.tracking_info) {
+            (Some(exp_ti), Some(act_ti)) => {
                 assert_eq!(
-                    exp_dv.offset, act_dv.offset,
-                    "deletion_vector.offset mismatch"
+                    exp_ti.status, act_ti.status,
+                    "tracking_info.status mismatch"
                 );
                 assert_eq!(
-                    exp_dv.size_in_bytes, act_dv.size_in_bytes,
-                    "deletion_vector.size_in_bytes mismatch"
+                    exp_ti.snapshot_id, act_ti.snapshot_id,
+                    "tracking_info.snapshot_id mismatch"
                 );
                 assert_eq!(
-                    exp_dv.inline_content, act_dv.inline_content,
-                    "deletion_vector.inline_content mismatch"
+                    exp_ti.sequence_number, act_ti.sequence_number,
+                    "tracking_info.sequence_number mismatch"
+                );
+                assert_eq!(
+                    exp_ti.file_sequence_number, act_ti.file_sequence_number,
+                    "tracking_info.file_sequence_number mismatch"
+                );
+                assert_eq!(
+                    exp_ti.first_row_id, act_ti.first_row_id,
+                    "tracking_info.first_row_id mismatch"
                 );
             }
             (None, None) => {}
-            _ => panic!("deletion_vector presence mismatch"),
+            _ => panic!("tracking_info presence mismatch"),
         }
+
+        // Compare inline_content
+        assert_eq!(
+            expected.inline_content, actual.inline_content,
+            "inline_content mismatch"
+        );
 
         assert_eq!(
             expected.partition_spec_id, actual.partition_spec_id,
@@ -1525,40 +1489,40 @@ mod tests {
             "file_size_in_bytes mismatch"
         );
 
-        // Compare manifest_stats
-        match (&expected.manifest_stats, &actual.manifest_stats) {
+        // Compare manifest_info
+        match (&expected.manifest_info, &actual.manifest_info) {
             (Some(exp_ms), Some(act_ms)) => {
                 assert_eq!(
                     exp_ms.added_files_count, act_ms.added_files_count,
-                    "manifest_stats.added_files_count mismatch"
+                    "manifest_info.added_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_files_count, act_ms.existing_files_count,
-                    "manifest_stats.existing_files_count mismatch"
+                    "manifest_info.existing_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.deletes_files_count, act_ms.deletes_files_count,
-                    "manifest_stats.deletes_files_count mismatch"
+                    "manifest_info.deletes_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.added_rows_count, act_ms.added_rows_count,
-                    "manifest_stats.added_rows_count mismatch"
+                    "manifest_info.added_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_rows_count, act_ms.existing_rows_count,
-                    "manifest_stats.existing_rows_count mismatch"
+                    "manifest_info.existing_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.delete_rows_count, act_ms.delete_rows_count,
-                    "manifest_stats.delete_rows_count mismatch"
+                    "manifest_info.delete_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.min_sequence_number, act_ms.min_sequence_number,
-                    "manifest_stats.min_sequence_number mismatch"
+                    "manifest_info.min_sequence_number mismatch"
                 );
             }
             (None, None) => {}
-            _ => panic!("manifest_stats presence mismatch"),
+            _ => panic!("manifest_info presence mismatch"),
         }
 
         assert_eq!(
@@ -1631,13 +1595,13 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
+    fn test_roundtrip_metadata_entry_with_manifest_info() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create metadata with manifest stats
-        let original_entry = create_metadata_entry_with_manifest_stats();
+        let original_entry = create_metadata_entry_with_manifest_info();
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
@@ -1692,23 +1656,11 @@ mod tests {
         // Verify inline_content specifically
         let read_entry = &entries[0];
         assert!(
-            read_entry.deletion_vector.is_some(),
-            "Deletion vector should be present"
+            read_entry.inline_content.is_some(),
+            "inline_content should be present"
         );
-        let read_dv = read_entry.deletion_vector.as_ref().unwrap();
-        let orig_dv = original_entry.deletion_vector.as_ref().unwrap();
-        assert_eq!(
-            read_dv.inline_content, orig_dv.inline_content,
-            "inline_content must match exactly"
-        );
-        assert!(
-            read_dv.inline_content.is_some(),
-            "inline_content should not be None"
-        );
-
-        // Verify the actual bytes match
-        let read_bytes = read_dv.inline_content.as_ref().unwrap();
-        let orig_bytes = orig_dv.inline_content.as_ref().unwrap();
+        let read_bytes = read_entry.inline_content.as_ref().unwrap();
+        let orig_bytes = original_entry.inline_content.as_ref().unwrap();
         assert_eq!(
             read_bytes.len(),
             orig_bytes.len(),
@@ -1732,7 +1684,7 @@ mod tests {
         // Create multiple entries including one with inline DV
         let entry1 = create_simple_metadata_entry();
         let entry2 = create_metadata_entry_with_dv();
-        let entry3 = create_metadata_entry_with_manifest_stats();
+        let entry3 = create_metadata_entry_with_manifest_info();
         let entry4 = create_metadata_entry_with_inline_dv();
 
         let metadata = Metadata {
@@ -1795,19 +1747,20 @@ mod tests {
                 content_type,
                 location: Some(format!("s3://bucket/file{}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
-                tracking_info: TrackingInfo {
+                tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
                     snapshot_id: Some(i as i64),
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
-                },
-                deletion_vector: None,
+                }),
+                inline_content: None,
+                content_info: None,
                 partition_spec_id: i as i64,
-                sort_order_id: i as i64,
+                sort_order_id: Some(i as i64),
                 record_count: (i * 10) as i64,
-                file_size_in_bytes: (i * 512) as i64,
-                manifest_stats: None,
+                file_size_in_bytes: Some((i * 512) as i64),
+                manifest_info: None,
                 referenced_file: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -1866,19 +1819,20 @@ mod tests {
                 content_type: DataContentType::Data,
                 location: Some(format!("s3://bucket/file{}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
-                tracking_info: TrackingInfo {
+                tracking_info: Some(TrackingInfo {
                     status,
                     snapshot_id: Some(i as i64),
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
-                },
-                deletion_vector: None,
+                }),
+                inline_content: None,
+                content_info: None,
                 partition_spec_id: 0,
-                sort_order_id: 0,
+                sort_order_id: Some(0),
                 record_count: 42,
-                file_size_in_bytes: 1024,
-                manifest_stats: None,
+                file_size_in_bytes: Some(1024),
+                manifest_info: None,
                 referenced_file: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -1928,19 +1882,20 @@ mod tests {
             content_type: DataContentType::Data,
             location: Some("s3://bucket/file.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: None,          // None
                 sequence_number: None,      // None
                 file_sequence_number: None, // None
                 first_row_id: None,         // None
-            },
-            deletion_vector: None, // None
+            }),
+            inline_content: None, // None
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 42,
-            file_size_in_bytes: 1024,
-            manifest_stats: None,  // None
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,   // None
             referenced_file: None, // None
             key_metadata: None,
             split_offsets: None,
@@ -1969,12 +1924,13 @@ mod tests {
 
         // Specifically verify the None values
         let actual = &entries[0];
-        assert!(actual.tracking_info.snapshot_id.is_none());
-        assert!(actual.tracking_info.sequence_number.is_none());
-        assert!(actual.tracking_info.file_sequence_number.is_none());
-        assert!(actual.tracking_info.first_row_id.is_none());
-        assert!(actual.deletion_vector.is_none());
-        assert!(actual.manifest_stats.is_none());
+        let ti = actual.tracking_info.as_ref().unwrap();
+        assert!(ti.snapshot_id.is_none());
+        assert!(ti.sequence_number.is_none());
+        assert!(ti.file_sequence_number.is_none());
+        assert!(ti.first_row_id.is_none());
+        assert!(actual.inline_content.is_none());
+        assert!(actual.manifest_info.is_none());
         assert!(actual.referenced_file.is_none());
 
         Ok(())
@@ -1991,19 +1947,20 @@ mod tests {
             content_type: DataContentType::Data,
             location: Some("s3://bucket/file.puffin".to_string()),
             file_format: DataFileFormat::Puffin,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
-            },
-            deletion_vector: None,
+            }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 42,
-            file_size_in_bytes: 1024,
-            manifest_stats: None,
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -2040,19 +1997,20 @@ mod tests {
             content_type: DataContentType::Data,
             location: Some(location.to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
-            },
-            deletion_vector: None,
+            }),
+            inline_content: None,
+            content_info: None,
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 100,
-            file_size_in_bytes: 1024,
-            manifest_stats: None,
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,
             referenced_file: None,
             key_metadata: None,
             split_offsets: None,
@@ -2070,23 +2028,23 @@ mod tests {
             content_type: DataContentType::PositionDeletes,
             location: Some(location.to_string()),
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
-            },
-            deletion_vector: Some(DeletionVector {
-                offset: Some(0),
-                size_in_bytes: Some(100),
-                inline_content: None,
+            }),
+            inline_content: None,
+            content_info: Some(ContentInfo {
+                offset: 0,
+                size_in_bytes: 100,
             }),
             partition_spec_id: 0,
-            sort_order_id: 0,
+            sort_order_id: Some(0),
             record_count: 10,
-            file_size_in_bytes: 512,
-            manifest_stats: None,
+            file_size_in_bytes: Some(108),
+            manifest_info: None,
             referenced_file: Some(referenced_file.to_string()),
             key_metadata: None,
             split_offsets: None,
@@ -2241,16 +2199,9 @@ mod tests {
         // even when not read back through the full reader path
         let engine = SyncEngine::new();
 
-        // Create a metadata entry with inline deletion vector
+        // Create a metadata entry with inline content
         let inline_dv_entry = create_metadata_entry_with_inline_dv();
-        let original_inline_bytes = inline_dv_entry
-            .deletion_vector
-            .as_ref()
-            .unwrap()
-            .inline_content
-            .as_ref()
-            .unwrap()
-            .clone();
+        let original_inline_bytes = inline_dv_entry.inline_content.as_ref().unwrap().clone();
 
         // Convert to engine data
         let engine_data = inline_dv_entry
@@ -2358,7 +2309,9 @@ mod tests {
 
         // Create a DV with Deleted status
         let mut dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 100);
-        dv_entry.tracking_info.status = TrackingStatus::Deleted;
+        if let Some(ref mut ti) = dv_entry.tracking_info {
+            ti.status = TrackingStatus::Deleted;
+        }
 
         // Create metadata with both entries
         let metadata = Metadata {
