@@ -71,10 +71,10 @@ pub(crate) struct LogSegment {
 /// It is used for chunking together files that should be read together with the
 /// same schema and the same predicate. A commit range can have multiple PartialCommitCovers
 /// to accomodate special case logic for content metadata trees.
-struct PartialCommitCover {
-    files: Vec<FileMeta>,
-    meta_predicate: Option<PredicateRef>,
-    read_schema: SchemaRef,
+pub(crate) struct PartialCommitCover {
+    pub(crate) files: Vec<FileMeta>,
+    pub(crate) meta_predicate: Option<PredicateRef>,
+    pub(crate) read_schema: SchemaRef,
 }
 
 impl LogSegment {
@@ -408,7 +408,7 @@ impl LogSegment {
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
-    fn find_commit_cover(
+    pub(crate) fn find_commit_cover(
         &self,
         commit_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
