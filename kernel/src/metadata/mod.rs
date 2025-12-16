@@ -201,8 +201,10 @@ impl Metadata {
             let scan_metadata = scan_metadata_result?;
             let engine_data = scan_metadata.scan_files.data();
 
-            // When building from snapshot, we don't have a CommitInfo snapshot_id, so pass None
-            metadata_builder.add_from_engine_data_add(engine_data, version, None)?;
+            // When building from snapshot, we don't have a CommitInfo snapshot_id, so pass None.
+            // Note: scan_files.data() has scan row schema, not Add action schema, so we use
+            // add_from_scan_row_data instead of add_from_engine_data_add.
+            metadata_builder.add_from_scan_row_data(engine_data, version, None)?;
         }
 
         metadata_builder.build(engine)

@@ -2627,3 +2627,96 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     Ok(())
 }
+
+/// Test that batch commits create a ContentRoot action that is properly detected
+/// during log replay. This test verifies:
+/// 1. Creates a table with initial data
+/// 2. Performs a batch commit (which writes a ContentRoot action)
+/// 3. Verifies the ContentRoot action is written to the commit file
+/// 4. Creates a fresh Snapshot and verifies it builds successfully
+#[tokio::test]
+async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create a simple table schema
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    // Setup table - wrap engine in Arc for helper functions
+    for (table_url, engine, store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "batch_commit_test").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Step 1: Add initial data (commit 1)
+        write_data_to_table(&table_url, &engine, schema.clone(), vec![1, 2, 3]).await?;
+
+        // Verify the first snapshot works
+        let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        assert_eq!(snapshot1.version(), 1);
+
+        // Step 2: Perform a batch commit (commit 2)
+        // This should create a ContentRoot action pointing to a metadata tree
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let mut batch_txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_batch_commit()
+            .with_engine_info("batch commit test")
+            .with_operation("BATCH_COMMIT".to_string());
+
+        // Add data in the batch commit
+        add_files_to_transaction(&mut batch_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
+
+        let batch_result = batch_txn.commit(engine.as_ref())?;
+        let batch_version = match batch_result {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), 2);
+                committed.commit_version()
+            }
+            _ => panic!("Batch commit should succeed"),
+        };
+
+        // Step 3: Verify the batch commit contains a contentRoot action
+        // Get the table path from the URL (without scheme and trailing slash)
+        let table_path = table_url
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+
+        let commit2 = store
+            .get(&Path::from(format!(
+                "{table_path}/_delta_log/00000000000000000002.json"
+            )))
+            .await?;
+
+        // Read the commit file and check for contentRoot
+        let commit_content = String::from_utf8(commit2.bytes().await?.to_vec())?;
+        assert!(
+            commit_content.contains("contentRoot"),
+            "Batch commit should contain a contentRoot action. Commit content: {}",
+            commit_content
+        );
+
+        // Step 4: Create a fresh Snapshot (simulating a new reader)
+        // This should detect the ContentRoot from commit 2 during log replay
+        let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+        // Verify we're at the expected version
+        assert_eq!(fresh_snapshot.version(), 2);
+
+        // Step 5: Verify the snapshot can access the log segment
+        // This tests that the content root detection during log segment building works
+        let log_segment = fresh_snapshot.log_segment();
+        assert_eq!(log_segment.end_version, 2);
+        assert_eq!(log_segment.ascending_commit_files.len(), 3); // commits 0, 1, 2
+
+        // Verify the batch commit version
+        assert_eq!(batch_version, 2);
+    }
+
+    Ok(())
+}

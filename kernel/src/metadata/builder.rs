@@ -220,6 +220,37 @@ impl MetadataBuilder {
         Ok(())
     }
 
+    /// Adds file metadata from scan row format `EngineData` to the metadata.
+    ///
+    /// This method is designed for scenarios where the data comes from a scan operation
+    /// and has the scan row schema format (path, size, modificationTime, stats at top level,
+    /// with fileConstantValues.partitionValues nested).
+    ///
+    /// # Arguments
+    /// * `engine_data` - The engine data containing scan row records to extract and add
+    /// * `version` - The version at which these files are being added
+    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if there was an error visiting the engine data
+    #[allow(dead_code)]
+    pub(crate) fn add_from_scan_row_data(
+        &mut self,
+        engine_data: &dyn EngineData,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> Result<(), crate::Error> {
+        let mut visitor = ScanRowToAddVisitor::default();
+        visitor.visit_rows_of(engine_data)?;
+
+        for add in visitor.adds {
+            self.add(add, version, snapshot_id);
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
         use crate::schema::ToSchema;
         use crate::IntoEngineData;
@@ -247,6 +278,22 @@ impl MetadataBuilder {
 /// modificationTime, stats) and constructs Add structs with minimal fields set.
 #[derive(Default)]
 struct WriteMetadataVisitor {
+    pub adds: Vec<Add>,
+}
+
+/// Visitor that extracts Add-like data from scan row schema.
+///
+/// The scan row schema has a different structure than the log Add action schema:
+/// - path (direct, not nested under "add")
+/// - size (direct)
+/// - modificationTime (direct)
+/// - stats (direct)
+/// - fileConstantValues.partitionValues (nested)
+/// - deletionVector (nested)
+///
+/// This visitor extracts these fields and constructs Add structs.
+#[derive(Default)]
+struct ScanRowToAddVisitor {
     pub adds: Vec<Add>,
 }
 
@@ -299,6 +346,73 @@ impl RowVisitor for WriteMetadataVisitor {
                     stats,
                     tags: None,
                     deletion_vector: None,
+                    base_row_id: None,
+                    default_row_commit_version: None,
+                    clustering_provider: None,
+                    data_manifest_path: None,
+                    data_manifest_position: None,
+                    delete_manifest_path: None,
+                    delete_manifest_position: None,
+                };
+                self.adds.push(add);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RowVisitor for ScanRowToAddVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::{column_name, MapType};
+        // Scan row schema has these fields at top level or nested:
+        // - path (top level)
+        // - size (top level)
+        // - modificationTime (top level)
+        // - stats (top level, string)
+        // - fileConstantValues.partitionValues (nested)
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("path"),
+                column_name!("size"),
+                column_name!("modificationTime"),
+                column_name!("stats"),
+                column_name!("fileConstantValues.partitionValues"),
+            ];
+            let types = vec![
+                DataType::STRING,
+                DataType::LONG,
+                DataType::LONG,
+                DataType::STRING,
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(path) = getters[0].get_opt(i, "scanRow.path")? {
+                let size: i64 = getters[1].get(i, "scanRow.size")?;
+                let modification_time: i64 = getters[2].get(i, "scanRow.modificationTime")?;
+                let stats: Option<String> = getters[3].get_opt(i, "scanRow.stats")?;
+                let partition_values: HashMap<String, String> = getters[4]
+                    .get_opt(i, "scanRow.fileConstantValues.partitionValues")?
+                    .unwrap_or_default();
+
+                let add = Add {
+                    path,
+                    partition_values,
+                    size,
+                    modification_time,
+                    data_change: true, // will be overridden by transaction
+                    stats,
+                    tags: None,
+                    deletion_vector: None, // TODO: extract deletion vector if present
                     base_row_id: None,
                     default_row_commit_version: None,
                     clustering_provider: None,

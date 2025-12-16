@@ -687,6 +687,12 @@ impl RowVisitor for InCommitTimestampVisitor {
     }
 }
 
+/// Visitor to extract ContentRoot actions from log batches.
+///
+/// ContentRoot actions point to a metadata tree that contains all file actions (adds/removes)
+/// up to and including the version where the content root was created. When we encounter a
+/// content root during log replay, we should use the metadata tree for file actions instead
+/// of continuing to replay older commits for those actions.
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct ContentRootVisitor {
@@ -1267,5 +1273,66 @@ mod tests {
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
         );
+    }
+
+    #[test]
+    fn test_parse_content_root() {
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177}}"#,
+            r#"{"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut visitor = ContentRootVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        let content_root = visitor
+            .content_root
+            .expect("Should have found content root");
+        assert_eq!(
+            content_root.path,
+            "_delta_log/00000000000000000003.content.parquet"
+        );
+        assert_eq!(content_root.size_in_bytes, 12345);
+    }
+
+    #[test]
+    fn test_parse_content_root_not_present() {
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut visitor = ContentRootVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert!(
+            visitor.content_root.is_none(),
+            "Should not have found content root"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_root_multiple_takes_first() {
+        // Although multiple content roots shouldn't happen in practice, test that we take the first one
+        let json_strings: StringArray = vec![
+            r#"{"contentRoot":{"path":"first.parquet","sizeInBytes":100}}"#,
+            r#"{"contentRoot":{"path":"second.parquet","sizeInBytes":200}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut visitor = ContentRootVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        let content_root = visitor
+            .content_root
+            .expect("Should have found content root");
+        assert_eq!(content_root.path, "first.parquet");
+        assert_eq!(content_root.size_in_bytes, 100);
     }
 }
