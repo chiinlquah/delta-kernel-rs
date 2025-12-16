@@ -1,5 +1,6 @@
 pub(crate) mod builder;
 mod reader;
+mod stats;
 pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
