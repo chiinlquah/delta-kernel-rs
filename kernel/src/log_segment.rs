@@ -8,6 +8,7 @@ use crate::actions::{
     ADD_NAME, CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -345,29 +346,8 @@ impl LogSegment {
         let content_root_version = content_root_with_version.as_ref().map(|(_, v)| *v);
         let content_root = content_root_with_version.map(|(cr, _)| cr);
 
-        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover(
-            commit_read_schema,
-            meta_predicate.clone(),
-            content_root_version,
-        )?;
-        let commit_reads = commits_and_compactions
-            .into_iter()
-            .map(|partial_commit_cover| {
-                engine.json_handler().read_json_files(
-                    &partial_commit_cover.files,
-                    partial_commit_cover.read_schema.clone(),
-                    partial_commit_cover.meta_predicate.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let commit_stream = commit_reads.into_iter().flat_map(|result| match result {
-            Ok(iter) => Box::new(iter.map_ok(|batch| ActionsBatch::new(batch, true)))
-                as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-            Err(e) => Box::new(std::iter::once(Err(e)))
-                as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-        });
+        let commit_stream =
+            CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
 
         let checkpoint_stream = self.create_checkpoint_stream(
             engine,

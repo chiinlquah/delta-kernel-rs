@@ -1,14 +1,14 @@
 //! Commit phase for log replay - processes JSON commit files.
 
-use itertools::Itertools;
-
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine};
+use delta_kernel::Version;
+use itertools::Itertools;
 
 /// Phase that processes JSON commit files into [`ActionsBatch`]s
-struct CommitReader {
+pub(crate) struct CommitReader {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
 }
 
@@ -19,12 +19,13 @@ impl CommitReader {
     /// - `engine`: Engine for reading files
     /// - `log_segment`: The log segment to process
     /// - `schema`: The schema to read the json files
-    fn try_new(
+    pub(crate) fn try_new(
         engine: &dyn Engine,
         log_segment: &LogSegment,
         schema: SchemaRef,
+        content_root_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let commit_covers = log_segment.find_commit_cover(schema, None, None)?;
+        let commit_covers = log_segment.find_commit_cover(schema, None, content_root_version)?;
         let commit_reads = commit_covers
             .into_iter()
             .map(|partial_commit_cover| {
@@ -63,6 +64,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
+    use crate::log_reader::commit::CommitReader;
     use crate::log_replay::ActionsBatch;
     use crate::scan::COMMIT_READ_SCHEMA;
     use crate::{DeltaResult, Error, Snapshot, SnapshotRef};
@@ -102,7 +104,7 @@ mod tests {
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
-        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema)?;
+        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema, None)?;
 
         let mut file_paths = vec![];
         for result in commit_phase {
