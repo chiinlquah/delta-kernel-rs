@@ -364,10 +364,13 @@ impl Transaction {
         // Handle batch commit - either write to metadata tree or include in JSON log
         if self.batch_commit && !self.add_files_metadata.is_empty() {
             // Find the latest content root in the log segment to avoid full replay
-            let latest_content_root = self.read_snapshot.log_segment().content_root(engine)?;
+            let latest_content_root = self
+                .read_snapshot
+                .log_segment()
+                .content_root_with_version(engine)?;
 
             // Decide whether to load from content root or build from snapshot
-            let metadata = if let Some(content_root_action) = latest_content_root {
+            let metadata = if let Some((content_root_action, _version)) = latest_content_root {
                 crate::metadata::Metadata::new_from_content_root(engine, &content_root_action)?
             } else {
                 // No content root found, build from snapshot (full replay)

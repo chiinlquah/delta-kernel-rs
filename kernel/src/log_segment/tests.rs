@@ -1119,8 +1119,12 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let mut iter = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1184,8 +1188,12 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let mut iter = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+    )?;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1237,8 +1245,12 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let mut iter = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1287,7 +1299,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1357,8 +1369,12 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let mut iter = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1634,7 +1650,7 @@ async fn test_commit_cover(
     )
     .await;
     let cover = log_segment
-        .find_commit_cover(get_commit_schema().clone(), None)
+        .find_commit_cover(get_commit_schema().clone(), None, None)
         .unwrap();
 
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
@@ -2365,7 +2381,6 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2383,7 +2398,6 @@ fn test_publish_validation() {
         checkpoint_parts: vec![],
         checkpoint_version: None,
         log_root: Url::parse("file:///path/").unwrap(),
-        latest_content_root_file: None,
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
@@ -2431,14 +2445,17 @@ fn test_content_root_found_in_commit() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
-    let content_root = log_segment.content_root(engine.as_ref())?;
-    assert!(content_root.is_some(), "Should find content root");
-    let cr = content_root.unwrap();
+    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
+    assert!(
+        content_root_with_version.is_some(),
+        "Should find content root"
+    );
+    let (cr, version) = content_root_with_version.unwrap();
     assert_eq!(cr.path, "memory:///test.content.parquet");
     assert_eq!(cr.size_in_bytes, 1024);
+    assert_eq!(version, 1);
 
     Ok(())
 }
@@ -2475,11 +2492,13 @@ fn test_content_root_not_found() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
-    let content_root = log_segment.content_root(engine.as_ref())?;
-    assert!(content_root.is_none(), "Should not find content root");
+    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
+    assert!(
+        content_root_with_version.is_none(),
+        "Should not find content root"
+    );
 
     Ok(())
 }
@@ -2512,15 +2531,18 @@ fn test_content_root_found_in_checkpoint() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
     // Should find content root in commit
-    let content_root = log_segment.content_root(engine.as_ref())?;
-    assert!(content_root.is_some(), "Should find content root");
-    let cr = content_root.unwrap();
+    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
+    assert!(
+        content_root_with_version.is_some(),
+        "Should find content root"
+    );
+    let (cr, version) = content_root_with_version.unwrap();
     assert_eq!(cr.path, "memory:///commit.content.parquet");
     assert_eq!(cr.size_in_bytes, 4096);
+    assert_eq!(version, 1);
 
     Ok(())
 }
@@ -2557,18 +2579,21 @@ fn test_content_root_returns_first_found() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
     // The function iterates from most recent to oldest, so it should find the first one
-    // it encounters. Since replay_for_metadata reads commits in descending order,
+    // it encounters. Since we read commits in descending order,
     // it should find version 1's content root first.
-    let content_root = log_segment.content_root(engine.as_ref())?;
-    assert!(content_root.is_some(), "Should find content root");
-    let cr = content_root.unwrap();
-    // Note: replay_for_metadata reads commits in descending order, so version 1 comes first
+    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
+    assert!(
+        content_root_with_version.is_some(),
+        "Should find content root"
+    );
+    let (cr, version) = content_root_with_version.unwrap();
+    // Note: we read commits in descending order, so version 1 comes first
     assert_eq!(cr.path, "memory:///second.content.parquet");
     assert_eq!(cr.size_in_bytes, 2048);
+    assert_eq!(version, 1);
 
     Ok(())
 }
@@ -2605,15 +2630,18 @@ fn test_content_root_with_multiple_commits() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: None,
     };
 
     // Should find content root in commit file (version 2 comes first in descending order)
-    let content_root = log_segment.content_root(engine.as_ref())?;
-    assert!(content_root.is_some(), "Should find content root");
-    let cr = content_root.unwrap();
+    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
+    assert!(
+        content_root_with_version.is_some(),
+        "Should find content root"
+    );
+    let (cr, version) = content_root_with_version.unwrap();
     assert_eq!(cr.path, "memory:///commit.content.parquet");
     assert_eq!(cr.size_in_bytes, 4096);
+    assert_eq!(version, 2);
 
     Ok(())
 }

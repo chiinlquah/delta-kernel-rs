@@ -519,22 +519,11 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let path0 = Path::from("_delta_log/00000000000000000000.json");
     block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
 
-    // Create commit files: versions 1, 2, 3, 4, 5
-    // Content root is at version 3, so we should only read commits 4 and 5
-    for version in 1..=5 {
-        let commit_content = format!(
-            r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
-            version
-        );
-        let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
-        block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
-    }
-
-    // Create engine
+    // Create engine first so we can use it for MetadataWriter
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
     // Create metadata for content_root using MetadataBuilder
-    {
+    let content_root_url = {
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
@@ -563,7 +552,27 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
 
         let metadata = builder.build(engine.as_ref()).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();
-        writer.write(engine.as_ref()).unwrap();
+        writer.write(engine.as_ref()).unwrap()
+    };
+
+    // Create commit files: versions 1, 2, 3, 4, 5
+    // Content root is at version 3, so we should only read commits 4 and 5
+    for version in 1..=5 {
+        let commit_content = if version == 3 {
+            // Version 3 has the contentRoot action pointing to the content root file
+            format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
+{{"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}"#,
+                version, content_root_url
+            )
+        } else {
+            format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
+                version
+            )
+        };
+        let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
+        block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
     }
 
     // Create ParsedLogPath objects for commits
@@ -583,22 +592,6 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         });
     }
 
-    // Create a LogSegment with content_root at version 3
-    let content_root_location = log_root
-        .join("00000000000000000003.content.parquet")
-        .unwrap();
-    let content_root_file = ParsedLogPath {
-        location: FileMeta {
-            location: content_root_location,
-            last_modified: 0,
-            size: 100,
-        },
-        filename: "00000000000000000003.content.parquet".to_string(),
-        extension: "parquet".to_string(),
-        version: 3,
-        file_type: LogPathFileType::Commit,
-    };
-
     let latest_commit_file = commit_files.last().cloned();
     let log_segment = crate::log_segment::LogSegment {
         end_version: 5,
@@ -609,7 +602,6 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file,
-        latest_content_root_file: Some(content_root_file),
     };
 
     // Create a Snapshot from the log_segment
@@ -728,25 +720,11 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let path0 = Path::from("_delta_log/00000000000000000000.json");
     block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
 
-    // Create commit files: versions 1, 2, 5, 10, 15, 20
-    // Content root is at version 10
-    // Commits before version 10 should be ignored (0, 1, 2, 5, 10)
-    // Only commits 15 and 20 should be included
-    let versions = vec![1, 2, 5, 10, 15, 20];
-    for version in &versions {
-        let commit_content = format!(
-            r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
-            version
-        );
-        let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
-        block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
-    }
-
     // Create engine
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
     // Create metadata for content_root using MetadataBuilder
-    {
+    let content_root_url = {
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
@@ -775,7 +753,30 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
 
         let metadata = builder.build(engine.as_ref()).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();
-        writer.write(engine.as_ref()).unwrap();
+        writer.write(engine.as_ref()).unwrap()
+    };
+
+    // Create commit files: versions 1, 2, 5, 10, 15, 20
+    // Content root is at version 10
+    // Commits before version 10 should be ignored (0, 1, 2, 5, 10)
+    // Only commits 15 and 20 should be included
+    let versions = vec![1, 2, 5, 10, 15, 20];
+    for version in &versions {
+        let commit_content = if *version == 10 {
+            // Version 10 has the contentRoot action pointing to the content root file
+            format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
+{{"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}"#,
+                version, content_root_url
+            )
+        } else {
+            format!(
+                r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}"#,
+                version
+            )
+        };
+        let path = Path::from(format!("_delta_log/{:020}.json", version).as_str());
+        block_on(async { store.put(&path, commit_content.into()).await }).unwrap();
     }
 
     // Create ParsedLogPath objects for commits (including version 0)
@@ -796,22 +797,6 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         });
     }
 
-    // Create a LogSegment with content_root at version 10
-    let content_root_location = log_root
-        .join("00000000000000000010.content.parquet")
-        .unwrap();
-    let content_root_file = ParsedLogPath {
-        location: FileMeta {
-            location: content_root_location,
-            last_modified: 0,
-            size: 100,
-        },
-        filename: "00000000000000000010.content.parquet".to_string(),
-        extension: "parquet".to_string(),
-        version: 10,
-        file_type: LogPathFileType::Commit,
-    };
-
     let log_segment = crate::log_segment::LogSegment {
         end_version: 20,
         checkpoint_version: None,
@@ -821,7 +806,6 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         checkpoint_parts: vec![],
         latest_crc_file: None,
         latest_commit_file: None,
-        latest_content_root_file: Some(content_root_file),
     };
 
     // Create a Snapshot from the log_segment

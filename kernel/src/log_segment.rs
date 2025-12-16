@@ -64,8 +64,6 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
-    /// The latest content root file.
-    pub latest_content_root_file: Option<ParsedLogPath>,
 }
 
 /// A partial commit cover is a set of files that cover is a set of files that is a
@@ -148,7 +146,6 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
-            latest_content_root_file: None,
         })
     }
 
@@ -343,9 +340,17 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Get the content root from the log if it exists (similar to protocol_and_metadata)
+        let content_root_with_version = self.content_root_with_version(engine)?;
+        let content_root_version = content_root_with_version.as_ref().map(|(_, v)| *v);
+        let content_root = content_root_with_version.map(|(cr, _)| cr);
+
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions =
-            self.find_commit_cover(commit_read_schema, meta_predicate.clone())?;
+        let commits_and_compactions = self.find_commit_cover(
+            commit_read_schema,
+            meta_predicate.clone(),
+            content_root_version,
+        )?;
         let commit_reads = commits_and_compactions
             .into_iter()
             .map(|partial_commit_cover| {
@@ -364,8 +369,12 @@ impl LogSegment {
                 as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
         });
 
-        let checkpoint_stream =
-            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
+        let checkpoint_stream = self.create_checkpoint_stream(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate,
+            content_root.as_ref(),
+        )?;
         Ok(Box::new(commit_stream.chain(checkpoint_stream)))
     }
 
@@ -403,6 +412,7 @@ impl LogSegment {
         &self,
         commit_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        content_root_version: Option<Version>,
     ) -> DeltaResult<Vec<PartialCommitCover>> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
@@ -418,17 +428,12 @@ impl LogSegment {
 
         let mut commit_covers = vec![];
         let mut selected_files = vec![];
-        let mut content_root_version = None;
         // Only be careful with content root version if we are reading add/remove actions since that is all it contains.
         let mut read_schema = commit_read_schema.clone();
 
-        if self.latest_content_root_file.is_some()
+        let content_root_version = if content_root_version.is_some()
             && (commit_read_schema.contains(ADD_NAME) || commit_read_schema.contains(REMOVE_NAME))
         {
-            content_root_version = self
-                .latest_content_root_file
-                .as_ref()
-                .map(|file| file.version);
             read_schema = Self::remove_file_actions_from_schema(commit_read_schema.clone())?;
             // TODO: Adapt the meta_predicate also if it references file actions. Today this isn't the case.
 
@@ -438,7 +443,10 @@ impl LogSegment {
                 all_files =
                     Box::new(all_files.filter(|f| f.version > content_root_version.unwrap_or(0)));
             }
-        }
+            content_root_version
+        } else {
+            None
+        };
         for next in all_files {
             match last_pushed {
                 // Resolve version number ties in favor of the later file (it covers a wider range)
@@ -503,16 +511,13 @@ impl LogSegment {
     }
 
     fn create_content_root_reader(
-        &self,
         engine: &dyn Engine,
+        content_root: &ContentRoot,
         checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        let content_root_file = self
-            .latest_content_root_file
-            .as_ref()
-            .ok_or_else(|| Error::generic("No content root file found"))?;
-        let metadata =
-            crate::metadata::Metadata::read(engine, &content_root_file.location.location)?;
+        let content_root_url = Url::parse(&content_root.path)
+            .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
+        let metadata = crate::metadata::Metadata::read(engine, &content_root_url)?;
         // TODO: Provide partition keys
         metadata.root_action_batches(engine, &checkpoint_read_schema, &[])
     }
@@ -533,6 +538,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        content_root: Option<&ContentRoot>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
@@ -543,9 +549,9 @@ impl LogSegment {
         let (content_root_stream, read_schema): (
             Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
             SchemaRef,
-        ) = if self.latest_content_root_file.is_some() && need_file_actions {
+        ) = if let Some(cr) = content_root.filter(|_| need_file_actions) {
             (
-                self.create_content_root_reader(engine, action_schema.clone())?,
+                Self::create_content_root_reader(engine, cr, action_schema.clone())?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )
         } else {
@@ -704,24 +710,34 @@ impl LogSegment {
         Ok((metadata_opt, protocol_opt))
     }
 
+    /// Find the content root action and its version from the log.
+    /// Returns the ContentRoot and the version of the commit where it was found.
+    /// This is used to optimize file action reading by skipping commits before the content root.
     #[allow(dead_code)]
-    pub(crate) fn content_root(&self, engine: &dyn Engine) -> DeltaResult<Option<ContentRoot>> {
+    pub(crate) fn content_root_with_version(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<(ContentRoot, Version)>> {
         let schema = get_commit_schema().project(&[CONTENT_ROOT_NAME])?;
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
             Some(Arc::new(
                 Expression::column([CONTENT_ROOT_NAME, "path"]).is_not_null(),
             ))
         });
-        let actions_batches = self.read_actions(engine, schema, META_PREDICATE.clone())?;
 
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            match ContentRoot::try_new_from_data(actions.as_ref()) {
-                Ok(Some(cr)) => {
-                    return Ok(Some(cr));
+        // Read commits in descending order (most recent first)
+        for commit_file in self.ascending_commit_files.iter().rev() {
+            let batches = engine.json_handler().read_json_files(
+                std::slice::from_ref(&commit_file.location),
+                schema.clone(),
+                META_PREDICATE.clone(),
+            )?;
+
+            for batch_result in batches {
+                let batch = batch_result?;
+                if let Ok(Some(cr)) = ContentRoot::try_new_from_data(batch.as_ref()) {
+                    return Ok(Some((cr, commit_file.version)));
                 }
-                // Skip batches that don't have ContentRoot field
-                _ => continue,
             }
         }
 
