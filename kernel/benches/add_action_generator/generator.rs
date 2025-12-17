@@ -123,7 +123,10 @@ mod tests {
     #[test]
     fn test_dv_probability() {
         let actions = generate_add_actions(1000, 0.3, 0, Some(42));
-        let dv_count = actions.iter().filter(|a| a.deletion_vector.is_some()).count();
+        let dv_count = actions
+            .iter()
+            .filter(|a| a.deletion_vector.is_some())
+            .count();
         let ratio = dv_count as f64 / 1000.0;
 
         // Should be roughly 30% with some variance

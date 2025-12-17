@@ -29,7 +29,8 @@ pub fn analyze_parquet_file(path: &str) {
     println!();
 
     // Collect column sizes across all row groups
-    let mut column_sizes: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let mut column_sizes: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
 
     for i in 0..metadata.num_row_groups() {
         let rg_metadata = metadata.row_group(i);
@@ -47,10 +48,13 @@ pub fn analyze_parquet_file(path: &str) {
 
     // Sort by compressed size
     let mut columns: Vec<_> = column_sizes.into_iter().collect();
-    columns.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    columns.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
 
     println!("Column Size Breakdown (sorted by compressed size):");
-    println!("{:<60} {:>15} {:>15} {:>10}", "Column Path", "Compressed", "Uncompressed", "Ratio");
+    println!(
+        "{:<60} {:>15} {:>15} {:>10}",
+        "Column Path", "Compressed", "Uncompressed", "Ratio"
+    );
     println!("{}", "-".repeat(110));
 
     let mut total_compressed = 0u64;

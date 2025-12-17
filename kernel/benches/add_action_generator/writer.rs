@@ -54,13 +54,13 @@ pub fn write_checkpoint_parquet(
         delta_kernel::Error::generic(format!("Failed to create Arrow writer: {}", e))
     })?;
 
-    writer.write(&batch).map_err(|e| {
-        delta_kernel::Error::generic(format!("Failed to write batch: {}", e))
-    })?;
+    writer
+        .write(&batch)
+        .map_err(|e| delta_kernel::Error::generic(format!("Failed to write batch: {}", e)))?;
 
-    writer.close().map_err(|e| {
-        delta_kernel::Error::generic(format!("Failed to close writer: {}", e))
-    })?;
+    writer
+        .close()
+        .map_err(|e| delta_kernel::Error::generic(format!("Failed to close writer: {}", e)))?;
 
     Ok(())
 }
@@ -78,7 +78,7 @@ fn build_checkpoint_add_schema() -> Arc<Schema> {
         Field::new("num3", DataType::Int64, true),
         Field::new("num4", DataType::Int64, true),
         Field::new("num5", DataType::Int64, true),
-        Field::new("num6", DataType::Float64, true),  // Dollar values
+        Field::new("num6", DataType::Float64, true), // Dollar values
         Field::new("num7", DataType::Int64, true),
         Field::new("num8", DataType::Int64, true),
         Field::new("num9", DataType::Int64, true),
@@ -95,8 +95,16 @@ fn build_checkpoint_add_schema() -> Arc<Schema> {
     // stats_parsed schema - nullable but always populated
     let stats_parsed_fields = Fields::from(vec![
         Field::new("numRecords", DataType::Int64, false),
-        Field::new("minValues", DataType::Struct(stats_columns_fields.clone()), true),
-        Field::new("maxValues", DataType::Struct(stats_columns_fields.clone()), true),
+        Field::new(
+            "minValues",
+            DataType::Struct(stats_columns_fields.clone()),
+            true,
+        ),
+        Field::new(
+            "maxValues",
+            DataType::Struct(stats_columns_fields.clone()),
+            true,
+        ),
         Field::new("nullCount", DataType::Struct(stats_columns_fields), true),
     ]);
 
@@ -200,9 +208,8 @@ fn build_record_batch(
     );
 
     // Create record batch with top-level "add" column
-    RecordBatch::try_new(schema.clone(), vec![Arc::new(add_struct)]).map_err(|e| {
-        delta_kernel::Error::generic(format!("Failed to create record batch: {}", e))
-    })
+    RecordBatch::try_new(schema.clone(), vec![Arc::new(add_struct)])
+        .map_err(|e| delta_kernel::Error::generic(format!("Failed to create record batch: {}", e)))
 }
 
 fn build_path_array(actions: &[AddActionMetadata]) -> ArrayRef {
@@ -210,10 +217,7 @@ fn build_path_array(actions: &[AddActionMetadata]) -> ArrayRef {
     Arc::new(delta_kernel::arrow::array::StringArray::from(paths))
 }
 
-fn build_partition_values_array(
-    _actions: &[AddActionMetadata],
-    n: usize,
-) -> DeltaResult<ArrayRef> {
+fn build_partition_values_array(_actions: &[AddActionMetadata], n: usize) -> DeltaResult<ArrayRef> {
     // Empty partition values for all actions
     let mut builder = MapBuilder::new(
         Some(MapFieldNames {
@@ -245,9 +249,10 @@ fn build_mod_time_array(actions: &[AddActionMetadata]) -> ArrayRef {
 }
 
 fn build_data_change_array(n: usize) -> ArrayRef {
-    Arc::new(delta_kernel::arrow::array::BooleanArray::from(
-        vec![true; n],
-    ))
+    Arc::new(delta_kernel::arrow::array::BooleanArray::from(vec![
+        true;
+        n
+    ]))
 }
 
 fn build_stats_parsed_array(actions: &[AddActionMetadata]) -> DeltaResult<ArrayRef> {
@@ -368,7 +373,28 @@ fn get_stats_columns_fields() -> Fields {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_stats_columns_struct<F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20>(
+fn build_stats_columns_struct<
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+>(
     actions: &[AddActionMetadata],
     phonetic_fn: F1,
     city_fn: F2,
@@ -467,15 +493,24 @@ fn build_null_count_struct(n: usize) -> DeltaResult<ArrayRef> {
     Ok(Arc::new(StructArray::new(
         get_stats_columns_fields(),
         vec![
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![Some("0"); n])),
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![Some("0"); n])),
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![Some("0"); n])),
+            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
+                Some("0");
+                n
+            ])),
+            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
+                Some("0");
+                n
+            ])),
+            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
+                Some("0");
+                n
+            ])),
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Float64Array::from(vec![0.0f64; n])),  // num6 is float64
+            Arc::new(Float64Array::from(vec![0.0f64; n])), // num6 is float64
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
             Arc::new(Int64Array::from(vec![0i64; n])),
@@ -566,9 +601,9 @@ fn build_tags_array(n: usize) -> DeltaResult<ArrayRef> {
     );
 
     for _ in 0..n {
-        builder.append(false).map_err(|e| {
-            delta_kernel::Error::generic(format!("Failed to append tags: {}", e))
-        })?;
+        builder
+            .append(false)
+            .map_err(|e| delta_kernel::Error::generic(format!("Failed to append tags: {}", e)))?;
     }
 
     Ok(Arc::new(builder.finish()))

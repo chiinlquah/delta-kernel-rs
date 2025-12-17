@@ -20,12 +20,13 @@
 //! - Absolute: Fake S3 paths
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use rand::Rng;
 use rand::rngs::StdRng;
+use rand::Rng;
 use roaring::RoaringTreemap;
 use uuid::Uuid;
 
 /// Magic number for portable RoaringBitmap serialization format
+#[allow(dead_code)]
 const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 
 /// Generator for deletion vectors
@@ -48,6 +49,7 @@ impl DeletionVectorGenerator {
     }
 
     /// Generate with explicit storage type preference (for testing)
+    #[allow(dead_code)]
     pub fn generate_with_type_distribution(
         &self,
         rng: &mut StdRng,
@@ -69,6 +71,7 @@ impl DeletionVectorGenerator {
     }
 
     /// Generate an inline deletion vector with actual RoaringTreemap serialization
+    #[allow(dead_code)]
     fn generate_inline_dv(
         &self,
         rng: &mut StdRng,
@@ -106,11 +109,7 @@ impl DeletionVectorGenerator {
     }
 
     /// Generate a relative deletion vector with UUID-based path
-    fn generate_relative_dv(
-        &self,
-        rng: &mut StdRng,
-        cardinality: i64,
-    ) -> DeletionVectorDescriptor {
+    fn generate_relative_dv(&self, rng: &mut StdRng, cardinality: i64) -> DeletionVectorDescriptor {
         // Generate a random prefix (0-2 hex characters)
         let prefix = format!("{:02x}", rng.gen::<u8>());
 
@@ -133,11 +132,8 @@ impl DeletionVectorGenerator {
     }
 
     /// Generate an absolute deletion vector with fake S3 path
-    fn generate_absolute_dv(
-        &self,
-        rng: &mut StdRng,
-        cardinality: i64,
-    ) -> DeletionVectorDescriptor {
+    #[allow(dead_code)]
+    fn generate_absolute_dv(&self, rng: &mut StdRng, cardinality: i64) -> DeletionVectorDescriptor {
         let uuid = Uuid::new_v4();
 
         DeletionVectorDescriptor {
@@ -181,7 +177,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let dv = gen.generate_relative_dv(&mut rng, 100);
 
-        assert_eq!(dv.storage_type, DeletionVectorStorageType::PersistedRelative);
+        assert_eq!(
+            dv.storage_type,
+            DeletionVectorStorageType::PersistedRelative
+        );
         assert!(dv.offset.is_some());
         assert_eq!(dv.cardinality, 100);
         assert!(dv.size_in_bytes >= 100 && dv.size_in_bytes < 1000);
@@ -195,10 +194,15 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let dv = gen.generate_absolute_dv(&mut rng, 100);
 
-        assert_eq!(dv.storage_type, DeletionVectorStorageType::PersistedAbsolute);
+        assert_eq!(
+            dv.storage_type,
+            DeletionVectorStorageType::PersistedAbsolute
+        );
         assert_eq!(dv.offset, Some(0));
         assert_eq!(dv.cardinality, 100);
-        assert!(dv.path_or_inline_dv.starts_with("s3://benchmark-bucket/dvs/"));
+        assert!(dv
+            .path_or_inline_dv
+            .starts_with("s3://benchmark-bucket/dvs/"));
         assert!(dv.path_or_inline_dv.ends_with(".bin"));
     }
 
@@ -220,12 +224,22 @@ mod tests {
         let gen = DeletionVectorGenerator::new();
         let mut rng = StdRng::seed_from_u64(42);
 
+        // Test that generate() always uses relative path DVs (most common in production)
+        for _ in 0..100 {
+            let dv = gen.generate(&mut rng, 10000);
+            assert_eq!(
+                dv.storage_type,
+                DeletionVectorStorageType::PersistedRelative
+            );
+        }
+
+        // Test generate_with_type_distribution for varied types
         let mut inline_count = 0;
         let mut relative_count = 0;
         let mut absolute_count = 0;
 
         for _ in 0..1000 {
-            let dv = gen.generate(&mut rng, 10000);
+            let dv = gen.generate_with_type_distribution(&mut rng, 10000, 0.4, 0.4);
             match dv.storage_type {
                 DeletionVectorStorageType::Inline => inline_count += 1,
                 DeletionVectorStorageType::PersistedRelative => relative_count += 1,
