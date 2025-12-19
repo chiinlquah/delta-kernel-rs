@@ -68,6 +68,21 @@ impl ParquetHandler for SyncParquetHandler {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
 
+    fn read_parquet_file_groups(
+        &self,
+        file_groups: Vec<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Vec<FileDataReadResultIterator>> {
+        // Sequential implementation for sync: call read_parquet_files for each group
+        file_groups
+            .into_iter()
+            .map(|group| {
+                self.read_parquet_files(&group, physical_schema.clone(), predicate.clone())
+            })
+            .collect()
+    }
+
     /// Writes engine data to a Parquet file at the specified location.
     ///
     /// This implementation uses synchronous file I/O to write the Parquet file.

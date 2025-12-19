@@ -777,6 +777,58 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
+    /// Read and parse multiple groups of Parquet files for parallel processing.
+    ///
+    /// This method enables parallel processing of independent file groups. Each group
+    /// in `file_groups` can be processed independently, while files within each group
+    /// maintain the same ordering guarantees as `read_parquet_files`.
+    ///
+    /// # Parameters
+    ///
+    /// - `file_groups` - A vector of file groups. Each inner `Vec<FileMeta>` is an
+    ///   independent group that can be processed in parallel with other groups.
+    /// - `physical_schema` - The schema to use for all groups
+    /// - `predicate` - Optional push-down predicate to apply to all groups
+    ///
+    /// # Returns
+    ///
+    /// A `Vec` of iterators, one per group, in the same order as `file_groups`.
+    /// Each iterator produces `EngineData` for its corresponding file group.
+    /// If any group fails to initialize, the entire method returns an error.
+    ///
+    /// # Ordering Guarantees
+    ///
+    /// - Files within each group maintain the same ordering as `read_parquet_files`
+    /// - Groups in the result match the order of `file_groups`
+    /// - Groups can be consumed in any order (they are independent)
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let group1 = vec![file1, file2];
+    /// let group2 = vec![file3, file4];
+    /// let file_groups = vec![group1, group2];
+    ///
+    /// let iterators = parquet_handler.read_parquet_file_groups(
+    ///     file_groups,
+    ///     schema.clone(),
+    ///     predicate.clone()
+    /// )?;
+    ///
+    /// // Process groups in parallel (e.g., with rayon)
+    /// iterators.into_par_iter().for_each(|iter| {
+    ///     for result in iter {
+    ///         // process data
+    ///     }
+    /// });
+    /// ```
+    fn read_parquet_file_groups(
+        &self,
+        file_groups: Vec<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Vec<FileDataReadResultIterator>>;
+
     /// Write data to a Parquet file at the specified URL.
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.

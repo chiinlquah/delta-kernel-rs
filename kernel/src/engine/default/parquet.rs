@@ -264,6 +264,47 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
+    fn read_parquet_file_groups(
+        &self,
+        file_groups: Vec<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Vec<FileDataReadResultIterator>> {
+        // Optimized async implementation: do all async work in a single block_on call
+        // This ensures any blocking I/O during iterator creation happens asynchronously
+        let store = self.store.clone();
+        let task_executor = self.task_executor.clone();
+
+        self.task_executor.block_on(async move {
+            // Create all futures upfront
+            let futures: Vec<_> = file_groups
+                .into_iter()
+                .map(|group| {
+                    read_parquet_files_impl(
+                        store.clone(),
+                        group,
+                        physical_schema.clone(),
+                        predicate.clone(),
+                    )
+                })
+                .collect();
+
+            // Execute all futures concurrently to get all streams
+            let streams = futures::future::try_join_all(futures).await?;
+
+            // Convert each stream to an iterator (still inside the async block)
+            Ok(streams
+                .into_iter()
+                .map(|stream| -> FileDataReadResultIterator {
+                    Box::new(super::BlockingStreamIterator {
+                        stream: Some(stream),
+                        task_executor: task_executor.clone(),
+                    })
+                })
+                .collect())
+        })
+    }
+
     /// Writes engine data to a Parquet file at the specified location.
     ///
     /// This implementation uses asynchronous file I/O with object_store to write the Parquet file.
@@ -545,13 +586,15 @@ mod tests {
 
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int8Array, RecordBatch, TimestampMicrosecondArray,
+        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{DataType, StructField, StructType};
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -1347,5 +1390,415 @@ mod tests {
             name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
             Some(&"2".into())
         );
+    }
+
+    // Helper function to create and write test parquet files
+    async fn create_test_parquet_file(
+        store: &Arc<InMemory>,
+        parquet_handler: &Arc<dyn ParquetHandler>,
+        file_name: &str,
+        values: Vec<i64>,
+    ) -> FileMeta {
+        let file_url = Url::parse(&format!("memory:///{}", file_name)).unwrap();
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(values)) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
+
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // Get file size from object store
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let meta = store.head(&path).await.unwrap();
+
+        FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: meta.size,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_basic() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create 3 test files with known data
+        let file1_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file1.parquet", vec![1, 2, 3])
+                .await;
+        let file2_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file2.parquet", vec![4, 5, 6])
+                .await;
+        let file3_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file3.parquet", vec![7, 8, 9])
+                .await;
+
+        // Group files: Group 1 has file1 and file2, Group 2 has file3
+        let file_groups = vec![vec![file1_meta, file2_meta], vec![file3_meta]];
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("value", DataType::LONG, false)]).unwrap(),
+        );
+
+        // Call the new method
+        let iterators = parquet_handler
+            .read_parquet_file_groups(file_groups, schema, None)
+            .unwrap();
+
+        // Verify we got 2 iterators
+        assert_eq!(iterators.len(), 2);
+
+        // Check group 1: should have data from file1 and file2 in order
+        let mut iter_iter = iterators.into_iter();
+        let group1_data: Vec<RecordBatch> = iter_iter
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let mut group1_values = Vec::new();
+        for batch in &group1_data {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            group1_values.extend_from_slice(col.values());
+        }
+        assert_eq!(group1_values, vec![1, 2, 3, 4, 5, 6]);
+
+        // Check group 2: should have data from file3
+        let group2_data: Vec<RecordBatch> = iter_iter
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let mut group2_values = Vec::new();
+        for batch in &group2_data {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            group2_values.extend_from_slice(col.values());
+        }
+        assert_eq!(group2_values, vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_empty() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("value", DataType::LONG, false)]).unwrap(),
+        );
+
+        // Test with empty vector
+        let empty_groups: Vec<Vec<FileMeta>> = vec![];
+        let iterators = parquet_handler
+            .read_parquet_file_groups(empty_groups, schema.clone(), None)
+            .unwrap();
+        assert_eq!(iterators.len(), 0);
+
+        // Test with groups containing empty vectors
+        let file1_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file1.parquet", vec![1, 2]).await;
+
+        let groups_with_empty = vec![vec![], vec![file1_meta], vec![]];
+        let iterators = parquet_handler
+            .read_parquet_file_groups(groups_with_empty, schema, None)
+            .unwrap();
+
+        assert_eq!(iterators.len(), 3);
+
+        let mut iter_iter = iterators.into_iter();
+
+        // First iterator should be empty
+        let count0 = iter_iter.next().unwrap().count();
+        assert_eq!(count0, 0);
+
+        // Second iterator should have data
+        let group1_data: Vec<RecordBatch> = iter_iter
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let mut values = Vec::new();
+        for batch in &group1_data {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend_from_slice(col.values());
+        }
+        assert_eq!(values, vec![1, 2]);
+
+        // Third iterator should be empty
+        let count2 = iter_iter.next().unwrap().count();
+        assert_eq!(count2, 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_single_group() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create test files
+        let file1_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file1.parquet", vec![1, 2]).await;
+        let file2_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file2.parquet", vec![3, 4]).await;
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("value", DataType::LONG, false)]).unwrap(),
+        );
+
+        // Test single group with multiple files
+        let single_group = vec![vec![file1_meta, file2_meta]];
+        let iterators = parquet_handler
+            .read_parquet_file_groups(single_group, schema, None)
+            .unwrap();
+
+        assert_eq!(iterators.len(), 1);
+
+        // Verify data
+        let data: Vec<RecordBatch> = iterators
+            .into_iter()
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let mut values = Vec::new();
+        for batch in &data {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend_from_slice(col.values());
+        }
+        assert_eq!(values, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_error_handling() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create one valid file
+        let file1_meta =
+            create_test_parquet_file(&store, &parquet_handler, "file1.parquet", vec![1, 2]).await;
+
+        // Create a file meta for a non-existent file
+        let bad_file_meta = FileMeta {
+            location: Url::parse("memory:///nonexistent.parquet").unwrap(),
+            last_modified: 0,
+            size: 1000,
+        };
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("value", DataType::LONG, false)]).unwrap(),
+        );
+
+        // Test with bad file in second group
+        // Creating iterators succeeds, but consuming them will fail
+        let file_groups = vec![vec![file1_meta], vec![bad_file_meta]];
+        let iterators = parquet_handler
+            .read_parquet_file_groups(file_groups, schema, None)
+            .unwrap();
+
+        assert_eq!(iterators.len(), 2);
+
+        let mut iter_iter = iterators.into_iter();
+
+        // First iterator should work fine
+        let data1: Result<Vec<RecordBatch>, _> = iter_iter
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect();
+        assert!(data1.is_ok(), "First group should succeed");
+
+        // Second iterator should error when consumed
+        let data2: Result<Vec<RecordBatch>, _> = iter_iter
+            .next()
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect();
+        assert!(data2.is_err(), "Should error on non-existent file");
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_schema_projection() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create files with multiple columns
+        let file_url1 = Url::parse("memory:///multi_col1.parquet").unwrap();
+        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "a",
+                    Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+                ),
+                (
+                    "b",
+                    Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+        parquet_handler
+            .write_parquet_file(
+                file_url1.clone(),
+                Box::new(std::iter::once(Ok(engine_data1))),
+            )
+            .unwrap();
+
+        let file_url2 = Url::parse("memory:///multi_col2.parquet").unwrap();
+        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "a",
+                    Arc::new(Int64Array::from(vec![3, 4])) as Arc<dyn Array>,
+                ),
+                (
+                    "b",
+                    Arc::new(Int64Array::from(vec![30, 40])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+        parquet_handler
+            .write_parquet_file(
+                file_url2.clone(),
+                Box::new(std::iter::once(Ok(engine_data2))),
+            )
+            .unwrap();
+
+        let path1 = Path::from_url_path(file_url1.path()).unwrap();
+        let meta1 = store.head(&path1).await.unwrap();
+        let file1_meta = FileMeta {
+            location: file_url1,
+            last_modified: 0,
+            size: meta1.size,
+        };
+
+        let path2 = Path::from_url_path(file_url2.path()).unwrap();
+        let meta2 = store.head(&path2).await.unwrap();
+        let file2_meta = FileMeta {
+            location: file_url2,
+            last_modified: 0,
+            size: meta2.size,
+        };
+
+        // Project only column "a"
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("a", DataType::LONG, false)]).unwrap(),
+        );
+
+        let file_groups = vec![vec![file1_meta], vec![file2_meta]];
+        let iterators = parquet_handler
+            .read_parquet_file_groups(file_groups, schema, None)
+            .unwrap();
+
+        assert_eq!(iterators.len(), 2);
+
+        // Verify both groups only have column "a"
+        for (idx, iter) in iterators.into_iter().enumerate() {
+            let data: Vec<RecordBatch> = iter.map(into_record_batch).try_collect().unwrap();
+            for batch in &data {
+                assert_eq!(batch.num_columns(), 1, "Group {} should have 1 column", idx);
+                assert_eq!(
+                    batch.schema().field(0).name(),
+                    "a",
+                    "Group {} should have column 'a'",
+                    idx
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_file_groups_many_groups() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create 100 groups with 1 file each
+        let mut file_groups = Vec::new();
+        for i in 0..100 {
+            let file_meta = create_test_parquet_file(
+                &store,
+                &parquet_handler,
+                &format!("file{}.parquet", i),
+                vec![i],
+            )
+            .await;
+            file_groups.push(vec![file_meta]);
+        }
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("value", DataType::LONG, false)]).unwrap(),
+        );
+
+        let iterators = parquet_handler
+            .read_parquet_file_groups(file_groups, schema, None)
+            .unwrap();
+
+        assert_eq!(iterators.len(), 100);
+
+        // Verify each iterator has the correct data
+        for (i, iter) in iterators.into_iter().enumerate() {
+            let data: Vec<RecordBatch> = iter.map(into_record_batch).try_collect().unwrap();
+            let mut values = Vec::new();
+            for batch in &data {
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                values.extend_from_slice(col.values());
+            }
+            assert_eq!(
+                values,
+                vec![i as i64],
+                "Group {} should have value {}",
+                i,
+                i
+            );
+        }
     }
 }
