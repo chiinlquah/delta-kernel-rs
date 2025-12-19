@@ -69,6 +69,113 @@ enum AddRemove {
     Remove(Remove),
 }
 
+/// A manifest entry paired with an optional manifest deletion vector that applies to it.
+///
+/// According to the Iceberg Single File Commits spec, manifest deletion vectors (ManifestDV)
+/// can filter out entries from a manifest by ordinal position without rewriting the manifest file.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct FilteredManifest {
+    /// The manifest entry (can be DataManifest or DeleteManifest)
+    pub(crate) manifest: MetadataEntry,
+    /// Optional manifest deletion vector that applies to entries in this manifest
+    /// If present, contains either inline deletion vector data or a reference to a puffin file
+    pub(crate) manifest_dv: Option<MetadataEntry>,
+}
+
+impl FilteredManifest {
+    /// Creates a new FilteredManifest with no deletion vector
+    #[allow(dead_code)]
+    pub(crate) fn new(manifest: MetadataEntry) -> Self {
+        Self {
+            manifest,
+            manifest_dv: None,
+        }
+    }
+
+    /// Creates a new FilteredManifest with a deletion vector
+    #[allow(dead_code)]
+    pub(crate) fn with_dv(manifest: MetadataEntry, manifest_dv: MetadataEntry) -> Self {
+        Self {
+            manifest,
+            manifest_dv: Some(manifest_dv),
+        }
+    }
+}
+
+/// Combined deletion vector maps for looking up DVs during manifest processing.
+///
+/// This structure separates deletion vectors into two categories:
+/// - Shared: DVs that apply to all data files (from unaffiliated manifests and unmatched root DVs)
+/// - Affiliated: DVs specific to a particular data manifest
+///
+/// When looking up a DV, the shared map is probed first, then the affiliated map.
+#[derive(Debug)]
+pub(crate) struct DeletionVectorMaps<'a> {
+    /// Shared DV map (unaffiliated delete manifests + unmatched DVs from root)
+    pub(crate) shared: &'a HashMap<String, DeletionVectorInfo>,
+    /// Affiliated DV map (specific to a particular data manifest)
+    pub(crate) affiliated: &'a HashMap<String, DeletionVectorInfo>,
+}
+
+impl<'a> DeletionVectorMaps<'a> {
+    /// Creates a new DeletionVectorMaps with both shared and affiliated maps.
+    pub(crate) fn new(
+        shared: &'a HashMap<String, DeletionVectorInfo>,
+        affiliated: &'a HashMap<String, DeletionVectorInfo>,
+    ) -> Self {
+        Self { shared, affiliated }
+    }
+
+    /// Looks up a deletion vector by file path.
+    /// Probes the shared map first, then the affiliated map.
+    pub(crate) fn get(&self, path: &str) -> Option<&DeletionVectorInfo> {
+        self.shared.get(path).or_else(|| self.affiliated.get(path))
+    }
+}
+
+/// State shared across all leaf manifests (child data manifests).
+///
+/// This contains deletion information that applies globally:
+/// - Unaffiliated delete manifests (apply to all data files)
+/// - Unmatched DVs from root (position deletes that reference files not in root)
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct SharedLeafState {
+    /// Delete manifests with no specific affiliation (apply to all data files)
+    pub(crate) unaffiliated_dv_manifests: Vec<FilteredManifest>,
+    /// Position deletion vectors from the root that didn't match any files in the root.
+    /// Key: referenced_file path, Value: DeletionVectorInfo
+    /// These need to be checked against files in child manifests.
+    pub(crate) unmatched_dvs: HashMap<String, DeletionVectorInfo>,
+}
+
+/// Complete state of the root manifest, including manifest references and deletion vectors.
+///
+/// This structure separates concerns:
+/// - Manifest references (data and affiliated delete manifests) are per-child-manifest
+/// - Shared state (unaffiliated manifests and unmatched DVs) apply to all children
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct LeafReferences {
+    /// References to child data manifests and their affiliated delete manifests
+    pub(crate) manifest_references: Vec<ManifestReferences>,
+    /// Shared state that applies to all leaf manifests
+    pub(crate) shared_state: SharedLeafState,
+}
+
+/// References to manifest files discovered in the root manifest.
+/// According to the Iceberg Single File Commits spec, the root manifest can reference
+/// child data manifests and delete manifests.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct ManifestReferences {
+    /// The data manifest entry to process, with optional manifest DV
+    pub(crate) data_manifest: FilteredManifest,
+    /// Delete manifest entries affiliated with this specific data manifest (via referenced_file)
+    pub(crate) affiliated_dv_manifests: Vec<FilteredManifest>,
+}
+
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
     ///
@@ -144,12 +251,13 @@ impl Metadata {
         }
 
         // Convert each MetadataEntry to AddRemove
+        // For root_action_batches, there are no affiliated manifests, so we pass an empty affiliated map
+        let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
+        let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
-            .map(|(i, entry)| {
-                entry_to_add_remove(entry, &deletion_vector_map, i, self.table_root.to_string())
-            })
+            .map(|(i, entry)| entry_to_add_remove(entry, &dv_maps, i, self.table_root.to_string()))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         // Return empty iterator if no add_removes
@@ -162,6 +270,415 @@ impl Metadata {
 
         // Create an evaluation handler reference that we can use in the iterator
         // We need to get it from the engine and keep it alive
+        let evaluation_handler = engine.evaluation_handler();
+
+        // Convert to iterator of single-row ActionsBatch
+        let iter = add_removes.into_iter().map(move |add_remove| {
+            add_remove_to_action_batch(add_remove, evaluation_handler.as_ref(), &schema_clone)
+        });
+
+        Ok(Box::new(iter))
+    }
+
+    /// Discovers child manifest references in the root manifest.
+    ///
+    /// This method implements the hierarchical metadata tree structure described in the
+    /// Iceberg Single File Commits specification. It parses the root manifest and identifies:
+    ///
+    /// - **Data manifest files** (content_type = DataManifest): References to child manifests
+    ///   containing actual data file entries
+    /// - **Delete manifest files** (content_type = DeleteManifest): References to manifests
+    ///   containing deletion vectors, grouped by their affiliation to data manifests
+    /// - **Manifest deletion vectors** (content_type = ManifestDV): Deletion vectors that
+    ///   apply to manifest entries themselves (TODO: not yet implemented)
+    ///
+    /// The returned `ManifestReferences` groups delete manifests into two categories:
+    /// - `affiliated_dv_manifests`: Delete manifests that reference a specific data manifest
+    ///   (via the `referenced_file` field)
+    /// - `unaffiliated_dv_manifests`: Delete manifests with no specific affiliation, which
+    ///   must be checked against all data files
+    ///
+    /// # Returns
+    /// An iterator over `ManifestReferences`, one for each data manifest in the root.
+    ///
+    /// # Example Usage
+    /// ```ignore
+    /// // Get manifest references from the root
+    /// let manifest_refs_iter = metadata.manifest_references()?;
+    ///
+    /// // Process each child manifest
+    /// for manifest_refs_result in manifest_refs_iter {
+    ///     let manifest_refs = manifest_refs_result?;
+    ///     let action_batches = Metadata::manifest_to_action_batches(
+    ///         manifest_refs,
+    ///         engine,
+    ///         schema,
+    ///         partition_keys
+    ///     )?;
+    ///     // Process action batches...
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub(crate) fn manifest_references(&self) -> DeltaResult<LeafReferences> {
+        // Get all metadata entries from the root manifest
+        let entries = self.entries()?;
+
+        // Separate entries by type
+        let mut data_manifest_entries = Vec::new();
+        let mut delete_manifest_entries = Vec::new();
+        let mut manifest_dv_entries = Vec::new();
+        let mut position_delete_entries = Vec::new();
+        let mut data_file_entries = Vec::new();
+
+        for entry in entries {
+            match entry.content_type {
+                DataContentType::DataManifest => data_manifest_entries.push(entry),
+                DataContentType::DeleteManifest => delete_manifest_entries.push(entry),
+                DataContentType::ManifestDV => manifest_dv_entries.push(entry),
+                DataContentType::PositionDeletes => position_delete_entries.push(entry),
+                DataContentType::Data => data_file_entries.push(entry),
+                DataContentType::EqualityDeletes => {
+                    return Err(Error::generic("Equality deletes are not supported"))
+                }
+            }
+        }
+
+        // Build a set of data files present in the root (for matching position deletes)
+        let root_data_files: std::collections::HashSet<String> = data_file_entries
+            .iter()
+            .filter_map(|entry| entry.location.clone())
+            .collect();
+
+        // Build a map of manifest DVs by their referenced manifest file
+        // Key: referenced_file path (the manifest being filtered)
+        // Value: The ManifestDV entry
+        let mut manifest_dv_map: HashMap<String, MetadataEntry> = HashMap::new();
+        for manifest_dv_entry in manifest_dv_entries {
+            if let Some(ref referenced_file) = manifest_dv_entry.referenced_file {
+                // If multiple DVs reference the same manifest, keep the one with highest sequence number
+                let sequence_number = manifest_dv_entry
+                    .tracking_info
+                    .as_ref()
+                    .and_then(|ti| ti.sequence_number)
+                    .unwrap_or(0);
+
+                manifest_dv_map
+                    .entry(referenced_file.clone())
+                    .and_modify(|existing| {
+                        let existing_seq = existing
+                            .tracking_info
+                            .as_ref()
+                            .and_then(|ti| ti.sequence_number)
+                            .unwrap_or(0);
+                        if sequence_number > existing_seq {
+                            *existing = manifest_dv_entry.clone();
+                        }
+                    })
+                    .or_insert(manifest_dv_entry);
+            }
+        }
+
+        // Build a map of unmatched deletion vectors (DVs that reference files not in root)
+        // These need to be passed through to child manifests
+        let mut unmatched_dvs: HashMap<String, DeletionVectorInfo> = HashMap::new();
+        for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
+            let is_deleted = dv_entry
+                .tracking_info
+                .as_ref()
+                .map(|ti| ti.status == TrackingStatus::Deleted)
+                .unwrap_or(false);
+
+            if !is_deleted {
+                let referenced_file = dv_entry
+                    .referenced_file
+                    .clone()
+                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
+
+                // Only add to unmatched_dvs if the referenced file is NOT in the root
+                if !root_data_files.contains(&referenced_file) {
+                    let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i)?;
+
+                    unmatched_dvs
+                        .entry(referenced_file)
+                        .and_modify(|existing| {
+                            if dv_info.sequence_number > existing.sequence_number {
+                                *existing = dv_info.clone();
+                            }
+                        })
+                        .or_insert(dv_info);
+                }
+            }
+        }
+
+        // Build a map of delete manifests by their affiliated data manifest
+        let mut affiliated_deletes: HashMap<String, Vec<MetadataEntry>> = HashMap::new();
+        let mut unaffiliated_deletes = Vec::new();
+
+        for delete_entry in delete_manifest_entries {
+            if let Some(ref referenced_file) = delete_entry.referenced_file {
+                affiliated_deletes
+                    .entry(referenced_file.clone())
+                    .or_default()
+                    .push(delete_entry);
+            } else {
+                unaffiliated_deletes.push(delete_entry);
+            }
+        }
+
+        // Convert unaffiliated deletes to FilteredManifest, pairing with DVs from the map
+        let unaffiliated_dv_manifests: Vec<FilteredManifest> = unaffiliated_deletes
+            .into_iter()
+            .map(|manifest_entry| {
+                let manifest_dv = manifest_entry
+                    .location
+                    .as_ref()
+                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
+
+                if let Some(dv) = manifest_dv {
+                    FilteredManifest::with_dv(manifest_entry, dv)
+                } else {
+                    FilteredManifest::new(manifest_entry)
+                }
+            })
+            .collect();
+
+        // Create ManifestReferences for each data manifest
+        let manifest_refs: Vec<DeltaResult<ManifestReferences>> = data_manifest_entries
+            .into_iter()
+            .map(|data_entry| {
+                let location = data_entry
+                    .location
+                    .clone()
+                    .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
+
+                // Check if there's a manifest DV for this data manifest
+                let data_manifest_dv = manifest_dv_map.get(&location).cloned();
+                let data_manifest = if let Some(dv) = data_manifest_dv {
+                    FilteredManifest::with_dv(data_entry, dv)
+                } else {
+                    FilteredManifest::new(data_entry)
+                };
+
+                // Get affiliated delete manifests for this data manifest and wrap with DVs
+                let affiliated_dv_manifests: Vec<FilteredManifest> = affiliated_deletes
+                    .get(&location)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|manifest_entry| {
+                                let manifest_dv = manifest_entry
+                                    .location
+                                    .as_ref()
+                                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
+
+                                if let Some(dv) = manifest_dv {
+                                    FilteredManifest::with_dv(manifest_entry.clone(), dv)
+                                } else {
+                                    FilteredManifest::new(manifest_entry.clone())
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Ok(ManifestReferences {
+                    data_manifest,
+                    affiliated_dv_manifests,
+                })
+            })
+            .collect();
+
+        let manifest_references = manifest_refs.into_iter().collect::<DeltaResult<Vec<_>>>()?;
+
+        Ok(LeafReferences {
+            manifest_references,
+            shared_state: SharedLeafState {
+                unaffiliated_dv_manifests,
+                unmatched_dvs,
+            },
+        })
+    }
+
+    /// Builds a deletion vector map from shared leaf state.
+    ///
+    /// This helper method loads all unaffiliated delete manifests and merges them
+    /// with unmatched DVs from the root to create a complete deletion vector map
+    /// that applies to all leaf data files.
+    ///
+    /// # Parameters
+    /// - `shared_state`: The shared state containing unaffiliated manifests and unmatched DVs
+    /// - `engine`: The engine for reading parquet files
+    ///
+    /// # Returns
+    /// A HashMap mapping file paths to their deletion vector information.
+    #[allow(dead_code)]
+    pub(crate) fn build_shared_dv_map(
+        shared_state: &SharedLeafState,
+        engine: &dyn Engine,
+    ) -> DeltaResult<HashMap<String, DeletionVectorInfo>> {
+        // Start with unmatched DVs from the root
+        let mut deletion_vector_map = shared_state.unmatched_dvs.clone();
+
+        // Process unaffiliated delete manifests
+        for filtered_manifest in shared_state.unaffiliated_dv_manifests.iter() {
+            let delete_manifest_location = filtered_manifest
+                .manifest
+                .location
+                .clone()
+                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
+            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
+                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
+            })?;
+
+            let mut delete_entries = Metadata::read(engine, &delete_manifest_url)?.entries()?;
+
+            // Apply manifest DV if present
+            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            }
+
+            merge_deletion_vectors(&mut deletion_vector_map, delete_entries)?;
+        }
+
+        Ok(deletion_vector_map)
+    }
+
+    /// Processes a LeafReferences into action batches for all child manifests.
+    ///
+    /// This is a convenience method that:
+    /// 1. Builds the shared DV map once from the root state
+    /// 2. Processes each child manifest with the shared DV map
+    /// 3. Chains all the resulting action batch iterators
+    ///
+    /// # Parameters
+    /// - `root_state`: The leaf references from the root manifest
+    /// - `engine`: The engine for reading parquet files
+    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
+    ///
+    /// # Returns
+    /// An iterator over all action batches from all child manifests.
+    #[allow(dead_code)]
+    pub(crate) fn root_to_action_batches(
+        root_state: LeafReferences,
+        engine: &dyn Engine,
+        schema: &SchemaRef,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Build the shared DV map once
+        let shared_dv_map = Self::build_shared_dv_map(&root_state.shared_state, engine)?;
+
+        // Process each manifest reference
+        let mut all_iters: Vec<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> =
+            Vec::new();
+
+        for manifest_refs in root_state.manifest_references {
+            let iter =
+                Self::manifest_to_action_batches(manifest_refs, &shared_dv_map, engine, schema)?;
+            all_iters.push(iter);
+        }
+
+        // Chain all iterators together
+        Ok(Box::new(all_iters.into_iter().flatten()))
+    }
+
+    /// Processes a ManifestReferences struct into action batches.
+    ///
+    /// This is the low-level method for reading a single child manifest. Given a
+    /// `ManifestReferences` and a pre-built deletion vector map, this method:
+    ///
+    /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
+    /// 2. **Reads affiliated delete manifests**: Processes delete manifests specific to this data manifest
+    /// 3. **Merges with shared DVs**: Combines affiliated DVs with the shared DV map
+    /// 4. **Converts entries to actions**: Transforms MetadataEntry records into Add/Remove actions
+    /// 5. **Returns action batches**: Produces an iterator of ActionsBatch objects
+    ///
+    /// # Parameters
+    /// - `manifest_refs`: The manifest references to process
+    /// - `shared_dv_map`: Pre-built deletion vector map from shared state
+    /// - `engine`: The engine for reading parquet files
+    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
+    ///
+    /// # Returns
+    /// An iterator over `ActionsBatch` objects, each containing a single Add or Remove action.
+    ///
+    /// # Notes
+    /// - Use `root_to_action_batches` for a higher-level API that processes all manifests
+    /// - The shared_dv_map should be built once and reused for all child manifests
+    #[allow(dead_code)]
+    pub(crate) fn manifest_to_action_batches(
+        manifest_refs: ManifestReferences,
+        shared_dv_map: &HashMap<String, DeletionVectorInfo>,
+        engine: &dyn Engine,
+        schema: &SchemaRef,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Read the data manifest file
+        let data_manifest_location = manifest_refs
+            .data_manifest
+            .manifest
+            .location
+            .clone()
+            .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
+        let data_manifest_url = Url::parse(&data_manifest_location)
+            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+
+        // Read the data manifest entries using the existing Metadata::read method
+        let mut data_manifest_entries = Metadata::read(engine, &data_manifest_url)?.entries()?;
+
+        // Apply manifest DV if present
+        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        }
+
+        // Build a separate map for affiliated delete manifests (specific to this data manifest)
+        let mut affiliated_dv_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
+
+        // Process affiliated delete manifests for this specific data manifest
+        for filtered_manifest in manifest_refs.affiliated_dv_manifests.iter() {
+            let delete_manifest_location = filtered_manifest
+                .manifest
+                .location
+                .clone()
+                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
+            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
+                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
+            })?;
+
+            let mut delete_entries = Metadata::read(engine, &delete_manifest_url)?.entries()?;
+
+            // Apply manifest DV if present
+            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            }
+
+            merge_deletion_vectors(&mut affiliated_dv_map, delete_entries)?;
+        }
+
+        // Combine shared and affiliated DV maps (using references, no cloning)
+        let dv_maps = DeletionVectorMaps::new(shared_dv_map, &affiliated_dv_map);
+
+        // Convert entries to AddRemove, filtering out non-data entries
+        let add_removes: Vec<AddRemove> = data_manifest_entries
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.content_type,
+                    DataContentType::Data | DataContentType::EqualityDeletes
+                )
+            })
+            .enumerate()
+            .map(|(i, entry)| {
+                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Return empty iterator if no add_removes
+        if add_removes.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        // Clone the schema for use in the closure
+        let schema_clone = schema.clone();
+
+        // Create an evaluation handler reference
         let evaluation_handler = engine.evaluation_handler();
 
         // Convert to iterator of single-row ActionsBatch
@@ -293,8 +810,8 @@ impl Metadata {
 }
 
 /// Information about a deletion vector associated with a data file.
-#[derive(Clone)]
-struct DeletionVectorInfo {
+#[derive(Clone, Debug)]
+pub(crate) struct DeletionVectorInfo {
     /// The deletion vector descriptor
     descriptor: DeletionVectorDescriptor,
     /// Sequence number for versioning
@@ -311,6 +828,138 @@ struct ProcessedDeletionVector {
     delete_manifest_path: Option<String>,
     /// Position in the delete manifest
     delete_manifest_position: Option<i64>,
+}
+
+/// Applies a manifest deletion vector to filter entries from a manifest.
+///
+/// Manifest deletion vectors (ManifestDV, content_type = 5) can filter out entries
+/// from a manifest by ordinal position without rewriting the manifest file. This is
+/// useful for merge-on-read operations where we want to remove entries without
+/// physically rewriting the manifest.
+///
+/// # Arguments
+/// * `entries` - The manifest entries to filter
+/// * `manifest_dv` - The ManifestDV entry containing the deletion vector
+///
+/// # Returns
+/// A filtered list of entries with deleted positions removed.
+///
+/// # Implementation Notes
+/// Currently only supports inline deletion vectors (stored in `inline_content`).
+/// External deletion vectors (referenced via `location`) are not yet supported.
+#[allow(dead_code)]
+fn apply_manifest_dv(
+    entries: Vec<MetadataEntry>,
+    manifest_dv: &MetadataEntry,
+) -> DeltaResult<Vec<MetadataEntry>> {
+    use roaring::RoaringTreemap;
+
+    // Check if we have inline content
+    let inline_content = match &manifest_dv.inline_content {
+        Some(content) if !content.is_empty() => content,
+        _ => {
+            // No inline content, check if external is specified
+            if manifest_dv.location.is_some() {
+                return Err(Error::generic(
+                    "External (persisted) manifest deletion vectors are not yet supported",
+                ));
+            }
+            // No DV data at all, return entries unfiltered
+            return Ok(entries);
+        }
+    };
+
+    // Parse the magic number from the first 4 bytes
+    if inline_content.len() < 4 {
+        return Err(Error::generic(
+            "Inline deletion vector is too small (less than 4 bytes)",
+        ));
+    }
+
+    let magic = u32::from_be_bytes([
+        inline_content[0],
+        inline_content[1],
+        inline_content[2],
+        inline_content[3],
+    ]);
+
+    // Magic numbers from the deletion vector format
+    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+    const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
+
+    // Deserialize the RoaringTreemap
+    let deleted_positions = match magic {
+        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&inline_content[4..])
+            .map_err(|err| Error::generic(format!("Failed to deserialize manifest DV: {}", err)))?,
+        ROARING_BITMAP_NATIVE_MAGIC => {
+            return Err(Error::generic(
+                "Native serialization format for manifest deletion vectors is not yet supported",
+            ));
+        }
+        _ => {
+            return Err(Error::generic(format!(
+                "Invalid magic number in manifest deletion vector: {}",
+                magic
+            )));
+        }
+    };
+
+    // Filter entries: keep only those whose ordinal position is NOT in the deletion vector
+    let filtered_entries: Vec<MetadataEntry> = entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            // If this position is NOT deleted, keep the entry
+            if !deleted_positions.contains(index as u64) {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(filtered_entries)
+}
+
+/// Merges deletion vectors from manifest entries into the deletion vector map.
+///
+/// Processes a list of MetadataEntry records (from a delete manifest) and adds
+/// their deletion vector information to the map, keeping the highest sequence number
+/// for each referenced file.
+#[allow(dead_code)]
+fn merge_deletion_vectors(
+    deletion_vector_map: &mut HashMap<String, DeletionVectorInfo>,
+    entries: Vec<MetadataEntry>,
+) -> DeltaResult<()> {
+    for (i, entry) in entries.into_iter().enumerate() {
+        // Only process PositionDeletes entries that are not deleted
+        let is_deleted = entry
+            .tracking_info
+            .as_ref()
+            .map(|ti| ti.status == TrackingStatus::Deleted)
+            .unwrap_or(false);
+
+        if !is_deleted && entry.content_type == DataContentType::PositionDeletes {
+            let referenced_file = entry
+                .referenced_file
+                .clone()
+                .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
+
+            let dv_info = metadata_entry_to_deletion_vector_info(entry, i)?;
+
+            // Only insert if this DV has a higher sequence number than any existing one for this file
+            deletion_vector_map
+                .entry(referenced_file)
+                .and_modify(|existing| {
+                    if dv_info.sequence_number > existing.sequence_number {
+                        *existing = dv_info.clone();
+                    }
+                })
+                .or_insert(dv_info);
+        }
+    }
+
+    Ok(())
 }
 
 /// Converts a MetadataEntry representing a deletion vector into a DeletionVectorInfo entry.
@@ -378,12 +1027,13 @@ fn metadata_entry_to_deletion_vector_info(
 /// delete_manifest_path, and delete_manifest_position if a deletion vector is found with a
 /// sequence number greater than the entry's sequence number.
 fn process_deletion_vector(
-    deletion_vector_map: &std::collections::HashMap<String, DeletionVectorInfo>,
+    dv_maps: &DeletionVectorMaps<'_>,
     full_path: &str,
     entry_sequence_number: Option<i64>,
     root_path: &str,
 ) -> DeltaResult<ProcessedDeletionVector> {
-    let dv_info = deletion_vector_map.get(full_path);
+    let dv_info = dv_maps.get(full_path);
+
     match dv_info {
         Some(info) if info.sequence_number > entry_sequence_number.unwrap_or(0) => {
             Ok(ProcessedDeletionVector {
@@ -445,10 +1095,12 @@ fn absolute_to_relative_path(absolute_path: &str, table_root: &str) -> String {
 /// - TrackingStatus::Added or TrackingStatus::Existed -> creates an Add action
 /// - TrackingStatus::Deleted -> creates a Remove action
 ///
-/// The deletion_vector_map is used to look up deletion vectors for the entry by its location path.
+/// The dv_maps are used to look up deletion vectors for the entry.
+/// The shared map is probed first (contains unaffiliated manifests and unmatched DVs from root),
+/// then the affiliated map (specific to this data manifest).
 fn entry_to_add_remove(
     entry: MetadataEntry,
-    deletion_vector_map: &std::collections::HashMap<String, DeletionVectorInfo>,
+    dv_maps: &DeletionVectorMaps<'_>,
     entry_index: usize,
     root_path: String,
 ) -> DeltaResult<AddRemove> {
@@ -465,8 +1117,7 @@ fn entry_to_add_remove(
         .tracking_info
         .as_ref()
         .and_then(|ti| ti.sequence_number);
-    let processed_dv =
-        process_deletion_vector(deletion_vector_map, &full_path, sequence_number, &root_path)?;
+    let processed_dv = process_deletion_vector(dv_maps, &full_path, sequence_number, &root_path)?;
 
     let status = entry
         .tracking_info
@@ -890,34 +1541,34 @@ impl From<TrackingStatus> for Scalar {
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ContentInfo {
     /// The offset in the file where the content starts.
-    offset: i64,
+    pub(crate) offset: i64,
 
     /// The length of thea referenced content stored in the file;
     /// required if content_offset is present.
-    size_in_bytes: i64,
+    pub(crate) size_in_bytes: i64,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct TrackingInfo {
-    status: TrackingStatus,
+    pub(crate) status: TrackingStatus,
 
     /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when null.
     /// Must be written in the root file.
-    snapshot_id: Option<i64>,
+    pub(crate) snapshot_id: Option<i64>,
 
     /// Data sequence number of the file. Inherited in when null and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
     /// Must be written in the root file.
-    sequence_number: Option<i64>,
+    pub(crate) sequence_number: Option<i64>,
 
     /// File sequence number indicating when the file was added. Inherited when null and status is added.
     /// Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
-    file_sequence_number: Option<i64>,
+    pub(crate) file_sequence_number: Option<i64>,
 
     /// The _row_id for the first row in the data file if content_type is Data.
     /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
-    first_row_id: Option<i64>,
+    pub(crate) first_row_id: Option<i64>,
 }
 
 impl From<TrackingInfo> for Scalar {
@@ -964,15 +1615,15 @@ impl From<TrackingInfo> for Scalar {
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ManifestStats {
-    added_files_count: i64,
-    existing_files_count: i64,
-    deletes_files_count: i64,
+    pub(crate) added_files_count: i64,
+    pub(crate) existing_files_count: i64,
+    pub(crate) deletes_files_count: i64,
 
-    added_rows_count: i64,
-    existing_rows_count: i64,
-    delete_rows_count: i64,
+    pub(crate) added_rows_count: i64,
+    pub(crate) existing_rows_count: i64,
+    pub(crate) delete_rows_count: i64,
 
-    min_sequence_number: i64,
+    pub(crate) min_sequence_number: i64,
 }
 
 impl From<ManifestStats> for Scalar {
@@ -1002,56 +1653,56 @@ impl From<ManifestStats> for Scalar {
 pub(crate) struct MetadataEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
-    content_type: DataContentType,
+    pub(crate) content_type: DataContentType,
 
     /// Optional if content_type is 5 and inline_content is not null, required otherwise
-    location: Option<String>,
+    pub(crate) location: Option<String>,
 
     /// avro, orc, parquet or puffin
-    file_format: DataFileFormat,
+    pub(crate) file_format: DataFileFormat,
 
-    tracking_info: Option<TrackingInfo>,
+    pub(crate) tracking_info: Option<TrackingInfo>,
 
-    inline_content: Option<Bytes>,
+    pub(crate) inline_content: Option<Bytes>,
 
-    content_info: Option<ContentInfo>,
+    pub(crate) content_info: Option<ContentInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
-    partition_spec_id: i64,
+    pub(crate) partition_spec_id: i64,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
-    sort_order_id: Option<i64>,
+    pub(crate) sort_order_id: Option<i64>,
 
     /// Number of records in this file, or the cardinality of a deletion vector
-    record_count: i64,
+    pub(crate) record_count: i64,
 
     /// Total file size in bytes. Must be defined if location is defined
-    file_size_in_bytes: Option<i64>,
+    pub(crate) file_size_in_bytes: Option<i64>,
 
     /// The column metrics, needs to be implemented, leave out for now
     /// https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
     // content_stats: Option<ContentStats>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
-    manifest_info: Option<ManifestStats>,
+    pub(crate) manifest_info: Option<ManifestStats>,
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
-    referenced_file: Option<String>,
+    pub(crate) referenced_file: Option<String>,
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
-    key_metadata: Option<Bytes>,
+    pub(crate) key_metadata: Option<Bytes>,
 
     /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
-    split_offsets: Option<Vec<i64>>,
+    pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Not used by Delta today
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
-    equality_ids: Option<Vec<i32>>,
+    pub(crate) equality_ids: Option<Vec<i32>>,
 }
 
 // Manual implementation of ToSchema to exclude fields that are not supported or not used by Delta:
@@ -2346,6 +2997,631 @@ mod tests {
             add.deletion_vector.is_none(),
             "DV with Deleted status should not be included"
         );
+
+        Ok(())
+    }
+
+    /// Helper to create a data manifest entry
+    fn create_data_manifest_entry(location: &str) -> MetadataEntry {
+        MetadataEntry {
+            content_type: DataContentType::DataManifest,
+            location: Some(location.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            manifest_info: Some(ManifestStats {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deletes_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                delete_rows_count: 0,
+                min_sequence_number: 50,
+            }),
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        }
+    }
+
+    /// Helper to create a delete manifest entry
+    fn create_delete_manifest_entry(
+        location: &str,
+        referenced_file: Option<&str>,
+    ) -> MetadataEntry {
+        MetadataEntry {
+            content_type: DataContentType::DeleteManifest,
+            location: Some(location.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 10,
+            file_size_in_bytes: Some(512),
+            manifest_info: Some(ManifestStats {
+                added_files_count: 5,
+                existing_files_count: 5,
+                deletes_files_count: 0,
+                added_rows_count: 50,
+                existing_rows_count: 50,
+                delete_rows_count: 0,
+                min_sequence_number: 75,
+            }),
+            referenced_file: referenced_file.map(String::from),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_manifest_references_with_affiliated_deletes() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data manifest
+        let data_manifest = create_data_manifest_entry("memory:///data-manifest.parquet");
+
+        // Create an affiliated delete manifest
+        let delete_manifest = create_delete_manifest_entry(
+            "memory:///delete-manifest.parquet",
+            Some("memory:///data-manifest.parquet"),
+        );
+
+        // Create an unaffiliated delete manifest
+        let unaffiliated_delete =
+            create_delete_manifest_entry("memory:///unaffiliated-delete.parquet", None);
+
+        // Create metadata with all entries
+        let metadata = Metadata {
+            data: vec![
+                data_manifest
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                delete_manifest
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                unaffiliated_delete
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get manifest references
+        let root_state = metadata.manifest_references()?;
+
+        // Verify we got one manifest reference
+        assert_eq!(root_state.manifest_references.len(), 1);
+
+        let refs = &root_state.manifest_references[0];
+
+        // Verify the data manifest entry
+        assert_eq!(
+            refs.data_manifest.manifest.location.as_ref().unwrap(),
+            "memory:///data-manifest.parquet"
+        );
+        assert!(refs.data_manifest.manifest_dv.is_none());
+
+        // Verify affiliated delete manifest
+        assert_eq!(refs.affiliated_dv_manifests.len(), 1);
+        assert_eq!(
+            refs.affiliated_dv_manifests[0]
+                .manifest
+                .location
+                .as_ref()
+                .unwrap(),
+            "memory:///delete-manifest.parquet"
+        );
+        assert!(refs.affiliated_dv_manifests[0].manifest_dv.is_none());
+
+        // Verify unaffiliated delete manifest (now in shared_state)
+        assert_eq!(root_state.shared_state.unaffiliated_dv_manifests.len(), 1);
+        assert_eq!(
+            root_state.shared_state.unaffiliated_dv_manifests[0]
+                .manifest
+                .location
+                .as_ref()
+                .unwrap(),
+            "memory:///unaffiliated-delete.parquet"
+        );
+        assert!(root_state.shared_state.unaffiliated_dv_manifests[0]
+            .manifest_dv
+            .is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_references_multiple_data_manifests() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create multiple data manifests
+        let data_manifest_1 = create_data_manifest_entry("memory:///data-manifest-1.parquet");
+        let data_manifest_2 = create_data_manifest_entry("memory:///data-manifest-2.parquet");
+
+        // Create affiliated delete manifests for each
+        let delete_manifest_1 = create_delete_manifest_entry(
+            "memory:///delete-manifest-1.parquet",
+            Some("memory:///data-manifest-1.parquet"),
+        );
+        let delete_manifest_2 = create_delete_manifest_entry(
+            "memory:///delete-manifest-2.parquet",
+            Some("memory:///data-manifest-2.parquet"),
+        );
+
+        // Create metadata with all entries
+        let metadata = Metadata {
+            data: vec![
+                data_manifest_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                data_manifest_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                delete_manifest_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                delete_manifest_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get manifest references
+        let root_state = metadata.manifest_references()?;
+
+        // Verify we got two manifest references
+        assert_eq!(root_state.manifest_references.len(), 2);
+
+        // Verify first manifest reference
+        let refs_1 = &root_state.manifest_references[0];
+        assert_eq!(
+            refs_1.data_manifest.manifest.location.as_ref().unwrap(),
+            "memory:///data-manifest-1.parquet"
+        );
+        assert_eq!(refs_1.affiliated_dv_manifests.len(), 1);
+        assert_eq!(
+            refs_1.affiliated_dv_manifests[0]
+                .manifest
+                .location
+                .as_ref()
+                .unwrap(),
+            "memory:///delete-manifest-1.parquet"
+        );
+
+        // Verify second manifest reference
+        let refs_2 = &root_state.manifest_references[1];
+        assert_eq!(
+            refs_2.data_manifest.manifest.location.as_ref().unwrap(),
+            "memory:///data-manifest-2.parquet"
+        );
+        assert_eq!(refs_2.affiliated_dv_manifests.len(), 1);
+        assert_eq!(
+            refs_2.affiliated_dv_manifests[0]
+                .manifest
+                .location
+                .as_ref()
+                .unwrap(),
+            "memory:///delete-manifest-2.parquet"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_to_action_batches_integration() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a child data manifest with actual data files
+        let data_entry_1 = create_data_entry("memory:///child-data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("memory:///child-data-2.parquet", 60);
+
+        let child_metadata = Metadata {
+            data: vec![
+                data_entry_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                data_entry_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Write the child manifest to a file
+        let child_manifest_writer = writer::MetadataWriter::try_new(child_metadata)?;
+        let child_manifest_url = child_manifest_writer.write(&engine)?;
+
+        // Create a MetadataEntry for the child manifest
+        let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
+
+        // Create ManifestReferences pointing to the child manifest
+        let manifest_refs = ManifestReferences {
+            data_manifest: FilteredManifest::new(child_manifest_entry),
+            affiliated_dv_manifests: vec![],
+        };
+
+        // Process manifest to action batches (empty shared DV map)
+        let schema = crate::actions::get_log_add_schema().clone();
+        let shared_dv_map = HashMap::new();
+        let action_batches =
+            Metadata::manifest_to_action_batches(manifest_refs, &shared_dv_map, &engine, &schema)?;
+
+        // Collect all Add actions
+        let mut all_adds = Vec::new();
+        for batch_result in action_batches {
+            let batch = batch_result?;
+            let mut visitor = AddVisitor::default();
+            visitor.visit_rows_of(batch.actions.as_ref())?;
+            all_adds.extend(visitor.adds);
+        }
+
+        // Verify we got both data files
+        assert_eq!(all_adds.len(), 2);
+
+        // Verify the paths (relative paths)
+        let paths: Vec<_> = all_adds.iter().map(|a| a.path.as_str()).collect();
+        assert!(paths.contains(&"child-data-1.parquet"));
+        assert!(paths.contains(&"child-data-2.parquet"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_manifest_dv_inline() -> DeltaResult<()> {
+        use roaring::RoaringTreemap;
+
+        // Create some test manifest entries
+        let entries = vec![
+            create_data_entry("memory:///file0.parquet", 50),
+            create_data_entry("memory:///file1.parquet", 60),
+            create_data_entry("memory:///file2.parquet", 70),
+            create_data_entry("memory:///file3.parquet", 80),
+            create_data_entry("memory:///file4.parquet", 90),
+        ];
+
+        // Create a RoaringTreemap that deletes positions 1 and 3
+        let mut deleted_positions = RoaringTreemap::new();
+        deleted_positions.insert(1);
+        deleted_positions.insert(3);
+
+        // Serialize to bytes with portable format
+        let mut serialized = Vec::new();
+        // Magic number for portable format
+        const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+        serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+
+        // Serialize the roaring bitmap
+        deleted_positions
+            .serialize_into(&mut serialized)
+            .expect("Failed to serialize roaring bitmap");
+
+        // Create a ManifestDV entry with inline content
+        let manifest_dv = MetadataEntry {
+            content_type: DataContentType::ManifestDV,
+            location: None,
+            file_format: DataFileFormat::Puffin,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: None,
+            }),
+            inline_content: Some(Bytes::from(serialized)),
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 2, // 2 deleted positions
+            file_size_in_bytes: None,
+            manifest_info: None,
+            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        // Apply the manifest DV
+        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+
+        // Verify we have 3 entries left (positions 0, 2, 4)
+        assert_eq!(filtered_entries.len(), 3);
+
+        // Verify the correct entries remain
+        assert_eq!(
+            filtered_entries[0].location.as_ref().unwrap(),
+            "memory:///file0.parquet"
+        );
+        assert_eq!(
+            filtered_entries[1].location.as_ref().unwrap(),
+            "memory:///file2.parquet"
+        );
+        assert_eq!(
+            filtered_entries[2].location.as_ref().unwrap(),
+            "memory:///file4.parquet"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_manifest_dv_empty_dv() -> DeltaResult<()> {
+        // Create some test manifest entries
+        let entries = vec![
+            create_data_entry("memory:///file0.parquet", 50),
+            create_data_entry("memory:///file1.parquet", 60),
+        ];
+
+        // Create a ManifestDV entry with NO inline content (no deletions)
+        let manifest_dv = MetadataEntry {
+            content_type: DataContentType::ManifestDV,
+            location: None,
+            file_format: DataFileFormat::Puffin,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 0,
+            file_size_in_bytes: None,
+            manifest_info: None,
+            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        // Apply the manifest DV (should return all entries)
+        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+
+        // Verify all entries remain
+        assert_eq!(filtered_entries.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unmatched_dvs_from_root() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file that exists in the root
+        let root_data_entry = create_data_entry("memory:///root-file.parquet", 50);
+
+        // Create a DV that references a file NOT in the root (will be in child manifest)
+        let unmatched_dv = create_dv_entry(
+            "memory:///dv-for-child.parquet",
+            "memory:///child-file.parquet", // References file not in root
+            100,
+        );
+
+        // Create a DV that references a file IN the root (should not be in unmatched_dvs)
+        let matched_dv = create_dv_entry(
+            "memory:///dv-for-root.parquet",
+            "memory:///root-file.parquet", // References file in root
+            100,
+        );
+
+        // Create root metadata with both DVs
+        let metadata = Metadata {
+            data: vec![
+                root_data_entry
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                unmatched_dv
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                matched_dv
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get manifest references
+        let root_state = metadata.manifest_references()?;
+
+        // Verify we have one unmatched DV (for the child file) in shared_state
+        assert_eq!(root_state.shared_state.unmatched_dvs.len(), 1);
+        assert!(root_state
+            .shared_state
+            .unmatched_dvs
+            .contains_key("memory:///child-file.parquet"));
+
+        // Verify the matched DV is NOT in unmatched_dvs
+        assert!(!root_state
+            .shared_state
+            .unmatched_dvs
+            .contains_key("memory:///root-file.parquet"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_shared_dv_map() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a delete manifest with some DVs
+        let dv_entry_1 = create_dv_entry("memory:///dv1.parquet", "memory:///data1.parquet", 100);
+        let dv_entry_2 = create_dv_entry("memory:///dv2.parquet", "memory:///data2.parquet", 150);
+
+        let delete_manifest = Metadata {
+            data: vec![
+                dv_entry_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                dv_entry_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Write the delete manifest
+        let delete_manifest_writer = writer::MetadataWriter::try_new(delete_manifest)?;
+        let delete_manifest_url = delete_manifest_writer.write(&engine)?;
+
+        // Create unmatched DVs
+        let mut unmatched_dvs = HashMap::new();
+        unmatched_dvs.insert(
+            "memory:///data3.parquet".to_string(),
+            metadata_entry_to_deletion_vector_info(
+                create_dv_entry("memory:///dv3.parquet", "memory:///data3.parquet", 200),
+                0,
+            )?,
+        );
+
+        // Create SharedLeafState
+        let shared_state = SharedLeafState {
+            unaffiliated_dv_manifests: vec![FilteredManifest::new(create_delete_manifest_entry(
+                delete_manifest_url.as_str(),
+                None,
+            ))],
+            unmatched_dvs,
+        };
+
+        // Build the shared DV map
+        let dv_map = Metadata::build_shared_dv_map(&shared_state, &engine)?;
+
+        // Verify we have all 3 DVs
+        assert_eq!(dv_map.len(), 3);
+        assert!(dv_map.contains_key("memory:///data1.parquet"));
+        assert!(dv_map.contains_key("memory:///data2.parquet"));
+        assert!(dv_map.contains_key("memory:///data3.parquet"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_hierarchical_metadata_tree() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create two child data manifests with actual data files
+        // Child manifest 1
+        let data_entry_1 = create_data_entry("memory:///partition1/data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("memory:///partition1/data-2.parquet", 60);
+
+        let child_metadata_1 = Metadata {
+            data: vec![
+                data_entry_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                data_entry_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        let child_manifest_writer_1 = writer::MetadataWriter::try_new(child_metadata_1)?;
+        let child_manifest_url_1 = child_manifest_writer_1.write(&engine)?;
+
+        // Child manifest 2 - use version 1 to avoid filename collision
+        let data_entry_3 = create_data_entry("memory:///partition2/data-3.parquet", 70);
+        let data_entry_4 = create_data_entry("memory:///partition2/data-4.parquet", 80);
+
+        let child_metadata_2 = Metadata {
+            data: vec![
+                data_entry_3
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                data_entry_4
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 1, // Use different version to avoid filename collision
+            table_root: table_root_url.clone(),
+        };
+
+        let child_manifest_writer_2 = writer::MetadataWriter::try_new(child_metadata_2)?;
+        let child_manifest_url_2 = child_manifest_writer_2.write(&engine)?;
+
+        // Create a root manifest that references both child manifests
+        let data_manifest_entry_1 = create_data_manifest_entry(child_manifest_url_1.as_str());
+        let data_manifest_entry_2 = create_data_manifest_entry(child_manifest_url_2.as_str());
+
+        let root_metadata = Metadata {
+            data: vec![
+                data_manifest_entry_1
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                data_manifest_entry_2
+                    .clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+        };
+
+        // Get manifest references from the root
+        let root_state = root_metadata.manifest_references()?;
+
+        // Process all manifests using the helper method
+        let schema = crate::actions::get_log_add_schema().clone();
+        let action_batches = Metadata::root_to_action_batches(root_state, &engine, &schema)?;
+
+        // Collect all Add actions
+        let mut all_adds = Vec::new();
+        for batch_result in action_batches {
+            let batch = batch_result?;
+            let mut visitor = AddVisitor::default();
+            visitor.visit_rows_of(batch.actions.as_ref())?;
+            all_adds.extend(visitor.adds);
+        }
+
+        // Verify we got all 4 data files
+        assert_eq!(all_adds.len(), 4);
+
+        // Verify the paths
+        let paths: Vec<_> = all_adds.iter().map(|a| a.path.as_str()).collect();
+        assert!(paths.contains(&"partition1/data-1.parquet"));
+        assert!(paths.contains(&"partition1/data-2.parquet"));
+        assert!(paths.contains(&"partition2/data-3.parquet"));
+        assert!(paths.contains(&"partition2/data-4.parquet"));
 
         Ok(())
     }
