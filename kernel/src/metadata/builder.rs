@@ -1,16 +1,77 @@
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::metadata::{
-    DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo, TrackingStatus,
+    ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
+    TrackingStatus,
 };
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::try_parse_uri;
-use crate::{DeltaResult, EngineData, Version};
+use crate::{DeltaResult, EngineData, Error, Version};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use url::Url;
+
+/// Extracts deletion vector content from a DeletionVectorDescriptor.
+///
+/// This function decodes the `path_or_inline_dv` field based on the storage type:
+///
+/// - `PersistedRelative`: The format is `<random prefix - optional><base85 encoded uuid>`.
+///   The UUID is 20 characters (base85 encoded), and any characters before that are the
+///   optional random prefix. The function reconstructs the absolute path to the DV file.
+///
+/// - `PersistedAbsolute`: The `path_or_inline_dv` contains the absolute path to the DV file.
+///
+/// - `Inline`: Currently not supported - returns an error. Inline DVs would need to be
+///   persisted first before being added to metadata.
+///
+/// # Format Differences: Delta vs Iceberg
+///
+/// Both Delta and Iceberg use the Roaring bitmap Portable format for deletion vectors:
+/// <https://github.com/RoaringBitmap/RoaringFormatSpec?tab=readme-ov-file#extension-for-64-bit-implementations>
+///
+/// However, the `size_in_bytes` field has different semantics:
+///
+/// **Delta format** (<https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vector-format>):
+/// - `size_in_bytes` represents only the size of the serialized Roaring bitmap data
+/// - The binary layout is: `[4-byte size prefix][bitmap data][4-byte CRC checksum]`
+/// - Delta's `size_in_bytes` excludes the 4-byte size prefix and 4-byte CRC
+///
+/// **Iceberg format** (<https://iceberg.apache.org/puffin-spec/#deletion-vector-v1-blob-type>):
+/// - `size_in_bytes` represents the total blob size including all framing
+/// - This includes the size prefix + bitmap data + CRC checksum
+///
+/// Therefore, when converting from Delta to Iceberg's [`ContentInfo`], we add 8 bytes
+/// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
+///
+/// # Arguments
+/// * `dv` - The deletion vector descriptor to extract content from
+/// * `table_root` - The table root URL (used for resolving relative paths)
+///
+/// # Returns
+/// A tuple of `(ContentInfo, String)` where the String is the absolute path to the DV file.
+fn extract_deletion_vector_content(
+    dv: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> DeltaResult<(ContentInfo, String)> {
+    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
+    // - 4 bytes: size prefix
+    // - 4 bytes: CRC checksum
+    let content_info = ContentInfo {
+        offset: dv.offset.map(|v| v as i64).unwrap_or(0),
+        size_in_bytes: dv.size_in_bytes as i64 + 8,
+    };
+
+    match dv.absolute_path(table_root)? {
+        Some(url) => Ok((content_info, url.to_string())),
+        // Inline DVs are not currently supported - they would need to be persisted first
+        None => Err(Error::DeletionVector(
+            "Inline deletion vectors are not supported. They must be persisted first.".to_string(),
+        )),
+    }
+}
 
 /// Builder for creating [`Metadata`] instances based on V4 Metadata
 #[derive(Debug)]
@@ -61,11 +122,18 @@ impl MetadataBuilder {
 
     #[allow(unreachable_code)]
     #[allow(dead_code)]
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: Option<i64>) {
-        if add.deletion_vector.is_some() {
-            todo!("DVs not yet implemented");
-        };
+    pub(crate) fn add(
+        &mut self,
+        add: Add,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        // Extract deletion vector content if present
+        let dv_content = add
+            .deletion_vector
+            .as_ref()
+            .map(|dv| extract_deletion_vector_content(dv, &self.table_root))
+            .transpose()?;
 
         let status = if version == self.version {
             TrackingStatus::Added
@@ -85,9 +153,11 @@ impl MetadataBuilder {
             })
             .unwrap_or(0);
 
+        let (content_info, referenced_file) = dv_content.unzip();
+
         let data_file_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(self.path_to_absolute(&add.path).unwrap()),
+            location: Some(self.path_to_absolute(&add.path)?),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
@@ -99,12 +169,16 @@ impl MetadataBuilder {
                 // first_row_id: add.base_row_id,
                 first_row_id: None,
             }),
+
+            // Data files don't have inline content
             inline_content: None,
-            content_info: None,
+
+            // Content info from deletion vector (if present)
+            content_info,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
-            sort_order_id: Some(0),
+            sort_order_id: None,
 
             record_count,
 
@@ -115,8 +189,8 @@ impl MetadataBuilder {
             // Which we need to convert from name-based to field-id-based
             manifest_info: None,
 
-            // Needs to be set in case of a DeleteManifest
-            referenced_file: None,
+            // Path to file where to apply the DV to
+            referenced_file,
 
             // Encryption is not supported
             key_metadata: None,
@@ -128,7 +202,8 @@ impl MetadataBuilder {
             equality_ids: None,
         };
 
-        self.pending_entries.push(data_file_entry)
+        self.pending_entries.push(data_file_entry);
+        Ok(())
     }
 
     /// Adds multiple `Add` records from `EngineData` to the metadata.
@@ -155,7 +230,7 @@ impl MetadataBuilder {
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add, version, snapshot_id);
+            self.add(add, version, snapshot_id)?;
         }
 
         Ok(())
@@ -186,7 +261,7 @@ impl MetadataBuilder {
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add, version, snapshot_id);
+            self.add(add, version, snapshot_id)?;
         }
 
         Ok(())
@@ -245,7 +320,7 @@ impl MetadataBuilder {
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
-            self.add(add, version, snapshot_id);
+            self.add(add, version, snapshot_id)?;
         }
 
         Ok(())
@@ -431,6 +506,7 @@ impl RowVisitor for ScanRowToAddVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
     use serde_json::json;
 
     #[test]
@@ -694,5 +770,145 @@ mod tests {
         assert_eq!(entries[2].record_count, 0);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_extract_deletion_vector_persisted_relative() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+
+        // Test case from the existing deletion_vector tests
+        // path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^"
+        // prefix: "ab" (2 chars before the 20 char uuid)
+        // encoded uuid (20 chars): "^-aqEH.-t@S}K{vb[*k^"
+        // which decodes to UUID: d2c639aa-8816-431a-aaf6-d3fe2512ff61
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        };
+
+        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+
+        // Should have location set to the absolute path
+        assert_eq!(
+            location,
+            "s3://my-bucket/my-table/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+        );
+
+        // Should have content_info with offset and size (+8 for size field and CRC)
+        assert_eq!(content_info.offset, 4);
+        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_deletion_vector_persisted_relative_no_prefix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+
+        // Test case with no prefix (uuid only, 20 chars)
+        // This is the test case from dv_example() in deletion_vector.rs
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+
+        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+
+        // Should have location set to the absolute path (no prefix directory)
+        assert_eq!(
+            location,
+            "s3://my-bucket/my-table/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+        );
+
+        // Should have content_info with offset and size (+8 for size field and CRC)
+        assert_eq!(content_info.offset, 1);
+        assert_eq!(content_info.size_in_bytes, 44); // 36 + 8
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_deletion_vector_persisted_absolute() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv:
+                "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+                    .to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        };
+
+        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+
+        // Should preserve the absolute path as-is
+        assert_eq!(
+            location,
+            "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+        );
+
+        // Should have content_info with offset and size (+8)
+        assert_eq!(content_info.offset, 4);
+        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_deletion_vector_inline_not_supported() {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
+
+        // This is the inline DV from dv_inline() in deletion_vector.rs
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L"
+                .to_string(),
+            offset: None,
+            size_in_bytes: 44,
+            cardinality: 6,
+        };
+
+        let result = extract_deletion_vector_content(&dv, &table_root);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Inline deletion vectors are not supported"));
+    }
+
+    #[test]
+    fn test_extract_deletion_vector_invalid_relative_path() {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
+
+        // path_or_inline_dv is too short (less than 20 chars)
+        let dv = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "short".to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+
+        let result = extract_deletion_vector_content(&dv, &table_root);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Invalid length"));
     }
 }

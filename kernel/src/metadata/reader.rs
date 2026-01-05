@@ -41,7 +41,7 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<MetadataEntry> {
-    // The getters are in order of flattened leaf fields (23 total):
+    // The getters are in order of flattened leaf fields (22 total):
     // 0: content_type
     // 1: location
     // 2: file_format

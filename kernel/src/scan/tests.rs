@@ -539,7 +539,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             delete_manifest_path: None,
             delete_manifest_position: None,
         };
-        builder.add(add, 3, None);
+        builder.add(add, 3, None)?;
 
         let metadata = builder.build(engine.as_ref()).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();
@@ -740,7 +740,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             delete_manifest_path: None,
             delete_manifest_position: None,
         };
-        builder.add(add, 10, None);
+        builder.add(add, 10, None)?;
 
         let metadata = builder.build(engine.as_ref()).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();

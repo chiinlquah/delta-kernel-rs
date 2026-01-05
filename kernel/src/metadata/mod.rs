@@ -1717,7 +1717,7 @@ impl crate::schema::ToSchema for MetadataEntry {
             DataContentType::get_struct_field("contentType"),
             Option::<String>::get_struct_field("location"),
             DataFileFormat::get_struct_field("fileFormat"),
-            Option::<TrackingInfo>::get_struct_field("trackingInfo"),
+            TrackingInfo::get_struct_field("trackingInfo"),
             Option::<Bytes>::get_struct_field("inlineContent"),
             Option::<ContentInfo>::get_struct_field("contentInfo"),
             i64::get_struct_field("partitionSpecId"),
@@ -1814,7 +1814,7 @@ impl crate::IntoEngineData for MetadataEntry {
             ],
         });
 
-        // Field 20: referenced_file
+        // Field 22: referenced_file
         flat_values.push(Scalar::from(self.referenced_file)); // referenced_file (STRING)
                                                               // key_metadata, split_offsets, equality_ids are intentionally excluded
 
