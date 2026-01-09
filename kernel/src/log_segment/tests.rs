@@ -2345,7 +2345,12 @@ fn test_log_segment_contiguous_commit_files() {
     );
 
     // disallow gaps in LogSegment
-    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    let table_root = Url::parse("file:///").unwrap();
+    let log_segment = LogSegment::try_new(
+        listed.unwrap(),
+        table_root.join("_delta_log/").unwrap(),
+        None,
+    );
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2372,12 +2377,14 @@ fn test_publish_validation() {
         create_log_path("file:///path/_delta_log/00000000000000000002.json"),
     ];
 
+    let log_root = Url::parse("file:///path/").unwrap();
     let log_segment = LogSegment {
         ascending_commit_files: regular_commits,
         ascending_compaction_files: vec![],
         checkpoint_parts: vec![],
         checkpoint_version: None,
-        log_root: Url::parse("file:///path/").unwrap(),
+        log_root: log_root.clone(),
+        table_root: log_root.clone(), // Test uses dummy path
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
@@ -2392,12 +2399,14 @@ fn test_publish_validation() {
         create_log_path("file:///path/_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
     ];
 
+    let log_root = Url::parse("file:///path/").unwrap();
     let log_segment_with_staged = LogSegment {
         ascending_commit_files: with_staged,
         ascending_compaction_files: vec![],
         checkpoint_parts: vec![],
         checkpoint_version: None,
-        log_root: Url::parse("file:///path/").unwrap(),
+        log_root: log_root.clone(),
+        table_root: log_root.clone(), // Test uses dummy path
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
@@ -2433,10 +2442,19 @@ fn test_content_root_found_in_commit() -> DeltaResult<()> {
         store.put(&path1, commit1_content.into()).await.unwrap();
     });
 
+    let table_root = {
+        let log_root_str = log_root.as_str();
+        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+            Url::parse(stripped).unwrap()
+        } else {
+            log_root.clone()
+        }
+    };
     let log_segment = LogSegment {
         end_version: 1,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root,
         ascending_commit_files: vec![
             create_log_path("memory:///_delta_log/00000000000000000000.json"),
             create_log_path("memory:///_delta_log/00000000000000000001.json"),
@@ -2480,10 +2498,19 @@ fn test_content_root_not_found() -> DeltaResult<()> {
         store.put(&path1, commit1_content.into()).await.unwrap();
     });
 
+    let table_root = {
+        let log_root_str = log_root.as_str();
+        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+            Url::parse(stripped).unwrap()
+        } else {
+            log_root.clone()
+        }
+    };
     let log_segment = LogSegment {
         end_version: 1,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root,
         ascending_commit_files: vec![
             create_log_path("memory:///_delta_log/00000000000000000000.json"),
             create_log_path("memory:///_delta_log/00000000000000000001.json"),
@@ -2520,10 +2547,19 @@ fn test_content_root_found_in_checkpoint() -> DeltaResult<()> {
         store.put(&path1, commit1_content.into()).await.unwrap();
     });
 
+    let table_root = {
+        let log_root_str = log_root.as_str();
+        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+            Url::parse(stripped).unwrap()
+        } else {
+            log_root.clone()
+        }
+    };
     let log_segment = LogSegment {
         end_version: 1,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root,
         ascending_commit_files: vec![create_log_path(
             "memory:///_delta_log/00000000000000000001.json",
         )],
@@ -2567,10 +2603,19 @@ fn test_content_root_returns_first_found() -> DeltaResult<()> {
         store.put(&path1, commit1_content.into()).await.unwrap();
     });
 
+    let table_root = {
+        let log_root_str = log_root.as_str();
+        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+            Url::parse(stripped).unwrap()
+        } else {
+            log_root.clone()
+        }
+    };
     let log_segment = LogSegment {
         end_version: 1,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root,
         ascending_commit_files: vec![
             create_log_path("memory:///_delta_log/00000000000000000000.json"),
             create_log_path("memory:///_delta_log/00000000000000000001.json"),
@@ -2618,10 +2663,19 @@ fn test_content_root_with_multiple_commits() -> DeltaResult<()> {
         store.put(&path2, commit2_content.into()).await.unwrap();
     });
 
+    let table_root = {
+        let log_root_str = log_root.as_str();
+        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+            Url::parse(stripped).unwrap()
+        } else {
+            log_root.clone()
+        }
+    };
     let log_segment = LogSegment {
         end_version: 2,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root,
         ascending_commit_files: vec![
             create_log_path("memory:///_delta_log/00000000000000000001.json"),
             create_log_path("memory:///_delta_log/00000000000000000002.json"),

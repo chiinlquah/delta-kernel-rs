@@ -54,6 +54,7 @@ pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
+    pub table_root: Url,
     /// Sorted commit files in the log segment (ascending)
     pub ascending_commit_files: Vec<ParsedLogPath>,
     /// Sorted (by start version) compaction files in the log segment (ascending)
@@ -85,6 +86,20 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        // Strip "_delta_log/" from log_root to get table_root
+        let table_root = {
+            let log_root_str = log_root.as_str();
+            if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
+                Url::parse(stripped).map_err(|e| {
+                    Error::generic(format!("Failed to parse table root from log_root: {}", e))
+                })?
+            } else {
+                return Err(Error::generic(format!(
+                    "log_root does not end with '_delta_log/': {}",
+                    log_root_str
+                )));
+            }
+        };
         let (
             mut ascending_commit_files,
             ascending_compaction_files,
@@ -142,6 +157,7 @@ impl LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
+            table_root,
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
@@ -494,10 +510,12 @@ impl LogSegment {
         engine: &dyn Engine,
         content_root: &ContentRoot,
         checkpoint_read_schema: SchemaRef,
+        table_root: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let content_root_url = Url::parse(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        let metadata = crate::metadata::Metadata::read(engine, &content_root_url)?;
+        let metadata =
+            crate::metadata::Metadata::read(engine, &content_root_url, table_root.clone())?;
         // TODO: Provide partition keys
         metadata.root_action_batches(engine, &checkpoint_read_schema, &[])
     }
@@ -531,7 +549,12 @@ impl LogSegment {
             SchemaRef,
         ) = if let Some(cr) = content_root.filter(|_| need_file_actions) {
             (
-                Self::create_content_root_reader(engine, cr, action_schema.clone())?,
+                Self::create_content_root_reader(
+                    engine,
+                    cr,
+                    action_schema.clone(),
+                    &self.table_root,
+                )?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )
         } else {

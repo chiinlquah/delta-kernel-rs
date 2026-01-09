@@ -50,6 +50,55 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Helper function to remove all files from a scan by adding them to a transaction.
+/// Returns the total count of files removed.
+fn remove_all_scan_files(
+    txn: &mut delta_kernel::transaction::Transaction,
+    scan: delta_kernel::scan::Scan,
+    engine: &dyn Engine,
+) -> DeltaResult<usize> {
+    let mut total_file_count = 0;
+    for scan_metadata_result in scan.scan_metadata(engine)? {
+        let scan_metadata = scan_metadata_result?;
+        let file_count = (scan_metadata.scan_files.data().len()
+            - scan_metadata.scan_files.selection_vector().len())
+            + scan_metadata
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&x| *x)
+                .count();
+        total_file_count += file_count;
+        txn.remove_files(scan_metadata.scan_files);
+    }
+    Ok(total_file_count)
+}
+
+/// Helper function to remove files from a scan with custom selection logic.
+/// The `modify_selection` closure is called for each batch and can modify the selection vector.
+/// Returns the total count of files removed.
+fn remove_scan_files_with_selection<F>(
+    txn: &mut delta_kernel::transaction::Transaction,
+    scan: delta_kernel::scan::Scan,
+    engine: &dyn Engine,
+    mut modify_selection: F,
+) -> DeltaResult<usize>
+where
+    F: FnMut(usize, &mut Vec<bool>) -> bool, // (batch_idx, selection_vector) -> should_remove
+{
+    let mut total_removed = 0;
+    for (batch_idx, scan_metadata_result) in scan.scan_metadata(engine)?.enumerate() {
+        let scan_metadata = scan_metadata_result?;
+        let (data, mut selection_vector) = scan_metadata.scan_files.into_parts();
+
+        if modify_selection(batch_idx, &mut selection_vector) {
+            total_removed += selection_vector.iter().filter(|&x| *x).count();
+            txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+        }
+    }
+    Ok(total_removed)
+}
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -151,6 +200,23 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     size
 }
 
+async fn batch_write_data_and_check_result_and_stats(
+    table_url: Url,
+    schema: SchemaRef,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    expected_since_commit: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let committer = Box::new(FileSystemCommitter::new());
+    let txn = snapshot
+        .clone()
+        .transaction(committer)?
+        .with_data_change(true)
+        .with_batch_commit();
+    append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
+        .await
+}
+
 async fn write_data_and_check_result_and_stats(
     table_url: Url,
     schema: SchemaRef,
@@ -159,8 +225,21 @@ async fn write_data_and_check_result_and_stats(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot.transaction(committer)?.with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction(committer)?
+        .with_data_change(true);
+    append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
+        .await
+}
 
+async fn append_data_and_check_result_and_stats(
+    _snapshot: Arc<Snapshot>,
+    mut txn: delta_kernel::transaction::Transaction,
+    schema: SchemaRef,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    expected_since_commit: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
         let data = RecordBatch::try_new(
@@ -2178,11 +2257,10 @@ async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_remove_files_verify_files_excluded_from_scan(
+/// Helper method: Adds and then removes files and then verifies they don't appear in the scan.
+async fn remove_files_verify_files_excluded_from_scan_impl(
+    use_batch_commit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Adds and then removes files and then verifies they don't appear in the scan.
-
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -2197,8 +2275,23 @@ async fn test_remove_files_verify_files_excluded_from_scan(
     {
         // First, add some files to the table
         let engine = Arc::new(engine);
-        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+        if use_batch_commit {
+            batch_write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                1,
+            )
             .await?;
+        } else {
+            write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                1,
+            )
+            .await?;
+        }
 
         // Get initial file count
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -2217,23 +2310,16 @@ async fn test_remove_files_verify_files_excluded_from_scan(
             .with_operation("DELETE".to_string())
             .with_data_change(true);
 
+        // Conditionally enable batch commit mode
+        if use_batch_commit {
+            txn = txn.with_batch_commit();
+        }
+
         // Create a new scan to get file metadata for removal
-        let scan2 = snapshot.scan_builder().build()?;
-        let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
-
-        // Create FilteredEngineData for removal (select all rows for removal)
-        let file_remove_count = (scan_metadata2.scan_files.data().len()
-            - scan_metadata2.scan_files.selection_vector().len())
-            + scan_metadata2
-                .scan_files
-                .selection_vector()
-                .iter()
-                .filter(|&x| *x)
-                .count();
-        assert!(file_remove_count > 0);
-
-        // Add remove files to transaction
-        txn.remove_files(scan_metadata2.scan_files);
+        // Process ALL scan metadata batches and add all files for removal
+        let scan2 = snapshot.clone().scan_builder().build()?;
+        let total_file_remove_count = remove_all_scan_files(&mut txn, scan2, engine.as_ref())?;
+        assert!(total_file_remove_count > 0);
 
         // Commit the transaction
         let result = txn.commit(engine.as_ref());
@@ -2262,12 +2348,21 @@ async fn test_remove_files_verify_files_excluded_from_scan(
 }
 
 #[tokio::test]
-async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
-{
-    // This test verifies that we can selectively remove files by:
-    // 1. Calling remove_files multiple times with different subsets
-    // 2. Modifying the selection vector to choose which files to remove
+async fn test_remove_files_verify_files_excluded_from_scan(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Tests both batch and non-batch commit modes.
+    for use_batch_commit in [false, true] {
+        remove_files_verify_files_excluded_from_scan_impl(use_batch_commit).await?;
+    }
+    Ok(())
+}
 
+/// Helper method: Verifies that we can selectively remove files by:
+/// 1. Calling remove_files multiple times with different subsets
+/// 2. Modifying the selection vector to choose which files to remove
+async fn remove_files_with_modified_selection_vector_impl(
+    use_batch_commit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -2282,13 +2377,23 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 
         // Write data multiple times to create multiple files
         for i in 1..=5 {
-            write_data_and_check_result_and_stats(
-                table_url.clone(),
-                schema.clone(),
-                engine.clone(),
-                i,
-            )
-            .await?;
+            if use_batch_commit {
+                batch_write_data_and_check_result_and_stats(
+                    table_url.clone(),
+                    schema.clone(),
+                    engine.clone(),
+                    i,
+                )
+                .await?;
+            } else {
+                write_data_and_check_result_and_stats(
+                    table_url.clone(),
+                    schema.clone(),
+                    engine.clone(),
+                    i,
+                )
+                .await?;
+            }
         }
 
         // Get initial file count
@@ -2320,55 +2425,81 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
             .with_operation("DELETE".to_string())
             .with_data_change(true);
 
-        // First batch: Remove only the first file
-        let scan2 = snapshot.clone().scan_builder().build()?;
-        let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
-        let (data, mut selection_vector) = scan_metadata2.scan_files.into_parts();
-
-        // Select only the first file for removal
-        let mut first_batch_removed = 0;
-        for selected in selection_vector.iter_mut() {
-            if *selected && first_batch_removed < 1 {
-                // Keep selected for removal
-                first_batch_removed += 1;
-            } else {
-                // Don't remove
-                *selected = false;
-            }
+        // Conditionally enable batch commit mode
+        if use_batch_commit {
+            txn = txn.with_batch_commit();
         }
+
+        // First batch: Remove only the first file
+        // In batch mode, files might be spread across multiple scan batches,
+        // so we need to process all of them
+        let scan2 = snapshot.clone().scan_builder().build()?;
+        let mut files_found = 0;
+        let first_batch_removed = remove_scan_files_with_selection(
+            &mut txn,
+            scan2,
+            engine.as_ref(),
+            |_batch_idx, selection_vector| {
+                // Select only the first file for removal (if we haven't found one yet)
+                for selected in selection_vector.iter_mut() {
+                    if *selected && files_found < 1 {
+                        files_found += 1;
+                    } else {
+                        *selected = false;
+                    }
+                }
+                selection_vector.iter().any(|&x| x) // Only add if any files selected
+            },
+        )?;
 
         assert_eq!(
             first_batch_removed, 1,
             "Should remove exactly 1 file in first batch"
         );
-        txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
         // Second batch: Remove only the last file
+        // Again, process all scan batches to find the last file
         let scan3 = snapshot.clone().scan_builder().build()?;
-        let scan_metadata3 = scan3.scan_metadata(engine.as_ref())?.next().unwrap()?;
-        let (data2, mut selection_vector2) = scan_metadata3.scan_files.into_parts();
 
-        // Find the last selected file and keep only that one selected
-        let mut last_selected_idx = None;
-        for (i, &selected) in selection_vector2.iter().enumerate() {
-            if selected {
-                last_selected_idx = Some(i);
+        // First, collect all scan batches to find the last selected file
+        let mut all_batches = vec![];
+        for scan_metadata in scan3.scan_metadata(engine.as_ref())? {
+            all_batches.push(scan_metadata?);
+        }
+
+        // Find the last selected file across all batches
+        let mut last_batch_idx = None;
+        let mut last_file_idx = None;
+        for (batch_idx, batch) in all_batches.iter().enumerate() {
+            for (file_idx, &selected) in batch.scan_files.selection_vector().iter().enumerate() {
+                if selected {
+                    last_batch_idx = Some(batch_idx);
+                    last_file_idx = Some(file_idx);
+                }
             }
         }
 
-        // Deselect all except the last one
-        for (i, selected) in selection_vector2.iter_mut().enumerate() {
-            if Some(i) != last_selected_idx {
-                *selected = false;
-            }
-        }
+        // Now process all batches again and remove only the last file
+        let scan4 = snapshot.clone().scan_builder().build()?;
+        let second_batch_removed = remove_scan_files_with_selection(
+            &mut txn,
+            scan4,
+            engine.as_ref(),
+            |batch_idx, selection_vector| {
+                // Deselect all except the last one
+                for (file_idx, selected) in selection_vector.iter_mut().enumerate() {
+                    if Some(batch_idx) != last_batch_idx || Some(file_idx) != last_file_idx {
+                        *selected = false;
+                    }
+                }
+                selection_vector.iter().any(|&x| x) // Only add if any files selected
+            },
+        )?;
 
-        let second_batch_removed = selection_vector2.iter().filter(|&x| *x).count();
         assert_eq!(
             second_batch_removed, 1,
             "Should remove exactly 1 file in second batch"
         );
-        txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
 
         // Commit the transaction
         let result = txn.commit(engine.as_ref())?;
@@ -2402,6 +2533,16 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
             }
             _ => panic!("Transaction did not succeed"),
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Tests both batch and non-batch commit modes.
+    for use_batch_commit in [false, true] {
+        remove_files_with_modified_selection_vector_impl(use_batch_commit).await?;
     }
     Ok(())
 }
@@ -2718,5 +2859,76 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         assert_eq!(batch_version, 2);
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that remove_files works correctly in batch commit mode.
+    // It should behave the same as non-batch mode for removes without root manifest paths.
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let engine = Arc::new(engine);
+        // First, add some files to the table
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+
+        // Get initial file count
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (_, selection_vector) = scan_metadata.scan_files.into_parts();
+        let initial_file_count = selection_vector.iter().filter(|&x| *x).count();
+
+        assert!(initial_file_count > 0);
+
+        // Now create a transaction with batch_commit enabled
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_batch_commit() // Enable batch commit mode
+            .with_engine_info("test engine")
+            .with_operation("DELETE".to_string())
+            .with_data_change(true);
+
+        // Create a new scan to get file metadata for removal
+        // Process all scan batches in case files are spread across multiple batches
+        let scan2 = snapshot.scan_builder().build()?;
+        let total_file_remove_count = remove_all_scan_files(&mut txn, scan2, engine.as_ref())?;
+        assert!(total_file_remove_count > 0);
+
+        // Commit the transaction
+        let result = txn.commit(engine.as_ref());
+
+        match result? {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), 2);
+
+                // Verify the new snapshot has no files
+                let new_snapshot = Snapshot::builder_for(table_url.clone())
+                    .at_version(2)
+                    .build(engine.as_ref())?;
+
+                let new_scan = new_snapshot.scan_builder().build()?;
+                let mut new_file_count = 0;
+                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
+                    new_file_count += new_metadata?.scan_files.data().len();
+                }
+
+                // All files were removed, so new_file_count should be zero
+                assert_eq!(new_file_count, 0);
+            }
+            _ => panic!("Transaction did not succeed."),
+        }
+    }
     Ok(())
 }

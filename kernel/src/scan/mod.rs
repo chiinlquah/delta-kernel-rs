@@ -483,6 +483,10 @@ impl Scan {
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
                     StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+                    StructField::nullable("dataManifestPath", DataType::STRING),
+                    StructField::nullable("dataManifestPosition", DataType::LONG),
+                    StructField::nullable("deleteManifestPath", DataType::STRING),
+                    StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             )])
         });

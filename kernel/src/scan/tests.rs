@@ -588,6 +588,10 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         end_version: 5,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root: {
+            let log_root_str = log_root.as_str();
+            Url::parse(log_root_str.strip_suffix("_delta_log/").unwrap()).unwrap()
+        },
         ascending_commit_files: commit_files,
         ascending_compaction_files: vec![],
         checkpoint_parts: vec![],
@@ -792,6 +796,10 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         end_version: 20,
         checkpoint_version: None,
         log_root: log_root.clone(),
+        table_root: {
+            let log_root_str = log_root.as_str();
+            Url::parse(log_root_str.strip_suffix("_delta_log/").unwrap()).unwrap()
+        },
         ascending_commit_files: commit_files,
         ascending_compaction_files: vec![],
         checkpoint_parts: vec![],

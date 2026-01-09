@@ -292,7 +292,7 @@ impl Transaction {
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         // Step 4: Generate all domain metadata actions (user and system domains)
-        let add_actions = self.generate_add_actions(
+        let actions = self.generate_log_actions(
             engine,
             commit_version,
             snapshot_id,
@@ -300,15 +300,7 @@ impl Transaction {
             set_transaction_actions,
         )?;
 
-        // Step 5: Generate remove actions
-        let remove_actions = self.generate_remove_actions(engine)?;
-
-        let filtered_actions = add_actions
-            .into_iter()
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
-            .chain(remove_actions);
-
-        // Step 6: Commit via the committer
+        // Step 5: Commit via the committer
         #[cfg(feature = "catalog-managed")]
         if self.committer.any_ref().is::<FileSystemCommitter>()
             && self
@@ -323,7 +315,7 @@ impl Transaction {
         let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
-            .commit(engine, Box::new(filtered_actions), commit_metadata)
+            .commit(engine, Box::new(actions.into_iter()), commit_metadata)
         {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
@@ -342,14 +334,14 @@ impl Transaction {
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
     /// domain metadata, and add actions (or content root for batch commits).
-    fn generate_add_actions(
+    fn generate_log_actions(
         &self,
         engine: &dyn Engine,
         commit_version: u64,
         snapshot_id: Option<i64>,
         commit_info_action: DeltaResult<Box<dyn EngineData>>,
         set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
-    ) -> DeltaResult<Vec<DeltaResult<Box<dyn EngineData>>>> {
+    ) -> DeltaResult<Vec<DeltaResult<FilteredEngineData>>> {
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
@@ -357,12 +349,21 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        let mut actions_vec = vec![commit_info_action];
-        actions_vec.extend(set_transaction_actions);
-        actions_vec.extend(domain_metadata_actions);
+        let mut actions_vec =
+            vec![commit_info_action.map(FilteredEngineData::with_all_rows_selected)];
+        actions_vec.extend(
+            set_transaction_actions
+                .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
+        );
+        actions_vec.extend(
+            domain_metadata_actions
+                .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
+        );
 
         // Handle batch commit - either write to metadata tree or include in JSON log
-        if self.batch_commit && !self.add_files_metadata.is_empty() {
+        if self.batch_commit
+            && (!self.add_files_metadata.is_empty() || !self.remove_files_metadata.is_empty())
+        {
             // Find the latest content root in the log segment to avoid full replay
             let latest_content_root = self
                 .read_snapshot
@@ -371,7 +372,11 @@ impl Transaction {
 
             // Decide whether to load from content root or build from snapshot
             let metadata = if let Some((content_root_action, _version)) = latest_content_root {
-                crate::metadata::Metadata::new_from_content_root(engine, &content_root_action)?
+                crate::metadata::Metadata::new_from_content_root(
+                    engine,
+                    &content_root_action,
+                    self.read_snapshot.table_root().clone(),
+                )?
             } else {
                 // No content root found, build from snapshot (full replay)
                 crate::metadata::Metadata::new_from_snapshot(engine, self.read_snapshot.clone())?
@@ -379,7 +384,7 @@ impl Transaction {
 
             let mut metadata_builder = metadata.to_builder();
             for add_metadata_result in self.add_files_metadata.iter() {
-                // TODO: files might be re-added
+                // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(
                     add_metadata_result.as_ref(),
                     commit_version,
@@ -387,11 +392,44 @@ impl Transaction {
                 )?;
             }
 
+            // In batch mode, process ALL remove actions and mark entries as DELETED in the ContentRoot
+            // The ContentRoot manages all file state, so any removes should be reflected there
+            // This applies whether we loaded from an existing ContentRoot or built from snapshot
+            if !self.remove_files_metadata.is_empty() {
+                use crate::actions::visitors::RemoveVisitor;
+                use crate::RowVisitor;
+
+                // Process each remove batch and mark all files as deleted in the ContentRoot
+                for remove_action_result in self.generate_remove_actions(engine)? {
+                    let remove_action = remove_action_result?;
+                    let mut visitor = RemoveVisitor::default();
+                    visitor.visit_rows_of(remove_action.data())?;
+
+                    // Mark all removes as deleted in the ContentRoot
+                    for remove in visitor.removes.iter() {
+                        // Mark the corresponding entry as DELETED in the metadata
+                        let file_path = Some(remove.path.as_str());
+                        let dv_path: Option<&str> = remove
+                            .deletion_vector
+                            .as_ref()
+                            .map(|dv| dv.path_or_inline_dv.as_str());
+
+                        metadata_builder.mark_deleted(
+                            file_path,
+                            dv_path,
+                            commit_version,
+                            snapshot_id,
+                        )?;
+                    }
+                }
+            }
+
             let new_metadata = metadata_builder.build(engine)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
             let content_root_action = ContentRoot {
                 path: content_metadata_path.to_string(),
+                // TODO: set size_in_bytes
                 size_in_bytes: 0,
             };
 
@@ -399,10 +437,13 @@ impl Transaction {
             let content_root_data =
                 content_root_action.into_engine_data(get_log_content_root_schema().clone(), engine);
 
-            actions_vec.push(content_root_data)
+            actions_vec.push(content_root_data.map(FilteredEngineData::with_all_rows_selected))
         } else {
             // Normal mode: add actions go in the JSON log
-            actions_vec.extend(add_actions);
+            actions_vec.extend(
+                add_actions.map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
+            );
+            actions_vec.extend(self.generate_remove_actions(engine)?)
         }
 
         Ok(actions_vec)
@@ -954,19 +995,20 @@ impl Transaction {
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
-                    Expression::null_literal(DataType::STRING).into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPath"]).into(),
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
-                    Expression::null_literal(DataType::LONG).into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPosition"]).into(),
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
-                    Expression::null_literal(DataType::STRING).into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPath"]).into(),
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
-                    Expression::null_literal(DataType::LONG).into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPosition"])
+                        .into(),
                 )
                 .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
                 .with_dropped_field("modificationTime"),

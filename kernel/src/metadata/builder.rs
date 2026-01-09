@@ -309,7 +309,6 @@ impl MetadataBuilder {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if there was an error visiting the engine data
-    #[allow(dead_code)]
     pub(crate) fn add_from_scan_row_data(
         &mut self,
         engine_data: &dyn EngineData,
@@ -321,6 +320,73 @@ impl MetadataBuilder {
 
         for add in visitor.adds {
             self.add(add, version, snapshot_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Adds a raw MetadataEntry to the builder.
+    ///
+    /// This is useful when copying entries from existing metadata.
+    #[allow(dead_code)]
+    pub(crate) fn add_entry(&mut self, entry: MetadataEntry) {
+        self.pending_entries.push(entry);
+    }
+
+    /// Marks existing entries as DELETED based on a matching file path or deletion vector.
+    ///
+    /// This method searches through pending entries and updates their tracking status to DELETED
+    /// if they match the provided criteria. It's used when processing Remove actions that reference
+    /// files in the root manifest.
+    ///
+    /// # Arguments
+    /// * `file_path` - Optional file path to match against entry locations
+    /// * `dv_path` - Optional deletion vector path to match
+    /// * `version` - The version at which this deletion occurs
+    /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
+    ///
+    pub(crate) fn mark_deleted(
+        &mut self,
+        file_path: Option<&str>,
+        dv_path: Option<&str>,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        // Convert paths to absolute before the loop to avoid borrow checker issues
+        let absolute_file_path = file_path
+            .map(|path| self.path_to_absolute(path))
+            .transpose()?;
+        let absolute_dv_path = dv_path
+            .map(|path| self.path_to_absolute(path))
+            .transpose()?;
+
+        for entry in &mut self.pending_entries {
+            // Check if this entry matches the file path or deletion vector path
+            let matches = if let Some(ref absolute_path) = absolute_file_path {
+                entry.location.as_ref() == Some(absolute_path)
+            } else if let Some(ref absolute_dv) = absolute_dv_path {
+                entry.referenced_file.as_ref() == Some(absolute_dv)
+            } else {
+                false
+            };
+
+            if matches {
+                // Update the tracking info to mark as deleted
+                if let Some(ref mut tracking_info) = entry.tracking_info {
+                    tracking_info.status = TrackingStatus::Deleted;
+                    tracking_info.snapshot_id = snapshot_id;
+                    tracking_info.sequence_number = Some(version as i64);
+                } else {
+                    // Create new tracking info if it doesn't exist
+                    entry.tracking_info = Some(TrackingInfo {
+                        status: TrackingStatus::Deleted,
+                        snapshot_id,
+                        sequence_number: Some(version as i64),
+                        file_sequence_number: Some(version as i64),
+                        first_row_id: None,
+                    });
+                }
+            }
         }
 
         Ok(())

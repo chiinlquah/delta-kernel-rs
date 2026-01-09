@@ -252,8 +252,12 @@ impl Metadata {
 
         // Convert each MetadataEntry to AddRemove
         // For root_action_batches, there are no affiliated manifests, so we pass an empty affiliated map
+        // Note: Entries with Deleted status will be converted to Remove actions, which will have null
+        // paths when processed through the Add-only scan schema. These are filtered out by the
+        // ScanFileVisitor (see scan/state.rs:201) which skips rows where path is null.
         let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
         let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
+
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
@@ -515,6 +519,7 @@ impl Metadata {
     pub(crate) fn build_shared_dv_map(
         shared_state: &SharedLeafState,
         engine: &dyn Engine,
+        table_root: &Url,
     ) -> DeltaResult<HashMap<String, DeletionVectorInfo>> {
         // Start with unmatched DVs from the root
         let mut deletion_vector_map = shared_state.unmatched_dvs.clone();
@@ -530,7 +535,8 @@ impl Metadata {
                 Error::generic(format!("Failed to parse delete manifest URL: {}", e))
             })?;
 
-            let mut delete_entries = Metadata::read(engine, &delete_manifest_url)?.entries()?;
+            let mut delete_entries =
+                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
 
             // Apply manifest DV if present
             if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
@@ -562,17 +568,24 @@ impl Metadata {
         root_state: LeafReferences,
         engine: &dyn Engine,
         schema: &SchemaRef,
+        table_root: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Build the shared DV map once
-        let shared_dv_map = Self::build_shared_dv_map(&root_state.shared_state, engine)?;
+        let shared_dv_map =
+            Self::build_shared_dv_map(&root_state.shared_state, engine, table_root)?;
 
         // Process each manifest reference
         let mut all_iters: Vec<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> =
             Vec::new();
 
         for manifest_refs in root_state.manifest_references {
-            let iter =
-                Self::manifest_to_action_batches(manifest_refs, &shared_dv_map, engine, schema)?;
+            let iter = Self::manifest_to_action_batches(
+                manifest_refs,
+                &shared_dv_map,
+                engine,
+                schema,
+                table_root,
+            )?;
             all_iters.push(iter);
         }
 
@@ -609,6 +622,7 @@ impl Metadata {
         shared_dv_map: &HashMap<String, DeletionVectorInfo>,
         engine: &dyn Engine,
         schema: &SchemaRef,
+        table_root: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Read the data manifest file
         let data_manifest_location = manifest_refs
@@ -621,7 +635,8 @@ impl Metadata {
             .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
 
         // Read the data manifest entries using the existing Metadata::read method
-        let mut data_manifest_entries = Metadata::read(engine, &data_manifest_url)?.entries()?;
+        let mut data_manifest_entries =
+            Metadata::read(engine, &data_manifest_url, table_root.clone())?.entries()?;
 
         // Apply manifest DV if present
         if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
@@ -642,7 +657,8 @@ impl Metadata {
                 Error::generic(format!("Failed to parse delete manifest URL: {}", e))
             })?;
 
-            let mut delete_entries = Metadata::read(engine, &delete_manifest_url)?.entries()?;
+            let mut delete_entries =
+                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
 
             // Apply manifest DV if present
             if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
@@ -738,7 +754,7 @@ impl Metadata {
     /// # Returns
     /// A `Metadata` instance deserialized from the parquet file.
     #[allow(dead_code)]
-    pub(crate) fn read(engine: &dyn Engine, path: &Url) -> DeltaResult<Self> {
+    pub(crate) fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -770,7 +786,7 @@ impl Metadata {
         Ok(Self {
             data,
             version: parsed.version,
-            table_root: path.clone(),
+            table_root,
         })
     }
 
@@ -783,7 +799,23 @@ impl Metadata {
     /// A `MetadataBuilder` that can be used to add more entries or build a new Metadata.
     #[allow(dead_code)]
     pub(crate) fn to_builder(&self) -> MetadataBuilder {
-        MetadataBuilder::new_for(self.table_root.clone(), self.version)
+        use crate::metadata::reader::MetadataEntryVisitor;
+        use crate::RowVisitor;
+
+        let mut builder = MetadataBuilder::new_for(self.table_root.clone(), self.version);
+
+        // Copy existing entries from this metadata into the builder
+        for engine_data in &self.data {
+            let mut visitor = MetadataEntryVisitor::default();
+            // Ignore errors - if we can't extract entries, just skip them
+            if visitor.visit_rows_of(engine_data.as_ref()).is_ok() {
+                for entry in visitor.entries {
+                    builder.add_entry(entry);
+                }
+            }
+        }
+
+        builder
     }
 
     /// Creates Metadata from a content root commit.
@@ -801,11 +833,12 @@ impl Metadata {
     pub(crate) fn new_from_content_root(
         engine: &dyn Engine,
         content_root: &ContentRoot,
+        table_root: Url,
     ) -> DeltaResult<Self> {
         // Parse and read from the content root file referenced by the ContentRoot action
         let content_root_url = Url::parse(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        Self::read(engine, &content_root_url)
+        Self::read(engine, &content_root_url, table_root)
     }
 }
 
@@ -2207,7 +2240,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2238,7 +2271,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2269,7 +2302,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2300,7 +2333,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2365,7 +2398,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2441,7 +2474,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -2513,7 +2546,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -2569,7 +2602,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -2634,7 +2667,7 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file)?;
+        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3277,8 +3310,13 @@ mod tests {
         // Process manifest to action batches (empty shared DV map)
         let schema = crate::actions::get_log_add_schema().clone();
         let shared_dv_map = HashMap::new();
-        let action_batches =
-            Metadata::manifest_to_action_batches(manifest_refs, &shared_dv_map, &engine, &schema)?;
+        let action_batches = Metadata::manifest_to_action_batches(
+            manifest_refs,
+            &shared_dv_map,
+            &engine,
+            &schema,
+            &table_root_url,
+        )?;
 
         // Collect all Add actions
         let mut all_adds = Vec::new();
@@ -3519,7 +3557,7 @@ mod tests {
         };
 
         // Build the shared DV map
-        let dv_map = Metadata::build_shared_dv_map(&shared_state, &engine)?;
+        let dv_map = Metadata::build_shared_dv_map(&shared_state, &engine, &table_root_url)?;
 
         // Verify we have all 3 DVs
         assert_eq!(dv_map.len(), 3);
@@ -3602,7 +3640,8 @@ mod tests {
 
         // Process all manifests using the helper method
         let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = Metadata::root_to_action_batches(root_state, &engine, &schema)?;
+        let action_batches =
+            Metadata::root_to_action_batches(root_state, &engine, &schema, &table_root_url)?;
 
         // Collect all Add actions
         let mut all_adds = Vec::new();

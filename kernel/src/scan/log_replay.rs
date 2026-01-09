@@ -295,6 +295,10 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
                 /*valueContainsNull*/ true,
             ),
         ),
+        StructField::nullable("dataManifestPath", DataType::STRING),
+        StructField::nullable("dataManifestPosition", DataType::LONG),
+        StructField::nullable("deleteManifestPath", DataType::STRING),
+        StructField::nullable("deleteManifestPosition", DataType::LONG),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -323,6 +327,10 @@ fn get_add_transform_expr() -> ExpressionRef {
                 column_expr_ref!("add.baseRowId"),
                 column_expr_ref!("add.defaultRowCommitVersion"),
                 column_expr_ref!("add.tags"),
+                column_expr_ref!("add.dataManifestPath"),
+                column_expr_ref!("add.dataManifestPosition"),
+                column_expr_ref!("add.deleteManifestPath"),
+                column_expr_ref!("add.deleteManifestPosition"),
             ])),
         ]))
     });
@@ -345,6 +353,10 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("deletionVector"),
                 column_expr_ref!("fileConstantValues.baseRowId"),
                 column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                column_expr_ref!("fileConstantValues.dataManifestPath"),
+                column_expr_ref!("fileConstantValues.dataManifestPosition"),
+                column_expr_ref!("fileConstantValues.deleteManifestPath"),
+                column_expr_ref!("fileConstantValues.deleteManifestPosition"),
             ],
         ))]))
     });
