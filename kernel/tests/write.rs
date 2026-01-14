@@ -2305,36 +2305,6 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn test_batch_commit_chaining() -> Result<(), Box<dyn std::error::Error>> {
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    for (table_url, engine, _store, _table_name) in
-        setup_test_tables(schema.clone(), &[], None, "test_table").await?
-    {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-
-        // Test that with_batch_commit can be chained with other builder methods
-        // This test verifies that the fluent API works correctly - if any method
-        // returns the wrong type, this won't compile
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
-            .with_batch_commit()
-            .with_engine_info("test engine")
-            .with_data_change(false)
-            .with_operation("TEST_OPERATION".to_string());
-
-        // Test that the transaction can be committed successfully
-        assert!(txn.commit(&engine)?.is_committed());
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_update_deletion_vectors_adds_expected_entries(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that deletion vector updates write proper Remove and Add actions

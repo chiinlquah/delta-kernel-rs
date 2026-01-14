@@ -14,6 +14,8 @@ use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
+use delta_kernel_derive::internal_api;
+
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
@@ -27,7 +29,6 @@ use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
-use delta_kernel_derive::internal_api;
 
 pub mod executor;
 pub mod file_stream;
@@ -81,6 +82,9 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
         item
     }
 }
+
+const DEFAULT_BUFFER_SIZE: usize = 1000;
+const DEFAULT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
@@ -156,10 +160,7 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
 }
 
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
-    /// Create a new [`DefaultEngine`] instance with the default executor.
-    ///
-    /// Uses `TokioBackgroundExecutor` as the default executor.
-    /// For custom executors, use [`DefaultEngine::new_with_executor`].
+    /// Create a [`DefaultEngineBuilder`] for constructing a [`DefaultEngine`] with custom options.
     ///
     /// # Parameters
     ///
@@ -329,7 +330,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store);
+        let engine = DefaultEngineBuilder::new(object_store).build();
         test_arrow_engine(&engine, &url);
     }
 

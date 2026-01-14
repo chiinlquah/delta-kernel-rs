@@ -68,6 +68,11 @@ pub(crate) struct LogSegment {
     /// Schema of the checkpoint file(s), if known from `_last_checkpoint` hint.
     /// Used to determine if `stats_parsed` is available for data skipping.
     pub checkpoint_schema: Option<SchemaRef>,
+    /// The maximum published commit version found during listing, if available.
+    /// Note that this published commit file maybe not be included in
+    /// [ascending_commit_files] if there is a catalog commit present for the same
+    /// version that took priority over it.
+    pub max_published_version: Option<Version>,
 }
 
 /// A partial commit cover is a set of files that cover is a set of files that is a
@@ -79,6 +84,12 @@ pub(crate) struct PartialCommitCover {
     pub(crate) files: Vec<FileMeta>,
     pub(crate) meta_predicate: Option<PredicateRef>,
     pub(crate) read_schema: SchemaRef,
+    /// The maximum published commit version found during listing, if available.
+    /// Note that this published commit file maybe not be included in
+    /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
+    /// version that took priority over it.
+    #[allow(dead_code)]
+    pub max_published_version: Option<Version>,
 }
 
 impl LogSegment {
@@ -109,6 +120,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            max_published_version,
         ) = listed_files.into_parts();
 
         // Ensure commit file versions are contiguous
@@ -167,6 +179,7 @@ impl LogSegment {
             latest_crc_file,
             latest_commit_file,
             checkpoint_schema,
+            max_published_version,
         })
     }
 
@@ -498,6 +511,7 @@ impl LogSegment {
                             files: copied_files,
                             meta_predicate: meta_predicate.clone(),
                             read_schema: read_schema.clone(),
+                            max_published_version: self.max_published_version,
                         });
                     }
                     // Reset back to the full schema for any commits after the root to ensure no
@@ -515,6 +529,7 @@ impl LogSegment {
             files: selected_files,
             meta_predicate: meta_predicate.clone(),
             read_schema: commit_read_schema.clone(),
+            max_published_version: self.max_published_version,
         });
         commit_covers.reverse();
         Ok(commit_covers)

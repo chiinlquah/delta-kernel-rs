@@ -598,6 +598,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         latest_crc_file: None,
         latest_commit_file,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Create a Snapshot from the log_segment
@@ -807,6 +808,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Create a Snapshot from the log_segment

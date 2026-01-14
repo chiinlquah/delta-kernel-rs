@@ -435,7 +435,7 @@ impl Transaction {
         let dv_update_actions: Vec<_> = self.generate_dv_update_actions(engine)?.collect();
 
         // Step 4: Generate all domain metadata actions (user and system domains)
-        let mut actions = self.generate_log_actions(
+        let actions = self.generate_log_actions(
             engine,
             commit_version,
             snapshot_id,
@@ -443,8 +443,14 @@ impl Transaction {
             set_transaction_actions,
         )?;
 
-        // Step 5: Add DV update actions (remove/add pairs for files with updated deletion vectors)
-        actions.extend(dv_update_actions);
+        // Step 5: Generate remove actions (collect to avoid borrowing self)
+        let remove_actions =
+            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+
+        let filtered_actions = actions
+            .into_iter()
+            .chain(remove_actions)
+            .chain(dv_update_actions);
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -461,7 +467,7 @@ impl Transaction {
         let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
-            .commit(engine, Box::new(actions.into_iter()), commit_metadata)
+            .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
@@ -588,14 +594,10 @@ impl Transaction {
             actions_vec.push(content_root_data.map(FilteredEngineData::with_all_rows_selected))
         } else {
             // Normal mode: add actions go in the JSON log
+            // Remove actions are added separately in the commit method
             actions_vec.extend(
                 add_actions.map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
             );
-            actions_vec.extend(self.generate_remove_actions(
-                engine,
-                self.remove_files_metadata.iter(),
-                &[],
-            )?)
         }
 
         Ok(actions_vec)
@@ -1289,7 +1291,8 @@ impl Transaction {
             .with_inserted_field(
                 Some("deletionVector"),
                 Expression::null_literal(DataType::LONG).into(),
-            );
+            )
+            .with_dropped_field("modificationTime");
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {
