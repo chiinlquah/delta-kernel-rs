@@ -434,6 +434,9 @@ impl Transaction {
         // Collect eagerly to avoid holding a borrow of `self` across the commit
         let dv_update_actions: Vec<_> = self.generate_dv_update_actions(engine)?.collect();
 
+        // Step 3b: Generate DV update actions (remove/add pairs) if any DV updates are present
+        let dv_update_actions = self.generate_dv_update_actions(engine)?;
+
         // Step 4: Generate all domain metadata actions (user and system domains)
         let mut actions = self.generate_log_actions(
             engine,
@@ -443,8 +446,19 @@ impl Transaction {
             set_transaction_actions,
         )?;
 
-        // Step 5: Add DV update actions (remove/add pairs for files with updated deletion vectors)
-        actions.extend(dv_update_actions);
+        // Step 5: Generate remove actions (collect to avoid borrowing self)
+        let remove_actions =
+            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+
+        // let actions = iter::once(commit_info_action)
+        //     .chain(add_actions)
+        //     .chain(set_transaction_actions)
+        //     .chain(domain_metadata_actions);
+
+        let filtered_actions = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions)
+            .chain(dv_update_actions);
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -1289,7 +1303,8 @@ impl Transaction {
             .with_inserted_field(
                 Some("deletionVector"),
                 Expression::null_literal(DataType::LONG).into(),
-            );
+            )
+            .with_dropped_field("modificationTime");
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {
