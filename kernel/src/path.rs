@@ -339,13 +339,23 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
-    /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
+    /// Create a new ParsedCheckpointPath<Url> for a content metadata parquet file.
+    ///
+    /// If `leaf_uuid` is `None`, creates a root manifest path:
+    ///   `<table_root>/_delta_log/<version>.content.parquet`
+    ///
+    /// If `leaf_uuid` is `Some(uuid)`, creates a leaf manifest path:
+    ///   `<table_root>/_delta_log/<version>.content.<uuid>.parquet`
     #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_content_metadata_path(
         table_root: &Url,
         version: Version,
+        leaf_uuid: Option<uuid::Uuid>,
     ) -> DeltaResult<Self> {
-        let filename = format!("{version:020}.content.parquet");
+        let filename = match leaf_uuid {
+            Some(uuid) => format!("{version:020}.content.{uuid}.parquet"),
+            None => format!("{version:020}.content.parquet"),
+        };
         let path = Self::create_path(table_root, filename)?;
         Ok(path)
     }

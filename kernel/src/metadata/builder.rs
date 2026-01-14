@@ -2,6 +2,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::metadata::writer::MetadataWriter;
 use crate::metadata::{
     ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
     TrackingStatus,
@@ -392,6 +393,93 @@ impl MetadataBuilder {
         Ok(())
     }
 
+    /// Writes the pending entries as a leaf manifest and returns a MetadataEntry referencing it.
+    ///
+    /// https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw/edit?tab=t.0#heading=h.unn922df0zzw
+    ///
+    /// This method:
+    /// 1. Builds a leaf Metadata with a unique UUID
+    /// 2. Writes it to a parquet file using MetadataWriter
+    /// 3. Returns a MetadataEntry (DataManifest type) that references the written leaf
+    ///
+    /// The returned MetadataEntry can be added to a root manifest to reference this leaf.
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for writing the parquet file
+    /// * `snapshot_id` - Optional snapshot ID for tracking info
+    ///
+    /// # Returns
+    /// * `Ok(MetadataEntry)` - A manifest entry referencing the written leaf file
+    /// * `Err` if there was an error building or writing the metadata
+    #[allow(dead_code)]
+    pub(crate) fn write_leaf(
+        &self,
+        engine: &dyn crate::Engine,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<MetadataEntry> {
+        // Build the leaf metadata with a UUID
+        let leaf_metadata = self.build_leaf(engine)?;
+
+        // Write the leaf manifest to a parquet file
+        let content_metadata_path = MetadataWriter::try_new(leaf_metadata)?.write(engine)?;
+
+        // Calculate aggregate stats from pending entries
+        let record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
+        let file_size_in_bytes: i64 = self
+            .pending_entries
+            .iter()
+            .filter_map(|e| e.file_size_in_bytes)
+            .sum();
+
+        Ok(MetadataEntry {
+            content_type: DataContentType::DataManifest,
+            location: Some(content_metadata_path.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id,
+                // Optional for leaf manifests
+                sequence_number: None,
+                // Optional for leaf manifests
+                file_sequence_number: None,
+                // Maybe later
+                first_row_id: None,
+            }),
+
+            // Data files don't have inline content
+            inline_content: None,
+
+            // Content info from deletion vector (if present)
+            content_info: None,
+
+            // TODO: Check how to set these based on uniform as a first iteration.
+            partition_spec_id: 0,
+            sort_order_id: None,
+
+            record_count,
+
+            file_size_in_bytes: Some(file_size_in_bytes),
+
+            // TODO: add.stats contains a JSON blob:
+            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+            // Which we need to convert from name-based to field-id-based
+            manifest_info: None,
+
+            // Path to file where to apply the DV to
+            referenced_file: None,
+
+            // Encryption is not supported
+            key_metadata: None,
+
+            // Not tracked by the current Kernel implementation
+            split_offsets: None,
+
+            // Equality deletes are not supported, passing in null
+            equality_ids: None,
+        })
+    }
+
+    /// Builds a root Metadata instance (leaf is `None`).
     pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
         use crate::schema::ToSchema;
         use crate::IntoEngineData;
@@ -409,6 +497,74 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
+            leaf: None,
+        })
+    }
+
+    /// Writes the pending entries as a root manifest and returns the URL where it was written.
+    ///
+    /// This method builds a root Metadata (no UUID) and writes it to a parquet file.
+    /// The root manifest typically contains references to leaf manifests (DataManifest entries)
+    /// rather than individual data files.
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for writing the parquet file
+    ///
+    /// # Returns
+    /// * `Ok(Url)` - The URL where the root manifest was written
+    /// * `Err` if there was an error building or writing the metadata
+    #[allow(dead_code)]
+    pub(crate) fn write_root(&self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
+        let root_metadata = self.build(engine)?;
+        MetadataWriter::try_new(root_metadata)?.write(engine)
+    }
+
+    /// Builds a leaf Metadata instance with a generated UUID.
+    pub(crate) fn build_leaf(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
+        use crate::schema::ToSchema;
+        use crate::IntoEngineData;
+
+        let data: Vec<Box<dyn EngineData>> = self
+            .pending_entries
+            .iter()
+            .map(|e| {
+                e.clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        Ok(Metadata {
+            table_root: self.table_root.clone(),
+            data,
+            version: self.version,
+            leaf: Some(uuid::Uuid::new_v4()),
+        })
+    }
+
+    /// Builds a leaf Metadata instance with a specific UUID.
+    #[allow(dead_code)]
+    pub(crate) fn build_leaf_with_uuid(
+        &self,
+        engine: &dyn crate::Engine,
+        leaf_uuid: uuid::Uuid,
+    ) -> DeltaResult<Metadata> {
+        use crate::schema::ToSchema;
+        use crate::IntoEngineData;
+
+        let data: Vec<Box<dyn EngineData>> = self
+            .pending_entries
+            .iter()
+            .map(|e| {
+                e.clone()
+                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        Ok(Metadata {
+            table_root: self.table_root.clone(),
+            data,
+            version: self.version,
+            leaf: Some(leaf_uuid),
         })
     }
 }
@@ -976,5 +1132,132 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid length"));
+    }
+
+    #[test]
+    fn test_write_root_with_leaf() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use crate::metadata::{DataContentType, Metadata};
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Step 1: Create a leaf builder with data file entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+
+        // Add some data file entries to the leaf
+        let data_entry_1 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        let data_entry_2 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-00001.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 200,
+            file_size_in_bytes: Some(2048),
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        leaf_builder.add_entry(data_entry_1);
+        leaf_builder.add_entry(data_entry_2);
+
+        // Step 2: Write the leaf manifest and get a MetadataEntry (DataManifest) back
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+
+        // Verify the leaf manifest entry
+        assert_eq!(
+            leaf_manifest_entry.content_type,
+            DataContentType::DataManifest
+        );
+        assert!(leaf_manifest_entry.location.is_some());
+        let leaf_location = leaf_manifest_entry.location.as_ref().unwrap();
+        // Leaf should have UUID in filename: <version>.content.<uuid>.parquet
+        assert!(leaf_location.contains(".content."));
+        assert!(leaf_location.ends_with(".parquet"));
+        // Count the dots to verify UUID is present (should have 3 dots: version.content.uuid.parquet)
+        let dots_count = leaf_location.matches('.').count();
+        assert!(
+            dots_count >= 3,
+            "Leaf filename should contain UUID: {}",
+            leaf_location
+        );
+        // Verify aggregate stats
+        assert_eq!(leaf_manifest_entry.record_count, 300); // 100 + 200
+        assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
+
+        // Step 3: Create a root builder and add the leaf manifest entry
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        root_builder.add_entry(leaf_manifest_entry.clone());
+
+        // Step 4: Write the root manifest
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Verify the root was written
+        // Root should NOT have UUID in filename: <version>.content.parquet
+        let root_path = root_url.path();
+        assert!(root_path.contains(".content.parquet"));
+        // Root filename should only have 2 dots: version.content.parquet
+        let root_filename = root_path.rsplit('/').next().unwrap();
+        let root_dots_count = root_filename.matches('.').count();
+        assert_eq!(
+            root_dots_count, 2,
+            "Root filename should NOT contain UUID: {}",
+            root_filename
+        );
+
+        // Step 5: Read back the root and verify
+        let read_root = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_entries = read_root.entries()?;
+        assert_eq!(root_entries.len(), 1);
+        assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
+        assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
+
+        // Step 6: Read back the leaf and verify
+        let leaf_url = Url::parse(leaf_manifest_entry.location.as_ref().unwrap())?;
+        let read_leaf = Metadata::read(&engine, &leaf_url, table_root.clone())?;
+        let leaf_entries = read_leaf.entries()?;
+        assert_eq!(leaf_entries.len(), 2);
+        assert_eq!(leaf_entries[0].content_type, DataContentType::Data);
+        assert_eq!(leaf_entries[1].content_type, DataContentType::Data);
+
+        Ok(())
     }
 }

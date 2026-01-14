@@ -17,19 +17,28 @@ impl MetadataWriter {
         Ok(Self { metadata })
     }
 
-    /// Returns the URL where the content metadata root file should be written.
+    /// Returns the URL where the content metadata file should be written.
     ///
     /// This method generates the checkpoint path based on the table's content root and the version
-    /// of the underlying snapshot being checkpointed. The resulting path follows the classic
+    /// of the underlying snapshot being checkpointed. The resulting path follows the
     /// Delta checkpoint naming convention (where the version is zero-padded to 20 digits):
     ///
-    /// `<table_root>/<version>.content.parquet`
+    /// For root manifests (no leaf UUID):
+    ///   `<table_root>/_delta_log/<version>.content.parquet`
     ///
-    /// For example, if the table root is `s3://bucket/path` and the version is `10`,
-    /// the checkpoint path will be: `s3://bucket/path/00000000000000000010.content.parquet`
+    /// For leaf manifests (with leaf UUID):
+    ///   `<table_root>/_delta_log/<version>.content.<uuid>.parquet`
+    ///
+    /// For example, if the table root is `s3://bucket/path` and the version is `10`:
+    /// - Root: `s3://bucket/path/_delta_log/00000000000000000010.content.parquet`
+    /// - Leaf: `s3://bucket/path/_delta_log/00000000000000000010.content.550e8400-e29b-41d4-a716-446655440000.parquet`
     fn checkpoint_path(&self) -> DeltaResult<Url> {
-        ParsedLogPath::new_content_metadata_path(&self.metadata.table_root, self.metadata.version)
-            .map(|parsed| parsed.location)
+        ParsedLogPath::new_content_metadata_path(
+            &self.metadata.table_root,
+            self.metadata.version,
+            self.metadata.leaf(),
+        )
+        .map(|parsed| parsed.location)
     }
 
     pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<Url> {

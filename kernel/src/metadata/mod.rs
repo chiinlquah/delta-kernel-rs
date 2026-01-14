@@ -57,11 +57,16 @@ fn metadata_entry_with_location_schema() -> &'static SchemaRef {
 /// - A collection of `MetadataEntry` records (one per file)
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
+/// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
 #[allow(dead_code)]
 pub(crate) struct Metadata {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
+    /// Optional UUID that identifies this metadata as a leaf manifest.
+    /// When writing a root manifest, this is `None`.
+    /// When writing a leaf manifest, this must be set to a unique UUID.
+    leaf: Option<uuid::Uuid>,
 }
 
 enum AddRemove {
@@ -179,6 +184,8 @@ pub(crate) struct ManifestReferences {
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
     ///
+    /// This creates a root manifest (leaf is `None`).
+    ///
     /// # Parameters
     /// - `version`: The Delta table version this metadata represents
     /// - `table_root`: The root URL of the Delta table
@@ -188,7 +195,37 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
+            leaf: None,
         }
+    }
+
+    /// Creates a new empty Metadata instance as a leaf manifest.
+    ///
+    /// Leaf manifests have a UUID automatically generated to uniquely identify them.
+    ///
+    /// # Parameters
+    /// - `version`: The Delta table version this metadata represents
+    /// - `table_root`: The root URL of the Delta table
+    #[allow(dead_code)]
+    pub(crate) fn new_leaf(version: Version, table_root: Url) -> Self {
+        Self {
+            data: vec![],
+            version,
+            table_root,
+            leaf: Some(uuid::Uuid::new_v4()),
+        }
+    }
+
+    /// Returns the leaf UUID if this is a leaf manifest, or `None` if it's a root manifest.
+    #[allow(dead_code)]
+    pub(crate) fn leaf(&self) -> Option<uuid::Uuid> {
+        self.leaf
+    }
+
+    /// Returns `true` if this is a leaf manifest (has a UUID set).
+    #[allow(dead_code)]
+    pub(crate) fn is_leaf(&self) -> bool {
+        self.leaf.is_some()
     }
 
     #[allow(dead_code)]
@@ -787,6 +824,9 @@ impl Metadata {
             data,
             version: parsed.version,
             table_root,
+            // When reading existing metadata, we don't know if it's a root or leaf
+            // This would need to be determined from the file path or stored in the metadata
+            leaf: None,
         })
     }
 
@@ -2233,6 +2273,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2264,6 +2305,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2295,6 +2337,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2326,6 +2369,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 3,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2391,6 +2435,7 @@ mod tests {
             ],
             version: 3,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2467,6 +2512,7 @@ mod tests {
             data,
             version: 4,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2539,6 +2585,7 @@ mod tests {
             data,
             version: 5,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2595,6 +2642,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2660,6 +2708,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write metadata
@@ -2766,6 +2815,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get action batches
@@ -2815,6 +2865,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get action batches
@@ -2858,6 +2909,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get action batches
@@ -2955,6 +3007,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get action batches
@@ -3012,6 +3065,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get action batches
@@ -3141,6 +3195,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get manifest references
@@ -3225,6 +3280,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get manifest references
@@ -3292,6 +3348,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write the child manifest to a file
@@ -3489,6 +3546,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get manifest references
@@ -3531,6 +3589,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Write the delete manifest
@@ -3593,6 +3652,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         let child_manifest_writer_1 = writer::MetadataWriter::try_new(child_metadata_1)?;
@@ -3613,6 +3673,7 @@ mod tests {
             ],
             version: 1, // Use different version to avoid filename collision
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         let child_manifest_writer_2 = writer::MetadataWriter::try_new(child_metadata_2)?;
@@ -3633,6 +3694,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            leaf: None,
         };
 
         // Get manifest references from the root
