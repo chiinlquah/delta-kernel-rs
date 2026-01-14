@@ -434,11 +434,8 @@ impl Transaction {
         // Collect eagerly to avoid holding a borrow of `self` across the commit
         let dv_update_actions: Vec<_> = self.generate_dv_update_actions(engine)?.collect();
 
-        // Step 3b: Generate DV update actions (remove/add pairs) if any DV updates are present
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
-
         // Step 4: Generate all domain metadata actions (user and system domains)
-        let mut actions = self.generate_log_actions(
+        let actions = self.generate_log_actions(
             engine,
             commit_version,
             snapshot_id,
@@ -450,13 +447,8 @@ impl Transaction {
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
-        // let actions = iter::once(commit_info_action)
-        //     .chain(add_actions)
-        //     .chain(set_transaction_actions)
-        //     .chain(domain_metadata_actions);
-
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .into_iter()
             .chain(remove_actions)
             .chain(dv_update_actions);
 
@@ -475,7 +467,7 @@ impl Transaction {
         let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
-            .commit(engine, Box::new(actions.into_iter()), commit_metadata)
+            .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
@@ -602,14 +594,10 @@ impl Transaction {
             actions_vec.push(content_root_data.map(FilteredEngineData::with_all_rows_selected))
         } else {
             // Normal mode: add actions go in the JSON log
+            // Remove actions are added separately in the commit method
             actions_vec.extend(
                 add_actions.map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
             );
-            actions_vec.extend(self.generate_remove_actions(
-                engine,
-                self.remove_files_metadata.iter(),
-                &[],
-            )?)
         }
 
         Ok(actions_vec)

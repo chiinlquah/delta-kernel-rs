@@ -102,6 +102,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
             engine.as_ref(),
             log_segment,
             get_commit_schema().clone(),
+            None,
         )?);
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest

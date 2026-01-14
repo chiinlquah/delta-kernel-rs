@@ -14,6 +14,8 @@ use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
+use delta_kernel_derive::internal_api;
+
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
@@ -138,27 +140,6 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
     }
 
     /// Set a custom task executor for the engine.
-    ///
-    /// See [`executor::TaskExecutor`] for more details.
-    pub fn with_task_executor<F: TaskExecutor>(
-        self,
-        task_executor: Arc<F>,
-    ) -> DefaultEngineBuilder<F> {
-        DefaultEngineBuilder {
-            object_store: self.object_store,
-            task_executor,
-            metrics_reporter: self.metrics_reporter,
-        }
-    }
-
-    /// Build the [`DefaultEngine`] instance.
-    pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
-    }
-}
-
-impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
-    /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
     /// See [`executor::TaskExecutor`] for more details.
     pub fn with_task_executor<F: TaskExecutor>(
@@ -350,70 +331,6 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_new_and_build() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_metrics_reporter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_custom_executor() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
-            rt.handle().clone(),
-        ));
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_task_executor(executor)
-            .build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::builder(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_all_options() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .with_task_executor(executor)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 

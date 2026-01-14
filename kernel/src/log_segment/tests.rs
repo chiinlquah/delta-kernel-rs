@@ -15,7 +15,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngineBuilder;
+use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -1389,7 +1389,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
 
-    let engine = DefaultEngine::new(store.clone());
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
@@ -2439,16 +2438,12 @@ fn test_log_segment_contiguous_commit_files() {
     .build();
 
     // disallow gaps in LogSegment
-    let table_root = Url::parse("file:///").unwrap();
     let log_segment = LogSegment::try_new(
         listed.unwrap(),
-        table_root.join("_delta_log/").unwrap(),
+        Url::parse("file:///_delta_log/").unwrap(),
         None,
         None,
     );
-
-    let log_segment =
-        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2566,6 +2561,7 @@ fn test_content_root_found_in_commit() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
@@ -2623,6 +2619,7 @@ fn test_content_root_not_found() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
@@ -2672,6 +2669,7 @@ fn test_content_root_found_in_checkpoint() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Should find content root in commit
@@ -2730,6 +2728,7 @@ fn test_content_root_returns_first_found() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // The function iterates from most recent to oldest, so it should find the first one
@@ -2791,6 +2790,7 @@ fn test_content_root_with_multiple_commits() -> DeltaResult<()> {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Should find content root in commit file (version 2 comes first in descending order)
