@@ -211,6 +211,11 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
 }
 
 impl ActionReconciliationProcessor {
+    /// Create a new [`ActionReconciliationProcessor`] instance
+    ///
+    /// # Parameters
+    /// - `minimum_file_retention_timestamp`: Minimum timestamp for file retention
+    /// - `txn_expiration_timestamp`: Optional transaction expiration timestamp
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,

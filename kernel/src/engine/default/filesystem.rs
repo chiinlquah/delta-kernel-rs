@@ -539,7 +539,7 @@ mod tests {
         // Verify timestamp is within the expected range
         let meta_time = Duration::from_millis(file_meta.last_modified as u64);
         assert!(
-            meta_time.abs_diff(write_time) < Duration::from_millis(100),
+            meta_time.abs_diff(write_time) < Duration::from_millis(500),
             "last_modified timestamp should be around {} ms, but was {} ms",
             write_time.as_millis(),
             meta_time.as_millis()

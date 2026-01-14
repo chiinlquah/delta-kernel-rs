@@ -53,6 +53,10 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
+    ///
+    /// # Parameters
+    /// - `engine`: The engine to use for reading and evaluating expressions
+    /// - `state_info`: Information about the scan state including predicates
     pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate

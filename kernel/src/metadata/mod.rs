@@ -11,15 +11,13 @@ use crate::actions::Remove;
 use crate::actions::{Add, ContentRoot};
 use crate::engine_data::EngineData;
 use crate::expressions::Scalar;
-use crate::expressions::Transform;
 use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType, ToSchema};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, ToSchema};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, Expression, FileMeta, SchemaRef, SnapshotRef,
-    Version,
+    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, SchemaRef, SnapshotRef, Version,
 };
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
@@ -27,25 +25,6 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use url::Url;
-
-/// Lazy static schema for MetadataEntry with an additional "sourceFile" field.
-/// This extends the base MetadataEntry schema with a string column to track the source file location.
-static METADATA_ENTRY_WITH_LOCATION_SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-
-/// Returns a schema that extends MetadataEntry with a "sourceFile" string column.
-/// The schema is computed once and cached for subsequent calls.
-fn metadata_entry_with_location_schema() -> &'static SchemaRef {
-    METADATA_ENTRY_WITH_LOCATION_SCHEMA.get_or_init(|| {
-        let base_schema = MetadataEntry::to_schema();
-        let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
-        fields.push(StructField::new(
-            "sourceFile",
-            DataType::STRING,
-            /*nullable*/ true,
-        ));
-        StructType::new_unchecked(fields).into()
-    })
-}
 
 /// Represents table metadata in Adaptive Metadata Tree (AMT) format.
 ///
@@ -164,7 +143,7 @@ pub(crate) struct SharedLeafState {
 #[allow(dead_code)]
 pub(crate) struct LeafReferences {
     /// References to child data manifests and their affiliated delete manifests
-    pub(crate) manifest_references: Vec<ManifestReferences>,
+    pub(crate) manifest_references: Vec<ManifestReference>,
     /// Shared state that applies to all leaf manifests
     pub(crate) shared_state: SharedLeafState,
 }
@@ -174,7 +153,7 @@ pub(crate) struct LeafReferences {
 /// child data manifests and delete manifests.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct ManifestReferences {
+pub(crate) struct ManifestReference {
     /// The data manifest entry to process, with optional manifest DV
     pub(crate) data_manifest: FilteredManifest,
     /// Delete manifest entries affiliated with this specific data manifest (via referenced_file)
@@ -333,14 +312,14 @@ impl Metadata {
     /// - **Manifest deletion vectors** (content_type = ManifestDV): Deletion vectors that
     ///   apply to manifest entries themselves (TODO: not yet implemented)
     ///
-    /// The returned `ManifestReferences` groups delete manifests into two categories:
+    /// The returned `ManifestReference` groups delete manifests into two categories:
     /// - `affiliated_dv_manifests`: Delete manifests that reference a specific data manifest
     ///   (via the `referenced_file` field)
     /// - `unaffiliated_dv_manifests`: Delete manifests with no specific affiliation, which
     ///   must be checked against all data files
     ///
     /// # Returns
-    /// An iterator over `ManifestReferences`, one for each data manifest in the root.
+    /// An iterator over `ManifestReference`, one for each data manifest in the root.
     ///
     /// # Example Usage
     /// ```ignore
@@ -484,7 +463,7 @@ impl Metadata {
             .collect();
 
         // Create ManifestReferences for each data manifest
-        let manifest_refs: Vec<DeltaResult<ManifestReferences>> = data_manifest_entries
+        let manifest_refs: Vec<DeltaResult<ManifestReference>> = data_manifest_entries
             .into_iter()
             .map(|data_entry| {
                 let location = data_entry
@@ -522,7 +501,7 @@ impl Metadata {
                     })
                     .unwrap_or_default();
 
-                Ok(ManifestReferences {
+                Ok(ManifestReference {
                     data_manifest,
                     affiliated_dv_manifests,
                 })
@@ -601,7 +580,7 @@ impl Metadata {
     /// # Returns
     /// An iterator over all action batches from all child manifests.
     #[allow(dead_code)]
-    pub(crate) fn root_to_action_batches(
+    pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         engine: &dyn Engine,
         schema: &SchemaRef,
@@ -630,10 +609,8 @@ impl Metadata {
         Ok(Box::new(all_iters.into_iter().flatten()))
     }
 
-    /// Processes a ManifestReferences struct into action batches.
-    ///
-    /// This is the low-level method for reading a single child manifest. Given a
-    /// `ManifestReferences` and a pre-built deletion vector map, this method:
+    /// Processes a ManifestReference
+    /// ManifestReferences` and a pre-built deletion vector map, this method:
     ///
     /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
     /// 2. **Reads affiliated delete manifests**: Processes delete manifests specific to this data manifest
@@ -655,7 +632,7 @@ impl Metadata {
     /// - The shared_dv_map should be built once and reused for all child manifests
     #[allow(dead_code)]
     pub(crate) fn manifest_to_action_batches(
-        manifest_refs: ManifestReferences,
+        manifest_refs: ManifestReference,
         shared_dv_map: &HashMap<String, DeletionVectorInfo>,
         engine: &dyn Engine,
         schema: &SchemaRef,
@@ -801,22 +778,11 @@ impl Metadata {
         let parsed =
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
-        let evaluation_handler = engine.evaluation_handler();
-        let expression = Arc::new(Expression::transform(
-            Transform::new_top_level().with_inserted_field(
-                /*insert after*/ Some("referencedFile"),
-                Expression::literal(file.location.as_str()).into(),
-            ),
-        ));
-        let evaluator = evaluation_handler.new_expression_evaluator(
+        let read_result_iter = engine.parquet_handler().read_parquet_files(
+            &[file],
             Arc::new(MetadataEntry::to_schema()),
-            expression,
-            metadata_entry_with_location_schema().clone().into(),
+            None,
         )?;
-        let read_result_iter = engine
-            .parquet_handler()
-            .read_parquet_files(&[file], Arc::new(MetadataEntry::to_schema()), None)?
-            .map(|result| evaluator.evaluate(result?.as_ref()));
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1804,6 +1770,36 @@ impl crate::schema::ToSchema for MetadataEntry {
             // split_offsets intentionally excluded - not used by Delta today
             // equality_ids intentionally excluded - not used by Delta today
         ])
+    }
+}
+
+impl MetadataEntry {
+    /// Returns MetadataEntry schema augmented with metadata columns for tracking.
+    /// Adds:
+    /// - RowIndex: 0-based position of entry within source manifest file
+    /// - FilePath: URL of the source manifest file
+    #[allow(dead_code)]
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn to_schema_with_metadata_columns() -> SchemaRef {
+        use crate::schema::{MetadataColumnSpec, ToSchema};
+
+        static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+        SCHEMA
+            .get_or_init(|| {
+                let base_schema = Self::to_schema();
+                let mut schema_with_tracking = base_schema;
+
+                schema_with_tracking = schema_with_tracking
+                    .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)
+                    .unwrap();
+
+                schema_with_tracking = schema_with_tracking
+                    .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)
+                    .unwrap();
+
+                Arc::new(schema_with_tracking)
+            })
+            .clone()
     }
 }
 
@@ -3358,8 +3354,8 @@ mod tests {
         // Create a MetadataEntry for the child manifest
         let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
 
-        // Create ManifestReferences pointing to the child manifest
-        let manifest_refs = ManifestReferences {
+        // Create ManifestReference pointing to the child manifest
+        let manifest_refs = ManifestReference {
             data_manifest: FilteredManifest::new(child_manifest_entry),
             affiliated_dv_manifests: vec![],
         };
@@ -3703,7 +3699,7 @@ mod tests {
         // Process all manifests using the helper method
         let schema = crate::actions::get_log_add_schema().clone();
         let action_batches =
-            Metadata::root_to_action_batches(root_state, &engine, &schema, &table_root_url)?;
+            Metadata::non_root_action_batches(root_state, &engine, &schema, &table_root_url)?;
 
         // Collect all Add actions
         let mut all_adds = Vec::new();
