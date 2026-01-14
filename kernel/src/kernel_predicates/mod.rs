@@ -641,8 +641,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
-            Expr::Unknown(_) => None,
+            Expr::ParseJson(_) | Expr::Unknown(_) => None,
         }
     }
 }
