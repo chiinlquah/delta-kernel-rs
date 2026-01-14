@@ -163,3 +163,8 @@ harness = false
 name = "add-action-generator"
 path = "benches/add_action_generator/main.rs"
 required-features = ["arrow", "default-engine-rustls", "rand", "clap"]
+
+[[bin]]
+name = "benchmark-runner"
+path = "benches/benchmark_runner/main.rs"
+required-features = ["arrow", "default-engine-rustls", "clap"]
