@@ -70,7 +70,7 @@ pub(crate) struct LogSegment {
     pub checkpoint_schema: Option<SchemaRef>,
     /// The maximum published commit version found during listing, if available.
     /// Note that this published commit file maybe not be included in
-    /// [ascending_commit_files] if there is a catalog commit present for the same
+    /// `ascending_commit_files` if there is a catalog commit present for the same
     /// version that took priority over it.
     pub max_published_version: Option<Version>,
 }
@@ -86,7 +86,7 @@ pub(crate) struct PartialCommitCover {
     pub(crate) read_schema: SchemaRef,
     /// The maximum published commit version found during listing, if available.
     /// Note that this published commit file maybe not be included in
-    /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
+    /// `LogSegment::ascending_commit_files` if there is a catalog commit present for the same
     /// version that took priority over it.
     #[allow(dead_code)]
     pub max_published_version: Option<Version>,
