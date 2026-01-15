@@ -593,7 +593,7 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -664,28 +664,6 @@ impl CommitInfo {
     /// Get the snapshot ID for this commit
     pub(crate) fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
-    }
-}
-
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for CommitInfo {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.timestamp.into(),
-            self.in_commit_timestamp.into(),
-            self.operation.into(),
-            self.operation_parameters.unwrap_or_default().try_into()?,
-            self.kernel_version.into(),
-            self.engine_info.into(),
-            self.txn_id.into(),
-            self.snapshot_id.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
