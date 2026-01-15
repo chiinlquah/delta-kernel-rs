@@ -188,6 +188,8 @@ impl MetadataBuilder {
             // TODO: add.stats contains a JSON blob:
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
             // Which we need to convert from name-based to field-id-based
+            content_stats: None,
+
             manifest_info: None,
 
             // Path to file where to apply the DV to
@@ -463,6 +465,8 @@ impl MetadataBuilder {
             // TODO: add.stats contains a JSON blob:
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
             // Which we need to convert from name-based to field-id-based
+            content_stats: None,
+
             manifest_info: None,
 
             // Path to file where to apply the DV to
@@ -1165,6 +1169,7 @@ mod tests {
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
+            content_stats: None,
             manifest_info: None,
             referenced_file: None,
             key_metadata: None,
@@ -1189,6 +1194,7 @@ mod tests {
             sort_order_id: None,
             record_count: 200,
             file_size_in_bytes: Some(2048),
+            content_stats: None,
             manifest_info: None,
             referenced_file: None,
             key_metadata: None,

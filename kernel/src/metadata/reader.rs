@@ -179,6 +179,7 @@ fn visit_metadata_entry_at<'a>(
         sort_order_id,
         record_count,
         file_size_in_bytes,
+        content_stats: None, // Requires table schema to read - not included in base schema
         manifest_info,
         referenced_file,
         key_metadata: None,  // Not currently used by Delta
