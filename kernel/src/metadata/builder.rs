@@ -97,7 +97,7 @@ impl MetadataBuilder {
     /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
     ///   This is used to convert Delta JSON stats (minValues, maxValues, nullCount) to the
     ///   content_stats StructData format when adding entries.
-    /// TODO: It is important to use the same schema which has been used to write the files
+    ///   TODO: It is important to use the same schema which has been used to write the files
     #[allow(dead_code)]
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
