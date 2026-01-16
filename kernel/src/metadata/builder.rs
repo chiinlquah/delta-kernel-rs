@@ -9,7 +9,7 @@ use crate::metadata::{
     TrackingStatus,
 };
 use crate::scan::state::Stats;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, StructType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Error, Version};
 use std::collections::HashMap;
@@ -84,7 +84,7 @@ pub(crate) struct MetadataBuilder {
     version: Version,
     /// Table schema for converting stats JSON to content_stats format.
     /// The builder will populate content_stats from the Delta JSON stats blob.
-    table_schema: StructType,
+    table_schema: Schema,
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
@@ -97,8 +97,9 @@ impl MetadataBuilder {
     /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
     ///   This is used to convert Delta JSON stats (minValues, maxValues, nullCount) to the
     ///   content_stats StructData format when adding entries.
+    /// TODO: It is important to use the same schema which has been used to write the files
     #[allow(dead_code)]
-    pub(crate) fn new_for(table_root: Url, version: Version, table_schema: StructType) -> Self {
+    pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
             table_root,
             pending_entries: Vec::new(),
@@ -768,8 +769,8 @@ mod tests {
     }
 
     /// Helper function to create an empty table schema for tests that don't need stats conversion
-    fn empty_schema() -> StructType {
-        StructType::new_unchecked([])
+    fn empty_schema() -> Schema {
+        Schema::new_unchecked([])
     }
 
     #[test]
