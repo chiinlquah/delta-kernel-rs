@@ -534,7 +534,8 @@ impl Transaction {
                 crate::metadata::Metadata::new_from_snapshot(engine, self.read_snapshot.clone())?
             };
 
-            let mut metadata_builder = metadata.to_builder();
+            let table_schema = self.read_snapshot.schema().as_ref().clone();
+            let mut metadata_builder = metadata.to_builder(table_schema);
             for add_metadata_result in self.add_files_metadata.iter() {
                 // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(

@@ -739,10 +739,11 @@ impl Metadata {
     ) -> DeltaResult<Self> {
         let table_root = snapshot.table_root().clone();
         let version = snapshot.version();
+        let table_schema = snapshot.schema().as_ref().clone();
         let scan = ScanBuilder::new(snapshot).build()?;
         let scan_metadata_iter = scan.scan_metadata(engine)?;
 
-        let mut metadata_builder = MetadataBuilder::new_for(table_root, version);
+        let mut metadata_builder = MetadataBuilder::new_for(table_root, version, table_schema);
 
         for scan_metadata_result in scan_metadata_iter {
             let scan_metadata = scan_metadata_result?;
@@ -801,14 +802,19 @@ impl Metadata {
     /// This creates a new builder initialized with the table root, allowing additional
     /// metadata entries to be added before building a new Metadata instance.
     ///
+    /// # Arguments
+    /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
+    ///   This is used to convert Delta JSON stats to the content_stats StructData format.
+    ///
     /// # Returns
     /// A `MetadataBuilder` that can be used to add more entries or build a new Metadata.
     #[allow(dead_code)]
-    pub(crate) fn to_builder(&self) -> MetadataBuilder {
+    pub(crate) fn to_builder(&self, table_schema: StructType) -> MetadataBuilder {
         use crate::metadata::reader::MetadataEntryVisitor;
         use crate::RowVisitor;
 
-        let mut builder = MetadataBuilder::new_for(self.table_root.clone(), self.version);
+        let mut builder =
+            MetadataBuilder::new_for(self.table_root.clone(), self.version, table_schema);
 
         // Copy existing entries from this metadata into the builder
         for engine_data in &self.data {

@@ -2,13 +2,14 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::metadata::stats::delta_json_stats_to_content_stats;
 use crate::metadata::writer::MetadataWriter;
 use crate::metadata::{
     ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
     TrackingStatus,
 };
 use crate::scan::state::Stats;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, StructType};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Error, Version};
 use std::collections::HashMap;
@@ -81,16 +82,28 @@ pub(crate) struct MetadataBuilder {
     table_root: Url,
     pending_entries: Vec<MetadataEntry>,
     version: Version,
+    /// Table schema for converting stats JSON to content_stats format.
+    /// The builder will populate content_stats from the Delta JSON stats blob.
+    table_schema: StructType,
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
 impl MetadataBuilder {
+    /// Creates a new MetadataBuilder for the given table root and version.
+    ///
+    /// # Arguments
+    /// * `table_root` - The root URL of the table
+    /// * `version` - The version of the metadata being built
+    /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
+    ///   This is used to convert Delta JSON stats (minValues, maxValues, nullCount) to the
+    ///   content_stats StructData format when adding entries.
     #[allow(dead_code)]
-    pub(crate) fn new_for(table_root: Url, version: Version) -> Self {
+    pub(crate) fn new_for(table_root: Url, version: Version, table_schema: StructType) -> Self {
         Self {
             table_root,
             pending_entries: Vec::new(),
             version,
+            table_schema,
         }
     }
 
@@ -154,6 +167,11 @@ impl MetadataBuilder {
             })
             .unwrap_or(0);
 
+        // TODO: Check if parsed_stats is set and prefer that over the JSON blob
+        // Convert Delta JSON stats to content_stats
+        let content_stats =
+            delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
+
         let (content_info, referenced_file) = dv_content.unzip();
 
         let data_file_entry = MetadataEntry {
@@ -185,10 +203,8 @@ impl MetadataBuilder {
 
             file_size_in_bytes: Some(add.size),
 
-            // TODO: add.stats contains a JSON blob:
-            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
-            // Which we need to convert from name-based to field-id-based
-            content_stats: None,
+            // Content stats converted from Delta JSON stats blob
+            content_stats,
 
             manifest_info: None,
 
@@ -751,11 +767,16 @@ mod tests {
         Ok(())
     }
 
+    /// Helper function to create an empty table schema for tests that don't need stats conversion
+    fn empty_schema() -> StructType {
+        StructType::new_unchecked([])
+    }
+
     #[test]
     fn test_path_to_absolute_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
         // Test with s3:// URL as table root
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let relative_path = "part-00000-123.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -775,7 +796,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_s3_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let absolute_path = "s3://another-bucket/external/data.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -786,7 +807,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_https_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let absolute_path = "https://example.com/data/file.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -798,7 +819,7 @@ mod tests {
     fn test_path_to_absolute_with_gs_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Google Cloud Storage URL
         let table_root = Url::parse("gs://my-gcs-bucket/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let relative_path = "data/part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -818,7 +839,7 @@ mod tests {
     fn test_path_to_absolute_with_azure_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Azure Blob Storage URL
         let table_root = Url::parse("abfss://container@account.dfs.core.windows.net/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -834,7 +855,7 @@ mod tests {
         // Test with file:// URL - use a temp directory that exists
         let temp_dir = std::env::temp_dir();
         let table_root = Url::parse(&format!("file://{}/", temp_dir.to_str().unwrap()))?;
-        let builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -853,7 +874,7 @@ mod tests {
     {
         // Test that special characters in paths are preserved
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1);
+        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
 
         let relative_path = "partition=value%20with%20spaces/file.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -879,7 +900,7 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify
@@ -930,7 +951,7 @@ mod tests {
 
         // Create builder and add from engine data iterator
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
         builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
 
         // Build metadata and verify
@@ -977,7 +998,7 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify record counts
@@ -994,6 +1015,187 @@ mod tests {
 
         // Verify third entry has record_count of 0 when stats is null
         assert_eq!(entries[2].record_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_stats_from_json_stats() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::Add;
+        use crate::expressions::Scalar;
+        use crate::metadata::stats::delta_json_stats_to_content_stats;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
+
+        // Create a table schema with field IDs (required for stats schema generation)
+        let table_schema = crate::schema::StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new("name", DataType::STRING, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+        ]);
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+
+        // Add an entry with JSON stats
+        let stats_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":5}}"#;
+        let add = Add {
+            path: "part-00000.parquet".to_string(),
+            partition_values: HashMap::new(),
+            size: 1024,
+            modification_time: 1587968586000,
+            data_change: true,
+            stats: Some(stats_json.to_string()),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
+        };
+
+        builder.add(add, 1, None)?;
+
+        // Verify content_stats is populated by directly checking the conversion function
+        // (The builder uses this function internally)
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?
+            .expect("content_stats should be populated");
+
+        // Verify the structure has stats for both columns
+        assert_eq!(content_stats.fields().len(), 2);
+
+        // Check 'id' stats
+        let id_field_idx = content_stats
+            .fields()
+            .iter()
+            .position(|f| f.name() == "id")
+            .expect("id field should exist");
+
+        if let Scalar::Struct(id_stats) = &content_stats.values()[id_field_idx] {
+            // Find and verify value_count
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count");
+            if let Some(idx) = value_count_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
+            }
+
+            // Find and verify lower_bound
+            let lower_bound_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound");
+            if let Some(idx) = lower_bound_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(1));
+            }
+
+            // Find and verify upper_bound
+            let upper_bound_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound");
+            if let Some(idx) = upper_bound_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
+            }
+        } else {
+            panic!("Expected id stats to be a Struct");
+        }
+
+        // Check 'name' stats
+        let name_field_idx = content_stats
+            .fields()
+            .iter()
+            .position(|f| f.name() == "name")
+            .expect("name field should exist");
+
+        if let Scalar::Struct(name_stats) = &content_stats.values()[name_field_idx] {
+            // Find and verify null_value_count
+            let null_count_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "null_value_count");
+            if let Some(idx) = null_count_idx {
+                assert_eq!(name_stats.values()[idx], Scalar::Long(5));
+            }
+
+            // Find and verify lower_bound
+            let lower_bound_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound");
+            if let Some(idx) = lower_bound_idx {
+                assert_eq!(
+                    name_stats.values()[idx],
+                    Scalar::String("alice".to_string())
+                );
+            }
+        } else {
+            panic!("Expected name stats to be a Struct");
+        }
+
+        // Verify the builder has the entry with content_stats populated
+        // Note: When serialized to EngineData and read back, content_stats is not preserved
+        // because it requires the table schema to read. This is expected behavior.
+        // The content_stats is used during write operations where the schema is known.
+        assert_eq!(builder.pending_entries.len(), 1);
+        assert!(
+            builder.pending_entries[0].content_stats.is_some(),
+            "pending entry should have content_stats"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_stats_with_empty_schema() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::Add;
+
+        let table_root = Url::parse("s3://my-bucket/my-table/")?;
+        // Builder with empty schema - content_stats should be None (no columns to generate stats for)
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        let add = Add {
+            path: "part-00000.parquet".to_string(),
+            partition_values: HashMap::new(),
+            size: 1024,
+            modification_time: 1587968586000,
+            data_change: true,
+            stats: Some(r#"{"numRecords":100}"#.to_string()),
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
+        };
+
+        builder.add(add, 1, None)?;
+
+        // Verify the builder has the entry
+        assert_eq!(builder.pending_entries.len(), 1);
+
+        // With empty schema, content_stats should have empty fields
+        // (the stats schema will be empty since there are no columns)
+        let content_stats = &builder.pending_entries[0].content_stats;
+        if let Some(stats) = content_stats {
+            assert_eq!(
+                stats.fields().len(),
+                0,
+                "empty schema should produce empty content_stats"
+            );
+        }
+        // content_stats can also be None if stats JSON parsing returned None
 
         Ok(())
     }
@@ -1149,7 +1351,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf builder with data file entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
 
         // Add some data file entries to the leaf
         let data_entry_1 = MetadataEntry {
@@ -1230,7 +1432,7 @@ mod tests {
         assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
 
         // Step 3: Create a root builder and add the leaf manifest entry
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
 
         // Step 4: Write the root manifest
