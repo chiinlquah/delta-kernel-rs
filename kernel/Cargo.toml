@@ -168,3 +168,8 @@ required-features = ["arrow", "default-engine-rustls", "rand", "clap"]
 name = "benchmark-runner"
 path = "benches/benchmark_runner/main.rs"
 required-features = ["arrow", "default-engine-rustls", "clap"]
+
+[[bin]]
+name = "backfill-delta-table"
+path = "benches/add_action_generator/backfill.rs"
+required-features = ["arrow", "default-engine-rustls", "rand", "clap"]
