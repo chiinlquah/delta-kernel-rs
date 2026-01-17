@@ -1,5 +1,5 @@
 pub(crate) mod builder;
-mod reader;
+pub(crate) mod reader;
 mod stats;
 pub(crate) mod writer;
 
@@ -39,9 +39,13 @@ use url::Url;
 /// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
 #[allow(dead_code)]
 pub(crate) struct Metadata {
-    data: Vec<Box<dyn EngineData>>,
+    pub(crate) data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
+    /// The location (path/URL) of this manifest file.
+    /// None for newly built metadata that hasn't been written yet.
+    /// Some(path) after reading from disk or writing.
+    manifest_location: Option<Url>,
     /// Optional UUID that identifies this metadata as a leaf manifest.
     /// When writing a root manifest, this is `None`.
     /// When writing a leaf manifest, this must be set to a unique UUID.
@@ -58,7 +62,6 @@ enum AddRemove {
 /// According to the Iceberg Single File Commits spec, manifest deletion vectors (ManifestDV)
 /// can filter out entries from a manifest by ordinal position without rewriting the manifest file.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct FilteredManifest {
     /// The manifest entry (can be DataManifest or DeleteManifest)
     pub(crate) manifest: MetadataEntry,
@@ -69,7 +72,6 @@ pub(crate) struct FilteredManifest {
 
 impl FilteredManifest {
     /// Creates a new FilteredManifest with no deletion vector
-    #[allow(dead_code)]
     pub(crate) fn new(manifest: MetadataEntry) -> Self {
         Self {
             manifest,
@@ -78,7 +80,6 @@ impl FilteredManifest {
     }
 
     /// Creates a new FilteredManifest with a deletion vector
-    #[allow(dead_code)]
     pub(crate) fn with_dv(manifest: MetadataEntry, manifest_dv: MetadataEntry) -> Self {
         Self {
             manifest,
@@ -124,7 +125,6 @@ impl<'a> DeletionVectorMaps<'a> {
 /// - Unaffiliated delete manifests (apply to all data files)
 /// - Unmatched DVs from root (position deletes that reference files not in root)
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct SharedLeafState {
     /// Delete manifests with no specific affiliation (apply to all data files)
     pub(crate) unaffiliated_dv_manifests: Vec<FilteredManifest>,
@@ -140,7 +140,6 @@ pub(crate) struct SharedLeafState {
 /// - Manifest references (data and affiliated delete manifests) are per-child-manifest
 /// - Shared state (unaffiliated manifests and unmatched DVs) apply to all children
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct LeafReferences {
     /// References to child data manifests and their affiliated delete manifests
     pub(crate) manifest_references: Vec<ManifestReference>,
@@ -152,7 +151,6 @@ pub(crate) struct LeafReferences {
 /// According to the Iceberg Single File Commits spec, the root manifest can reference
 /// child data manifests and delete manifests.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct ManifestReference {
     /// The data manifest entry to process, with optional manifest DV
     pub(crate) data_manifest: FilteredManifest,
@@ -174,6 +172,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
+            manifest_location: None,
             leaf: None,
         }
     }
@@ -191,6 +190,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
+            manifest_location: None,
             leaf: Some(uuid::Uuid::new_v4()),
         }
     }
@@ -207,8 +207,7 @@ impl Metadata {
         self.leaf.is_some()
     }
 
-    #[allow(dead_code)]
-    fn entries(&self) -> DeltaResult<Vec<MetadataEntry>> {
+    pub(crate) fn entries(&self) -> DeltaResult<Vec<MetadataEntry>> {
         let mut all_entries = Vec::new();
         use crate::engine_data::RowVisitor;
         for batch in self.data.iter() {
@@ -234,10 +233,24 @@ impl Metadata {
         // Key: referenced_file path, Value: DeletionVectorInfo
         let mut deletion_vector_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
 
-        // Separate entries into data files and deletion vectors
-        let (data_entries, dv_entries): (Vec<_>, Vec<_>) = entries
-            .into_iter()
-            .partition(|entry| entry.content_type != DataContentType::PositionDeletes);
+        // Separate entries into data files, deletion vectors, and manifest entries
+        // Data entries: Data and EqualityDeletes (will be converted to Add/Remove actions)
+        // DV entries: PositionDeletes (will be used to build deletion vector map)
+        // Manifest entries: DataManifest, DeleteManifest, ManifestDV (handled by non_root_action_batches)
+        let (mut data_entries, dv_entries): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|entry| {
+                matches!(
+                    entry.content_type,
+                    DataContentType::Data | DataContentType::EqualityDeletes
+                )
+            });
+        // Filter out manifest-related entries from data_entries (though they should already be excluded by the partition)
+        data_entries.retain(|entry| {
+            matches!(
+                entry.content_type,
+                DataContentType::Data | DataContentType::EqualityDeletes
+            )
+        });
 
         // Process deletion vector entries
         for (i, dv_entry) in dv_entries.into_iter().enumerate() {
@@ -252,7 +265,13 @@ impl Metadata {
                     .referenced_file
                     .clone()
                     .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
-                let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i)?;
+                // For DVs in root manifest, use the root manifest path if available, otherwise empty string
+                let manifest_path = self
+                    .manifest_location
+                    .as_ref()
+                    .map(|u| u.as_str())
+                    .unwrap_or("");
+                let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
 
                 // Only insert if this DV has a higher sequence number than any existing one for this file
                 deletion_vector_map
@@ -277,7 +296,14 @@ impl Metadata {
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
-            .map(|(i, entry)| entry_to_add_remove(entry, &dv_maps, i, self.table_root.to_string()))
+            .map(|(i, entry)| {
+                let manifest_path = self
+                    .manifest_location
+                    .as_ref()
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| self.table_root.to_string());
+                entry_to_add_remove(entry, &dv_maps, i, self.table_root.as_str(), manifest_path)
+            })
             .collect::<DeltaResult<Vec<_>>>()?;
 
         // Return empty iterator if no add_removes
@@ -338,7 +364,6 @@ impl Metadata {
     ///     // Process action batches...
     /// }
     /// ```
-    #[allow(dead_code)]
     pub(crate) fn manifest_references(&self) -> DeltaResult<LeafReferences> {
         // Get all metadata entries from the root manifest
         let entries = self.entries()?;
@@ -416,7 +441,14 @@ impl Metadata {
 
                 // Only add to unmatched_dvs if the referenced file is NOT in the root
                 if !root_data_files.contains(&referenced_file) {
-                    let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i)?;
+                    // For DVs in root manifest, use the root manifest path if available, otherwise empty string
+                    let manifest_path = self
+                        .manifest_location
+                        .as_ref()
+                        .map(|u| u.as_str())
+                        .unwrap_or("");
+                    let dv_info =
+                        metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
 
                     unmatched_dvs
                         .entry(referenced_file)
@@ -531,7 +563,6 @@ impl Metadata {
     ///
     /// # Returns
     /// A HashMap mapping file paths to their deletion vector information.
-    #[allow(dead_code)]
     pub(crate) fn build_shared_dv_map(
         shared_state: &SharedLeafState,
         engine: &dyn Engine,
@@ -559,7 +590,11 @@ impl Metadata {
                 delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
             }
 
-            merge_deletion_vectors(&mut deletion_vector_map, delete_entries)?;
+            merge_deletion_vectors(
+                &mut deletion_vector_map,
+                delete_entries,
+                &delete_manifest_location,
+            )?;
         }
 
         Ok(deletion_vector_map)
@@ -579,7 +614,6 @@ impl Metadata {
     ///
     /// # Returns
     /// An iterator over all action batches from all child manifests.
-    #[allow(dead_code)]
     pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         engine: &dyn Engine,
@@ -630,7 +664,6 @@ impl Metadata {
     /// # Notes
     /// - Use `root_to_action_batches` for a higher-level API that processes all manifests
     /// - The shared_dv_map should be built once and reused for all child manifests
-    #[allow(dead_code)]
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
         shared_dv_map: &HashMap<String, DeletionVectorInfo>,
@@ -679,7 +712,11 @@ impl Metadata {
                 delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
             }
 
-            merge_deletion_vectors(&mut affiliated_dv_map, delete_entries)?;
+            merge_deletion_vectors(
+                &mut affiliated_dv_map,
+                delete_entries,
+                &delete_manifest_location,
+            )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
@@ -696,7 +733,13 @@ impl Metadata {
             })
             .enumerate()
             .map(|(i, entry)| {
-                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
+                entry_to_add_remove(
+                    entry,
+                    &dv_maps,
+                    i,
+                    table_root.as_str(),
+                    data_manifest_location.clone(),
+                )
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -790,6 +833,7 @@ impl Metadata {
             data,
             version: parsed.version,
             table_root,
+            manifest_location: Some(path.clone()),
             // When reading existing metadata, we don't know if it's a root or leaf
             // This would need to be determined from the file path or stored in the metadata
             leaf: None,
@@ -857,6 +901,8 @@ pub(crate) struct DeletionVectorInfo {
     sequence_number: i64,
     /// Index of this entry in the metadata tree
     entry_index: i64,
+    /// Path to the delete manifest containing this DV entry
+    delete_manifest_path: String,
 }
 
 /// Result of processing deletion vector information for a file entry.
@@ -887,7 +933,7 @@ struct ProcessedDeletionVector {
 /// Currently only supports inline deletion vectors (stored in `inline_content`).
 /// External deletion vectors (referenced via `location`) are not yet supported.
 #[allow(dead_code)]
-fn apply_manifest_dv(
+pub(crate) fn apply_manifest_dv(
     entries: Vec<MetadataEntry>,
     manifest_dv: &MetadataEntry,
 ) -> DeltaResult<Vec<MetadataEntry>> {
@@ -969,6 +1015,7 @@ fn apply_manifest_dv(
 fn merge_deletion_vectors(
     deletion_vector_map: &mut HashMap<String, DeletionVectorInfo>,
     entries: Vec<MetadataEntry>,
+    delete_manifest_path: &str,
 ) -> DeltaResult<()> {
     for (i, entry) in entries.into_iter().enumerate() {
         // Only process PositionDeletes entries that are not deleted
@@ -984,7 +1031,7 @@ fn merge_deletion_vectors(
                 .clone()
                 .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
 
-            let dv_info = metadata_entry_to_deletion_vector_info(entry, i)?;
+            let dv_info = metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path)?;
 
             // Only insert if this DV has a higher sequence number than any existing one for this file
             deletion_vector_map
@@ -1011,6 +1058,7 @@ fn merge_deletion_vectors(
 fn metadata_entry_to_deletion_vector_info(
     dv_entry: MetadataEntry,
     entry_index: usize,
+    delete_manifest_path: &str,
 ) -> DeltaResult<DeletionVectorInfo> {
     let sequence_number = dv_entry
         .tracking_info
@@ -1057,6 +1105,7 @@ fn metadata_entry_to_deletion_vector_info(
         },
         sequence_number,
         entry_index: entry_index_i64,
+        delete_manifest_path: delete_manifest_path.to_string(),
     })
 }
 
@@ -1069,7 +1118,6 @@ fn process_deletion_vector(
     dv_maps: &DeletionVectorMaps<'_>,
     full_path: &str,
     entry_sequence_number: Option<i64>,
-    root_path: &str,
 ) -> DeltaResult<ProcessedDeletionVector> {
     let dv_info = dv_maps.get(full_path);
 
@@ -1077,7 +1125,7 @@ fn process_deletion_vector(
         Some(info) if info.sequence_number > entry_sequence_number.unwrap_or(0) => {
             Ok(ProcessedDeletionVector {
                 descriptor: Some(info.descriptor.clone()),
-                delete_manifest_path: Some(root_path.to_string()),
+                delete_manifest_path: Some(info.delete_manifest_path.clone()),
                 delete_manifest_position: Some(info.entry_index),
             })
         }
@@ -1141,22 +1189,26 @@ fn entry_to_add_remove(
     entry: MetadataEntry,
     dv_maps: &DeletionVectorMaps<'_>,
     entry_index: usize,
-    root_path: String,
+    table_root: &str,
+    manifest_path: String,
 ) -> DeltaResult<AddRemove> {
     use std::collections::HashMap;
 
-    let full_path = entry
-        .location
-        .ok_or_else(|| Error::generic("Action requires location"))?;
+    let full_path = entry.location.ok_or_else(|| {
+        Error::generic(format!(
+            "Action requires location (content_type: {:?})",
+            entry.content_type
+        ))
+    })?;
 
     // Convert absolute path to relative path by removing the table root prefix
     // The path in entry.location is an absolute URL, but Add actions expect relative paths
-    let path = absolute_to_relative_path(&full_path, &root_path);
+    let path = absolute_to_relative_path(&full_path, table_root);
     let sequence_number = entry
         .tracking_info
         .as_ref()
         .and_then(|ti| ti.sequence_number);
-    let processed_dv = process_deletion_vector(dv_maps, &full_path, sequence_number, &root_path)?;
+    let processed_dv = process_deletion_vector(dv_maps, &full_path, sequence_number)?;
 
     let status = entry
         .tracking_info
@@ -1181,7 +1233,7 @@ fn entry_to_add_remove(
                     base_row_id: first_row_id,
                     default_row_commit_version: snapshot_id,
                     clustering_provider: None, // TODO: Set from when final decision is made.
-                    data_manifest_path: Some(root_path),
+                    data_manifest_path: Some(manifest_path.clone()),
                     data_manifest_position: Some(entry_index.try_into().map_err(|_| {
                         Error::generic("Entry index is too large to convert to i64")
                     })?),
@@ -1204,7 +1256,7 @@ fn entry_to_add_remove(
                     deletion_vector: processed_dv.descriptor,
                     base_row_id: first_row_id,
                     default_row_commit_version: snapshot_id,
-                    data_manifest_path: Some(root_path),
+                    data_manifest_path: Some(manifest_path),
                     data_manifest_position: Some(entry_index.try_into().map_err(|_| {
                         Error::generic("Entry index is too large to convert to i64")
                     })?),
@@ -2398,6 +2450,7 @@ mod tests {
             data: vec![engine_data],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2683,6 +2736,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2715,6 +2769,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2747,6 +2802,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2779,6 +2835,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 3,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2845,6 +2902,7 @@ mod tests {
             ],
             version: 3,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2923,6 +2981,7 @@ mod tests {
             data,
             version: 4,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -2997,6 +3056,7 @@ mod tests {
             data,
             version: 5,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3055,6 +3115,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3122,6 +3183,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3231,6 +3293,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3281,6 +3344,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3325,6 +3389,7 @@ mod tests {
                 .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3423,6 +3488,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3481,6 +3547,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3613,6 +3680,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3698,6 +3766,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3766,6 +3835,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -3966,6 +4036,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -4009,6 +4080,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -4023,6 +4095,7 @@ mod tests {
             metadata_entry_to_deletion_vector_info(
                 create_dv_entry("memory:///dv3.parquet", "memory:///data3.parquet", 200),
                 0,
+                "memory:///test_delete_manifest.parquet",
             )?,
         );
 
@@ -4072,6 +4145,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -4093,6 +4167,7 @@ mod tests {
             ],
             version: 1, // Use different version to avoid filename collision
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 
@@ -4114,6 +4189,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
+            manifest_location: None,
             leaf: None,
         };
 

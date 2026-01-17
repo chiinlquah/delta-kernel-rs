@@ -545,8 +545,22 @@ impl LogSegment {
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
         let metadata =
             crate::metadata::Metadata::read(engine, &content_root_url, table_root.clone())?;
+
+        // Get actions from root manifest
         // TODO: Provide partition keys
-        metadata.root_action_batches(engine, &checkpoint_read_schema, &[])
+        let root_batches = metadata.root_action_batches(engine, &checkpoint_read_schema, &[])?;
+
+        // Get actions from leaf manifests (DataManifest entries)
+        let leaf_refs = metadata.manifest_references()?;
+        let leaf_batches = crate::metadata::Metadata::non_root_action_batches(
+            leaf_refs,
+            engine,
+            &checkpoint_read_schema,
+            table_root,
+        )?;
+
+        // Chain root and leaf actions together
+        Ok(Box::new(root_batches.chain(leaf_batches)))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.

@@ -44,7 +44,7 @@ pub(crate) mod state_info;
 pub(crate) mod test_utils;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]

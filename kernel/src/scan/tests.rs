@@ -202,6 +202,25 @@ pub(crate) fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult
     Ok(files)
 }
 
+/// Helper function to get file paths from a scan, allowing deletion vectors to be present.
+/// This is useful for tests that scan content root with leaf manifests where DVs may be populated.
+pub(crate) fn get_files_for_scan_allow_dvs(
+    scan: Scan,
+    engine: &dyn Engine,
+) -> DeltaResult<Vec<String>> {
+    let scan_metadata_iter = scan.scan_metadata(engine)?;
+    fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
+        paths.push(scan_file.path.to_string());
+        // Note: scan_file.dv_info.deletion_vector may be Some when scanning from content root with leaf manifests
+    }
+    let mut files = vec![];
+    for res in scan_metadata_iter {
+        let scan_metadata = res?;
+        files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
+    }
+    Ok(files)
+}
+
 #[test]
 fn test_scan_metadata_paths() {
     let path =
