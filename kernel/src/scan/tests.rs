@@ -202,6 +202,25 @@ pub(crate) fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult
     Ok(files)
 }
 
+/// Helper function to get file paths from a scan, allowing deletion vectors to be present.
+/// This is useful for tests that scan content root with leaf manifests where DVs may be populated.
+pub(crate) fn get_files_for_scan_allow_dvs(
+    scan: Scan,
+    engine: &dyn Engine,
+) -> DeltaResult<Vec<String>> {
+    let scan_metadata_iter = scan.scan_metadata(engine)?;
+    fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
+        paths.push(scan_file.path.to_string());
+        // Note: scan_file.dv_info.deletion_vector may be Some when scanning from content root with leaf manifests
+    }
+    let mut files = vec![];
+    for res in scan_metadata_iter {
+        let scan_metadata = res?;
+        files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
+    }
+    Ok(files)
+}
+
 #[test]
 fn test_scan_metadata_paths() {
     let path =
@@ -373,12 +392,13 @@ fn test_replay_for_scan_metadata() {
     let engine = SyncEngine::new();
 
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    let scan = snapshot.scan_builder().build().unwrap();
-    let data: Vec<_> = scan
-        .replay_for_scan_metadata(&engine)
-        .unwrap()
-        .try_collect()
-        .unwrap();
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+
+    // replay_for_scan_metadata returns (iter, has_stats_parsed, checkpoint_schema)
+    let (data_iter, _has_stats_parsed, _checkpoint_schema) =
+        scan.replay_for_scan_metadata(&engine).unwrap();
+
+    let data: Vec<_> = data_iter.try_collect().unwrap();
     // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
     // could be skipped when looking for adds/removes.
     //
@@ -614,9 +634,8 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];
@@ -826,9 +845,8 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];

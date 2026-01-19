@@ -58,11 +58,18 @@ pub fn scan(
 
     // Count first task if it exists
     let mut num_tasks = if first_task.is_some() { 1 } else { 0 };
+    let mut num_files = 0;
 
-    // Enumerate remaining tasks
+    // Count files in first task
+    if let Some(Ok(metadata)) = first_task {
+        num_files += metadata.scan_files.data().len();
+    }
+
+    // Enumerate remaining tasks and count files
     for result in metadata_iter {
-        result?; // Just ensure it succeeds
+        let metadata = result?;
         num_tasks += 1;
+        num_files += metadata.scan_files.data().len();
     }
 
     let time_to_enumerate_all = first_task_start.elapsed();
@@ -72,8 +79,8 @@ pub fn scan(
         time_to_first_task,
         time_to_enumerate_all,
         num_tasks,
-        num_tasks, // num_files = num_tasks for scan metadata
-        0,         // total_bytes not easily available from scan_metadata
+        num_files,
+        0, // total_bytes not easily available from scan_metadata
     );
 
     Ok(BenchmarkMetrics::new(
@@ -209,7 +216,7 @@ pub fn write(
     let mut batches = Vec::new();
     let num_batches = num_files / batch_size;
     for _ in 0..num_batches {
-        batches.push(create_add_files_metadata(add_files_schema, batch_size)?);
+        batches.push(create_add_files_metadata(&add_files_schema, batch_size)?);
     }
 
     add_batches_to_txn(&mut txn, batches, bulk_mode)?;

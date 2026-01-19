@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
@@ -22,8 +21,9 @@ use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::metadata::writer::MetadataWriter;
-use crate::path::LogRoot;
+use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -35,33 +35,12 @@ use crate::schema::{
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
+use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
-
-// This is a workaround due to the fact that expression evaluation happens
-// on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
-// required fields.
-// TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
-// on FilteredEngineData directly.
-struct NullableStatsTransform;
-impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) if field.is_nullable() => Borrowed(field),
-            data_type => Owned(StructField {
-                name: field.name.clone(),
-                data_type: data_type.into_owned(),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
-        };
-        Some(field)
-    }
-}
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -89,8 +68,12 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
 }
 
-/// The static instance referenced by [`add_files_schema`].
-pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// Returns a minimal add files schema with only numRecords as a statistic.
+///
+/// This is used by the default engine implementation for backward compatibility.
+/// For full statistics support, use `Transaction::add_files_schema()`.
+#[allow(dead_code)] // Used in default-engine feature
+pub(crate) static MINIMAL_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
@@ -108,9 +91,11 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 /// This column holds new DV descriptors appended to scan file metadata before transforming to final add actions.
 static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
-/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
-static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
+/// Extend a schema with the dataChange column and return a new SchemaRef.
+///
+/// The dataChange column is inserted after the modificationTime field.
+fn with_data_change_col(schema: &SchemaRef) -> SchemaRef {
+    let mut fields = schema.fields().collect::<Vec<_>>();
     let len = fields.len();
     let insert_position = fields
         .iter()
@@ -118,7 +103,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
         .unwrap_or(len);
     fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
-});
+}
 
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
@@ -245,6 +230,54 @@ static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
+}
+
+/// Extracts leaf column paths from a stats schema structure.
+///
+/// Walks through minValues/maxValues schemas (they have same structure) and returns
+/// all leaf columns as ColumnName instances representing their full paths.
+fn extract_leaf_columns_from_stats(
+    stats_schema: &StructType,
+) -> Vec<crate::expressions::ColumnName> {
+    // Look for minValues field (could also use maxValues, they're identical)
+    let Some(min_values_field) = stats_schema.fields().find(|f| f.name() == "minValues") else {
+        return vec![]; // No min/max fields means no eligible columns
+    };
+
+    let DataType::Struct(min_values_struct) = min_values_field.data_type() else {
+        return vec![];
+    };
+
+    let mut columns = Vec::new();
+    let mut path = Vec::new();
+    extract_leaf_columns_recursive(min_values_struct, &mut path, &mut columns);
+    columns
+}
+
+/// Recursively extracts leaf column paths from a schema.
+fn extract_leaf_columns_recursive(
+    schema: &StructType,
+    current_path: &mut Vec<String>,
+    result: &mut Vec<crate::expressions::ColumnName>,
+) {
+    use crate::expressions::ColumnName;
+
+    for field in schema.fields() {
+        current_path.push(field.name().to_string());
+
+        match field.data_type() {
+            DataType::Struct(nested) => {
+                // Recurse into nested struct
+                extract_leaf_columns_recursive(nested, current_path, result);
+            }
+            _ => {
+                // Leaf column - add to result
+                result.push(ColumnName::new(current_path.iter().map(|s| s.as_str())));
+            }
+        }
+
+        current_path.pop();
+    }
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -464,13 +497,18 @@ impl Transaction {
             return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            commit_version,
+            self.commit_timestamp,
+            self.read_snapshot.log_segment().max_published_version,
+        );
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(version),
+            Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(file_meta)?,
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -523,16 +561,26 @@ impl Transaction {
                 .content_root_with_version(engine)?;
 
             // Decide whether to load from content root or build from snapshot
-            let metadata = if let Some((content_root_action, _version)) = latest_content_root {
-                crate::metadata::Metadata::new_from_content_root(
-                    engine,
-                    &content_root_action,
-                    self.read_snapshot.table_root().clone(),
-                )?
-            } else {
-                // No content root found, build from snapshot (full replay)
-                crate::metadata::Metadata::new_from_snapshot(engine, self.read_snapshot.clone())?
-            };
+            let (metadata, root_manifest_path) =
+                if let Some((content_root_action, _version)) = latest_content_root {
+                    let root_path = content_root_action.path.clone();
+                    let metadata = crate::metadata::Metadata::new_from_content_root(
+                        engine,
+                        &content_root_action,
+                        self.read_snapshot.table_root().clone(),
+                    )?;
+                    (metadata, Some(root_path))
+                } else {
+                    // No content root found, build from snapshot (full replay)
+                    // In this case, there's no existing root manifest, so all entries are conceptually in the root
+                    (
+                        crate::metadata::Metadata::new_from_snapshot(
+                            engine,
+                            self.read_snapshot.clone(),
+                        )?,
+                        None,
+                    )
+                };
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             let mut metadata_builder = metadata.to_builder(table_schema);
@@ -562,19 +610,86 @@ impl Transaction {
 
                     // Mark all removes as deleted in the ContentRoot
                     for remove in visitor.removes.iter() {
-                        // Mark the corresponding entry as DELETED in the metadata
-                        let file_path = Some(remove.path.as_str());
-                        let dv_path: Option<&str> = remove
-                            .deletion_vector
+                        // Check if this remove has source manifest information (leaf manifest)
+                        // If data_manifest_path or delete_manifest_path are set AND they're not equal
+                        // to the root manifest path, we should use delete_from_leaf to mark the entry
+                        // in the leaf manifest
+                        let data_in_leaf = remove
+                            .data_manifest_path
                             .as_ref()
-                            .map(|dv| dv.path_or_inline_dv.as_str());
+                            .filter(|path| {
+                                // Check if path is not the root manifest
+                                root_manifest_path.as_ref() != Some(path)
+                            })
+                            .is_some()
+                            && remove.data_manifest_position.is_some();
 
-                        metadata_builder.mark_deleted(
-                            file_path,
-                            dv_path,
-                            commit_version,
-                            snapshot_id,
-                        )?;
+                        let dv_in_leaf = remove
+                            .delete_manifest_path
+                            .as_ref()
+                            .filter(|path| {
+                                // Check if path is not the root manifest
+                                root_manifest_path.as_ref() != Some(path)
+                            })
+                            .is_some()
+                            && remove.delete_manifest_position.is_some();
+
+                        // Use delete_from_leaf for entries in leaf manifests
+                        if data_in_leaf {
+                            if let (Some(manifest_path), Some(position)) = (
+                                remove.data_manifest_path.as_ref(),
+                                remove.data_manifest_position,
+                            ) {
+                                metadata_builder.delete_from_leaf(
+                                    manifest_path,
+                                    position as u64,
+                                    commit_version,
+                                    snapshot_id,
+                                )?;
+                            }
+                        }
+
+                        if dv_in_leaf {
+                            if let (Some(dv_manifest_path), Some(dv_position)) = (
+                                remove.delete_manifest_path.as_ref(),
+                                remove.delete_manifest_position,
+                            ) {
+                                metadata_builder.delete_from_leaf(
+                                    dv_manifest_path,
+                                    dv_position as u64,
+                                    commit_version,
+                                    snapshot_id,
+                                )?;
+                            }
+                        }
+
+                        // Use mark_deleted for entries in root manifest
+                        // If data file is in leaf, pass None for file_path
+                        // If DV is in leaf, pass None for dv_path
+                        if !data_in_leaf || !dv_in_leaf {
+                            let file_path = if data_in_leaf {
+                                None
+                            } else {
+                                Some(remove.path.as_str())
+                            };
+
+                            // Only mark DV as deleted in root if we didn't handle it via leaf
+                            let dv_path: Option<&str> = if dv_in_leaf {
+                                None
+                            } else {
+                                remove
+                                    .deletion_vector
+                                    .as_ref()
+                                    .map(|dv| dv.path_or_inline_dv.as_str())
+                            };
+
+                            metadata_builder.mark_deleted(
+                                file_path,
+                                dv_path,
+                                commit_version,
+                                snapshot_id,
+                            )?;
+                        }
                     }
                 }
             }
@@ -933,16 +1048,77 @@ impl Transaction {
     /// file to be added to the table. Kernel takes this information and extends it to the full add_file
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
-    /// For now, Kernel only supports the number of records as a file statistic.
-    /// This will change in a future release.
-    ///
-    /// Note: While currently static, in the future the schema might change depending on
-    /// options set on the transaction or features enabled on the table.
+    /// The stats field structure is determined by table configuration. See [`stats_schema`] for details.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    pub fn add_files_schema(&self) -> &'static SchemaRef {
-        &BASE_ADD_FILES_SCHEMA
+    /// [`stats_schema`]: crate::transaction::Transaction::stats_schema
+    pub fn add_files_schema(&self) -> SchemaRef {
+        let stats_schema = self.stats_schema();
+
+        StructTypeBuilder::from_schema(mandatory_add_file_schema())
+            .add_field(StructField::nullable(
+                "stats",
+                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+            ))
+            .build_arc_unchecked()
+    }
+
+    /// Returns the expected schema for file statistics that should be collected during writes.
+    ///
+    /// This schema represents the structure of the `stats` field that engines must populate
+    /// when reporting file metadata. The schema includes:
+    /// - `numRecords` (LONG): Total number of records in the file
+    /// - `nullCount` (STRUCT): Null counts for configured columns (all leaf fields as LONG)
+    /// - `minValues` (STRUCT): Minimum values for eligible columns
+    /// - `maxValues` (STRUCT): Maximum values for eligible columns
+    /// - `tightBounds` (BOOLEAN): Whether min/max are exact bounds (default true)
+    ///
+    /// The columns included are determined by table properties:
+    /// - `delta.dataSkippingStatsColumns`: Explicit list of columns (takes precedence)
+    /// - `delta.dataSkippingNumIndexedCols`: Numeric limit (default 32, or -1 for all)
+    ///
+    /// Only data-skipping eligible types are included in min/max. Partition columns are
+    /// automatically excluded.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// let stats_schema = txn.stats_schema();
+    ///
+    /// // Engine collects statistics matching this schema structure
+    /// let file_stats = collect_stats_for_file(parquet_file, &stats_schema);
+    /// ```
+    pub fn stats_schema(&self) -> SchemaRef {
+        self.read_snapshot
+            .table_configuration()
+            .expected_stats_schema()
+            .unwrap_or_else(|_| Arc::new(StructType::new_unchecked([])))
+    }
+
+    /// Returns the list of leaf columns for which statistics should be collected during writes.
+    ///
+    /// Each `ColumnName` represents a column path for which min, max, and null count
+    /// statistics should be collected. For nested columns, the path includes all parent
+    /// field names (e.g., `["address", "city"]` for `address.city`).
+    ///
+    /// This list contains leaf columns only. If a struct column is configured for statistics,
+    /// all its leaf descendants with eligible types will be included.
+    ///
+    /// Partition columns are automatically excluded.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// let stats_columns = txn.stats_columns();
+    ///
+    /// for column in stats_columns {
+    ///     println!("Collect stats for: {}", column); // Prints: "id", "user.name", etc.
+    /// }
+    /// ```
+    pub fn stats_columns(&self) -> Vec<crate::expressions::ColumnName> {
+        let stats_schema = self.stats_schema();
+        extract_leaf_columns_from_stats(&stats_schema)
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -997,6 +1173,10 @@ impl Transaction {
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            self.stats_columns()
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect(),
         )
     }
 
@@ -1109,8 +1289,10 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
-                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+                with_row_tracking_cols(&self.add_files_schema()),
+                with_row_tracking_cols(&with_stats_col(&with_data_change_col(
+                    &self.add_files_schema(),
+                ))),
                 self.data_change,
             );
 
@@ -1124,8 +1306,8 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                self.add_files_schema().clone(),
-                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
+                self.add_files_schema(),
+                with_stats_col(&with_data_change_col(&self.add_files_schema())),
                 self.data_change,
             );
 
@@ -1133,7 +1315,8 @@ impl Transaction {
         }
     }
 
-    fn into_committed(self, version: Version) -> CommittedTransaction {
+    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+        let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
         let stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
                 + 1,
@@ -1144,11 +1327,11 @@ impl Transaction {
                 + 1,
         };
 
-        CommittedTransaction {
+        Ok(CommittedTransaction {
             transaction: self,
-            commit_version: version,
+            commit_version: parsed_commit.version,
             post_commit_stats: stats,
-        }
+        })
     }
 
     fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
@@ -1275,24 +1458,26 @@ impl Transaction {
                 Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
                     .into(),
             )
+            // Preserve manifest location fields before dropping FILE_CONSTANT_VALUES_NAME
+            // These fields tell the transaction whether files are in leaf manifests,
+            // which determines whether to use delete_from_leaf vs mark_deleted
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPath"]).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPosition"]).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPath"]).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPosition"]).into(),
+            )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime")
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::null_literal(DataType::STRING).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::null_literal(DataType::LONG).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::null_literal(DataType::STRING).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::null_literal(DataType::LONG).into(),
-            )
             .with_dropped_field("modificationTime");
 
         // Drop any additional columns specified in columns_to_drop
@@ -1485,6 +1670,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1493,12 +1680,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1516,6 +1705,13 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, etc.).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1654,7 +1850,6 @@ pub struct RetryableTransaction {
 mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
     use crate::Snapshot;
     use std::path::PathBuf;
 
@@ -1717,23 +1912,29 @@ mod tests {
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
-        let expected = StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                DataType::struct_type_unchecked(vec![StructField::nullable(
-                    "numRecords",
-                    DataType::LONG,
-                )]),
-            ),
-        ]);
-        assert_eq!(*schema, expected.into());
+
+        // The schema should include the mandatory fields
+        assert!(schema.fields().any(|f| f.name() == "path"));
+        assert!(schema.fields().any(|f| f.name() == "partitionValues"));
+        assert!(schema.fields().any(|f| f.name() == "size"));
+        assert!(schema.fields().any(|f| f.name() == "modificationTime"));
+
+        // The stats field should be present and should be a struct
+        let stats_field = schema
+            .fields()
+            .find(|f| f.name() == "stats")
+            .expect("stats field should exist");
+        assert!(matches!(stats_field.data_type(), DataType::Struct(_)));
+
+        // Verify that stats schema contains the expected fields based on table config
+        if let DataType::Struct(stats_schema) = stats_field.data_type() {
+            // Should always have numRecords
+            assert!(stats_schema.fields().any(|f| f.name() == "numRecords"));
+            // Should have tightBounds
+            assert!(stats_schema.fields().any(|f| f.name() == "tightBounds"));
+            // May have nullCount, minValues, maxValues depending on table config
+        }
+
         Ok(())
     }
 
@@ -2026,4 +2227,584 @@ mod tests {
     // have DV updates but others don't) is provided by the end-to-end integration test
     // kernel/tests/dv.rs and kernel/tests/write.rs, which exercises
     // the full deletion vector write workflow including the DvMatchVisitor logic.
+
+    /// Helper to create an initial Delta table with Protocol and Metadata (version 0)
+    fn create_initial_table(table_root: &Url) -> DeltaResult<()> {
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use uuid::Uuid;
+
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+                {"name": "value", "type": "string", "nullable": true, "metadata": {}}
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        create_dir_all(&delta_log_path)
+            .map_err(|e| Error::generic(format!("Failed to create _delta_log: {e}")))?;
+
+        let file_path = delta_log_path.join("00000000000000000000.json");
+        write(&file_path, data)
+            .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Helper to write a ContentRoot action to a specific version
+    fn write_content_root_action(
+        table_root: &Url,
+        content_root_path: &str,
+        version: u64,
+    ) -> DeltaResult<()> {
+        use serde_json::json;
+        use std::fs::write;
+
+        let content_root = json!({
+            "contentRoot": {
+                "path": content_root_path,
+                "sizeInBytes": 0
+            }
+        });
+
+        let data = serde_json::to_vec(&content_root)?;
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        let file_name = format!("{:020}.json", version);
+        let file_path = delta_log_path.join(file_name);
+        write(&file_path, data)
+            .map_err(|e| Error::generic(format!("Failed to write ContentRoot: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Helper to get file list from scan
+    fn get_files_from_scan(table_root: &Url, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(engine)?;
+        let scan = snapshot.scan_builder().build()?;
+        // Use get_files_for_scan_allow_dvs since content root tests may have DVs populated
+        crate::scan::tests::get_files_for_scan_allow_dvs(scan, engine)
+    }
+
+    /// Helper to create an Add action with minimal boilerplate
+    fn make_add_action(path: String) -> crate::actions::Add {
+        crate::actions::Add {
+            path,
+            partition_values: Default::default(),
+            size: 1024,
+            modification_time: 1677811178336,
+            data_change: true,
+            stats: None,
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
+        }
+    }
+
+    /// Tests that removing files with data_manifest_path uses delete_from_leaf properly
+    /// by verifying through the Scan API that files are removed
+    #[test]
+    fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::metadata::builder::MetadataBuilder;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Step 1: Create initial table (v0) with Protocol + Metadata
+        create_initial_table(&table_root)?;
+
+        // Step 2: Build metadata tree with leaf manifest containing Add actions
+        let mut leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
+
+        for path in &data_files {
+            leaf_builder.add(make_add_action(path.clone()), 1, Some(1))?;
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let mut root_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        root_builder.add_entry(leaf_manifest_entry);
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Step 3: Write ContentRoot action (v1)
+        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+
+        // Step 4: Scan to get initial file list
+        let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
+            .into_iter()
+            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .collect();
+        assert_eq!(initial_files.len(), 5, "Expected 5 data files");
+
+        // Step 5: Use Transaction API to remove file at index 2 (v2)
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot
+            .transaction(committer)?
+            .with_batch_commit()
+            .with_operation("DELETE".to_string());
+
+        // Remove file at scan batch index 2
+        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+            let scan_data = res?;
+            if index == 2 {
+                txn.remove_files(scan_data.scan_files);
+                break;
+            }
+        }
+
+        // Commit the transaction
+        let _committed = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(c) => c,
+            _ => panic!("Transaction should succeed"),
+        };
+
+        // Step 6: Scan again to verify file was removed
+        let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
+            .into_iter()
+            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .collect();
+        assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
+
+        // Verify that one of the original files is now missing
+        let removed_count = initial_files
+            .iter()
+            .filter(|f| !final_files.contains(f))
+            .count();
+        assert_eq!(removed_count, 1, "Expected exactly 1 file to be removed");
+
+        Ok(())
+    }
+
+    /// Helper to create an Add action with a deletion vector
+    fn make_add_action_with_dv(path: String, dv_path: String) -> crate::actions::Add {
+        use crate::actions::deletion_vector::{
+            DeletionVectorDescriptor, DeletionVectorStorageType,
+        };
+
+        crate::actions::Add {
+            path,
+            partition_values: Default::default(),
+            size: 1024,
+            modification_time: 1677811178336,
+            data_change: true,
+            stats: None,
+            tags: None,
+            deletion_vector: Some(DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: dv_path,
+                offset: Some(0),
+                size_in_bytes: 100,
+                cardinality: 5,
+            }),
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
+        }
+    }
+
+    /// Tests that removing files with deletion vectors in leaf manifests works properly
+    #[test]
+    fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::metadata::builder::MetadataBuilder;
+        use crate::metadata::{
+            ContentInfo, DataContentType, DataFileFormat, MetadataEntry, TrackingInfo,
+            TrackingStatus,
+        };
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table (v0) with Protocol + Metadata
+        create_initial_table(&table_root)?;
+
+        // Step 2: Build metadata tree with TWO leaf manifests:
+        // - Data leaf manifest with data file entries (some reference DVs)
+        // - Delete leaf manifest with PositionDeletes entries (the actual DV files)
+
+        // Create data leaf manifest with 5 data files
+        let mut data_leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+
+        // Files without DV
+        data_leaf_builder.add(
+            make_add_action("data/file-0.parquet".to_string()),
+            1,
+            Some(1),
+        )?;
+        data_leaf_builder.add(
+            make_add_action("data/file-1.parquet".to_string()),
+            1,
+            Some(1),
+        )?;
+
+        // Files with DV (file-2 and file-3) - use the builder's add() method which extracts DV content
+        data_leaf_builder.add(
+            make_add_action_with_dv(
+                "data/file-2.parquet".to_string(),
+                "vBn[lx{q8@P<9BNH/isA".to_string(), // Valid 20-char encoded UUID
+            ),
+            1,
+            Some(1),
+        )?;
+        data_leaf_builder.add(
+            make_add_action_with_dv(
+                "data/file-3.parquet".to_string(),
+                "^-aqEH.-t@S}K{vb[*k^".to_string(), // Another valid 20-char encoded UUID
+            ),
+            1,
+            Some(1),
+        )?;
+
+        // File without DV
+        data_leaf_builder.add(
+            make_add_action("data/file-4.parquet".to_string()),
+            1,
+            Some(1),
+        )?;
+
+        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, Some(1))?;
+
+        // Create delete leaf manifest with PositionDeletes entries for the DVs
+        let mut delete_leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+
+        // DV entry for file-2.parquet
+        let dv_entry_2 = MetadataEntry {
+            content_type: DataContentType::PositionDeletes,
+            location: Some(format!(
+                "{}deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin",
+                table_root
+            )),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(2),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: Some(ContentInfo {
+                offset: 0,
+                size_in_bytes: 108, // 100 + 8
+            }),
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 5, // cardinality from the DV descriptor
+            file_size_in_bytes: Some(108),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: Some(format!("{}data/file-2.parquet", table_root)),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        // DV entry for file-3.parquet
+        let dv_entry_3 = MetadataEntry {
+            content_type: DataContentType::PositionDeletes,
+            location: Some(format!(
+                "{}ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+                table_root
+            )),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(2),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: Some(ContentInfo {
+                offset: 0,
+                size_in_bytes: 108,
+            }),
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 5,
+            file_size_in_bytes: Some(108),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: Some(format!("{}data/file-3.parquet", table_root)),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        delete_leaf_builder.add_entry(dv_entry_2);
+        delete_leaf_builder.add_entry(dv_entry_3);
+
+        let delete_leaf_entry = delete_leaf_builder.write_leaf(&engine, Some(1))?;
+
+        // Create root manifest with both data and delete leaf manifests
+        let mut root_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        root_builder.add_entry(data_leaf_entry);
+        root_builder.add_entry(delete_leaf_entry);
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Step 3: Write ContentRoot action (v1)
+        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+
+        // Step 4: Scan to get initial file list
+        let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
+            .into_iter()
+            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .collect();
+        assert_eq!(initial_files.len(), 5, "Expected 5 data files");
+
+        // Step 5: Use Transaction API to remove file-2 (which has a deletion vector)
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot
+            .transaction(committer)?
+            .with_batch_commit()
+            .with_operation("DELETE".to_string());
+
+        // Remove file at scan batch index 2 (file-2.parquet which has a DV)
+        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+            let scan_data = res?;
+            if index == 2 {
+                txn.remove_files(scan_data.scan_files);
+                break;
+            }
+        }
+
+        // Commit the transaction
+        let _committed = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(c) => c,
+            _ => panic!("Transaction should succeed"),
+        };
+
+        // Step 6: Scan again to verify file was removed
+        let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
+            .into_iter()
+            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .collect();
+        assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
+
+        // Verify that exactly one file was removed
+        let removed_count = initial_files
+            .iter()
+            .filter(|f| !final_files.contains(f))
+            .count();
+        assert_eq!(removed_count, 1, "Expected exactly 1 file to be removed");
+
+        // Verify that file-2.parquet (the one with DV) is no longer present
+        assert!(
+            !final_files.iter().any(|f| f.contains("file-2.parquet")),
+            "file-2.parquet should have been removed"
+        );
+
+        // Step 7: Verify the ManifestDV for the delete manifest
+        // When delete_from_leaf is used, it creates a ManifestDV entry that marks which
+        // indices in the leaf manifest are deleted, without rewriting the leaf file.
+        use crate::metadata::reader::MetadataEntryVisitor;
+        use crate::metadata::Metadata;
+        use crate::RowVisitor;
+
+        // Read the ContentRoot action from version 2 to get the new manifest path
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        let v2_log_file = delta_log_path.join("00000000000000000002.json");
+        let v2_log_content = std::fs::read_to_string(&v2_log_file)
+            .map_err(|e| Error::generic(format!("Failed to read v2 log: {e}")))?;
+
+        // Parse the ContentRoot action to get the manifest path
+        let content_root_path: String = v2_log_content
+            .lines()
+            .find_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("contentRoot")?
+                            .get("path")?
+                            .as_str()
+                            .map(String::from)
+                    })
+            })
+            .ok_or_else(|| Error::generic("No ContentRoot found in v2"))?;
+
+        // Read the root manifest
+        let root_manifest_url = Url::parse(&content_root_path)
+            .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
+        let root_metadata = Metadata::read(&engine, &root_manifest_url, table_root.clone())?;
+
+        // Extract all entries from the root manifest
+        let mut root_visitor = MetadataEntryVisitor::default();
+        for engine_data in &root_metadata.data {
+            root_visitor.visit_rows_of(engine_data.as_ref())?;
+        }
+
+        // Find the delete manifest in the root
+        // With the fix to write_leaf, delete manifests are now correctly marked as DeleteManifest
+        let delete_manifest = root_visitor
+            .entries
+            .iter()
+            .find(|entry| entry.content_type == DataContentType::DeleteManifest)
+            .ok_or_else(|| Error::generic("No delete manifest found in root"))?;
+
+        let delete_manifest_path = delete_manifest
+            .location
+            .clone()
+            .ok_or_else(|| Error::generic("Delete manifest has no location"))?;
+
+        // Verify that ManifestDVs were created for both manifests
+        let manifest_dvs: Vec<&MetadataEntry> = root_visitor
+            .entries
+            .iter()
+            .filter(|entry| entry.content_type == DataContentType::ManifestDV)
+            .collect();
+
+        assert_eq!(
+            manifest_dvs.len(),
+            2,
+            "Expected 2 ManifestDVs (one for data manifest, one for delete manifest)"
+        );
+
+        // Find the ManifestDV for the delete manifest
+        let delete_manifest_dv = manifest_dvs
+            .iter()
+            .find(|dv| dv.referenced_file.as_ref() == Some(&delete_manifest_path))
+            .ok_or_else(|| Error::generic("No ManifestDV found for delete manifest"))?;
+
+        // Verify the ManifestDV has cardinality 1 (one deleted DV entry)
+        assert_eq!(
+            delete_manifest_dv.record_count, 1,
+            "Delete manifest ManifestDV should have cardinality 1"
+        );
+
+        // Decode the roaring bitmap to verify the deleted index
+        use roaring::RoaringTreemap;
+        let inline_content = delete_manifest_dv
+            .inline_content
+            .as_ref()
+            .ok_or_else(|| Error::generic("ManifestDV has no inline content"))?;
+
+        if inline_content.len() < 4 {
+            return Err(Box::new(Error::generic(
+                "ManifestDV inline content too short",
+            )));
+        }
+        let deleted_indices =
+            RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
+                Box::new(Error::generic(format!(
+                    "Failed to deserialize ManifestDV: {e}"
+                ))) as Box<dyn std::error::Error>
+            })?;
+
+        assert_eq!(
+            deleted_indices.len(),
+            1,
+            "ManifestDV should mark exactly 1 index as deleted"
+        );
+
+        let deleted_index = deleted_indices.iter().next().unwrap();
+
+        // Read the delete manifest and verify the entry at the deleted index
+        let delete_manifest_url = Url::parse(&delete_manifest_path)
+            .map_err(|e| Error::generic(format!("Failed to parse delete manifest URL: {e}")))?;
+        let delete_manifest_metadata =
+            Metadata::read(&engine, &delete_manifest_url, table_root.clone())?;
+
+        let mut delete_visitor = MetadataEntryVisitor::default();
+        for engine_data in &delete_manifest_metadata.data {
+            delete_visitor.visit_rows_of(engine_data.as_ref())?;
+        }
+
+        // Get the DV entry at the deleted index
+        let deleted_dv_entry = delete_visitor
+            .entries
+            .get(deleted_index as usize)
+            .ok_or_else(|| Error::generic(format!("No entry at index {}", deleted_index)))?;
+
+        // Verify it's a PositionDeletes entry for file-2.parquet
+        assert_eq!(
+            deleted_dv_entry.content_type,
+            DataContentType::PositionDeletes,
+            "Deleted entry should be PositionDeletes"
+        );
+
+        assert!(
+            deleted_dv_entry
+                .referenced_file
+                .as_ref()
+                .is_some_and(|f| f.contains("file-2.parquet")),
+            "Deleted DV entry should reference file-2.parquet"
+        );
+
+        Ok(())
+    }
 }

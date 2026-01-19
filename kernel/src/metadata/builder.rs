@@ -8,10 +8,14 @@ use crate::metadata::{
     ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
     TrackingStatus,
 };
+
+#[cfg(test)]
+use crate::metadata::ManifestStats;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Error, Version};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use url::Url;
@@ -380,12 +384,14 @@ impl MetadataBuilder {
             .map(|path| self.path_to_absolute(path))
             .transpose()?;
 
+        // TODO: we should make pending entries a HashMap<String, MetadataEntry> to make this faster
         for entry in &mut self.pending_entries {
             // Check if this entry matches the file path or deletion vector path
             let matches = if let Some(ref absolute_path) = absolute_file_path {
                 entry.location.as_ref() == Some(absolute_path)
+                    || entry.referenced_file.as_ref() == Some(absolute_path)
             } else if let Some(ref absolute_dv) = absolute_dv_path {
-                entry.referenced_file.as_ref() == Some(absolute_dv)
+                entry.location.as_ref() == Some(absolute_dv)
             } else {
                 false
             };
@@ -406,6 +412,217 @@ impl MetadataBuilder {
                         first_row_id: None,
                     });
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Marks a specific entry in a leaf manifest as deleted using a deletion vector.
+    ///
+    /// This method finds the leaf manifest entry corresponding to the provided file path,
+    /// and updates or creates a ManifestDV (deletion vector for manifest entries) to mark
+    /// the specified index as deleted. The deleted entries are tracked in a roaring bitmap
+    /// stored inline.
+    ///
+    /// The method gets the entry count from the leaf manifest's `manifest_info` field,
+    /// which tracks file counts by status. If all entries become deleted, the manifest
+    /// entry is automatically marked as deleted.
+    ///
+    /// # Arguments
+    /// * `leaf_file_path` - The path to the leaf manifest file
+    /// * `index` - The index (row number) within the leaf manifest to mark as deleted
+    /// * `version` - The version at which this deletion occurs
+    /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
+    ///
+    #[allow(dead_code)]
+    pub(crate) fn delete_from_leaf(
+        &mut self,
+        leaf_file_path: &str,
+        index: u64,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        use roaring::RoaringTreemap;
+
+        // Convert leaf path to absolute
+        let absolute_leaf_path = self.path_to_absolute(leaf_file_path)?;
+
+        // Find the leaf manifest entry and get entry count from manifest_info
+        let leaf_manifest = self
+            .pending_entries
+            .iter()
+            .find(|entry| {
+                (entry.content_type == DataContentType::DataManifest
+                    || entry.content_type == DataContentType::DeleteManifest)
+                    && entry.location.as_ref() == Some(&absolute_leaf_path)
+            })
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "Leaf manifest not found at path: {}",
+                    absolute_leaf_path
+                ))
+            })?;
+
+        // Get the entry counts from manifest_info
+        let manifest_info = leaf_manifest.manifest_info.as_ref().ok_or_else(|| {
+            Error::generic(format!(
+                "Leaf manifest missing manifest_info: {}",
+                absolute_leaf_path
+            ))
+        })?;
+
+        // Total entry count includes all entries (added + existing + deleted) for bounds checking
+        let total_entry_count = manifest_info.added_files_count
+            + manifest_info.existing_files_count
+            + manifest_info.deletes_files_count;
+
+        // Active entry count only includes non-deleted entries (added + existing)
+        // for determining if the manifest should be marked as deleted
+        let active_entry_count =
+            manifest_info.added_files_count + manifest_info.existing_files_count;
+
+        // Validate that the index is within bounds (check against total)
+        if index >= total_entry_count as u64 {
+            return Err(Error::generic(format!(
+                "Index {} is out of bounds for manifest with {} entries",
+                index, total_entry_count
+            )));
+        }
+
+        // Find or create the ManifestDV entry for this leaf
+        let manifest_dv_position = self.pending_entries.iter().position(|entry| {
+            entry.content_type == DataContentType::ManifestDV
+                && entry.referenced_file.as_ref() == Some(&absolute_leaf_path)
+        });
+
+        let cardinality = if let Some(pos) = manifest_dv_position {
+            // Update existing ManifestDV
+            let manifest_dv = &mut self.pending_entries[pos];
+
+            // Deserialize the existing roaring bitmap (skip the 4-byte magic number prefix)
+            let mut treemap = if let Some(ref inline_content) = manifest_dv.inline_content {
+                if inline_content.len() < 4 {
+                    return Err(Error::generic(
+                        "Invalid manifest DV: inline content too small",
+                    ));
+                }
+                RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
+                    Error::generic(format!(
+                        "Failed to deserialize deletion vector bitmap: {}",
+                        e
+                    ))
+                })?
+            } else {
+                RoaringTreemap::new()
+            };
+
+            // Add the index to the bitmap
+            treemap.insert(index);
+
+            // Serialize back to inline_content with magic number prefix
+            let mut serialized = Vec::new();
+            // Magic number for portable format
+            const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+            serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+            treemap.serialize_into(&mut serialized).map_err(|e| {
+                Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
+            })?;
+
+            let cardinality = treemap.len();
+
+            // Update the entry
+            manifest_dv.inline_content = Some(Bytes::from(serialized));
+            manifest_dv.record_count = cardinality as i64;
+
+            // Update tracking info to reflect the new version
+            if let Some(ref mut tracking_info) = manifest_dv.tracking_info {
+                tracking_info.sequence_number = Some(version as i64);
+                tracking_info.snapshot_id = snapshot_id;
+            }
+
+            cardinality
+        } else {
+            // Create new ManifestDV entry
+            let mut treemap = RoaringTreemap::new();
+            treemap.insert(index);
+
+            // Serialize the bitmap with magic number prefix
+            let mut serialized = Vec::new();
+            // Magic number for portable format
+            const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+            serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+            treemap.serialize_into(&mut serialized).map_err(|e| {
+                Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
+            })?;
+
+            let cardinality = treemap.len();
+
+            let manifest_dv_entry = MetadataEntry {
+                content_type: DataContentType::ManifestDV,
+                location: None,                       // ManifestDVs use inline content
+                file_format: DataFileFormat::Parquet, // Not actually used for inline content
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id,
+                    sequence_number: Some(version as i64),
+                    file_sequence_number: Some(version as i64),
+                    first_row_id: None,
+                }),
+                inline_content: Some(Bytes::from(serialized)),
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: cardinality as i64,
+                file_size_in_bytes: None,
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: Some(absolute_leaf_path.clone()),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+
+            self.pending_entries.push(manifest_dv_entry);
+
+            cardinality
+        };
+
+        // If all active (non-deleted) entries are deleted, mark the manifest as deleted
+        if cardinality as i64 == active_entry_count {
+            let manifest_position = self
+                .pending_entries
+                .iter()
+                .position(|entry| {
+                    (entry.content_type == DataContentType::DataManifest
+                        || entry.content_type == DataContentType::DeleteManifest)
+                        && entry.location.as_ref() == Some(&absolute_leaf_path)
+                })
+                .ok_or_else(|| {
+                    Error::generic(format!(
+                        "Manifest entry not found at path: {}",
+                        absolute_leaf_path
+                    ))
+                })?;
+
+            let manifest_entry = &mut self.pending_entries[manifest_position];
+
+            if let Some(ref mut tracking_info) = manifest_entry.tracking_info {
+                tracking_info.status = TrackingStatus::Deleted;
+                tracking_info.snapshot_id = snapshot_id;
+                tracking_info.sequence_number = Some(version as i64);
+            } else {
+                manifest_entry.tracking_info = Some(TrackingInfo {
+                    status: TrackingStatus::Deleted,
+                    snapshot_id,
+                    sequence_number: Some(version as i64),
+                    file_sequence_number: Some(version as i64),
+                    first_row_id: None,
+                });
             }
         }
 
@@ -450,8 +667,69 @@ impl MetadataBuilder {
             .filter_map(|e| e.file_size_in_bytes)
             .sum();
 
+        // Calculate manifest stats (entry counts by status)
+        let mut added_files_count = 0i64;
+        let mut existing_files_count = 0i64;
+        let mut deletes_files_count = 0i64;
+        let mut added_rows_count = 0i64;
+        let mut existing_rows_count = 0i64;
+        let mut delete_rows_count = 0i64;
+        let mut min_sequence_number = i64::MAX;
+
+        for entry in &self.pending_entries {
+            if let Some(ref tracking_info) = entry.tracking_info {
+                if let Some(seq) = tracking_info.sequence_number {
+                    min_sequence_number = min_sequence_number.min(seq);
+                }
+
+                match tracking_info.status {
+                    TrackingStatus::Added => {
+                        added_files_count += 1;
+                        added_rows_count += entry.record_count;
+                    }
+                    TrackingStatus::Existed => {
+                        existing_files_count += 1;
+                        existing_rows_count += entry.record_count;
+                    }
+                    TrackingStatus::Deleted => {
+                        deletes_files_count += 1;
+                        delete_rows_count += entry.record_count;
+                    }
+                }
+            }
+        }
+
+        // If no entries, set min_sequence_number to 0
+        if min_sequence_number == i64::MAX {
+            min_sequence_number = 0;
+        }
+
+        let manifest_info = Some(crate::metadata::ManifestStats {
+            added_files_count,
+            existing_files_count,
+            deletes_files_count,
+            added_rows_count,
+            existing_rows_count,
+            delete_rows_count,
+            min_sequence_number,
+        });
+
+        // Determine content type based on what's in the manifest
+        // If all entries are PositionDeletes, this is a DeleteManifest
+        // Otherwise, it's a DataManifest
+        let content_type = if self
+            .pending_entries
+            .iter()
+            .all(|entry| entry.content_type == DataContentType::PositionDeletes)
+            && !self.pending_entries.is_empty()
+        {
+            DataContentType::DeleteManifest
+        } else {
+            DataContentType::DataManifest
+        };
+
         Ok(MetadataEntry {
-            content_type: DataContentType::DataManifest,
+            content_type,
             location: Some(content_metadata_path.to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
@@ -478,13 +756,13 @@ impl MetadataBuilder {
             record_count,
 
             file_size_in_bytes: Some(file_size_in_bytes),
-
             // TODO: add.stats contains a JSON blob:
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
             // Which we need to convert from name-based to field-id-based
             content_stats: None,
 
-            manifest_info: None,
+            // Manifest statistics tracking entry counts by status
+            manifest_info,
 
             // Path to file where to apply the DV to
             referenced_file: None,
@@ -518,6 +796,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
+            manifest_location: None, // Will be set when written
             leaf: None,
         })
     }
@@ -558,6 +837,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
+            manifest_location: None, // Will be set when written
             leaf: Some(uuid::Uuid::new_v4()),
         })
     }
@@ -585,6 +865,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
+            manifest_location: None, // Will be set when written
             leaf: Some(leaf_uuid),
         })
     }
@@ -688,6 +969,10 @@ impl RowVisitor for ScanRowToAddVisitor {
         // - modificationTime (top level)
         // - stats (top level, string)
         // - fileConstantValues.partitionValues (nested)
+        // - fileConstantValues.dataManifestPath (nested)
+        // - fileConstantValues.dataManifestPosition (nested)
+        // - fileConstantValues.deleteManifestPath (nested)
+        // - fileConstantValues.deleteManifestPosition (nested)
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let names = vec![
                 column_name!("path"),
@@ -695,6 +980,10 @@ impl RowVisitor for ScanRowToAddVisitor {
                 column_name!("modificationTime"),
                 column_name!("stats"),
                 column_name!("fileConstantValues.partitionValues"),
+                column_name!("fileConstantValues.dataManifestPath"),
+                column_name!("fileConstantValues.dataManifestPosition"),
+                column_name!("fileConstantValues.deleteManifestPath"),
+                column_name!("fileConstantValues.deleteManifestPosition"),
             ];
             let types = vec![
                 DataType::STRING,
@@ -706,6 +995,10 @@ impl RowVisitor for ScanRowToAddVisitor {
                     DataType::STRING,
                     true,
                 ))),
+                DataType::STRING,
+                DataType::LONG,
+                DataType::STRING,
+                DataType::LONG,
             ];
             (names, types).into()
         });
@@ -722,6 +1015,16 @@ impl RowVisitor for ScanRowToAddVisitor {
                     .get_opt(i, "scanRow.fileConstantValues.partitionValues")?
                     .unwrap_or_default();
 
+                // Extract manifest location fields
+                let data_manifest_path: Option<String> =
+                    getters[5].get_opt(i, "scanRow.fileConstantValues.dataManifestPath")?;
+                let data_manifest_position: Option<i64> =
+                    getters[6].get_opt(i, "scanRow.fileConstantValues.dataManifestPosition")?;
+                let delete_manifest_path: Option<String> =
+                    getters[7].get_opt(i, "scanRow.fileConstantValues.deleteManifestPath")?;
+                let delete_manifest_position: Option<i64> =
+                    getters[8].get_opt(i, "scanRow.fileConstantValues.deleteManifestPosition")?;
+
                 let add = Add {
                     path,
                     partition_values,
@@ -734,10 +1037,10 @@ impl RowVisitor for ScanRowToAddVisitor {
                     base_row_id: None,
                     default_row_commit_version: None,
                     clustering_provider: None,
-                    data_manifest_path: None,
-                    data_manifest_position: None,
-                    delete_manifest_path: None,
-                    delete_manifest_position: None,
+                    data_manifest_path,
+                    data_manifest_position,
+                    delete_manifest_path,
+                    delete_manifest_position,
                 };
                 self.adds.push(add);
             }
@@ -1466,6 +1769,501 @@ mod tests {
         assert_eq!(leaf_entries.len(), 2);
         assert_eq!(leaf_entries[0].content_type, DataContentType::Data);
         assert_eq!(leaf_entries[1].content_type, DataContentType::Data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_single_entry() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Step 1: Create a leaf with 10 data entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        for i in 0..10 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                }),
+                inline_content: None,
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        // Write the leaf
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Step 2: Create a root with the leaf, then delete entry at index 5
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+
+        root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
+
+        // Step 3: Write the root
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Step 4: Read back the root and verify ManifestDV entry exists
+        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_entries = root_metadata.entries()?;
+
+        // Should have: 1 DataManifest + 1 ManifestDV
+        assert_eq!(root_entries.len(), 2);
+
+        let manifest_dv = root_entries
+            .iter()
+            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .expect("ManifestDV should exist");
+
+        assert_eq!(manifest_dv.referenced_file.as_ref(), Some(&leaf_path));
+        assert_eq!(manifest_dv.record_count, 1);
+
+        // Verify the inline content contains the deleted index (skip magic number)
+        let inline_content = manifest_dv
+            .inline_content
+            .as_ref()
+            .expect("inline_content should exist");
+        assert!(inline_content.len() >= 4, "Should have magic number prefix");
+        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+        assert!(treemap.contains(5));
+        assert_eq!(treemap.len(), 1);
+
+        // Step 5: Read the leaf and apply ManifestDV to verify filtering
+        let leaf_url = Url::parse(&leaf_path)?;
+        let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root.clone())?;
+        let leaf_entries = leaf_metadata.entries()?;
+        assert_eq!(leaf_entries.len(), 10); // Original 10 entries
+
+        // Apply the ManifestDV
+        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv)?;
+        assert_eq!(filtered_entries.len(), 9); // 1 deleted, 9 remaining
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_multiple_entries() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a leaf with 10 data entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        for i in 0..10 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                }),
+                inline_content: None,
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Create root and delete multiple entries
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+
+        root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 7, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Read back and verify
+        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_entries = root_metadata.entries()?;
+        assert_eq!(root_entries.len(), 2); // DataManifest + ManifestDV
+
+        let manifest_dv = root_entries
+            .iter()
+            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .unwrap();
+        assert_eq!(manifest_dv.record_count, 3);
+
+        // Verify all deleted indices
+        let inline_content = manifest_dv.inline_content.as_ref().unwrap();
+        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+        assert!(treemap.contains(2));
+        assert!(treemap.contains(5));
+        assert!(treemap.contains(7));
+
+        // Apply ManifestDV and verify filtering
+        let leaf_url = Url::parse(&leaf_path)?;
+        let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root)?;
+        let leaf_entries = leaf_metadata.entries()?;
+        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv)?;
+        assert_eq!(filtered_entries.len(), 7); // 3 deleted, 7 remaining
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_all_entries_marks_deleted() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a leaf with 3 data entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        for i in 0..3 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                }),
+                inline_content: None,
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Create root and delete all 3 entries
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+
+        root_builder.delete_from_leaf(&leaf_path, 0, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 1, 2, Some(2))?;
+        // The third deletion should automatically mark the manifest as deleted
+        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Read back and verify the manifest is marked as deleted
+        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        let root_entries = root_metadata.entries()?;
+
+        let leaf_manifest = root_entries
+            .iter()
+            .find(|e| {
+                e.content_type == DataContentType::DataManifest
+                    && e.location.as_ref() == Some(&leaf_path)
+            })
+            .expect("Leaf manifest should exist");
+
+        assert_eq!(
+            leaf_manifest.tracking_info.as_ref().unwrap().status,
+            TrackingStatus::Deleted
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_index_out_of_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a leaf with 10 entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        for i in 0..10 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                }),
+                inline_content: None,
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+
+        let result = root_builder.delete_from_leaf(&leaf_path, 10, 2, Some(2));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of bounds"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_nonexistent_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Try to delete from a non-existent leaf
+        let result = root_builder.delete_from_leaf("nonexistent.parquet", 5, 2, Some(2));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Leaf manifest not found"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Create a leaf
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        for i in 0..5 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                }),
+                inline_content: None,
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+        let leaf_url = Url::parse(&leaf_path)?;
+        let relative_path = leaf_url
+            .path()
+            .strip_prefix(table_root.path())
+            .unwrap_or(leaf_url.path());
+
+        // Create root and delete using relative path
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+        root_builder.delete_from_leaf(relative_path, 3, 2, Some(2))?;
+
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Read back and verify ManifestDV references absolute path
+        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        let root_entries = root_metadata.entries()?;
+
+        let manifest_dv = root_entries
+            .iter()
+            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .unwrap();
+
+        assert_eq!(manifest_dv.referenced_file.as_ref(), Some(&leaf_path));
+
+        // Verify the deletion was recorded
+        let inline_content = manifest_dv.inline_content.as_ref().unwrap();
+        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+        assert!(treemap.contains(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_from_leaf_with_existing_deleted_entries(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a leaf manifest that already has some deleted entries
+        // This simulates a manifest that has been updated over time
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Create a manifest entry with manifest_info showing:
+        // - 2 added files (indices 0, 1)
+        // - 1 existing file (index 2)
+        // - 2 deleted files (indices 3, 4)
+        // Total: 5 entries, but only 3 are active (non-deleted)
+        let manifest_entry = MetadataEntry {
+            content_type: DataContentType::DataManifest,
+            location: Some(format!("{}leaf-manifest.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 5, // Total entries in the leaf
+            file_size_in_bytes: Some(2048),
+            content_stats: None,
+            manifest_info: Some(ManifestStats {
+                added_files_count: 2,
+                existing_files_count: 1,
+                deletes_files_count: 2, // 2 entries are already deleted
+                added_rows_count: 200,
+                existing_rows_count: 100,
+                delete_rows_count: 200,
+                min_sequence_number: 1,
+            }),
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        let leaf_path = manifest_entry.location.as_ref().unwrap().clone();
+        root_builder.add_entry(manifest_entry);
+
+        // Delete all 3 active entries (indices 0, 1, 2)
+        // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be marked deleted
+        // With the NEW logic: cardinality (3) == active_entry_count (3), so manifest IS marked deleted
+        root_builder.delete_from_leaf(&leaf_path, 0, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 1, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Read back and verify the manifest is marked as deleted
+        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        let root_entries = root_metadata.entries()?;
+
+        let leaf_manifest = root_entries
+            .iter()
+            .find(|e| {
+                e.content_type == DataContentType::DataManifest
+                    && e.location.as_ref() == Some(&leaf_path)
+            })
+            .expect("Leaf manifest should exist");
+
+        // The critical assertion: manifest should be marked as deleted
+        // because all ACTIVE entries (3) have been deleted, even though
+        // the total entry count (5) includes 2 already-deleted entries
+        assert_eq!(
+            leaf_manifest.tracking_info.as_ref().unwrap().status,
+            TrackingStatus::Deleted,
+            "Manifest should be marked as deleted when all active entries are deleted, \
+             even if some entries were already deleted"
+        );
+
+        // Verify ManifestDV has cardinality 3 (not 5)
+        let manifest_dv = root_entries
+            .iter()
+            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .expect("ManifestDV should exist");
+
+        assert_eq!(
+            manifest_dv.record_count, 3,
+            "ManifestDV should only track the 3 newly deleted entries"
+        );
 
         Ok(())
     }

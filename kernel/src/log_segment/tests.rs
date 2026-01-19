@@ -27,6 +27,7 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
     sidecar_batch_with_given_paths_and_sizes,
 };
+use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
@@ -1170,10 +1171,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-
-    let mut iter = log_segment.create_checkpoint_stream(
+    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
+        None,
         None,
         None,
     )?;
@@ -1241,9 +1242,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
     )?;
 
-    let mut iter = log_segment.create_checkpoint_stream(
+    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
+        None,
         None,
         None,
     )?;
@@ -1306,9 +1308,10 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
     )?;
 
-    let mut iter = log_segment.create_checkpoint_stream(
+    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
+        None,
         None,
         None,
     )?;
@@ -1359,8 +1362,14 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
+
+    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema,
+        None,
+        None,
+        None,
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1448,9 +1457,10 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
     )?;
 
-    let mut iter = log_segment.create_checkpoint_stream(
+    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
+        None,
         None,
         None,
     )?;
@@ -2907,6 +2917,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
+// ============================================================================
+// max_published_version tests
+// ============================================================================
+
 #[tokio::test]
 async fn test_max_published_version_only_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -3005,4 +3019,327 @@ async fn test_max_published_version_checkpoint_only() {
     })
     .await;
     assert_eq!(log_segment.max_published_version, None);
+}
+
+// ============================================================================
+// schema_has_compatible_stats_parsed tests
+// ============================================================================
+
+// Helper to create a checkpoint schema with stats_parsed for testing
+fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked(min_values_fields.clone()),
+        ),
+        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+// Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
+fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
+    StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked(column_fields.clone()),
+        ),
+        StructField::nullable("maxValues", StructType::new_unchecked(column_fields)),
+    ])
+}
+
+// Helper to create a checkpoint schema without stats_parsed
+fn create_checkpoint_schema_without_stats_parsed() -> StructType {
+    use crate::schema::StructType;
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats", DataType::STRING),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_basic() {
+    // Create a checkpoint schema with stats_parsed containing an integer column
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    // Exact type match should work
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+
+    // Type widening (int -> long) should work
+    let stats_schema_widened =
+        create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema_widened
+    ));
+
+    // Incompatible type (string -> int) should fail
+    let checkpoint_schema_string =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]);
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema_string,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_column_fails() {
+    // Checkpoint has "id" column, stats schema needs "other" column
+    // Now that we properly check, missing column should FAIL because coalesce won't work
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("other", DataType::INTEGER)]);
+
+    // Missing column in checkpoint should fail - we need the column for data skipping
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_extra_column_ok() {
+    // Checkpoint has extra columns not needed by stats schema (should be OK)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING),
+    ]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_no_stats_parsed() {
+    // Checkpoint schema without stats_parsed field
+    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_empty_stats_schema() {
+    // Empty stats schema (no columns needed for data skipping)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema = create_stats_schema(vec![]);
+
+    // If no columns are needed for data skipping, any stats_parsed is compatible
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_multiple_columns() {
+    // Multiple columns - check that we iterate over all columns and find incompatibility
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::STRING),
+    ]);
+
+    // First column matches, second is incompatible
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
+    // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        // No minValues or maxValues fields
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+
+    // Should return true - missing minValues/maxValues is handled gracefully with continue
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
+    // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        // minValues is a primitive type instead of a Struct
+        StructField::nullable("minValues", DataType::STRING),
+        StructField::nullable("maxValues", DataType::STRING),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+
+    // Should return false - minValues/maxValues must be Struct types
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+// ============================================================================
+// new_with_commit tests
+// ============================================================================
+
+/// Asserts that `new` is `orig` extended with exactly one commit via `LogSegment::new_with_commit`.
+fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
+    // Check: What should have changed
+    assert_eq!(orig.end_version + 1, new.end_version);
+    assert_eq!(
+        orig.ascending_commit_files.len() + 1,
+        new.ascending_commit_files.len()
+    );
+    assert_eq!(
+        orig.latest_commit_file.as_ref().unwrap().version + 1,
+        new.latest_commit_file.as_ref().unwrap().version
+    );
+
+    // Check: What should be the same
+    fn normalize(log_segment: LogSegment) -> LogSegment {
+        LogSegment {
+            end_version: 0,
+            max_published_version: None,
+            ascending_commit_files: vec![],
+            latest_commit_file: None,
+            ..log_segment
+        }
+    }
+
+    assert_eq!(normalize(orig), normalize(new));
+}
+
+#[tokio::test]
+async fn test_new_with_commit_published_commit() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+    let new_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 5);
+
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
+
+    assert_eq!(new_log_segment.max_published_version, Some(5));
+    assert_log_segment_extended(log_segment, new_log_segment);
+}
+
+#[tokio::test]
+async fn test_new_with_commit_staged_commit() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+    let new_commit = ParsedLogPath::create_parsed_staged_commit(&table_root, 5);
+
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
+
+    assert_eq!(new_log_segment.max_published_version, Some(4));
+    assert_log_segment_extended(log_segment, new_log_segment);
+}
+
+#[tokio::test]
+async fn test_new_with_commit_not_commit_type() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let checkpoint = create_log_path("file:///_delta_log/00000000000000000005.checkpoint.parquet");
+
+    let result = log_segment.new_with_commit_appended(checkpoint);
+
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail log file is not a commit file.",
+    );
+}
+
+#[tokio::test]
+async fn test_new_with_commit_not_end_version_plus_one() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+
+    let wrong_version_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 10);
+    let result = log_segment.new_with_commit_appended(wrong_version_commit);
+
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
+    );
 }
