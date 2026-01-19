@@ -176,10 +176,8 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// # Yielded Data
 ///
 /// All batches conform to [`output_schema()`][Self::output_schema], which is determined by:
-/// - **V1 checkpoints**: Schema based on [`CHECKPOINT_ACTIONS_SCHEMA_V1`] (add, remove, metadata,
-///   protocol, txn, sidecar)
-/// - **V2 checkpoints**: Schema based on [`CHECKPOINT_ACTIONS_SCHEMA_V2`] (same as V1 plus
-///   checkpointMetadata)
+/// - **V1 checkpoints**: Schema includes add, remove, metadata, protocol, txn, and sidecar fields
+/// - **V2 checkpoints**: Same as V1 plus checkpointMetadata field
 ///
 /// The `add.stats` and `add.stats_parsed` fields are included or excluded based on table
 /// properties (`delta.checkpoint.writeStatsAsJson` and `delta.checkpoint.writeStatsAsStruct`).
