@@ -871,15 +871,14 @@ fn test_create_one_top_level_null() {
             assert_eq!(record_batch.num_columns(), 1);
             assert!(record_batch.column(0).is_null(0));
         }
-        Err(Error::Arrow(e)) => {
-            // Arrow validated and rejected the null value - this is also acceptable
-            assert!(
-                e.to_string().contains("non-nullable"),
-                "Expected nullability error, got: {e}"
-            );
-        }
         Err(e) => {
-            panic!("Unexpected error type: {e}");
+            // Arrow validated and rejected the null value - this is also acceptable.
+            // The error may be wrapped in Backtraced, so check the message.
+            let error_msg = e.to_string();
+            assert!(
+                error_msg.contains("non-nullable"),
+                "Expected nullability error, got: {error_msg}"
+            );
         }
     }
 }
