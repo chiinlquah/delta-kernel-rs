@@ -423,6 +423,11 @@ impl LogSegment {
     /// Also returns:
     /// - `Option<bool>` indicating if checkpoint has compatible stats_parsed
     /// - The checkpoint read schema (with stats_parsed if compatible)
+    ///
+    /// # Parameters
+    /// - `data_predicate`: Optional predicate for manifest-level data skipping. When reading from
+    ///   a content root with hierarchical manifests, this predicate is used to skip child manifests
+    ///   whose `content_stats` indicate they cannot contain matching data.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -431,6 +436,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        data_predicate: Option<PredicateRef>,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         Option<bool>,
@@ -451,6 +457,7 @@ impl LogSegment {
                 meta_predicate,
                 stats_schema,
                 content_root.as_ref(),
+                data_predicate,
             )?;
 
         Ok((
@@ -484,6 +491,7 @@ impl LogSegment {
                 action_schema,
                 meta_predicate,
                 None,
+                None, // No data predicate for manifest-level skipping
             )?;
         Ok(actions_iter)
     }
@@ -597,11 +605,18 @@ impl LogSegment {
         Ok(commit_covers)
     }
 
+    /// Creates an iterator over action batches from a content root (AMT manifest).
+    ///
+    /// # Parameters
+    /// - `data_predicate`: Optional predicate for manifest-level data skipping. When provided,
+    ///   child manifests whose `content_stats` indicate they cannot contain matching data
+    ///   will be skipped (not opened).
     fn create_content_root_reader(
         engine: &dyn Engine,
         content_root: &ContentRoot,
         checkpoint_read_schema: SchemaRef,
         table_root: &Url,
+        data_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let content_root_url = Url::parse(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
@@ -613,7 +628,8 @@ impl LogSegment {
         let root_batches = metadata.root_action_batches(engine, &checkpoint_read_schema, &[])?;
 
         // Get actions from leaf manifests (DataManifest entries)
-        let leaf_refs = metadata.manifest_references()?;
+        // Pass the data predicate for manifest-level skipping based on content_stats
+        let leaf_refs = metadata.manifest_references(data_predicate.as_ref())?;
         let leaf_batches = crate::metadata::Metadata::non_root_action_batches(
             leaf_refs,
             engine,
@@ -726,6 +742,10 @@ impl LogSegment {
     /// - Iterator over action batches from checkpoint and sidecar files
     /// - `Option<bool>` indicating if checkpoint has compatible stats_parsed
     /// - The checkpoint read schema (with stats_parsed if compatible)
+    ///
+    /// # Parameters
+    /// - `data_predicate`: Optional predicate for manifest-level data skipping when reading
+    ///   from a content root with hierarchical manifests.
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -733,6 +753,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         content_root: Option<&ContentRoot>,
+        data_predicate: Option<PredicateRef>,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         Option<bool>,
@@ -754,6 +775,7 @@ impl LogSegment {
                     cr,
                     action_schema.clone(),
                     &self.table_root,
+                    data_predicate,
                 )?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )

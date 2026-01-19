@@ -10,7 +10,9 @@ use crate::actions::deletion_vector::DeletionVectorStorageType;
 use crate::actions::Remove;
 use crate::actions::{Add, ContentRoot};
 use crate::engine_data::EngineData;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData};
+use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
+use crate::kernel_predicates::KernelPredicateEvaluator;
 use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
@@ -24,7 +26,136 @@ use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use tracing::debug;
 use url::Url;
+
+/// A stats provider that extracts min/max statistics from AMT manifest `content_stats`.
+///
+/// This struct implements `ParquetStatsProvider` to enable predicate evaluation against
+/// manifest-level statistics for data skipping. The `content_stats` field in a manifest
+/// entry contains aggregated min/max bounds over all files in that manifest.
+///
+/// The stats structure follows the AMT format:
+/// ```text
+/// content_stats: {
+///   column_name: {
+///     value_count: i64,
+///     null_value_count: i64,  // if nullable
+///     lower_bound: <column_type>,
+///     upper_bound: <column_type>,
+///     exact_bounds: bool
+///   },
+///   ...
+/// }
+/// ```
+struct ManifestStatsProvider<'a> {
+    /// The content_stats from a manifest entry
+    content_stats: &'a StructData,
+    /// Total record count from the manifest entry (used for rowcount stat)
+    record_count: i64,
+}
+
+impl<'a> ManifestStatsProvider<'a> {
+    /// Creates a new ManifestStatsProvider from a manifest entry's content_stats.
+    fn new(content_stats: &'a StructData, record_count: i64) -> Self {
+        Self {
+            content_stats,
+            record_count,
+        }
+    }
+
+    /// Looks up a nested scalar value in the content_stats structure.
+    ///
+    /// TODO: Fix nested fields
+    /// TODO: Lookup based on field-id
+    /// TODO: Explore option of pushing this to the engine
+    /// TODO: Add missing fields around sizes and nan's
+    ///
+    /// Given a column name like `["col1"]`, this navigates:
+    /// `content_stats.col1.<stat_field>` where stat_field is "lower_bound", "upper_bound", etc.
+    fn get_stat_value(&self, col: &ColumnName, stat_field: &str) -> Option<Scalar> {
+        let col_stats = self.get_column_stats(col)?;
+        col_stats
+            .fields()
+            .iter()
+            .zip(col_stats.values())
+            .find(|(field, _)| field.name() == stat_field)
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_null())
+            .cloned()
+    }
+
+    /// Gets the stats struct for a specific column from content_stats.
+    fn get_column_stats(&self, col: &ColumnName) -> Option<&StructData> {
+        col.iter()
+            .try_fold(self.content_stats, |current, field_name| {
+                current
+                    .fields()
+                    .iter()
+                    .zip(current.values())
+                    .find(|(field, _)| field.name() == field_name)
+                    .and_then(|(_, value)| match value {
+                        Scalar::Struct(nested) => Some(nested),
+                        _ => None,
+                    })
+            })
+    }
+}
+
+impl<'a> ParquetStatsProvider for ManifestStatsProvider<'a> {
+    fn get_parquet_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+        self.get_stat_value(col, "lower_bound")
+    }
+
+    fn get_parquet_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+        self.get_stat_value(col, "upper_bound")
+    }
+
+    fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
+        match self.get_stat_value(col, "null_value_count") {
+            Some(Scalar::Long(count)) => Some(count),
+            _ => None,
+        }
+    }
+
+    fn get_parquet_rowcount_stat(&self) -> i64 {
+        self.record_count
+    }
+}
+
+/// Evaluates whether a manifest can be skipped based on its content_stats and a predicate.
+///
+/// Returns `true` if the manifest can definitely be skipped (no files in the manifest
+/// can possibly satisfy the predicate based on min/max stats).
+/// Returns `false` if the manifest might contain matching files and should be opened.
+///
+/// If content_stats is None or the predicate cannot be evaluated, returns `false` (cannot skip).
+fn can_skip_manifest(entry: &MetadataEntry, predicate: &Predicate) -> bool {
+    let content_stats = match &entry.content_stats {
+        Some(stats) => stats,
+        None => return false, // No stats available, cannot skip
+    };
+
+    let provider = ManifestStatsProvider::new(content_stats, entry.record_count);
+
+    // Use the KernelPredicateEvaluator to evaluate the predicate against manifest stats.
+    // The evaluator returns Some(true) if the predicate might match, Some(false) if it
+    // definitely cannot match, or None if it cannot be determined.
+    match provider.eval(predicate) {
+        Some(false) => {
+            // Predicate definitely cannot match any rows in this manifest
+            debug!(
+                "Skipping manifest {:?} - predicate cannot match based on stats",
+                entry.location
+            );
+            true
+        }
+        _ => {
+            // Predicate might match, or we couldn't determine - don't skip
+            false
+        }
+    }
+}
 
 /// Represents table metadata in Adaptive Metadata Tree (AMT) format.
 ///
@@ -349,8 +480,8 @@ impl Metadata {
     ///
     /// # Example Usage
     /// ```ignore
-    /// // Get manifest references from the root
-    /// let manifest_refs_iter = metadata.manifest_references()?;
+    /// // Get manifest references from the root (no manifest-level skipping)
+    /// let manifest_refs_iter = metadata.manifest_references(None)?;
     ///
     /// // Process each child manifest
     /// for manifest_refs_result in manifest_refs_iter {
@@ -364,7 +495,15 @@ impl Metadata {
     ///     // Process action batches...
     /// }
     /// ```
-    pub(crate) fn manifest_references(&self) -> DeltaResult<LeafReferences> {
+    ///
+    /// # Parameters
+    /// - `predicate`: Optional predicate for manifest-level data skipping. When provided,
+    ///   manifests whose `content_stats` indicate they cannot contain matching data will
+    ///   be skipped (not included in the returned references).
+    pub(crate) fn manifest_references(
+        &self,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<LeafReferences> {
         // Get all metadata entries from the root manifest
         let entries = self.entries()?;
 
@@ -493,6 +632,24 @@ impl Metadata {
                 }
             })
             .collect();
+
+        // Apply manifest-level data skipping if a predicate is provided
+        let total_manifests = data_manifest_entries.len();
+        let data_manifest_entries: Vec<MetadataEntry> = if let Some(pred) = predicate {
+            data_manifest_entries
+                .into_iter()
+                .filter(|entry| !can_skip_manifest(entry, pred))
+                .collect()
+        } else {
+            data_manifest_entries
+        };
+        let skipped_manifests = total_manifests - data_manifest_entries.len();
+        if skipped_manifests > 0 {
+            debug!(
+                "Manifest-level data skipping: skipped {}/{} manifests",
+                skipped_manifests, total_manifests
+            );
+        }
 
         // Create ManifestReferences for each data manifest
         let manifest_refs: Vec<DeltaResult<ManifestReference>> = data_manifest_entries
@@ -3690,8 +3847,8 @@ mod tests {
             leaf: None,
         };
 
-        // Get manifest references
-        let root_state = metadata.manifest_references()?;
+        // Get manifest references (no manifest-level skipping for this test)
+        let root_state = metadata.manifest_references(None)?;
 
         // Verify we got one manifest reference
         assert_eq!(root_state.manifest_references.len(), 1);
@@ -3776,8 +3933,8 @@ mod tests {
             leaf: None,
         };
 
-        // Get manifest references
-        let root_state = metadata.manifest_references()?;
+        // Get manifest references (no manifest-level skipping for this test)
+        let root_state = metadata.manifest_references(None)?;
 
         // Verify we got two manifest references
         assert_eq!(root_state.manifest_references.len(), 2);
@@ -4046,8 +4203,8 @@ mod tests {
             leaf: None,
         };
 
-        // Get manifest references
-        let root_state = metadata.manifest_references()?;
+        // Get manifest references (no manifest-level skipping for this test)
+        let root_state = metadata.manifest_references(None)?;
 
         // Verify we have one unmatched DV (for the child file) in shared_state
         assert_eq!(root_state.shared_state.unmatched_dvs.len(), 1);
@@ -4199,8 +4356,8 @@ mod tests {
             leaf: None,
         };
 
-        // Get manifest references from the root
-        let root_state = root_metadata.manifest_references()?;
+        // Get manifest references from the root (no manifest-level skipping for this test)
+        let root_state = root_metadata.manifest_references(None)?;
 
         // Process all manifests using the helper method
         let schema = crate::actions::get_log_add_schema().clone();
