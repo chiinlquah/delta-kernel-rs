@@ -71,6 +71,7 @@ pub(crate) fn expected_stats_schema(
 }
 
 // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
+#[allow(unused)]
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
@@ -116,6 +117,7 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 ///   to be used for data skipping statistics. Defaults to 32.
 ///
 /// All fields are nullable.
+#[allow(unused)]
 struct BaseStatsTransform {
     n_columns: Option<DataSkippingNumIndexedCols>,
     added_columns: u64,
@@ -124,6 +126,7 @@ struct BaseStatsTransform {
 }
 
 impl BaseStatsTransform {
+    #[allow(unused)]
     fn new(props: &TableProperties) -> Self {
         // if data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified
@@ -163,12 +166,13 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 
         self.path.push(field.name.clone());
         let data_type = field.data_type();
+        let is_struct = matches!(data_type, DataType::Struct(_));
 
         // keep the field if it:
         // - is a struct field and we need to traverse its children
         // - OR it is referenced by the column names
         // - OR it is a primitive type / leaf field
-        let should_include = matches!(data_type, DataType::Struct(_))
+        let should_include = is_struct
             || self
                 .column_names
                 .as_ref()
@@ -181,7 +185,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         }
 
         // increment count only for leaf columns.
-        if !matches!(data_type, DataType::Struct(_)) {
+        if !is_struct {
             self.added_columns += 1;
         }
 
@@ -209,6 +213,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 // removes all fields with non eligible data types
 //
 // should only be applied to schema processed via `BaseStatsTransform`.
+#[allow(unused)]
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
@@ -237,6 +242,7 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 // Returns true if the column name is included in the list of column names
 // or if the column name is a prefix of any column name in the list
 // or if the column name is a child of any column name in the list
+#[allow(unused)]
 fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) -> bool {
     column_names.iter().any(|name| {
         name.as_ref().starts_with(column_name) || column_name.as_ref().starts_with(name)
@@ -245,6 +251,7 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 
 /// Checks if a data type is eligible for min/max file skipping.
 /// https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61
+#[allow(unused)]
 fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
         data_type,

@@ -75,7 +75,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
@@ -292,7 +292,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -365,7 +365,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -417,9 +417,8 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.checkpoint()?;
-    let result = writer.checkpoint_data(&engine)?;
-    let data_iter = result;
+    let writer = snapshot.create_checkpoint_writer()?;
+    let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
 
@@ -474,7 +473,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -556,7 +555,7 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot.checkpoint().unwrap_err(),
+        snapshot.create_checkpoint_writer().unwrap_err(),
         crate::Error::Generic(e) if e == "Found staged commit file in log segment"
     ));
     Ok(())
@@ -630,7 +629,7 @@ async fn test_checkpoint_data_struct_enabled() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // Call checkpoint_data
     let result = writer.checkpoint_data(&engine)?;
@@ -689,7 +688,7 @@ async fn test_checkpoint_data_default_settings() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // Call checkpoint_data
     let result = writer.checkpoint_data(&engine)?;
@@ -742,7 +741,7 @@ async fn test_checkpoint_stats_iteration() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     let result = writer.checkpoint_data(&engine)?;
 
@@ -884,7 +883,7 @@ async fn test_all_stats_config_combinations() -> DeltaResult<()> {
 
         // Create checkpoint 1
         let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let writer1 = snapshot1.checkpoint()?;
+        let writer1 = snapshot1.create_checkpoint_writer()?;
         let result1 = writer1.checkpoint_data(&engine)?;
 
         // Verify checkpoint 1 schema
@@ -913,7 +912,7 @@ async fn test_all_stats_config_combinations() -> DeltaResult<()> {
 
         // Create checkpoint 2
         let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-        let writer2 = snapshot2.checkpoint()?;
+        let writer2 = snapshot2.create_checkpoint_writer()?;
         let result2 = writer2.checkpoint_data(&engine)?;
 
         // Verify checkpoint 2 schema
