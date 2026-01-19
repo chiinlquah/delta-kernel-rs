@@ -3,12 +3,15 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
+use crate::expressions::{Scalar, StructData};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
 use crate::DeltaResult;
+use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 /// Number of stats slots reserved per column.
 const NUM_STATS_PER_COLUMN: i32 = 200;
@@ -372,6 +375,308 @@ pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType>
     let mut visitor = StatsSchemaVisitor;
     let fields = visit_struct(table_struct, &mut visitor)?;
     Ok(StructType::new_unchecked(fields))
+}
+
+/// Delta Protocol JSON stats format.
+///
+/// This struct represents the statistics stored in the `stats` field of Add actions
+/// in Delta Lake format. The format is:
+/// ```json
+/// {
+///     "numRecords": 100,
+///     "minValues": {"col1": 0, "col2": "a"},
+///     "maxValues": {"col1": 10, "col2": "z"},
+///     "nullCount": {"col1": 0, "col2": 5}
+/// }
+/// ```
+///
+/// The optional `tightBounds` field indicates whether the statistics are exact:
+/// - `true` (or absent): bounds are tight/exact, accurately representing the data
+/// - `false`: bounds may be wider than actual data (e.g., due to deletion vectors)
+#[derive(Debug, Clone, Default)]
+struct DeltaJsonStats {
+    num_records: Option<i64>,
+    min_values: HashMap<String, JsonValue>,
+    max_values: HashMap<String, JsonValue>,
+    null_count: HashMap<String, i64>,
+    /// Whether the min/max bounds are tight (exact). Defaults to true when not present.
+    /// When false, the bounds may be wider than the actual data due to deletion vectors
+    /// or other operations that logically remove rows without updating statistics.
+    tight_bounds: bool,
+}
+
+impl DeltaJsonStats {
+    /// Parse a JSON stats string from Delta Protocol format.
+    fn parse(json_str: &str) -> Option<Self> {
+        // TODO: We should delegate this to the engine.. at some point...
+        let parsed: JsonValue = serde_json::from_str(json_str).ok()?;
+        let obj = parsed.as_object()?;
+
+        let num_records = obj
+            .get("numRecords")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+
+        let min_values = obj
+            .get("minValues")
+            .and_then(|v| v.as_object())
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+
+        let max_values = obj
+            .get("maxValues")
+            .and_then(|v| v.as_object())
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+
+        let null_count = obj
+            .get("nullCount")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_i64()
+                            .or_else(|| v.as_u64().map(|u| u as i64))
+                            .map(|count| (k.clone(), count))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // tightBounds defaults to true when not present (for backwards compatibility).
+        // When false, the bounds may be wider than the actual data (e.g., due to deletion vectors).
+        let tight_bounds = obj
+            .get("tightBounds")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        Some(Self {
+            num_records,
+            min_values,
+            max_values,
+            null_count,
+            tight_bounds,
+        })
+    }
+}
+
+/// Converts a JSON value to a Scalar based on the expected data type.
+fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scalar> {
+    match data_type {
+        DataType::Primitive(ptype) => match ptype {
+            PrimitiveType::String => value.as_str().map(|s| Scalar::String(s.to_string())),
+            PrimitiveType::Long => value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|u| u as i64))
+                .map(Scalar::Long),
+            PrimitiveType::Integer => value
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .map(Scalar::Integer),
+            PrimitiveType::Short => value
+                .as_i64()
+                .and_then(|v| i16::try_from(v).ok())
+                .map(Scalar::Short),
+            PrimitiveType::Byte => value
+                .as_i64()
+                .and_then(|v| i8::try_from(v).ok())
+                .map(Scalar::Byte),
+            PrimitiveType::Float => value.as_f64().map(|f| Scalar::Float(f as f32)),
+            PrimitiveType::Double => value.as_f64().map(Scalar::Double),
+            PrimitiveType::Boolean => value.as_bool().map(Scalar::Boolean),
+            PrimitiveType::Date => value.as_str().and_then(|s| {
+                // Parse date string "YYYY-MM-DD" to days since epoch
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|date| {
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+                        Some(Scalar::Date((date - epoch).num_days() as i32))
+                    })
+            }),
+            PrimitiveType::Timestamp => value.as_str().and_then(|s| {
+                // Parse timestamp string to microseconds since epoch
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| Scalar::Timestamp(dt.timestamp_micros()))
+            }),
+            PrimitiveType::TimestampNtz => value.as_str().and_then(|s| {
+                // Parse timestamp without timezone
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                    .ok()
+                    .or_else(|| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+                    .map(|dt| Scalar::TimestampNtz(dt.and_utc().timestamp_micros()))
+            }),
+            PrimitiveType::Binary | PrimitiveType::Decimal(..) => None, // Not supported in JSON stats
+        },
+        _ => None, // Complex types not supported in min/max stats
+    }
+}
+
+/// Builds a content_stats StructData for a single column from Delta JSON stats.
+///
+/// Creates a struct with the stats schema fields (value_count, null_value_count,
+/// lower_bound, upper_bound, exact_bounds) populated from the Delta JSON stats.
+///
+/// # Arguments
+/// * `field` - The table schema field for this column
+/// * `stats_struct` - The stats schema for this column
+/// * `num_records` - The number of records (value_count)
+/// * `min_value` - The minimum value (lower_bound)
+/// * `max_value` - The maximum value (upper_bound)
+/// * `null_count` - The count of null values
+/// * `tight_bounds` - Whether the bounds are tight/exact (from Delta's `tightBounds` field)
+fn build_column_stats(
+    field: &StructField,
+    stats_struct: &StructType,
+    num_records: Option<i64>,
+    min_value: Option<&JsonValue>,
+    max_value: Option<&JsonValue>,
+    null_count: Option<i64>,
+    tight_bounds: bool,
+) -> StructData {
+    let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
+    let mut values: Vec<Scalar> = Vec::with_capacity(fields.len());
+
+    for stats_field in &fields {
+        let scalar = match stats_field.name().as_str() {
+            "value_count" => num_records.map(Scalar::Long),
+            "null_value_count" => null_count.map(Scalar::Long),
+            "nan_value_count" => None, // Not available in Delta JSON stats
+            "avg_value_size" => None,  // Not available in Delta JSON stats
+            "max_value_size" => None,  // Not available in Delta JSON stats
+            "lower_bound" => min_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            "upper_bound" => max_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            "exact_bounds" => {
+                // exact_bounds reflects Delta's tightBounds field:
+                // - true: bounds are exact (all rows in file satisfy min <= value <= max)
+                // - false: bounds may be wider (e.g., deletion vectors have removed some rows)
+                // Only set if we have bounds to report
+                if min_value.is_some() || max_value.is_some() {
+                    Some(Scalar::Boolean(tight_bounds))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        // Use null for missing values
+        let scalar = scalar.unwrap_or_else(|| Scalar::Null(stats_field.data_type().clone()));
+        values.push(scalar);
+    }
+
+    // SAFETY: We've constructed values to match fields in count and type
+    StructData::new_unchecked(fields, values)
+}
+
+/// Recursively builds content_stats StructData for a struct field.
+fn build_struct_stats(
+    table_struct: &StructType,
+    stats_struct: &StructType,
+    delta_stats: &DeltaJsonStats,
+    prefix: &str,
+) -> StructData {
+    let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
+    let mut values: Vec<Scalar> = Vec::with_capacity(fields.len());
+
+    for stats_field in &fields {
+        let column_name = if prefix.is_empty() {
+            stats_field.name().to_string()
+        } else {
+            format!("{}.{}", prefix, stats_field.name())
+        };
+
+        // Find the corresponding field in the table schema
+        let table_field = table_struct.field(stats_field.name());
+
+        // Determine if this is a nested struct in the table schema or a primitive column
+        // The stats schema always wraps columns in a Struct (containing value_count, bounds, etc.)
+        // So we need to check the TABLE schema to know if we should recurse
+        let scalar = if let Some(tf) = table_field {
+            match tf.data_type() {
+                DataType::Struct(nested_table_struct) => {
+                    // Table field is a nested struct - recurse into it
+                    if let DataType::Struct(nested_stats_struct) = stats_field.data_type() {
+                        let nested_data = build_struct_stats(
+                            nested_table_struct,
+                            nested_stats_struct,
+                            delta_stats,
+                            &column_name,
+                        );
+                        Scalar::Struct(nested_data)
+                    } else {
+                        Scalar::Null(stats_field.data_type().clone())
+                    }
+                }
+                _ => {
+                    // Table field is a primitive - build column stats
+                    if let DataType::Struct(inner_stats) = stats_field.data_type() {
+                        let column_stats = build_column_stats(
+                            tf,
+                            inner_stats,
+                            delta_stats.num_records,
+                            delta_stats.min_values.get(&column_name),
+                            delta_stats.max_values.get(&column_name),
+                            delta_stats.null_count.get(&column_name).copied(),
+                            delta_stats.tight_bounds,
+                        );
+                        Scalar::Struct(column_stats)
+                    } else {
+                        Scalar::Null(stats_field.data_type().clone())
+                    }
+                }
+            }
+        } else {
+            Scalar::Null(stats_field.data_type().clone())
+        };
+
+        values.push(scalar);
+    }
+
+    // SAFETY: We've constructed values to match fields in count and type
+    StructData::new_unchecked(fields, values)
+}
+
+/// Converts Delta Protocol JSON stats to content_stats StructData format.
+///
+/// This function takes the raw JSON stats string from a Delta Add action and converts
+/// it to the StructData format expected by the content_stats field in MetadataEntry.
+///
+/// # Arguments
+///
+/// * `stats_json` - The JSON stats string from the Add action's `stats` field
+/// * `table_schema` - The table's data schema (used to determine column types and generate stats schema)
+///
+/// # Returns
+///
+/// Returns `Ok(Some(StructData))` if conversion succeeds, `Ok(None)` if stats_json is None or
+/// cannot be parsed, or an error if the stats schema cannot be generated.
+///
+/// # Example
+///
+/// ```ignore
+/// let stats_json = r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":100},"nullCount":{"id":0}}"#;
+/// let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?;
+/// ```
+#[allow(dead_code)]
+pub(crate) fn delta_json_stats_to_content_stats(
+    stats_json: Option<&str>,
+    table_schema: &StructType,
+) -> DeltaResult<Option<StructData>> {
+    let Some(json_str) = stats_json else {
+        return Ok(None);
+    };
+
+    let Some(delta_stats) = DeltaJsonStats::parse(json_str) else {
+        return Ok(None);
+    };
+
+    // Generate the stats schema from the table schema
+    let content_stats_schema = stats_schema(table_schema)?;
+
+    // Build the content_stats StructData
+    let content_stats = build_struct_stats(table_schema, &content_stats_schema, &delta_stats, "");
+
+    Ok(Some(content_stats))
 }
 
 #[cfg(test)]
@@ -744,5 +1049,417 @@ mod tests {
         assert_eq!(c_struct.fields().count(), 4);
         assert!(c_struct.field("value_count").is_some());
         assert!(c_struct.field("lower_bound").is_some());
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_basic() {
+        // Create a table schema with field IDs
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json = r#"{
+            "numRecords": 100,
+            "minValues": {"id": 1, "name": "alice"},
+            "maxValues": {"id": 100, "name": "zoe"},
+            "nullCount": {"id": 0, "name": 5}
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        // Verify the structure
+        assert_eq!(content_stats.fields().len(), 2);
+
+        // Check 'id' stats
+        let id_field = content_stats.fields().iter().find(|f| f.name() == "id");
+        assert!(id_field.is_some());
+
+        // Check 'name' stats
+        let name_field = content_stats.fields().iter().find(|f| f.name() == "name");
+        assert!(name_field.is_some());
+
+        // Verify values
+        let values = content_stats.values();
+        assert_eq!(values.len(), 2);
+
+        // Check that id stats contain the expected values
+        if let Scalar::Struct(id_stats) = &values[0] {
+            // Find value_count
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count");
+            if let Some(idx) = value_count_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
+            }
+
+            // Find lower_bound
+            let lower_bound_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound");
+            if let Some(idx) = lower_bound_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(1));
+            }
+
+            // Find upper_bound
+            let upper_bound_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound");
+            if let Some(idx) = upper_bound_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
+            }
+        } else {
+            panic!("Expected id stats to be a Struct");
+        }
+
+        // Check that name stats contain the expected values
+        if let Scalar::Struct(name_stats) = &values[1] {
+            // Find null_value_count (name is nullable)
+            let null_count_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "null_value_count");
+            if let Some(idx) = null_count_idx {
+                assert_eq!(name_stats.values()[idx], Scalar::Long(5));
+            }
+
+            // Find lower_bound
+            let lower_bound_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound");
+            if let Some(idx) = lower_bound_idx {
+                assert_eq!(
+                    name_stats.values()[idx],
+                    Scalar::String("alice".to_string())
+                );
+            }
+
+            // Find upper_bound
+            let upper_bound_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound");
+            if let Some(idx) = upper_bound_idx {
+                assert_eq!(name_stats.values()[idx], Scalar::String("zoe".to_string()));
+            }
+        } else {
+            panic!("Expected name stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_none() {
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+
+        // None input should return None
+        let result =
+            delta_json_stats_to_content_stats(None, &table_schema).expect("should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_invalid_json() {
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+
+        // Invalid JSON should return None (graceful handling)
+        let result = delta_json_stats_to_content_stats(Some("not valid json"), &table_schema)
+            .expect("should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_partial_stats() {
+        // Test with partial stats (only numRecords, no min/max/null)
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 1)]);
+
+        let stats_json = r#"{"numRecords": 50}"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        // Should still produce a valid structure with null values for missing stats
+        assert_eq!(content_stats.fields().len(), 1);
+
+        if let Scalar::Struct(id_stats) = &content_stats.values()[0] {
+            // value_count should be populated
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count");
+            if let Some(idx) = value_count_idx {
+                assert_eq!(id_stats.values()[idx], Scalar::Long(50));
+            }
+
+            // lower_bound should be null
+            let lower_bound_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound");
+            if let Some(idx) = lower_bound_idx {
+                assert!(id_stats.values()[idx].is_null());
+            }
+        } else {
+            panic!("Expected id stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_numeric_types() {
+        // Test various numeric types
+        let table_schema = StructType::new_unchecked([
+            field_with_id("int_col", DataType::INTEGER, false, 1),
+            field_with_id("short_col", DataType::SHORT, false, 2),
+            field_with_id("byte_col", DataType::BYTE, false, 3),
+            field_with_id("double_col", DataType::DOUBLE, true, 4),
+            field_with_id("float_col", DataType::FLOAT, true, 5),
+        ]);
+
+        let stats_json = r#"{
+            "numRecords": 10,
+            "minValues": {"int_col": -100, "short_col": -10, "byte_col": -1, "double_col": 0.5, "float_col": 1.5},
+            "maxValues": {"int_col": 100, "short_col": 10, "byte_col": 1, "double_col": 99.9, "float_col": 9.9}
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        assert_eq!(content_stats.fields().len(), 5);
+
+        // Verify int_col
+        if let Scalar::Struct(int_stats) = &content_stats.values()[0] {
+            let lower_idx = int_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .unwrap();
+            let upper_idx = int_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .unwrap();
+            assert_eq!(int_stats.values()[lower_idx], Scalar::Integer(-100));
+            assert_eq!(int_stats.values()[upper_idx], Scalar::Integer(100));
+        }
+
+        // Verify double_col
+        if let Scalar::Struct(double_stats) = &content_stats.values()[3] {
+            let lower_idx = double_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .unwrap();
+            let upper_idx = double_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .unwrap();
+            assert_eq!(double_stats.values()[lower_idx], Scalar::Double(0.5));
+            assert_eq!(double_stats.values()[upper_idx], Scalar::Double(99.9));
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_tight_bounds_true() {
+        // Test with tightBounds: true (explicit)
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        let stats_json = r#"{
+            "numRecords": 10,
+            "minValues": {"value": 0},
+            "maxValues": {"value": 9},
+            "nullCount": {"value": 0},
+            "tightBounds": true
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        if let Scalar::Struct(value_stats) = &content_stats.values()[0] {
+            let exact_bounds_idx = value_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "exact_bounds")
+                .expect("should have exact_bounds field");
+            assert_eq!(
+                value_stats.values()[exact_bounds_idx],
+                Scalar::Boolean(true),
+                "exact_bounds should be true when tightBounds is true"
+            );
+        } else {
+            panic!("Expected value stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_tight_bounds_false() {
+        // Test with tightBounds: false (e.g., file has deletion vectors)
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        let stats_json = r#"{
+            "numRecords": 10,
+            "minValues": {"value": 0},
+            "maxValues": {"value": 9},
+            "nullCount": {"value": 0},
+            "tightBounds": false
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        if let Scalar::Struct(value_stats) = &content_stats.values()[0] {
+            let exact_bounds_idx = value_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "exact_bounds")
+                .expect("should have exact_bounds field");
+            assert_eq!(
+                value_stats.values()[exact_bounds_idx],
+                Scalar::Boolean(false),
+                "exact_bounds should be false when tightBounds is false"
+            );
+        } else {
+            panic!("Expected value stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_tight_bounds_default() {
+        // Test without tightBounds field (should default to true for backwards compatibility)
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        let stats_json = r#"{
+            "numRecords": 10,
+            "minValues": {"value": 0},
+            "maxValues": {"value": 9},
+            "nullCount": {"value": 0}
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        if let Scalar::Struct(value_stats) = &content_stats.values()[0] {
+            let exact_bounds_idx = value_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "exact_bounds")
+                .expect("should have exact_bounds field");
+            assert_eq!(
+                value_stats.values()[exact_bounds_idx],
+                Scalar::Boolean(true),
+                "exact_bounds should default to true when tightBounds is absent"
+            );
+        } else {
+            panic!("Expected value stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_timestamp_parsing() {
+        // Test timestamp parsing with RFC3339 format (as used in Delta stats)
+        let table_schema =
+            StructType::new_unchecked([field_with_id("ts", DataType::TIMESTAMP, true, 1)]);
+
+        // Format from Delta Protocol: "2023-05-31T18:58:33.633Z"
+        let stats_json = r#"{
+            "numRecords": 5,
+            "minValues": {"ts": "2023-05-31T18:58:33.633Z"},
+            "maxValues": {"ts": "2023-05-31T18:58:33.633Z"},
+            "nullCount": {"ts": 0}
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        if let Scalar::Struct(ts_stats) = &content_stats.values()[0] {
+            let lower_idx = ts_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+
+            // Verify it's a valid timestamp (not null)
+            match &ts_stats.values()[lower_idx] {
+                Scalar::Timestamp(micros) => {
+                    // 2023-05-31T18:58:33.633Z in microseconds since epoch
+                    // Should be approximately 1685559513633000 microseconds
+                    assert!(*micros > 0, "timestamp should be positive");
+                    assert!(
+                        *micros > 1685559513000000 && *micros < 1685559514000000,
+                        "timestamp should be around 2023-05-31T18:58:33.633Z, got {}",
+                        micros
+                    );
+                }
+                other => panic!("Expected Timestamp scalar, got {:?}", other),
+            }
+        } else {
+            panic!("Expected ts stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_delta_json_stats_date_parsing() {
+        // Test date parsing with YYYY-MM-DD format
+        let table_schema =
+            StructType::new_unchecked([field_with_id("date_col", DataType::DATE, true, 1)]);
+
+        let stats_json = r#"{
+            "numRecords": 10,
+            "minValues": {"date_col": "2023-01-15"},
+            "maxValues": {"date_col": "2023-12-31"},
+            "nullCount": {"date_col": 0}
+        }"#;
+
+        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert stats")
+            .expect("should have stats");
+
+        if let Scalar::Struct(date_stats) = &content_stats.values()[0] {
+            let lower_idx = date_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+            let upper_idx = date_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .expect("should have upper_bound");
+
+            // 2023-01-15 is 19372 days since 1970-01-01
+            // 2023-12-31 is 19722 days since 1970-01-01
+            match &date_stats.values()[lower_idx] {
+                Scalar::Date(days) => {
+                    assert_eq!(*days, 19372, "2023-01-15 should be 19372 days since epoch");
+                }
+                other => panic!("Expected Date scalar for lower_bound, got {:?}", other),
+            }
+
+            match &date_stats.values()[upper_idx] {
+                Scalar::Date(days) => {
+                    assert_eq!(*days, 19722, "2023-12-31 should be 19722 days since epoch");
+                }
+                other => panic!("Expected Date scalar for upper_bound, got {:?}", other),
+            }
+        } else {
+            panic!("Expected date_col stats to be a Struct");
+        }
     }
 }

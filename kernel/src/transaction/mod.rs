@@ -582,7 +582,8 @@ impl Transaction {
                     )
                 };
 
-            let mut metadata_builder = metadata.to_builder();
+            let table_schema = self.read_snapshot.schema().as_ref().clone();
+            let mut metadata_builder = metadata.to_builder(table_schema);
             for add_metadata_result in self.add_files_metadata.iter() {
                 // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(
@@ -2364,7 +2365,8 @@ mod tests {
         create_initial_table(&table_root)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
@@ -2372,7 +2374,8 @@ mod tests {
         }
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut root_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
         root_builder.add_entry(leaf_manifest_entry);
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2486,7 +2489,8 @@ mod tests {
         // - Delete leaf manifest with PositionDeletes entries (the actual DV files)
 
         // Create data leaf manifest with 5 data files
-        let mut data_leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut data_leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
 
         // Files without DV
         data_leaf_builder.add(
@@ -2528,7 +2532,8 @@ mod tests {
         let data_leaf_entry = data_leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Create delete leaf manifest with PositionDeletes entries for the DVs
-        let mut delete_leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut delete_leaf_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
 
         // DV entry for file-2.parquet
         let dv_entry_2 = MetadataEntry {
@@ -2600,7 +2605,8 @@ mod tests {
         let delete_leaf_entry = delete_leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Create root manifest with both data and delete leaf manifests
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1);
+        let mut root_builder =
+            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
         root_builder.add_entry(data_leaf_entry);
         root_builder.add_entry(delete_leaf_entry);
         let root_url = root_builder.write_root(&engine)?;

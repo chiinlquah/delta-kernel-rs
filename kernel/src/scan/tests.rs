@@ -538,8 +538,10 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
+        use crate::schema::StructType;
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 3);
+        let mut builder =
+            MetadataBuilder::new_for(table_root.clone(), 3, StructType::new_unchecked([]));
 
         // Add the action that should be in content_root
         let add = Add {
@@ -744,8 +746,10 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
+        use crate::schema::StructType;
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 10);
+        let mut builder =
+            MetadataBuilder::new_for(table_root.clone(), 10, StructType::new_unchecked([]));
 
         // Add the action that should be in content_root
         let add = Add {

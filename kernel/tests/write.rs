@@ -33,7 +33,9 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 
 use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata,
@@ -2048,11 +2050,15 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table: one int column named 'number'
+    // create a simple table: one int column named 'number' with parquet.field.id metadata
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )])?);
+    )
+    .with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(1),
+    )])])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2776,11 +2782,15 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table: one int column named 'number'
+    // create a simple table: one int column named 'number' with parquet.field.id metadata
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )])?);
+    )
+    .with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(1),
+    )])])?);
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2877,7 +2887,11 @@ async fn remove_files_with_modified_selection_vector_impl(
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )])?);
+    )
+    .with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(1),
+    )])])?);
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -3289,11 +3303,15 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
 {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Create a simple table schema
+    // Create a simple table schema with parquet.field.id metadata
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )])?);
+    )
+    .with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(1),
+    )])])?);
 
     // Setup table - wrap engine in Arc for helper functions
     for (table_url, engine, store, _table_name) in
@@ -3381,7 +3399,11 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )])?);
+    )
+    .with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(1),
+    )])])?);
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
