@@ -1,13 +1,3 @@
-<<<<<<< HEAD
-//! Transforms for populating stats_parsed and stats fields in checkpoint data.
-//!
-//! When writing checkpoints, statistics can be stored in two formats:
-//! - `stats`: JSON string format (controlled by `writeStatsAsJson` table property)
-//! - `stats_parsed`: Native struct format (controlled by `writeStatsAsStruct` table property)
-//!
-//! This module provides transforms to populate these fields using COALESCE expressions,
-//! ensuring that stats are preserved regardless of the source format (commits vs checkpoints).
-=======
 //! Transforms for populating stats and partition values fields in checkpoint data.
 //!
 //! When writing checkpoints, statistics and partition values can be stored in two formats:
@@ -16,7 +6,6 @@
 //!
 //! This module provides transforms to populate these fields using COALESCE expressions,
 //! ensuring that data is preserved regardless of the source format (commits vs checkpoints).
->>>>>>> e3b64981417ec47ab66cffe0b48c3112fb2c0ee7
 
 use std::sync::Arc;
 
@@ -29,11 +18,8 @@ use crate::table_properties::TableProperties;
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const STATS_PARSED_FIELD: &str = "stats_parsed";
-<<<<<<< HEAD
-=======
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
 pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
->>>>>>> e3b64981417ec47ab66cffe0b48c3112fb2c0ee7
 
 /// Configuration for stats transformation based on table properties.
 #[derive(Debug, Clone, Copy)]
@@ -51,38 +37,26 @@ impl StatsTransformConfig {
     }
 }
 
-<<<<<<< HEAD
-/// Builds a transform for the Add action to populate and/or drop stats fields.
-///
-/// The transform handles all four scenarios based on table properties:
-=======
 /// Builds a transform for the Add action to populate and/or drop stats and partition values fields.
 ///
 /// The transform handles all scenarios based on table properties:
 ///
 /// Stats fields:
->>>>>>> e3b64981417ec47ab66cffe0b48c3112fb2c0ee7
 /// - When `writeStatsAsJson=true`: `stats = COALESCE(stats, ToJson(stats_parsed))`
 /// - When `writeStatsAsJson=false`: drop `stats` field
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
 ///
-<<<<<<< HEAD
-=======
 /// Partition values fields (when table is partitioned and writeStatsAsStruct=true):
 /// - `partitionValues_parsed = COALESCE(partitionValues_parsed, ParsePartitionValues(partitionValues))`
 /// - `partitionValues = COALESCE(partitionValues, PartitionValuesToMap(partitionValues_parsed))`
 ///
->>>>>>> e3b64981417ec47ab66cffe0b48c3112fb2c0ee7
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
 pub(crate) fn build_stats_transform(
     config: &StatsTransformConfig,
     stats_schema: SchemaRef,
-<<<<<<< HEAD
-=======
     partition_schema: Option<SchemaRef>,
->>>>>>> e3b64981417ec47ab66cffe0b48c3112fb2c0ee7
 ) -> ExpressionRef {
     let mut add_transform = Transform::new_nested([ADD_NAME]);
 
@@ -207,7 +181,6 @@ fn build_partition_values_map_expr() -> ExpressionRef {
 ///
 /// The read schema must include these fields for ALL reads (checkpoints + commits)
 /// even though commits don't have them. This ensures the columns exist
-
 /// (as nulls) so COALESCE can operate correctly.
 pub(crate) fn build_checkpoint_read_schema_with_stats(
     base_schema: &StructType,

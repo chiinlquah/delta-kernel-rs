@@ -288,7 +288,7 @@ fn create_checkpoint(
     // Write checkpoint file
     let checkpoint_filename = checkpoint_path
         .path_segments()
-        .and_then(|s| s.last())
+        .and_then(|mut s| s.next_back())
         .unwrap_or("checkpoint.parquet");
     let checkpoint_file_path = table_path.join("_delta_log").join(checkpoint_filename);
     let size = buffer.len() as u64;

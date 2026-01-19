@@ -652,6 +652,16 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
+        Expression::ParsePartitionValues(_) => {
+            // ParsePartitionValues is used internally for checkpoint writing.
+            // FFI does not currently support this expression.
+            unimplemented!("ParsePartitionValues expression is not supported in FFI")
+        }
+        Expression::PartitionValuesToMap(_) => {
+            // PartitionValuesToMap is used internally for checkpoint writing.
+            // FFI does not currently support this expression.
+            unimplemented!("PartitionValuesToMap expression is not supported in FFI")
+        }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }

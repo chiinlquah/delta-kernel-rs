@@ -216,7 +216,7 @@ pub fn write(
     let mut batches = Vec::new();
     let num_batches = num_files / batch_size;
     for _ in 0..num_batches {
-        batches.push(create_add_files_metadata(add_files_schema, batch_size)?);
+        batches.push(create_add_files_metadata(&add_files_schema, batch_size)?);
     }
 
     add_batches_to_txn(&mut txn, batches, bulk_mode)?;

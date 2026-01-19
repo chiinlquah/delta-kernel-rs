@@ -251,25 +251,21 @@ impl Iterator for TransformingCheckpointIterator {
     }
 }
 
+impl CheckpointDataIterator for TransformingCheckpointIterator {
+    fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
 
-impl Iterator for TransformingCheckpointIterator {
-    type Item = DeltaResult<FilteredEngineData>;
+    fn is_exhausted(&self) -> bool {
+        self.inner.is_exhausted()
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // First, yield all transformed action batches
-        if let Some(batch) = self.inner.next() {
-            // If no evaluator, pass through unchanged
-            let Some(evaluator) = &self.evaluator else {
-                return Some(batch);
-            };
+    fn actions_count(&self) -> i64 {
+        self.inner.actions_count()
+    }
 
-            // Apply the transform to the batch
-            Some(batch.and_then(|filtered_data| {
-                let (engine_data, selection_vector) = filtered_data.into_parts();
-                let transformed = evaluator.evaluate(engine_data.as_ref())?;
-                FilteredEngineData::try_new(transformed, selection_vector)
-            }));
-        }
+    fn add_actions_count(&self) -> i64 {
+        self.inner.add_actions_count()
     }
 }
 
@@ -368,11 +364,6 @@ impl CheckpointWriter {
             .table_configuration()
             .expected_stats_schema()?;
 
-        // Read schema includes stats_parsed so COALESCE expressions can operate on it.
-        // For commits, stats_parsed will be read as nulls (column doesn't exist in source).
-        let read_schema =
-            build_checkpoint_read_schema_with_stats(&CHECKPOINT_ACTIONS_SCHEMA, &stats_schema);
-
         // Get partition values schema (None if table is not partitioned)
         let partition_schema = self
             .snapshot
@@ -384,12 +375,6 @@ impl CheckpointWriter {
             .snapshot
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
-
-        // Read actions from log segment
-        let actions =
-            self.snapshot
-                .log_segment()
-                .read_actions(engine, read_schema.clone(), None)?;
 
         let base_schema = if is_v2_checkpoints_supported {
             &CHECKPOINT_ACTIONS_SCHEMA_V2
@@ -418,16 +403,6 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        // Build output schema based on stats config (determines which fields are included)
-
-        let output_schema =
-            build_checkpoint_output_schema(&config, &CHECKPOINT_ACTIONS_SCHEMA, &stats_schema);
-
-        // Build transform expression and create expression evaluator
-        let transform_expr = build_stats_transform(&config, stats_schema);
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            read_schema,
-
         let output_schema = build_checkpoint_output_schema(
             &config,
             base_schema,
@@ -442,18 +417,6 @@ impl CheckpointWriter {
             transform_expr,
             output_schema.clone().into(),
         )?;
-
-        // Create action reconciliation iterator (without checkpoint metadata)
-        let inner = ActionReconciliationIterator::new(Box::new(checkpoint_data));
-
-        // Handle V2 checkpoint metadata separately - it has a different schema
-        // and shouldn't go through the stats transform
-        let checkpoint_metadata = if is_v2_checkpoints_supported {
-            let batch = self.create_checkpoint_metadata_batch(engine)?;
-            Some(batch.filtered_data)
-        } else {
-            None
-        };
 
         // For V2 checkpoints, chain the checkpoint metadata batch to the action stream.
         // The checkpoint metadata batch uses the read schema (with stats_parsed), so it can

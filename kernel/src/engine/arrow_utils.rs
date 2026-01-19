@@ -33,6 +33,13 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
 
+/// Unix epoch date (1970-01-01) used for date arithmetic.
+/// Safety: This is a known valid date constant that will never fail to construct.
+#[allow(clippy::expect_used)]
+static UNIX_EPOCH_DATE: std::sync::LazyLock<chrono::NaiveDate> = std::sync::LazyLock::new(|| {
+    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date")
+});
+
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
 
@@ -1273,10 +1280,7 @@ pub(crate) fn parse_partition_values_impl(
                         v.as_ref().and_then(|s| {
                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                                 .ok()
-                                .map(|d| {
-                                    (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                                        .num_days() as i32
-                                })
+                                .map(|d| (d - *UNIX_EPOCH_DATE).num_days() as i32)
                         })
                     })
                     .collect();
@@ -1381,8 +1385,7 @@ fn value_to_string(array: &ArrayRef, idx: usize, data_type: &ArrowDataType) -> D
         ArrowDataType::Boolean => Ok(array.as_boolean().value(idx).to_string()),
         ArrowDataType::Date32 => {
             let days = array.as_primitive::<Date32Type>().value(idx);
-            let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                .unwrap()
+            let date = UNIX_EPOCH_DATE
                 .checked_add_signed(chrono::Duration::days(days as i64))
                 .ok_or_else(|| Error::generic("Invalid date value"))?;
             Ok(date.format("%Y-%m-%d").to_string())

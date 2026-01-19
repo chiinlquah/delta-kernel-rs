@@ -886,7 +886,11 @@ impl LogSegment {
             .map_ok(|batch| ActionsBatch::new(batch, false))
             .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
 
-        Ok((Box::new(Box::new(content_root_stream.chain(actions_iter))), has_stats_parsed, checkpoint_read_schema))
+        Ok((
+            Box::new(Box::new(content_root_stream.chain(actions_iter))),
+            has_stats_parsed,
+            checkpoint_read_schema,
+        ))
     }
 
     /// Extracts sidecar file references from a checkpoint file.

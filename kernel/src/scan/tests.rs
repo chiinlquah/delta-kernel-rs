@@ -632,9 +632,8 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];
@@ -842,9 +841,8 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];

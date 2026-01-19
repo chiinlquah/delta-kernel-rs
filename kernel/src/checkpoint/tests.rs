@@ -9,7 +9,6 @@ use crate::arrow::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
-use crate::checkpoint::create_last_checkpoint_data;
 use crate::checkpoint::{create_last_checkpoint_data, CheckpointDataIterator};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::DefaultEngineBuilder;
@@ -553,13 +552,13 @@ async fn test_v2_checkpoint_unified_schema() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer()?;
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let data_iter = writer.checkpoint_data(&engine)?;
 
     // Get the expected schema from the iterator
     let expected_schema = data_iter.output_schema().clone();
 
     // Verify all batches have the same schema
-    while let Some(batch_result) = data_iter.next() {
+    for batch_result in data_iter {
         let batch = batch_result?;
         let data = batch.apply_selection_vector()?;
         let record_batch = data.try_into_record_batch()?;
