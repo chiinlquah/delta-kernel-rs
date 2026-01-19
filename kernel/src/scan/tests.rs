@@ -392,12 +392,13 @@ fn test_replay_for_scan_metadata() {
     let engine = SyncEngine::new();
 
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    let scan = snapshot.scan_builder().build().unwrap();
-    let data: Vec<_> = scan
-        .replay_for_scan_metadata(&engine)
-        .unwrap()
-        .try_collect()
-        .unwrap();
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+
+    // replay_for_scan_metadata returns (iter, has_stats_parsed, checkpoint_schema)
+    let (data_iter, _has_stats_parsed, _checkpoint_schema) =
+        scan.replay_for_scan_metadata(&engine).unwrap();
+
+    let data: Vec<_> = data_iter.try_collect().unwrap();
     // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
     // could be skipped when looking for adds/removes.
     //
@@ -631,9 +632,8 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];
@@ -841,9 +841,8 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let scan = snapshot.scan_builder().build()?;
 
     // Call replay_for_scan_metadata and collect all actions
-    let action_batches: Vec<_> = scan
-        .replay_for_scan_metadata(engine.as_ref())?
-        .try_collect()?;
+    let (action_iter, _, _) = scan.replay_for_scan_metadata(engine.as_ref())?;
+    let action_batches: Vec<_> = action_iter.try_collect()?;
 
     // Extract all add action paths and track which came from log batches vs content root
     let mut add_paths = vec![];
