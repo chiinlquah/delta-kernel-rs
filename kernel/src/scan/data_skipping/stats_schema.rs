@@ -34,7 +34,7 @@ use crate::{
 ///    minValues: <derived min/max schema>,
 ///    maxValues: <derived min/max schema>,
 /// }
-/// ``` 
+/// ```
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
