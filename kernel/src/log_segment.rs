@@ -625,7 +625,13 @@ impl LogSegment {
 
         // Get actions from root manifest
         // TODO: Provide partition keys
-        let root_batches = metadata.root_action_batches(engine, &checkpoint_read_schema, &[])?;
+        // Pass the data predicate for data skipping based on content_stats
+        let root_batches = metadata.root_action_batches(
+            engine,
+            &checkpoint_read_schema,
+            &[],
+            data_predicate.as_ref(),
+        )?;
 
         // Get actions from leaf manifests (DataManifest entries)
         // Pass the data predicate for manifest-level skipping based on content_stats
@@ -635,6 +641,7 @@ impl LogSegment {
             engine,
             &checkpoint_read_schema,
             table_root,
+            data_predicate.as_ref(),
         )?;
 
         // Chain root and leaf actions together

@@ -123,14 +123,18 @@ impl<'a> ParquetStatsProvider for ManifestStatsProvider<'a> {
     }
 }
 
-/// Evaluates whether a manifest can be skipped based on its content_stats and a predicate.
+/// Evaluates whether an entry can be skipped based on its content_stats and a predicate.
 ///
-/// Returns `true` if the manifest can definitely be skipped (no files in the manifest
+/// This function works for any `MetadataEntry` type - data files, manifests, etc.
+/// It uses the entry's `content_stats` (min/max bounds) to determine if the predicate
+/// can possibly match any rows in the entry.
+///
+/// Returns `true` if the entry can definitely be skipped (no rows in the entry
 /// can possibly satisfy the predicate based on min/max stats).
-/// Returns `false` if the manifest might contain matching files and should be opened.
+/// Returns `false` if the entry might contain matching rows and should be processed.
 ///
 /// If content_stats is None or the predicate cannot be evaluated, returns `false` (cannot skip).
-fn can_skip_manifest(entry: &MetadataEntry, predicate: &Predicate) -> bool {
+fn can_skip_entry(entry: &MetadataEntry, predicate: &Predicate) -> bool {
     let content_stats = match &entry.content_stats {
         Some(stats) => stats,
         None => return false, // No stats available, cannot skip
@@ -138,14 +142,14 @@ fn can_skip_manifest(entry: &MetadataEntry, predicate: &Predicate) -> bool {
 
     let provider = ManifestStatsProvider::new(content_stats, entry.record_count);
 
-    // Use the KernelPredicateEvaluator to evaluate the predicate against manifest stats.
+    // Use the KernelPredicateEvaluator to evaluate the predicate against stats.
     // The evaluator returns Some(true) if the predicate might match, Some(false) if it
     // definitely cannot match, or None if it cannot be determined.
     match provider.eval(predicate) {
         Some(false) => {
-            // Predicate definitely cannot match any rows in this manifest
+            // Predicate definitely cannot match any rows in this entry
             debug!(
-                "Skipping manifest {:?} - predicate cannot match based on stats",
+                "Skipping entry {:?} - predicate cannot match based on stats",
                 entry.location
             );
             true
@@ -155,6 +159,36 @@ fn can_skip_manifest(entry: &MetadataEntry, predicate: &Predicate) -> bool {
             false
         }
     }
+}
+
+/// Filters a vector of entries based on a predicate using content_stats.
+///
+/// Returns only entries that might contain matching data (cannot be skipped).
+/// Logs the number of entries skipped for debugging.
+fn filter_entries_by_predicate(
+    entries: Vec<MetadataEntry>,
+    predicate: Option<&PredicateRef>,
+    entry_type: &str,
+) -> Vec<MetadataEntry> {
+    let Some(pred) = predicate else {
+        return entries;
+    };
+
+    let total = entries.len();
+    let filtered: Vec<MetadataEntry> = entries
+        .into_iter()
+        .filter(|entry| !can_skip_entry(entry, pred))
+        .collect();
+
+    let skipped = total - filtered.len();
+    if skipped > 0 {
+        debug!(
+            "Data skipping: skipped {}/{} {} based on content_stats",
+            skipped, total, entry_type
+        );
+    }
+
+    filtered
 }
 
 /// Represents table metadata in Adaptive Metadata Tree (AMT) format.
@@ -349,11 +383,17 @@ impl Metadata {
         Ok(all_entries)
     }
 
+    /// Converts root manifest entries to action batches.
+    ///
+    /// # Parameters
+    /// - `predicate`: Optional predicate for data skipping. When provided, entries whose
+    ///   `content_stats` indicate they cannot contain matching data will be skipped.
     pub(crate) fn root_action_batches(
         &self,
         engine: &dyn Engine,
         schema: &SchemaRef,
         _partition_keys: &[String],
+        predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         use std::collections::HashMap;
 
@@ -382,6 +422,9 @@ impl Metadata {
                 DataContentType::Data | DataContentType::EqualityDeletes
             )
         });
+
+        // Apply predicate-based data skipping to filter out entries that cannot match
+        let data_entries = filter_entries_by_predicate(data_entries, predicate, "root data entries");
 
         // Process deletion vector entries
         for (i, dv_entry) in dv_entries.into_iter().enumerate() {
@@ -634,22 +677,8 @@ impl Metadata {
             .collect();
 
         // Apply manifest-level data skipping if a predicate is provided
-        let total_manifests = data_manifest_entries.len();
-        let data_manifest_entries: Vec<MetadataEntry> = if let Some(pred) = predicate {
-            data_manifest_entries
-                .into_iter()
-                .filter(|entry| !can_skip_manifest(entry, pred))
-                .collect()
-        } else {
-            data_manifest_entries
-        };
-        let skipped_manifests = total_manifests - data_manifest_entries.len();
-        if skipped_manifests > 0 {
-            debug!(
-                "Manifest-level data skipping: skipped {}/{} manifests",
-                skipped_manifests, total_manifests
-            );
-        }
+        let data_manifest_entries =
+            filter_entries_by_predicate(data_manifest_entries, predicate, "child manifests");
 
         // Create ManifestReferences for each data manifest
         let manifest_refs: Vec<DeltaResult<ManifestReference>> = data_manifest_entries
@@ -768,6 +797,8 @@ impl Metadata {
     /// - `root_state`: The leaf references from the root manifest
     /// - `engine`: The engine for reading parquet files
     /// - `schema`: The action schema (typically from `get_log_add_schema()`)
+    /// - `predicate`: Optional predicate for data skipping. When provided, data file entries
+    ///   whose `content_stats` indicate they cannot contain matching data will be skipped.
     ///
     /// # Returns
     /// An iterator over all action batches from all child manifests.
@@ -776,6 +807,7 @@ impl Metadata {
         engine: &dyn Engine,
         schema: &SchemaRef,
         table_root: &Url,
+        predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Build the shared DV map once
         let shared_dv_map =
@@ -792,6 +824,7 @@ impl Metadata {
                 engine,
                 schema,
                 table_root,
+                predicate,
             )?;
             all_iters.push(iter);
         }
@@ -800,26 +833,29 @@ impl Metadata {
         Ok(Box::new(all_iters.into_iter().flatten()))
     }
 
-    /// Processes a ManifestReference
-    /// ManifestReferences` and a pre-built deletion vector map, this method:
+    /// Processes a ManifestReference into action batches.
+    ///
+    /// Given a `ManifestReference` and a pre-built deletion vector map, this method:
     ///
     /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
     /// 2. **Reads affiliated delete manifests**: Processes delete manifests specific to this data manifest
     /// 3. **Merges with shared DVs**: Combines affiliated DVs with the shared DV map
-    /// 4. **Converts entries to actions**: Transforms MetadataEntry records into Add/Remove actions
-    /// 5. **Returns action batches**: Produces an iterator of ActionsBatch objects
+    /// 4. **Filters entries**: Applies predicate-based data skipping using content_stats
+    /// 5. **Converts entries to actions**: Transforms MetadataEntry records into Add/Remove actions
+    /// 6. **Returns action batches**: Produces an iterator of ActionsBatch objects
     ///
     /// # Parameters
     /// - `manifest_refs`: The manifest references to process
     /// - `shared_dv_map`: Pre-built deletion vector map from shared state
     /// - `engine`: The engine for reading parquet files
     /// - `schema`: The action schema (typically from `get_log_add_schema()`)
+    /// - `predicate`: Optional predicate for data skipping
     ///
     /// # Returns
     /// An iterator over `ActionsBatch` objects, each containing a single Add or Remove action.
     ///
     /// # Notes
-    /// - Use `root_to_action_batches` for a higher-level API that processes all manifests
+    /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
     /// - The shared_dv_map should be built once and reused for all child manifests
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
@@ -827,6 +863,7 @@ impl Metadata {
         engine: &dyn Engine,
         schema: &SchemaRef,
         table_root: &Url,
+        predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Read the data manifest file
         let data_manifest_location = manifest_refs
@@ -846,6 +883,10 @@ impl Metadata {
         if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
             data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
         }
+
+        // Apply predicate-based data skipping to filter out entries that cannot match
+        let data_manifest_entries =
+            filter_entries_by_predicate(data_manifest_entries, predicate, "leaf data entries");
 
         // Build a separate map for affiliated delete manifests (specific to this data manifest)
         let mut affiliated_dv_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
@@ -3460,9 +3501,9 @@ mod tests {
             leaf: None,
         };
 
-        // Get action batches
+        // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3511,9 +3552,9 @@ mod tests {
             leaf: None,
         };
 
-        // Get action batches
+        // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3556,9 +3597,9 @@ mod tests {
             leaf: None,
         };
 
-        // Get action batches
+        // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3655,9 +3696,9 @@ mod tests {
             leaf: None,
         };
 
-        // Get action batches
+        // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3714,9 +3755,9 @@ mod tests {
             leaf: None,
         };
 
-        // Get action batches
+        // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[])?;
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -4018,12 +4059,14 @@ mod tests {
         // Process manifest to action batches (empty shared DV map)
         let schema = crate::actions::get_log_add_schema().clone();
         let shared_dv_map = HashMap::new();
+        // No data skipping for this test
         let action_batches = Metadata::manifest_to_action_batches(
             manifest_refs,
             &shared_dv_map,
             &engine,
             &schema,
             &table_root_url,
+            None,
         )?;
 
         // Collect all Add actions
@@ -4361,8 +4404,9 @@ mod tests {
 
         // Process all manifests using the helper method
         let schema = crate::actions::get_log_add_schema().clone();
+        // No data skipping for this test
         let action_batches =
-            Metadata::non_root_action_batches(root_state, &engine, &schema, &table_root_url)?;
+            Metadata::non_root_action_batches(root_state, &engine, &schema, &table_root_url, None)?;
 
         // Collect all Add actions
         let mut all_adds = Vec::new();
