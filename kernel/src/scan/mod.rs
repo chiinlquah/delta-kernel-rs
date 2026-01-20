@@ -605,6 +605,7 @@ impl Scan {
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
+                self.physical_predicate(), // Pass predicate for manifest-level skipping
             )?;
         let it = action_batch_iter.chain(existing_data.into_iter().map(apply_transform));
 
@@ -647,6 +648,8 @@ impl Scan {
     )> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
+        // However, we do pass the data predicate for manifest-level skipping when reading from
+        // content roots with hierarchical manifests.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -655,6 +658,7 @@ impl Scan {
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
+                self.physical_predicate(), // Pass predicate for manifest-level skipping
             )
     }
 
