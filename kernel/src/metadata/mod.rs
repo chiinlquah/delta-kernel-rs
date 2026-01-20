@@ -424,7 +424,8 @@ impl Metadata {
         });
 
         // Apply predicate-based data skipping to filter out entries that cannot match
-        let data_entries = filter_entries_by_predicate(data_entries, predicate, "root data entries");
+        let data_entries =
+            filter_entries_by_predicate(data_entries, predicate, "root data entries");
 
         // Process deletion vector entries
         for (i, dv_entry) in dv_entries.into_iter().enumerate() {
@@ -4426,6 +4427,447 @@ mod tests {
         assert!(paths.contains(&"partition1/data-2.parquet"));
         assert!(paths.contains(&"partition2/data-3.parquet"));
         assert!(paths.contains(&"partition2/data-4.parquet"));
+
+        Ok(())
+    }
+
+    /// Helper to create content_stats for testing data skipping.
+    /// Creates stats for a single integer column "id" with the given min/max bounds.
+    fn create_id_content_stats(min_value: i32, max_value: i32) -> DeltaResult<StructData> {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
+
+        // Create schema for a single "id" column
+        let table_schema =
+            StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)
+                .with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                )])]);
+
+        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
+        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
+
+        // Build the 'id' stats struct (4 fields for non-nullable int: value_count, lower_bound, upper_bound, exact_bounds)
+        let id_stats_schema = match content_stats_fields[0].data_type() {
+            DataType::Struct(s) => s.as_ref().clone(),
+            _ => panic!("Expected struct type"),
+        };
+        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
+        let id_stats = StructData::try_new(
+            id_stats_fields,
+            vec![
+                Scalar::Long(100),          // value_count
+                Scalar::Integer(min_value), // lower_bound
+                Scalar::Integer(max_value), // upper_bound
+                Scalar::Boolean(true),      // exact_bounds
+            ],
+        )?;
+
+        // Build the content_stats struct containing the id stats
+        StructData::try_new(content_stats_fields, vec![Scalar::Struct(id_stats)])
+    }
+
+    /// Helper to create a MetadataEntry with content_stats for testing.
+    fn create_data_entry_with_stats(
+        location: &str,
+        min_id: i32,
+        max_id: i32,
+    ) -> DeltaResult<MetadataEntry> {
+        Ok(MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(location.to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: Some(create_id_content_stats(min_id, max_id)?),
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        })
+    }
+
+    #[test]
+    fn test_can_skip_entry_with_content_stats() -> DeltaResult<()> {
+        use crate::expressions::{column_expr, Expression, Predicate};
+
+        // Create entries with different id ranges:
+        // Entry 1: id in [1, 100]
+        // Entry 2: id in [101, 200]
+        // Entry 3: id in [201, 300]
+        let entry1 = create_data_entry_with_stats("file1.parquet", 1, 100)?;
+        let entry2 = create_data_entry_with_stats("file2.parquet", 101, 200)?;
+        let entry3 = create_data_entry_with_stats("file3.parquet", 201, 300)?;
+
+        // Test 1: Predicate "id = 50" should NOT skip entry1, but SHOULD skip entry2 and entry3
+        let pred_eq_50: Predicate = column_expr!("id").eq(Expression::literal(50i32));
+        assert!(
+            !can_skip_entry(&entry1, &pred_eq_50),
+            "Entry with id [1,100] should NOT be skipped for id=50"
+        );
+        assert!(
+            can_skip_entry(&entry2, &pred_eq_50),
+            "Entry with id [101,200] SHOULD be skipped for id=50"
+        );
+        assert!(
+            can_skip_entry(&entry3, &pred_eq_50),
+            "Entry with id [201,300] SHOULD be skipped for id=50"
+        );
+
+        // Test 2: Predicate "id > 150" should skip entry1, NOT skip entry2 and entry3
+        let pred_gt_150: Predicate = column_expr!("id").gt(Expression::literal(150i32));
+        assert!(
+            can_skip_entry(&entry1, &pred_gt_150),
+            "Entry with id [1,100] SHOULD be skipped for id>150"
+        );
+        assert!(
+            !can_skip_entry(&entry2, &pred_gt_150),
+            "Entry with id [101,200] should NOT be skipped for id>150"
+        );
+        assert!(
+            !can_skip_entry(&entry3, &pred_gt_150),
+            "Entry with id [201,300] should NOT be skipped for id>150"
+        );
+
+        // Test 3: Predicate "id < 50" should NOT skip entry1, but SHOULD skip entry2 and entry3
+        let pred_lt_50: Predicate = column_expr!("id").lt(Expression::literal(50i32));
+        assert!(
+            !can_skip_entry(&entry1, &pred_lt_50),
+            "Entry with id [1,100] should NOT be skipped for id<50"
+        );
+        assert!(
+            can_skip_entry(&entry2, &pred_lt_50),
+            "Entry with id [101,200] SHOULD be skipped for id<50"
+        );
+        assert!(
+            can_skip_entry(&entry3, &pred_lt_50),
+            "Entry with id [201,300] SHOULD be skipped for id<50"
+        );
+
+        // Test 4: Predicate "id >= 1 AND id <= 300" should NOT skip any entry
+        let pred_range: Predicate = Predicate::and(
+            column_expr!("id").ge(Expression::literal(1i32)),
+            column_expr!("id").le(Expression::literal(300i32)),
+        );
+        assert!(
+            !can_skip_entry(&entry1, &pred_range),
+            "Entry with id [1,100] should NOT be skipped for 1<=id<=300"
+        );
+        assert!(
+            !can_skip_entry(&entry2, &pred_range),
+            "Entry with id [101,200] should NOT be skipped for 1<=id<=300"
+        );
+        assert!(
+            !can_skip_entry(&entry3, &pred_range),
+            "Entry with id [201,300] should NOT be skipped for 1<=id<=300"
+        );
+
+        // Test 5: Predicate "id > 500" should skip ALL entries
+        let pred_gt_500: Predicate = column_expr!("id").gt(Expression::literal(500i32));
+        assert!(
+            can_skip_entry(&entry1, &pred_gt_500),
+            "Entry with id [1,100] SHOULD be skipped for id>500"
+        );
+        assert!(
+            can_skip_entry(&entry2, &pred_gt_500),
+            "Entry with id [101,200] SHOULD be skipped for id>500"
+        );
+        assert!(
+            can_skip_entry(&entry3, &pred_gt_500),
+            "Entry with id [201,300] SHOULD be skipped for id>500"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_can_skip_entry_without_content_stats() -> DeltaResult<()> {
+        use crate::expressions::{column_expr, Expression, Predicate};
+
+        // Create an entry WITHOUT content_stats
+        let entry_no_stats = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some("file.parquet".to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None, // No stats!
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        // Without content_stats, we can never skip (safe default)
+        let pred: Predicate = column_expr!("id").gt(Expression::literal(500i32));
+        assert!(
+            !can_skip_entry(&entry_no_stats, &pred),
+            "Entry without content_stats should NEVER be skipped"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_entries_by_predicate_integration() -> DeltaResult<()> {
+        use crate::expressions::{column_expr, Expression, Predicate};
+
+        // Create 5 entries with different id ranges:
+        // Entry 1: id in [1, 100]
+        // Entry 2: id in [101, 200]
+        // Entry 3: id in [201, 300]
+        // Entry 4: id in [301, 400]
+        // Entry 5: id in [401, 500]
+        let entries = vec![
+            create_data_entry_with_stats("file1.parquet", 1, 100)?,
+            create_data_entry_with_stats("file2.parquet", 101, 200)?,
+            create_data_entry_with_stats("file3.parquet", 201, 300)?,
+            create_data_entry_with_stats("file4.parquet", 301, 400)?,
+            create_data_entry_with_stats("file5.parquet", 401, 500)?,
+        ];
+
+        // Test 1: No predicate - all entries should be returned
+        let filtered = filter_entries_by_predicate(entries.clone(), None, "test entries");
+        assert_eq!(filtered.len(), 5, "No predicate should return all entries");
+
+        // Test 2: Predicate "id = 150" - only entry2 should remain
+        let pred_eq_150: Predicate = column_expr!("id").eq(Expression::literal(150i32));
+        let pred_ref = Arc::new(pred_eq_150);
+        let filtered =
+            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Predicate id=150 should return 1 entry (file2)"
+        );
+        assert_eq!(
+            filtered[0].location.as_ref().unwrap(),
+            "file2.parquet",
+            "Only file2 should match id=150"
+        );
+
+        // Test 3: Predicate "id > 250" - entries 3, 4, 5 should remain
+        let pred_gt_250: Predicate = column_expr!("id").gt(Expression::literal(250i32));
+        let pred_ref = Arc::new(pred_gt_250);
+        let filtered =
+            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
+        assert_eq!(
+            filtered.len(),
+            3,
+            "Predicate id>250 should return 3 entries"
+        );
+        let locations: Vec<_> = filtered
+            .iter()
+            .map(|e| e.location.as_ref().unwrap().as_str())
+            .collect();
+        assert!(locations.contains(&"file3.parquet"));
+        assert!(locations.contains(&"file4.parquet"));
+        assert!(locations.contains(&"file5.parquet"));
+
+        // Test 4: Predicate "id < 150" - entries 1 and 2 should remain
+        // Entry1 [1,100]: all values < 150, not skipped
+        // Entry2 [101,200]: some values < 150 (101-149), not skipped
+        // Entry3,4,5: min > 150, all skipped
+        let pred_lt_150: Predicate = column_expr!("id").lt(Expression::literal(150i32));
+        let pred_ref = Arc::new(pred_lt_150);
+        let filtered =
+            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Predicate id<150 should return 2 entries (file1 and file2)"
+        );
+        let locations: Vec<_> = filtered
+            .iter()
+            .map(|e| e.location.as_ref().unwrap().as_str())
+            .collect();
+        assert!(locations.contains(&"file1.parquet"));
+        assert!(locations.contains(&"file2.parquet"));
+
+        // Test 5: Predicate "id > 1000" - no entries should remain
+        let pred_gt_1000: Predicate = column_expr!("id").gt(Expression::literal(1000i32));
+        let pred_ref = Arc::new(pred_gt_1000);
+        let filtered = filter_entries_by_predicate(entries, Some(&pred_ref), "test entries");
+        assert_eq!(
+            filtered.len(),
+            0,
+            "Predicate id>1000 should skip all entries"
+        );
+
+        Ok(())
+    }
+
+    /// Test manifest skipping using direct entry filtering (without serialization).
+    ///
+    /// This test demonstrates the data skipping behavior at the manifest level
+    /// by directly testing `filter_entries_by_predicate` on DataManifest entries.
+    #[test]
+    fn test_manifest_skipping_with_predicate() -> DeltaResult<()> {
+        use crate::expressions::{column_expr, Expression, Predicate};
+
+        // Create DataManifest entries with content_stats representing different id ranges
+        // These represent child manifests in a hierarchical metadata tree
+        //
+        // Manifest 1: contains data files with id in [1, 100]
+        // Manifest 2: contains data files with id in [101, 200]
+        // Manifest 3: contains data files with id in [201, 300]
+
+        let manifest1 = MetadataEntry {
+            content_type: DataContentType::DataManifest,
+            location: Some("manifest1.parquet".to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: Some(create_id_content_stats(1, 100)?),
+            manifest_info: Some(ManifestStats {
+                added_files_count: 10,
+                existing_files_count: 0,
+                deletes_files_count: 0,
+                added_rows_count: 100,
+                existing_rows_count: 0,
+                delete_rows_count: 0,
+                min_sequence_number: 100,
+            }),
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        let manifest2 = MetadataEntry {
+            location: Some("manifest2.parquet".to_string()),
+            content_stats: Some(create_id_content_stats(101, 200)?),
+            ..manifest1.clone()
+        };
+
+        let manifest3 = MetadataEntry {
+            location: Some("manifest3.parquet".to_string()),
+            content_stats: Some(create_id_content_stats(201, 300)?),
+            ..manifest1.clone()
+        };
+
+        let manifests = vec![manifest1, manifest2, manifest3];
+
+        // Test 1: No predicate - all 3 manifests should be returned
+        let filtered = filter_entries_by_predicate(manifests.clone(), None, "child manifests");
+        assert_eq!(
+            filtered.len(),
+            3,
+            "No predicate should return all 3 manifests"
+        );
+
+        // Test 2: Predicate "id = 50" - only manifest1 should be returned
+        let pred_eq_50: Predicate = column_expr!("id").eq(Expression::literal(50i32));
+        let pred_ref = Arc::new(pred_eq_50);
+        let filtered =
+            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Predicate id=50 should return 1 manifest"
+        );
+        assert_eq!(
+            filtered[0].location.as_ref().unwrap(),
+            "manifest1.parquet",
+            "Only manifest1 should match id=50"
+        );
+
+        // Test 3: Predicate "id > 150" - manifests 2 and 3 should be returned
+        let pred_gt_150: Predicate = column_expr!("id").gt(Expression::literal(150i32));
+        let pred_ref = Arc::new(pred_gt_150);
+        let filtered =
+            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Predicate id>150 should return 2 manifests"
+        );
+        let locations: Vec<_> = filtered
+            .iter()
+            .map(|e| e.location.as_ref().unwrap().as_str())
+            .collect();
+        assert!(locations.contains(&"manifest2.parquet"));
+        assert!(locations.contains(&"manifest3.parquet"));
+
+        // Test 4: Predicate "id > 500" - no manifests should be returned
+        let pred_gt_500: Predicate = column_expr!("id").gt(Expression::literal(500i32));
+        let pred_ref = Arc::new(pred_gt_500);
+        let filtered =
+            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
+        assert_eq!(
+            filtered.len(),
+            0,
+            "Predicate id>500 should skip all manifests"
+        );
+
+        // Test 5: Predicate "id < 250" - manifests 1 and 2 should be returned
+        // Manifest1 [1,100]: max=100 < 250, not skipped
+        // Manifest2 [101,200]: max=200 < 250, not skipped
+        // Manifest3 [201,300]: min=201 < 250 but max=300 > 250, some rows might match, not skipped
+        // Actually, for "id < 250", manifest3 has min=201 and max=300
+        // Since some values in [201,249] satisfy id < 250, manifest3 should NOT be skipped
+        let pred_lt_250: Predicate = column_expr!("id").lt(Expression::literal(250i32));
+        let pred_ref = Arc::new(pred_lt_250);
+        let filtered =
+            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
+        assert_eq!(
+            filtered.len(),
+            3,
+            "Predicate id<250 should return all 3 manifests (all might have matching rows)"
+        );
+
+        // Test 6: Predicate "id < 100" - manifest1 might match, manifests 2 and 3 should be skipped
+        // Manifest1 [1,100]: max=100 >= 100, but some values < 100, not skipped
+        // Manifest2 [101,200]: min=101 > 100, cannot have id < 100, skipped
+        // Manifest3 [201,300]: min=201 > 100, cannot have id < 100, skipped
+        let pred_lt_100: Predicate = column_expr!("id").lt(Expression::literal(100i32));
+        let pred_ref = Arc::new(pred_lt_100);
+        let filtered = filter_entries_by_predicate(manifests, Some(&pred_ref), "child manifests");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Predicate id<100 should return 1 manifest (only manifest1)"
+        );
+        assert_eq!(
+            filtered[0].location.as_ref().unwrap(),
+            "manifest1.parquet",
+            "Only manifest1 should match id<100"
+        );
 
         Ok(())
     }
