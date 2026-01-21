@@ -2,7 +2,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::metadata::stats::delta_json_stats_to_content_stats;
+use crate::metadata::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::metadata::writer::MetadataWriter;
 use crate::metadata::{
     ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
@@ -714,6 +714,13 @@ impl MetadataBuilder {
             min_sequence_number,
         });
 
+        // Aggregate content_stats from all pending entries
+        let content_stats = aggregate_content_stats(
+            self.pending_entries
+                .iter()
+                .map(|e| e.content_stats.as_ref()),
+        );
+
         // Determine content type based on what's in the manifest
         // If all entries are PositionDeletes, this is a DeleteManifest
         // Otherwise, it's a DataManifest
@@ -756,10 +763,9 @@ impl MetadataBuilder {
             record_count,
 
             file_size_in_bytes: Some(file_size_in_bytes),
-            // TODO: add.stats contains a JSON blob:
-            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
-            // Which we need to convert from name-based to field-id-based
-            content_stats: None,
+
+            // Aggregated content_stats from all entries in this manifest
+            content_stats,
 
             // Manifest statistics tracking entry counts by status
             manifest_info,
@@ -1500,6 +1506,220 @@ mod tests {
             );
         }
         // content_stats can also be None if stats JSON parsing returned None
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_leaf_aggregates_content_stats() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use crate::expressions::Scalar;
+        use crate::metadata::stats::delta_json_stats_to_content_stats;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a table schema with field IDs (required for stats schema generation)
+        let table_schema = StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new("name", DataType::STRING, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+        ]);
+
+        // Create a builder with the table schema
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+
+        // Create content_stats for file 1: id=[1, 50], name=["alice", "mike"]
+        let stats1_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":50,"name":"mike"},"nullCount":{"id":0,"name":5}}"#;
+        let content_stats_1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)?;
+
+        let entry1 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: content_stats_1,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        // Create content_stats for file 2: id=[40, 100], name=["bob", "zoe"]
+        let stats2_json = r#"{"numRecords":150,"minValues":{"id":40,"name":"bob"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":10}}"#;
+        let content_stats_2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)?;
+
+        let entry2 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-00001.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 150,
+            file_size_in_bytes: Some(2048),
+            content_stats: content_stats_2,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(entry1);
+        builder.add_entry(entry2);
+
+        // Write the leaf manifest
+        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+
+        // Verify content_stats is populated on the leaf manifest entry
+        assert!(
+            leaf_manifest_entry.content_stats.is_some(),
+            "write_leaf should aggregate content_stats from entries"
+        );
+
+        let aggregated_stats = leaf_manifest_entry.content_stats.as_ref().unwrap();
+
+        // Verify the aggregated stats
+        assert_eq!(aggregated_stats.fields().len(), 2);
+
+        // Check id stats: value_count=250, lower=1, upper=100
+        if let Scalar::Struct(id_stats) = &aggregated_stats.values()[0] {
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count")
+                .expect("should have value_count");
+            let lower_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+            let upper_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .expect("should have upper_bound");
+
+            assert_eq!(id_stats.values()[value_count_idx], Scalar::Long(250));
+            assert_eq!(id_stats.values()[lower_idx], Scalar::Long(1));
+            assert_eq!(id_stats.values()[upper_idx], Scalar::Long(100));
+        } else {
+            panic!("Expected id stats to be a Struct");
+        }
+
+        // Check name stats: null_value_count=15, lower="alice", upper="zoe"
+        if let Scalar::Struct(name_stats) = &aggregated_stats.values()[1] {
+            let null_count_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "null_value_count")
+                .expect("should have null_value_count");
+            let lower_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+            let upper_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .expect("should have upper_bound");
+
+            assert_eq!(name_stats.values()[null_count_idx], Scalar::Long(15)); // 5 + 10
+            assert_eq!(
+                name_stats.values()[lower_idx],
+                Scalar::String("alice".to_string())
+            );
+            assert_eq!(
+                name_stats.values()[upper_idx],
+                Scalar::String("zoe".to_string())
+            );
+        } else {
+            panic!("Expected name stats to be a Struct");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_leaf_no_content_stats_when_entries_have_none(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a builder with empty schema
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Create entries without content_stats
+        let entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+            }),
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None, // No stats
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(entry);
+
+        // Write the leaf manifest
+        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+
+        // When all entries have None content_stats, the aggregate should also be None
+        assert!(
+            leaf_manifest_entry.content_stats.is_none(),
+            "write_leaf should return None content_stats when all entries have None"
+        );
 
         Ok(())
     }
