@@ -1330,16 +1330,37 @@ mod tests {
         use crate::metadata::stats::delta_json_stats_to_content_stats;
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
 
-        // Create a table schema with field IDs (required for stats schema generation)
+        // Create a table schema with field IDs and column mapping annotations
+        // (column mapping is required when metadata tree feature is enabled)
         let table_schema = crate::schema::StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::new("name", DataType::STRING, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
+            StructField::new("id", DataType::LONG, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+            StructField::new("name", DataType::STRING, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-name".to_string()),
+                ),
+            ]),
         ]);
 
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
