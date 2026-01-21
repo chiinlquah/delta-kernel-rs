@@ -636,6 +636,249 @@ fn build_struct_stats(
     StructData::new_unchecked(fields, values)
 }
 
+/// Aggregates multiple content_stats into a single content_stats for a manifest.
+///
+/// This function merges statistics from multiple data file entries into aggregate
+/// statistics suitable for a manifest entry. The aggregation rules are:
+///
+/// - `value_count`: sum of all value_counts
+/// - `null_value_count`: sum of all null_value_counts
+/// - `nan_value_count`: sum of all nan_value_counts
+/// - `avg_value_size`: set to null (would require weighted average calculation)
+/// - `max_value_size`: max of all max_value_sizes
+/// - `lower_bound`: min of all lower_bounds
+/// - `upper_bound`: max of all upper_bounds
+/// - `exact_bounds`: AND of all exact_bounds (false if any is false)
+///
+/// For nested struct columns, the aggregation is applied recursively.
+///
+/// # Arguments
+///
+/// * `stats_list` - Iterator of Option<&StructData> representing content_stats from multiple entries
+///
+/// # Returns
+///
+/// Returns `Some(StructData)` with aggregated statistics if at least one input has stats,
+/// or `None` if all inputs are `None`.
+#[allow(dead_code)]
+pub(crate) fn aggregate_content_stats<'a>(
+    stats_list: impl Iterator<Item = Option<&'a StructData>>,
+) -> Option<StructData> {
+    // Collect non-None stats
+    let stats_vec: Vec<&StructData> = stats_list.flatten().collect();
+
+    if stats_vec.is_empty() {
+        return None;
+    }
+
+    // Use the first stats as a template for the schema
+    let template = stats_vec[0];
+    let fields: Vec<StructField> = template.fields().to_vec();
+    let mut aggregated_values: Vec<Scalar> = Vec::with_capacity(fields.len());
+
+    // Iterate through each column's stats
+    for (field_idx, field) in fields.iter().enumerate() {
+        // Collect this field's values from all stats
+        let field_values: Vec<&Scalar> = stats_vec.iter().map(|s| &s.values()[field_idx]).collect();
+
+        let aggregated = aggregate_column_stats(field, &field_values);
+        aggregated_values.push(aggregated);
+    }
+
+    Some(StructData::new_unchecked(fields, aggregated_values))
+}
+
+/// Aggregates statistics for a single column across multiple entries.
+///
+/// If the column's stats are themselves structs (either nested table column or primitive stats),
+/// this function determines whether to recurse for nested columns or aggregate primitive stats.
+fn aggregate_column_stats(field: &StructField, values: &[&Scalar]) -> Scalar {
+    // Check if this is a stats struct (has lower_bound/upper_bound fields) or a nested column
+    match field.data_type() {
+        DataType::Struct(inner_struct) => {
+            // Check if this looks like a primitive stats struct (has lower_bound field)
+            if inner_struct.field("lower_bound").is_some() {
+                // This is a primitive column's stats struct - aggregate the stats fields
+                aggregate_primitive_stats(inner_struct.as_ref(), values)
+            } else {
+                // This is a nested table column - recurse into its fields
+                let inner_stats: Vec<&StructData> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        Scalar::Struct(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+
+                if inner_stats.is_empty() {
+                    return Scalar::Null(field.data_type().clone());
+                }
+
+                let inner_fields: Vec<StructField> = inner_struct.fields().cloned().collect();
+                let mut inner_aggregated: Vec<Scalar> = Vec::with_capacity(inner_fields.len());
+
+                for (idx, inner_field) in inner_fields.iter().enumerate() {
+                    let inner_values: Vec<&Scalar> =
+                        inner_stats.iter().map(|s| &s.values()[idx]).collect();
+                    inner_aggregated.push(aggregate_column_stats(inner_field, &inner_values));
+                }
+
+                Scalar::Struct(StructData::new_unchecked(inner_fields, inner_aggregated))
+            }
+        }
+        _ => {
+            // Not a struct, shouldn't happen in well-formed stats
+            Scalar::Null(field.data_type().clone())
+        }
+    }
+}
+
+/// Aggregates primitive column stats fields (value_count, lower_bound, etc.)
+fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> Scalar {
+    // Extract the inner StructData from each Scalar::Struct
+    let struct_values: Vec<&StructData> = values
+        .iter()
+        .filter_map(|v| match v {
+            Scalar::Struct(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    if struct_values.is_empty() {
+        return Scalar::Null(DataType::Struct(Box::new(stats_struct.clone())));
+    }
+
+    let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
+    let mut aggregated_values: Vec<Scalar> = Vec::with_capacity(fields.len());
+
+    for (field_idx, field) in fields.iter().enumerate() {
+        let field_name = field.name().as_str();
+        let field_scalars: Vec<&Scalar> = struct_values
+            .iter()
+            .map(|s| &s.values()[field_idx])
+            .collect();
+
+        let aggregated = match field_name {
+            // Sum fields
+            "value_count" | "null_value_count" | "nan_value_count" => {
+                sum_long_scalars(&field_scalars)
+            }
+            // Max fields
+            "max_value_size" => max_long_scalars(&field_scalars),
+            // Min bound
+            "lower_bound" => min_scalar(&field_scalars, field.data_type()),
+            // Max bound
+            "upper_bound" => max_scalar(&field_scalars, field.data_type()),
+            // AND of all exact_bounds
+            "exact_bounds" => and_boolean_scalars(&field_scalars),
+            // Skip avg_value_size (would need weighted average, not straightforward)
+            "avg_value_size" => Scalar::Null(field.data_type().clone()),
+            // Unknown field - preserve as null
+            _ => Scalar::Null(field.data_type().clone()),
+        };
+
+        aggregated_values.push(aggregated);
+    }
+
+    Scalar::Struct(StructData::new_unchecked(fields, aggregated_values))
+}
+
+/// Sums Long scalars, ignoring nulls.
+fn sum_long_scalars(scalars: &[&Scalar]) -> Scalar {
+    let mut sum: i64 = 0;
+    let mut has_value = false;
+
+    for scalar in scalars {
+        if let Scalar::Long(v) = scalar {
+            sum += v;
+            has_value = true;
+        }
+    }
+
+    if has_value {
+        Scalar::Long(sum)
+    } else {
+        Scalar::Null(DataType::LONG)
+    }
+}
+
+/// Takes the maximum of Long scalars, ignoring nulls.
+fn max_long_scalars(scalars: &[&Scalar]) -> Scalar {
+    let mut max: Option<i64> = None;
+
+    for scalar in scalars {
+        if let Scalar::Long(v) = scalar {
+            max = Some(max.map_or(*v, |m| m.max(*v)));
+        }
+    }
+
+    max.map(Scalar::Long)
+        .unwrap_or_else(|| Scalar::Null(DataType::LONG))
+}
+
+/// Takes the minimum scalar value, ignoring nulls.
+fn min_scalar(scalars: &[&Scalar], data_type: &DataType) -> Scalar {
+    let mut min: Option<&Scalar> = None;
+
+    for scalar in scalars {
+        if scalar.is_null() {
+            continue;
+        }
+        min = Some(match min {
+            None => scalar,
+            Some(current_min) => {
+                match current_min.logical_partial_cmp(scalar) {
+                    Some(std::cmp::Ordering::Greater) => scalar, // scalar < current_min
+                    _ => current_min,
+                }
+            }
+        });
+    }
+
+    min.cloned()
+        .unwrap_or_else(|| Scalar::Null(data_type.clone()))
+}
+
+/// Takes the maximum scalar value, ignoring nulls.
+fn max_scalar(scalars: &[&Scalar], data_type: &DataType) -> Scalar {
+    let mut max: Option<&Scalar> = None;
+
+    for scalar in scalars {
+        if scalar.is_null() {
+            continue;
+        }
+        max = Some(match max {
+            None => scalar,
+            Some(current_max) => {
+                match current_max.logical_partial_cmp(scalar) {
+                    Some(std::cmp::Ordering::Less) => scalar, // scalar > current_max
+                    _ => current_max,
+                }
+            }
+        });
+    }
+
+    max.cloned()
+        .unwrap_or_else(|| Scalar::Null(data_type.clone()))
+}
+
+/// ANDs boolean scalars. Returns false if any is false, true if all are true, null otherwise.
+fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
+    let mut result: Option<bool> = None;
+
+    for scalar in scalars {
+        match scalar {
+            Scalar::Boolean(false) => return Scalar::Boolean(false), // Short-circuit on false
+            Scalar::Boolean(true) => result = Some(result.unwrap_or(true)),
+            _ => {} // Ignore nulls
+        }
+    }
+
+    result
+        .map(Scalar::Boolean)
+        .unwrap_or_else(|| Scalar::Null(DataType::BOOLEAN))
+}
+
 /// Converts Delta Protocol JSON stats to content_stats StructData format.
 ///
 /// This function takes the raw JSON stats string from a Delta Add action and converts
@@ -1460,6 +1703,327 @@ mod tests {
             }
         } else {
             panic!("Expected date_col stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_basic() {
+        // Create a table schema with field IDs
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+        ]);
+
+        // Create content_stats for file 1: id=[1, 50], name=["alice", "mike"]
+        let stats1_json = r#"{
+            "numRecords": 100,
+            "minValues": {"id": 1, "name": "alice"},
+            "maxValues": {"id": 50, "name": "mike"},
+            "nullCount": {"id": 0, "name": 5}
+        }"#;
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        // Create content_stats for file 2: id=[40, 100], name=["bob", "zoe"]
+        let stats2_json = r#"{
+            "numRecords": 150,
+            "minValues": {"id": 40, "name": "bob"},
+            "maxValues": {"id": 100, "name": "zoe"},
+            "nullCount": {"id": 0, "name": 10}
+        }"#;
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        // Aggregate
+        let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
+            .expect("should aggregate");
+
+        // Verify aggregated stats
+        assert_eq!(aggregated.fields().len(), 2);
+
+        // Check id stats: value_count=250, lower=1, upper=100
+        if let Scalar::Struct(id_stats) = &aggregated.values()[0] {
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count")
+                .expect("should have value_count");
+            let lower_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+            let upper_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .expect("should have upper_bound");
+
+            assert_eq!(id_stats.values()[value_count_idx], Scalar::Long(250));
+            assert_eq!(id_stats.values()[lower_idx], Scalar::Long(1));
+            assert_eq!(id_stats.values()[upper_idx], Scalar::Long(100));
+        } else {
+            panic!("Expected id stats to be a Struct");
+        }
+
+        // Check name stats: value_count=250, null_value_count=15, lower="alice", upper="zoe"
+        if let Scalar::Struct(name_stats) = &aggregated.values()[1] {
+            let value_count_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count")
+                .expect("should have value_count");
+            let null_count_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "null_value_count")
+                .expect("should have null_value_count");
+            let lower_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+            let upper_idx = name_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "upper_bound")
+                .expect("should have upper_bound");
+
+            assert_eq!(name_stats.values()[value_count_idx], Scalar::Long(250));
+            assert_eq!(name_stats.values()[null_count_idx], Scalar::Long(15)); // 5 + 10
+            assert_eq!(
+                name_stats.values()[lower_idx],
+                Scalar::String("alice".to_string())
+            );
+            assert_eq!(
+                name_stats.values()[upper_idx],
+                Scalar::String("zoe".to_string())
+            );
+        } else {
+            panic!("Expected name stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_with_none() {
+        // Test that None entries are skipped
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+
+        let stats_json = r#"{
+            "numRecords": 100,
+            "minValues": {"id": 1},
+            "maxValues": {"id": 50}
+        }"#;
+        let stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        // Aggregate with None entries mixed in
+        let aggregated = aggregate_content_stats([None, Some(&stats), None].into_iter())
+            .expect("should aggregate");
+
+        // Should have the same values as the single input
+        if let Scalar::Struct(id_stats) = &aggregated.values()[0] {
+            let value_count_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "value_count")
+                .expect("should have value_count");
+            let lower_idx = id_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "lower_bound")
+                .expect("should have lower_bound");
+
+            assert_eq!(id_stats.values()[value_count_idx], Scalar::Long(100));
+            assert_eq!(id_stats.values()[lower_idx], Scalar::Long(1));
+        }
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_all_none() {
+        // Test that all None returns None
+        let result = aggregate_content_stats([None, None, None].into_iter());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_empty() {
+        // Test empty iterator returns None
+        let result = aggregate_content_stats(std::iter::empty());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_exact_bounds() {
+        // Test that exact_bounds is AND'ed across all entries
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        // File 1 with tightBounds: true
+        let stats1_json = r#"{
+            "numRecords": 100,
+            "minValues": {"value": 1},
+            "maxValues": {"value": 50},
+            "tightBounds": true
+        }"#;
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        // File 2 with tightBounds: false (e.g., has deletion vector)
+        let stats2_json = r#"{
+            "numRecords": 100,
+            "minValues": {"value": 40},
+            "maxValues": {"value": 100},
+            "tightBounds": false
+        }"#;
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        // Aggregate - exact_bounds should be false because one input is false
+        let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
+            .expect("should aggregate");
+
+        if let Scalar::Struct(value_stats) = &aggregated.values()[0] {
+            let exact_bounds_idx = value_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "exact_bounds")
+                .expect("should have exact_bounds");
+
+            assert_eq!(
+                value_stats.values()[exact_bounds_idx],
+                Scalar::Boolean(false),
+                "exact_bounds should be false when any input is false"
+            );
+        } else {
+            panic!("Expected value stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_all_exact_bounds_true() {
+        // Test that exact_bounds is true when all inputs are true
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        let stats1_json = r#"{
+            "numRecords": 100,
+            "minValues": {"value": 1},
+            "maxValues": {"value": 50},
+            "tightBounds": true
+        }"#;
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        let stats2_json = r#"{
+            "numRecords": 100,
+            "minValues": {"value": 40},
+            "maxValues": {"value": 100},
+            "tightBounds": true
+        }"#;
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
+            .expect("should aggregate");
+
+        if let Scalar::Struct(value_stats) = &aggregated.values()[0] {
+            let exact_bounds_idx = value_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "exact_bounds")
+                .expect("should have exact_bounds");
+
+            assert_eq!(
+                value_stats.values()[exact_bounds_idx],
+                Scalar::Boolean(true),
+                "exact_bounds should be true when all inputs are true"
+            );
+        } else {
+            panic!("Expected value stats to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_content_stats_nested_struct() {
+        // Test aggregation with nested struct columns
+        let inner_struct = StructType::new_unchecked([
+            field_with_id("nested_id", DataType::LONG, false, 2),
+            field_with_id("nested_name", DataType::STRING, true, 3),
+        ]);
+        let table_schema = StructType::new_unchecked([field_with_id(
+            "outer",
+            DataType::Struct(Box::new(inner_struct)),
+            true,
+            1,
+        )]);
+
+        // Note: Delta JSON stats use dot-notation for nested fields
+        let stats1_json = r#"{
+            "numRecords": 100,
+            "minValues": {"outer.nested_id": 1, "outer.nested_name": "alice"},
+            "maxValues": {"outer.nested_id": 50, "outer.nested_name": "mike"},
+            "nullCount": {"outer.nested_name": 5}
+        }"#;
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        let stats2_json = r#"{
+            "numRecords": 150,
+            "minValues": {"outer.nested_id": 40, "outer.nested_name": "bob"},
+            "maxValues": {"outer.nested_id": 100, "outer.nested_name": "zoe"},
+            "nullCount": {"outer.nested_name": 10}
+        }"#;
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+            .expect("should convert")
+            .expect("should have stats");
+
+        let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
+            .expect("should aggregate");
+
+        // Navigate to outer.nested_id stats
+        if let Scalar::Struct(outer_stats) = &aggregated.values()[0] {
+            // The outer struct contains stats for nested_id and nested_name
+            let nested_id_idx = outer_stats
+                .fields()
+                .iter()
+                .position(|f| f.name() == "nested_id")
+                .expect("should have nested_id");
+
+            if let Scalar::Struct(nested_id_stats) = &outer_stats.values()[nested_id_idx] {
+                let value_count_idx = nested_id_stats
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "value_count")
+                    .expect("should have value_count");
+                let lower_idx = nested_id_stats
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "lower_bound")
+                    .expect("should have lower_bound");
+                let upper_idx = nested_id_stats
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "upper_bound")
+                    .expect("should have upper_bound");
+
+                assert_eq!(nested_id_stats.values()[value_count_idx], Scalar::Long(250));
+                assert_eq!(nested_id_stats.values()[lower_idx], Scalar::Long(1));
+                assert_eq!(nested_id_stats.values()[upper_idx], Scalar::Long(100));
+            } else {
+                panic!("Expected nested_id stats to be a Struct");
+            }
+        } else {
+            panic!("Expected outer stats to be a Struct");
         }
     }
 }
