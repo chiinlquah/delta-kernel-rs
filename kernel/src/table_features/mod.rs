@@ -601,7 +601,7 @@ static METADATA_TREE_EXPERIMENTAL_INFO: FeatureInfo = FeatureInfo {
     min_reader_version: 3,
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::ColumnMapping)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

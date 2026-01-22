@@ -2313,20 +2313,51 @@ mod tests {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
 
         // Create a simple table schema with a few fields
-        // We need to add parquet.field.id metadata to each field for stats_schema to work
+        // We need to add parquet.field.id and column mapping metadata to each field
+        // (column mapping is required when metadata tree feature is enabled)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::new("name", DataType::STRING, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(3),
-            )]),
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+            StructField::new("name", DataType::STRING, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-name".to_string()),
+                ),
+            ]),
+            StructField::new("value", DataType::DOUBLE, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(3),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(3),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-value".to_string()),
+                ),
+            ]),
         ]);
 
         // Generate schema with content_stats
@@ -2398,16 +2429,37 @@ mod tests {
 
         let engine = SyncEngine::new();
 
-        // Create a simple table schema with parquet field IDs
+        // Create a simple table schema with parquet field IDs and column mapping annotations
+        // (column mapping is required when metadata tree feature is enabled)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+            StructField::new("value", DataType::DOUBLE, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-value".to_string()),
+                ),
+            ]),
         ]);
 
         // Generate the schema with content_stats
@@ -2503,13 +2555,24 @@ mod tests {
 
         let engine = SyncEngine::new();
 
-        // Create a simple table schema with parquet field IDs
+        // Create a simple table schema with parquet field IDs and column mapping annotations
+        // (column mapping is required when metadata tree feature is enabled)
         let table_schema =
             StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)
-                .with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                )])]);
+                .with_metadata([
+                    (
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                    (
+                        ColumnMetadataKey::ColumnMappingId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                    (
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                        MetadataValue::String("col-id".to_string()),
+                    ),
+                ])]);
 
         // Generate the schema with content_stats
         let schema_with_stats =
@@ -2560,16 +2623,37 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create a simple table schema with parquet field IDs
+        // Create a simple table schema with parquet field IDs and column mapping annotations
+        // (column mapping is required when metadata tree feature is enabled)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::new("name", DataType::STRING, true).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+            StructField::new("name", DataType::STRING, true).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-name".to_string()),
+                ),
+            ]),
         ]);
 
         // Generate the schema with content_stats
@@ -4433,16 +4517,28 @@ mod tests {
 
     /// Helper to create content_stats for testing data skipping.
     /// Creates stats for a single integer column "id" with the given min/max bounds.
+    /// Includes column mapping annotations as required when metadata tree feature is enabled.
     fn create_id_content_stats(min_value: i32, max_value: i32) -> DeltaResult<StructData> {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
 
-        // Create schema for a single "id" column
+        // Create schema for a single "id" column with column mapping annotations
+        // (required when metadata tree feature is enabled)
         let table_schema =
             StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)
-                .with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                )])]);
+                .with_metadata([
+                    (
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                    (
+                        ColumnMetadataKey::ColumnMappingId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                    (
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                        MetadataValue::String("col-id".to_string()),
+                    ),
+                ])]);
 
         let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
         let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();

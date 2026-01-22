@@ -147,11 +147,24 @@ const STATS_OFFSET_UPPER_BOUND: i32 = 7;
 const STATS_OFFSET_EXACT_BOUNDS: i32 = 8;
 
 /// Creates a [`StructField`] with the given name, data type, nullability, and field ID.
+/// Also includes column mapping annotations (`delta.columnMapping.id` and
+/// `delta.columnMapping.physicalName`) which are required when the metadata tree feature
+/// is enabled (as it requires column mapping to be enabled).
 fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> StructField {
-    StructField::new(name, data_type, nullable).with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(field_id as i64),
-    )])
+    StructField::new(name, data_type, nullable).with_metadata([
+        (
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(field_id as i64),
+        ),
+        (
+            ColumnMetadataKey::ColumnMappingId.as_ref(),
+            MetadataValue::Number(field_id as i64),
+        ),
+        (
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String(format!("col-{}", name)),
+        ),
+    ])
 }
 
 /// Extracts the parquet field ID from a StructField's metadata.
@@ -637,6 +650,8 @@ fn build_struct_stats(
 }
 
 /// Aggregates multiple content_stats into a single content_stats for a manifest.
+///
+/// TODO: This sould be moved to the engine, because it's more efficient to do this there.
 ///
 /// This function merges statistics from multiple data file entries into aggregate
 /// statistics suitable for a manifest entry. The aggregation rules are:
