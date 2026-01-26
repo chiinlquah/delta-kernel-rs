@@ -66,6 +66,7 @@ pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    skip_leaf_manifests: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -84,6 +85,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            skip_leaf_manifests: false,
         }
     }
 
@@ -121,6 +123,17 @@ impl ScanBuilder {
         self
     }
 
+    /// Skip reading from leaf manifests (only read root + delta log).
+    /// This is useful when the caller wants to reprocess all actions
+    /// and create their own leaf structure.
+    ///
+    /// NOTE: This is pub(crate) only - not exposed to external users.
+    /// It's used internally by Transaction::release_root_and_delta_actions().
+    pub(crate) fn skip_leaf_manifests(mut self, skip: bool) -> Self {
+        self.skip_leaf_manifests = skip;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -145,6 +158,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
+            skip_leaf_manifests: self.skip_leaf_manifests,
         })
     }
 }
@@ -366,6 +380,7 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
+    skip_leaf_manifests: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -606,6 +621,7 @@ impl Scan {
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
+                false,                     // Don't skip leaf manifests for incremental scans
             )?;
         let it = action_batch_iter.chain(existing_data.into_iter().map(apply_transform));
 
@@ -659,6 +675,7 @@ impl Scan {
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
+                self.skip_leaf_manifests,
             )
     }
 

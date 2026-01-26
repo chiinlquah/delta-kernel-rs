@@ -590,7 +590,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
             .with_batch_commit();
 
         // Step 2: Create leaf and add files
-        let mut leaf = txn.new_leaf_node_writer();
+        let mut leaf = txn.new_leaf_node_writer(&engine)?;
         let add_files_schema = txn.add_files_schema();
         let metadata = create_add_files_metadata(
             &add_files_schema,
@@ -646,7 +646,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
 
         // Create and add 3 leaves with different files
         for i in 0..3 {
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let files = vec![
                 (
                     format!("leaf{}_file1.parquet", i).leak() as &str,
@@ -706,7 +706,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .transaction(Box::new(FileSystemCommitter::new()))?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 &txn.add_files_schema(),
                 vec![
@@ -732,7 +732,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .transaction(Box::new(FileSystemCommitter::new()))?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 &txn.add_files_schema(),
                 vec![
@@ -758,7 +758,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                 .transaction(Box::new(FileSystemCommitter::new()))?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 &txn.add_files_schema(),
                 vec![
@@ -817,7 +817,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 &add_files_schema,
@@ -854,7 +854,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Create DV updates using the actual manifest locations we found
             let mut dv_updates = vec![];
@@ -952,7 +952,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Update ONLY fileA's DV with new cardinality
             let dv_updates = vec![DvUpdate {
@@ -1031,7 +1031,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                 .with_batch_commit();
 
             // Create leaf1 with fileA
-            let mut leaf1 = txn.new_leaf_node_writer();
+            let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata1 = create_add_files_metadata(
                 &add_files_schema,
@@ -1042,7 +1042,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
             txn.add_leaf(result1)?;
 
             // Create leaf2 with fileB
-            let mut leaf2 = txn.new_leaf_node_writer();
+            let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
             let metadata2 = create_add_files_metadata(
                 &add_files_schema,
                 vec![("fileB.parquet", 3072, 1000001, 75)],
@@ -1076,7 +1076,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // DON'T add any data files to this leaf - we're only adding DVs for existing files
 
@@ -1171,7 +1171,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                 .with_batch_commit();
 
             // Create AFFILIATED leaf for fileA (DV references file in SAME data manifest as fileA)
-            let mut leaf_a = txn.new_leaf_node_writer();
+            let mut leaf_a = txn.new_leaf_node_writer(&engine)?;
             let dv_updates_a = vec![DvUpdate {
                 data_file_path: "fileA.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1195,7 +1195,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
             txn.add_leaf(result_a)?;
 
             // Create AFFILIATED leaf for fileB (DV references file in SAME data manifest as fileB)
-            let mut leaf_b = txn.new_leaf_node_writer();
+            let mut leaf_b = txn.new_leaf_node_writer(&engine)?;
             let dv_updates_b = vec![DvUpdate {
                 data_file_path: "fileB.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1321,9 +1321,6 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit(); // Enable batch commit to use leaf writer
 
-            // Get the root manifest URL from the transaction
-            let root_manifest_url = txn.root_manifest_url(&engine)?;
-
             let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
 
             // Get the first (and only) scan metadata batch
@@ -1332,14 +1329,9 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
                 .expect("Should have scan metadata")?;
 
             // Create leaf and move files from root
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
-            // Pass the root manifest URL so files can be tracked for removal
-            leaf.add_existing_actions(
-                scan_metadata.scan_files,
-                AddType::DataFileOnly,
-                root_manifest_url,
-            )?;
+            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -1485,7 +1477,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 &add_files_schema,
@@ -1557,13 +1549,9 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                 .expect("Should have scan metadata")?;
 
             // Create new leaf (leaf B) and move files from leaf A
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
-            leaf.add_existing_actions(
-                scan_metadata.scan_files,
-                AddType::DataFileOnly,
-                None, // Files are from leaf A, not root
-            )?;
+            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -1628,26 +1616,18 @@ async fn test_dv_update_marks_root_dv_deleted() -> Result<(), Box<dyn std::error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let scan = snapshot.clone().scan_builder().build()?;
-            let root_manifest_url = snapshot
-                .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))?
-                .root_manifest_url(&engine)?;
 
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()))?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Rescan to get file from root
             for scan_metadata_result in scan.scan_metadata(&engine)? {
                 let scan_metadata = scan_metadata_result?;
-                leaf.add_existing_actions(
-                    scan_metadata.scan_files,
-                    AddType::DataFileOnly,
-                    root_manifest_url.clone(),
-                )?;
+                leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
             }
 
             let result = leaf.finish(&engine)?;
@@ -1707,17 +1687,13 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            // Get root manifest URL
-            let root_manifest_url = txn.root_manifest_url(&engine)?;
-
             // Rescan to find file location
             let file_location = collect_data_file_locations(&scan, &engine)?
                 .into_iter()
                 .next()
                 .unwrap();
 
-            let mut leaf = txn.new_leaf_node_writer();
-            leaf.set_root_manifest_url(root_manifest_url);
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Try to update DV for file in root - should error
             let dv_updates = vec![DvUpdate {
@@ -1777,7 +1753,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
-            let mut leaf1 = txn.new_leaf_node_writer();
+            let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 &txn.add_files_schema(),
                 vec![("fileA.parquet", 2048, 1000000, 50)],
@@ -1800,7 +1776,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
-            let mut leaf2 = txn.new_leaf_node_writer();
+            let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
                 &txn.add_files_schema(),
                 vec![("fileB.parquet", 3072, 1000001, 75)],
@@ -1831,7 +1807,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             let mut dv_updates = vec![];
             for (path, manifest_path, index) in &file_locations {
@@ -1914,15 +1890,10 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit();
 
-            let root_manifest_url = txn.root_manifest_url(&engine)?;
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Use DataFileAndDV - should extract both files and DVs
-            leaf.add_existing_actions(
-                scan_metadata.scan_files,
-                AddType::DataFileAndDV,
-                root_manifest_url,
-            )?;
+            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileAndDV)?;
 
             let result = leaf.finish(&engine)?;
             txn.add_leaf(result)?;
@@ -1971,7 +1942,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
-            let mut leaf1 = txn.new_leaf_node_writer();
+            let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
                 &add_files_schema,
@@ -2004,7 +1975,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer();
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Add DV for fileA
             let (file_path, manifest_path, index) = &file_locations[0];
@@ -2064,8 +2035,6 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let root_manifest_url = txn.root_manifest_url(&engine)?;
-
             // Collect scan metadata
             let mut scan_metadatas = vec![];
             for scan_metadata_result in scan.scan_metadata(&engine)? {
@@ -2073,17 +2042,12 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                 scan_metadatas.push(scan_metadata);
             }
 
-            let mut leaf = txn.new_leaf_node_writer();
-            leaf.set_root_manifest_url(root_manifest_url.clone());
+            let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Use DVOnly mode - this should force unaffiliated DV manifest
             // The unit test in leaf_writer.rs verifies the internal behavior
             for scan_metadata in scan_metadatas {
-                leaf.add_existing_actions(
-                    scan_metadata.scan_files,
-                    AddType::DVOnly,
-                    root_manifest_url.clone(),
-                )?;
+                leaf.add_existing_actions(scan_metadata.scan_files, AddType::DVOnly)?;
             }
 
             let result = leaf.finish(&engine)?;

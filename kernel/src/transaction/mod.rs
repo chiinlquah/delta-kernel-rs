@@ -337,6 +337,12 @@ pub struct Transaction {
     leaf_manifests: Vec<crate::metadata::MetadataEntry>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
+    /// Whether the root has been released to the client via release_root_and_delta_actions().
+    /// When true, leaf writers will not track root entries for removal.
+    root_released: bool,
+    /// Cached root manifest URL to avoid repeated lookups when creating leaf writers.
+    /// Initialized lazily on first access.
+    cached_root_manifest_url: std::cell::OnceCell<Option<Url>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -388,6 +394,8 @@ impl Transaction {
             aggregated_root_dv_actions: HashSet::new(),
             leaf_manifests: vec![],
             snapshot_id: generate_snapshot_id(),
+            root_released: false,
+            cached_root_manifest_url: std::cell::OnceCell::new(),
         })
     }
 
@@ -577,36 +585,69 @@ impl Transaction {
                 || !self.remove_files_metadata.is_empty()
                 || !self.leaf_manifests.is_empty())
         {
-            // Find the latest content root in the log segment to avoid full replay
+            // Find the latest content root in the log segment
             let latest_content_root = self
                 .read_snapshot
                 .log_segment()
                 .content_root_with_version(engine)?;
 
-            // Decide whether to load from content root or build from snapshot
-            let (metadata, root_manifest_path) =
-                if let Some((content_root_action, _version)) = latest_content_root {
+            let table_schema = self.read_snapshot.schema().as_ref().clone();
+            let table_root = self.read_snapshot.table_root().clone();
+            let current_version = self.read_snapshot.version();
+
+            // Load existing metadata and determine the version from which to replay delta log
+            let (mut metadata_builder, root_manifest_path, replay_from_version) =
+                if let Some((content_root_action, content_root_version)) = latest_content_root {
+                    // Load metadata from content root (gets root manifest + leaf references)
                     let root_path = content_root_action.path.clone();
                     let metadata = crate::metadata::Metadata::new_from_content_root(
                         engine,
                         &content_root_action,
-                        self.read_snapshot.table_root().clone(),
+                        table_root.clone(),
                     )?;
-                    (metadata, Some(root_path))
+                    let builder = metadata.to_builder(table_schema.clone());
+                    // Replay delta log from the version after the content root
+                    (builder, Some(root_path), content_root_version + 1)
                 } else {
-                    // No content root found, build from snapshot (full replay)
-                    // In this case, there's no existing root manifest, so all entries are conceptually in the root
-                    (
-                        crate::metadata::Metadata::new_from_snapshot(
-                            engine,
-                            self.read_snapshot.clone(),
-                        )?,
-                        None,
-                    )
+                    // No content root found, start with empty metadata
+                    let builder = crate::metadata::builder::MetadataBuilder::new_for(
+                        table_root.clone(),
+                        current_version,
+                        table_schema.clone(),
+                    );
+                    // Replay all delta log commits from the beginning
+                    (builder, None, 0)
                 };
 
-            let table_schema = self.read_snapshot.schema().as_ref().clone();
-            let mut metadata_builder = metadata.to_builder(table_schema);
+            // If root was released to client control, clear all root data and DV entries
+            // The client will add them back via leaf manifests
+            if self.root_released {
+                metadata_builder.clear_root_data_and_dv_entries();
+
+                // TODO: Process incremental removes from delta log and mark them as DELETED
+                // in the appropriate leaf manifests. This requires:
+                // 1. Scanning delta log for Remove actions since the content root version
+                // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
+                // 3. Calling metadata_builder.delete_from_leaf() for each removed file
+                // This is deferred to future work as it requires a new delta log processor.
+            } else if replay_from_version <= current_version {
+                // Root not released: replay delta log commits to add incremental changes
+                // Create a scan of just root + delta log (skip leaves to avoid duplicates)
+                let scan = crate::scan::ScanBuilder::new(self.read_snapshot.clone())
+                    .skip_leaf_manifests(true)
+                    .build()?;
+                let scan_metadata_iter = scan.scan_metadata(engine)?;
+
+                for scan_metadata_result in scan_metadata_iter {
+                    let scan_metadata = scan_metadata_result?;
+                    let engine_data = scan_metadata.scan_files.data();
+
+                    // Add incremental actions from delta log to the metadata builder
+                    // Pass None for snapshot_id since we're replaying existing commits
+                    metadata_builder.add_from_scan_row_data(engine_data, current_version, None)?;
+                }
+            }
+
             for add_metadata_result in self.add_files_metadata.iter() {
                 // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(
@@ -799,20 +840,118 @@ impl Transaction {
         self
     }
 
+    /// Returns a Scan that replays actions from both the root manifest (if present) and delta log.
+    ///
+    /// After calling this method, the transaction records that the root has been "released" to the
+    /// client. Any subsequent LeafNodeWriter instances created via `new_leaf_node_writer()` will NOT
+    /// track root entries for removal, since the client is now responsible for managing which
+    /// actions move from root to leaves.
+    ///
+    /// This is useful for partition-aware compaction workflows where the client wants to:
+    /// 1. Read all actions from root + delta log
+    /// 2. Process and partition them according to custom logic
+    /// 3. Write partitioned actions to leaf manifests
+    /// 4. Commit the transaction with only the leaf manifests (root stays unchanged)
+    ///
+    /// # Returns
+    ///
+    /// A Scan that will return all Add actions from:
+    /// - The root manifest (if present in the checkpoint) - entries where `dataManifestPath` is NULL
+    /// - All delta log files since the checkpoint - entries where `dataManifestPath` is NULL
+    ///
+    /// Note: The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is non-NULL)
+    /// using an internal skip mechanism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// txn = txn.with_batch_commit();
+    ///
+    /// // Get all actions from root + delta
+    /// let scan = txn.release_root_and_delta_actions()?;
+    ///
+    /// // Process actions and partition them
+    /// for action_batch in scan.scan_metadata(engine)? {
+    ///     let actions = process_and_partition(action_batch)?;
+    ///
+    ///     // Write to leaf manifests
+    ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
+    ///     for action in actions {
+    ///         leaf.add_existing_actions(action, AddType::DataFileAndDV)?;
+    ///     }
+    ///     let leaf_result = leaf.finish(engine)?;
+    ///     txn.add_leaf(leaf_result)?;
+    /// }
+    ///
+    /// // Commit the transaction
+    /// txn.commit(engine)?;
+    /// ```
+    pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
+        // Validation: must be in batch commit mode
+        if !self.batch_commit {
+            return Err(Error::generic(
+                "release_root_and_delta_actions() requires batch_commit mode. Call with_batch_commit() first."
+            ));
+        }
+
+        // Validation: can only be called once
+        if self.root_released {
+            return Err(Error::generic(
+                "release_root_and_delta_actions() can only be called once per transaction",
+            ));
+        }
+
+        // Mark root as released
+        self.root_released = true;
+
+        // TODO: we need custom replay here to:
+        // 1. Add it any currently added/removed actions to the log replay.
+        // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
+        //
+        // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
+        let scan_builder = crate::scan::ScanBuilder::new(self.read_snapshot.clone());
+        let scan = scan_builder.skip_leaf_manifests(true).build()?;
+
+        Ok(scan)
+    }
+
     /// Create a new leaf node writer for this transaction.
     ///
     /// The writer can be used to add files to a leaf manifest, which will be written
     /// and incorporated into the root manifest when the transaction commits.
     ///
+    /// # Arguments
+    /// * `engine` - The engine to use for fetching the root manifest URL (only on first call)
+    ///
     /// # Returns
-    /// A new LeafNodeWriter initialized with the transaction's table root, version, and timestamp.
-    pub fn new_leaf_node_writer(&self) -> crate::transaction::leaf_writer::LeafNodeWriter {
-        crate::transaction::leaf_writer::LeafNodeWriter::new(
+    /// A new LeafNodeWriter initialized with the transaction's table root, version, timestamp,
+    /// and root manifest URL. The root manifest URL is cached after the first lookup.
+    pub fn new_leaf_node_writer(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<crate::transaction::leaf_writer::LeafNodeWriter> {
+        // Get or fetch the root manifest URL (cached after first access)
+        let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
+            url.clone()
+        } else {
+            let url = self.root_manifest_url(engine)?;
+            let _ = self.cached_root_manifest_url.set(url.clone());
+            url
+        };
+
+        let track_root_removals = !self.root_released;
+
+        let writer = crate::transaction::leaf_writer::LeafNodeWriter::new(
             self.read_snapshot.table_root().clone(),
             self.read_snapshot.version() + 1,
             self.snapshot_id,
             self.read_snapshot.schema(),
-        )
+            track_root_removals,
+            root_manifest_url,
+        );
+
+        Ok(writer)
     }
 
     /// Get the root manifest URL from the latest content root, if it exists.

@@ -97,6 +97,10 @@ pub struct LeafNodeWriter {
     /// Optional root manifest URL for validation
     /// Used to prevent updating DVs for files still in the root manifest
     root_manifest_url: Option<Url>,
+
+    /// Whether to track root entries for removal.
+    /// Set to false when Transaction has released root to client control.
+    track_root_removals: bool,
 }
 
 /// Type of action to add to the leaf.
@@ -169,6 +173,7 @@ fn track_manifest_entry_for_removal(
     root_manifest_url: &Option<Url>,
     manifest_dvs: &mut HashMap<Url, RoaringTreemap>,
     root_entries_to_remove: &mut HashSet<String>,
+    track_root_removals: bool,
 ) -> DeltaResult<()> {
     if let (Some(manifest_path_str), Some(position)) = (manifest_path, manifest_position) {
         let manifest_url = Url::parse(&manifest_path_str)
@@ -180,13 +185,18 @@ fn track_manifest_entry_for_removal(
             .unwrap_or(false);
 
         if is_from_root {
-            root_entries_to_remove.insert(path);
+            if track_root_removals {
+                root_entries_to_remove.insert(path);
+            }
         } else {
             let entry = manifest_dvs.entry(manifest_url).or_default();
             entry.insert(position as u64);
         }
     } else {
-        root_entries_to_remove.insert(path);
+        // Files without manifest info are in root
+        if track_root_removals {
+            root_entries_to_remove.insert(path);
+        }
     }
     Ok(())
 }
@@ -314,6 +324,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     &self.root_manifest_url,
                     &mut self.leaf_writer.manifest_dvs,
                     &mut self.leaf_writer.root_entries_to_remove,
+                    self.leaf_writer.track_root_removals,
                 )?;
 
                 let size: i64 = getters[SIZE_IDX].get(i, "size")?;
@@ -356,6 +367,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     &self.root_manifest_url,
                     &mut self.leaf_writer.manifest_dvs,
                     &mut self.leaf_writer.root_dv_entries_to_remove,
+                    self.leaf_writer.track_root_removals,
                 )?;
 
                 extract_deletion_vector_at(i, &getters[DV_START_IDX..])?
@@ -423,11 +435,15 @@ impl LeafNodeWriter {
     /// * `version` - The version this leaf is being written for
     /// * `snapshot_id` - The snapshot ID for tracking info
     /// * `table_schema` - The table's data schema with parquet.field.id metadata
+    /// * `track_root_removals` - Whether to track root entries for removal
+    /// * `root_manifest_url` - Optional URL of the root manifest for validation
     pub(crate) fn new(
         table_root: Url,
         version: Version,
         snapshot_id: i64,
         table_schema: SchemaRef,
+        track_root_removals: bool,
+        root_manifest_url: Option<Url>,
     ) -> Self {
         Self {
             data_builder: MetadataBuilder::new_for(
@@ -444,18 +460,9 @@ impl LeafNodeWriter {
             snapshot_id,
             deletion_vectors: HashMap::new(),
             has_dv_only_entries: false,
-            root_manifest_url: None,
+            root_manifest_url,
+            track_root_removals,
         }
-    }
-
-    /// Set the root manifest URL for validation.
-    ///
-    /// This is used to prevent updating DVs for files that are still in the root manifest.
-    ///
-    /// # Arguments
-    /// * `root_manifest_url` - The URL of the root manifest
-    pub fn set_root_manifest_url(&mut self, root_manifest_url: Option<Url>) {
-        self.root_manifest_url = root_manifest_url;
     }
 
     /// Buffer net new files for writing to data manifest.
@@ -493,15 +500,16 @@ impl LeafNodeWriter {
     ///   DvOnly calls must ensure either:
     ///   1.  The data file is in a leaf already (leaf DV manifests are not applied to the root).
     ///   2.  the data file in the root root is also moved to a leaf manifest separately with DataFileOnly.
-    /// * `root_manifest_url` - Optional URL of the root manifest (to detect root vs leaf sources)
     pub fn add_existing_actions(
         &mut self,
         scan_metadata: FilteredEngineData,
         add_type: AddType,
-        root_manifest_url: Option<Url>,
     ) -> DeltaResult<()> {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
+
+        // Clone root_manifest_url before creating visitor to avoid borrow conflicts
+        let root_manifest_url = self.root_manifest_url.clone();
 
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
@@ -852,7 +860,8 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer = LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema);
+        let mut writer =
+            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
         // Add files
         let metadata = create_test_add_metadata(vec![("file1.parquet", 1024, 1000000, 100)])?;
@@ -895,7 +904,8 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer = LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema);
+        let mut writer =
+            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
         // Add 10 files
         let files: Vec<_> = (0..10)
@@ -934,7 +944,8 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let writer = LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema);
+        let writer =
+            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
         // Don't add any files, just call finish
         let result = writer.finish(engine.as_ref())?;
@@ -966,8 +977,14 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema.clone());
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
 
         // Verify initially has_dv_only_entries is false
         assert!(
@@ -1028,7 +1045,8 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer = LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema);
+        let mut writer =
+            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
         // Create scan data with 4 files
         let num_files = 4;
@@ -1229,7 +1247,7 @@ mod tests {
         let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
 
         // Add the existing actions with the filtered data
-        writer.add_existing_actions(filtered_data, AddType::DataFileOnly, None)?;
+        writer.add_existing_actions(filtered_data, AddType::DataFileOnly)?;
 
         // Finish and check the result
         let result = writer.finish(engine.as_ref())?;

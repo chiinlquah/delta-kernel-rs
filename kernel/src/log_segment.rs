@@ -428,7 +428,10 @@ impl LogSegment {
     /// - `data_predicate`: Optional predicate for manifest-level data skipping. When reading from
     ///   a content root with hierarchical manifests, this predicate is used to skip child manifests
     ///   whose `content_stats` indicate they cannot contain matching data.
+    /// - `skip_leaf_manifests`: When true, skips reading from the content root (leaf manifests).
+    ///   Only root manifest + delta log will be read. Used by Transaction::release_root_and_delta_actions().
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
@@ -437,15 +440,16 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         data_predicate: Option<PredicateRef>,
+        skip_leaf_manifests: bool,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         Option<bool>,
         SchemaRef,
     )> {
-        // Get the content root from the log if it exists (similar to protocol_and_metadata)
+        // Always get the content root from the log if it exists
         let content_root_with_version = self.content_root_with_version(engine)?;
         let content_root_version = content_root_with_version.as_ref().map(|(_, v)| *v);
-        let content_root = content_root_with_version.map(|(cr, _)| cr);
+        let content_root = content_root_with_version.as_ref().map(|(cr, _)| cr);
 
         let commit_stream =
             CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
@@ -456,8 +460,9 @@ impl LogSegment {
                 checkpoint_read_schema,
                 meta_predicate,
                 stats_schema,
-                content_root.as_ref(),
+                content_root,
                 data_predicate,
+                skip_leaf_manifests,
             )?;
 
         Ok((
@@ -491,7 +496,8 @@ impl LogSegment {
                 action_schema,
                 meta_predicate,
                 None,
-                None, // No data predicate for manifest-level skipping
+                None,  // No data predicate for manifest-level skipping
+                false, // Don't skip leaf manifests by default
             )?;
         Ok(actions_iter)
     }
@@ -611,12 +617,14 @@ impl LogSegment {
     /// - `data_predicate`: Optional predicate for manifest-level data skipping. When provided,
     ///   child manifests whose `content_stats` indicate they cannot contain matching data
     ///   will be skipped (not opened).
+    /// - `skip_leaf_manifests`: When true, only read the root manifest, not the leaf manifests.
     fn create_content_root_reader(
         engine: &dyn Engine,
         content_root: &ContentRoot,
         checkpoint_read_schema: SchemaRef,
         table_root: &Url,
         data_predicate: Option<PredicateRef>,
+        skip_leaf_manifests: bool,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let content_root_url = Url::parse(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
@@ -633,19 +641,24 @@ impl LogSegment {
             data_predicate.as_ref(),
         )?;
 
-        // Get actions from leaf manifests (DataManifest entries)
+        // Get actions from leaf manifests (DataManifest entries) unless skipping
         // Pass the data predicate for manifest-level skipping based on content_stats
-        let leaf_refs = metadata.manifest_references(data_predicate.as_ref())?;
-        let leaf_batches = crate::metadata::Metadata::non_root_action_batches(
-            leaf_refs,
-            engine,
-            &checkpoint_read_schema,
-            table_root,
-            data_predicate.as_ref(),
-        )?;
+        if skip_leaf_manifests {
+            // Only return root actions
+            Ok(Box::new(root_batches))
+        } else {
+            let leaf_refs = metadata.manifest_references(data_predicate.as_ref())?;
+            let leaf_batches = crate::metadata::Metadata::non_root_action_batches(
+                leaf_refs,
+                engine,
+                &checkpoint_read_schema,
+                table_root,
+                data_predicate.as_ref(),
+            )?;
 
-        // Chain root and leaf actions together
-        Ok(Box::new(root_batches.chain(leaf_batches)))
+            // Chain root and leaf actions together
+            Ok(Box::new(root_batches.chain(leaf_batches)))
+        }
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
@@ -753,6 +766,8 @@ impl LogSegment {
     /// # Parameters
     /// - `data_predicate`: Optional predicate for manifest-level data skipping when reading
     ///   from a content root with hierarchical manifests.
+    /// - `skip_leaf_manifests`: When true, don't read from the content root's leaf manifests.
+    #[allow(clippy::too_many_arguments)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -761,6 +776,7 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         content_root: Option<&ContentRoot>,
         data_predicate: Option<PredicateRef>,
+        skip_leaf_manifests: bool,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         Option<bool>,
@@ -768,8 +784,9 @@ impl LogSegment {
     )> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Read the content root file it exists and file actions are necessary.
-        // The content root serves the same point as a checkpoint file for file actions,
+        // Read the content root file if it exists and file actions are necessary.
+        // The skip_leaf_manifests flag controls whether we read leaf manifests or just the root.
+        // The content root serves the same purpose as a checkpoint file for file actions,
         // so remove file actions from the schema if they are present for actually reading
         // the checkpoint files.
         let (content_root_stream, read_schema): (
@@ -783,6 +800,7 @@ impl LogSegment {
                     action_schema.clone(),
                     &self.table_root,
                     data_predicate,
+                    skip_leaf_manifests,
                 )?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )
