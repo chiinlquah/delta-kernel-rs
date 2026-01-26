@@ -592,3 +592,166 @@ pub fn create_add_files_metadata(
 
     Ok(Box::new(ArrowEngineData::new(batch)))
 }
+
+/// Reads a manifest parquet file and returns its contents as a RecordBatch.
+/// This is useful for testing to verify the contents of written manifest files.
+pub async fn read_manifest_parquet(url: &Url) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    // Create storage backend from URL
+    let store = delta_kernel::engine::default::storage::store_from_url(url)?;
+
+    // Parse the file path from the URL
+    let file_path = object_store::path::Path::from_url_path(url.path())?;
+
+    // Read the parquet file
+    let get_result = store.get(&file_path).await?;
+    let bytes = get_result.bytes().await?;
+
+    // Build parquet reader
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    let reader = builder.build()?;
+
+    // Read all batches and combine them
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch?);
+    }
+
+    // Combine all batches into one
+    if batches.is_empty() {
+        return Err("Empty parquet file".into());
+    }
+
+    if batches.len() == 1 {
+        Ok(batches.into_iter().next().unwrap())
+    } else {
+        // Combine multiple batches
+        use delta_kernel::arrow::compute::concat_batches;
+        let schema = batches[0].schema();
+        let combined = concat_batches(&schema, &batches)?;
+        Ok(combined)
+    }
+}
+
+/// Creates add file metadata with deletion vectors for testing.
+/// Type alias for deletion vector tuple: (storage_type, path_or_inline_dv, offset, size_in_bytes, cardinality)
+type DeletionVectorTuple = (String, String, Option<i32>, i32, i64);
+
+/// Type alias for add file with deletion vector: (file_path, file_size, mod_time, num_records, deletion_vector)
+type AddFileWithDv<'a> = (&'a str, i64, i64, i64, Option<DeletionVectorTuple>);
+
+/// Each tuple contains: (file_path, file_size, mod_time, num_records, deletion_vector)
+pub fn create_add_files_with_dvs(
+    add_files_schema: &SchemaRef,
+    files: Vec<AddFileWithDv>,
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+    use delta_kernel::arrow::array::StructArray;
+
+    let num_files = files.len();
+
+    // Build arrays for each file
+    let path_array = StringArray::from(files.iter().map(|(p, _, _, _, _)| *p).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|(_, s, _, _, _)| *s).collect::<Vec<_>>());
+    let mod_time_array =
+        Int64Array::from(files.iter().map(|(_, _, m, _, _)| *m).collect::<Vec<_>>());
+    let num_records_array =
+        Int64Array::from(files.iter().map(|(_, _, _, n, _)| *n).collect::<Vec<_>>());
+
+    // Create empty map for partitionValues (repeated for each file)
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let empty_keys = StringArray::from(Vec::<&str>::new());
+    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+    let empty_entries = StructArray::from(vec![
+        (
+            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+            Arc::new(empty_keys) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            Arc::new(empty_values) as ArrayRef,
+        ),
+    ]);
+    let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+    let partition_values_array = Arc::new(MapArray::new(
+        entries_field,
+        offsets,
+        empty_entries,
+        None,
+        false,
+    ));
+
+    let stats_struct = StructArray::from(vec![(
+        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+        Arc::new(num_records_array) as ArrayRef,
+    )]);
+
+    // Create deletion vector struct if present
+    let dv_storage_type: Vec<Option<&str>> = files
+        .iter()
+        .map(|(_, _, _, _, dv)| dv.as_ref().map(|(st, _, _, _, _)| st.as_str()))
+        .collect();
+    let dv_path: Vec<Option<&str>> = files
+        .iter()
+        .map(|(_, _, _, _, dv)| dv.as_ref().map(|(_, p, _, _, _)| p.as_str()))
+        .collect();
+    let dv_offset: Vec<Option<i32>> = files
+        .iter()
+        .map(|(_, _, _, _, dv)| dv.as_ref().and_then(|(_, _, o, _, _)| *o))
+        .collect();
+    let dv_size: Vec<Option<i32>> = files
+        .iter()
+        .map(|(_, _, _, _, dv)| dv.as_ref().map(|(_, _, _, s, _)| *s))
+        .collect();
+    let dv_cardinality: Vec<Option<i64>> = files
+        .iter()
+        .map(|(_, _, _, _, dv)| dv.as_ref().map(|(_, _, _, _, c)| *c))
+        .collect();
+
+    let dv_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("storageType", ArrowDataType::Utf8, true)),
+            Arc::new(StringArray::from(dv_storage_type)) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("pathOrInlineDv", ArrowDataType::Utf8, true)),
+            Arc::new(StringArray::from(dv_path)) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("offset", ArrowDataType::Int32, true)),
+            Arc::new(Int32Array::from(dv_offset)) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("sizeInBytes", ArrowDataType::Int32, true)),
+            Arc::new(Int32Array::from(dv_size)) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("cardinality", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(dv_cardinality)) as ArrayRef,
+        ),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        vec![
+            Arc::new(path_array) as ArrayRef,
+            partition_values_array as ArrayRef,
+            Arc::new(size_array) as ArrayRef,
+            Arc::new(mod_time_array) as ArrayRef,
+            Arc::new(stats_struct) as ArrayRef,
+            Arc::new(dv_struct) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Box::new(ArrowEngineData::new(batch)))
+}

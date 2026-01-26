@@ -16,7 +16,7 @@ use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Error, Version};
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
@@ -58,7 +58,7 @@ use url::Url;
 ///
 /// # Returns
 /// A tuple of `(ContentInfo, String)` where the String is the absolute path to the DV file.
-fn extract_deletion_vector_content(
+pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<(ContentInfo, String)> {
@@ -88,7 +88,12 @@ pub(crate) struct MetadataBuilder {
     version: Version,
     /// Table schema for converting stats JSON to content_stats format.
     /// The builder will populate content_stats from the Delta JSON stats blob.
+    /// This schema must match the schema used to write the files and must include
+    /// parquet.field.id metadata on fields for proper stats mapping.
     table_schema: Schema,
+    /// Set of seen file paths to prevent duplicate entries.
+    /// Only populated when processing existing actions, not new actions.
+    values_seen: HashSet<String>,
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
@@ -98,10 +103,11 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `table_root` - The root URL of the table
     /// * `version` - The version of the metadata being built
-    /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
-    ///   This is used to convert Delta JSON stats (minValues, maxValues, nullCount) to the
-    ///   content_stats StructData format when adding entries.
-    ///   TODO: It is important to use the same schema which has been used to write the files
+    /// * `table_schema` - The table schema with parquet.field.id metadata for stats conversion.
+    ///   This parameter is essential for converting Delta JSON stats (minValues, maxValues, nullCount)
+    ///   to the content_stats StructData format when adding entries via `add()`. The schema must
+    ///   match the schema used to write the files and must include parquet.field.id metadata on
+    ///   fields for proper stats field mapping
     #[allow(dead_code)]
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
@@ -109,6 +115,7 @@ impl MetadataBuilder {
             pending_entries: Vec::new(),
             version,
             table_schema,
+            values_seen: HashSet::new(),
         }
     }
 
@@ -147,6 +154,31 @@ impl MetadataBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
+        self.add_with_dedup(add, version, snapshot_id)
+    }
+
+    /// Add an entry with deduplication.
+    ///
+    /// # Arguments
+    /// * `add` - The Add action to convert to a MetadataEntry
+    /// * `version` - The version to use for tracking info
+    /// * `snapshot_id` - The snapshot ID for tracking info
+    #[allow(unreachable_code)]
+    #[allow(dead_code)]
+    pub(crate) fn add_with_dedup(
+        &mut self,
+        add: Add,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        let absolute_path = self.path_to_absolute(&add.path)?;
+
+        // Check for duplicates and skip if already seen
+        if !self.values_seen.insert(absolute_path.clone()) {
+            // Already seen this file path - skip it
+            return Ok(());
+        }
+
         // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
@@ -181,7 +213,7 @@ impl MetadataBuilder {
 
         let data_file_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(self.path_to_absolute(&add.path)?),
+            location: Some(absolute_path),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
@@ -357,6 +389,54 @@ impl MetadataBuilder {
         self.pending_entries.push(entry);
     }
 
+    /// Returns true if this builder has any pending entries.
+    #[allow(dead_code)]
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.pending_entries.is_empty()
+    }
+
+    /// Remove data file entries by path.
+    ///
+    /// This removes entries where the location matches and there is no referenced_file
+    /// (i.e., data file entries, not DV entries).
+    ///
+    /// # Arguments
+    /// * `file_path` - The file path to match against entry locations
+    pub(crate) fn remove_data_file(&mut self, file_path: &str) -> DeltaResult<()> {
+        let absolute_path = self.path_to_absolute(file_path)?;
+
+        self.pending_entries.retain(|entry| {
+            // Only match data files (location matches, no referenced_file)
+            let is_data_file =
+                entry.location.as_ref() == Some(&absolute_path) && entry.referenced_file.is_none();
+            !is_data_file
+        });
+
+        self.values_seen.remove(&absolute_path);
+        Ok(())
+    }
+
+    /// Remove DV entries by DV location or referenced file.
+    ///
+    /// This removes entries where the location OR referenced_file matches the given path.
+    /// This handles both standalone DV entries and DV entries that reference data files.
+    ///
+    /// # Arguments
+    /// * `dv_identifier` - The DV path to match (can be location or referenced file)
+    pub(crate) fn remove_dv(&mut self, dv_identifier: &str) -> DeltaResult<()> {
+        let absolute_path = self.path_to_absolute(dv_identifier)?;
+
+        self.pending_entries.retain(|entry| {
+            // Match DVs by location OR referenced_file
+            let is_dv = entry.location.as_ref() == Some(&absolute_path)
+                || entry.referenced_file.as_ref() == Some(&absolute_path);
+            !is_dv
+        });
+
+        self.values_seen.remove(&absolute_path);
+        Ok(())
+    }
+
     /// Marks existing entries as DELETED based on a matching file path or deletion vector.
     ///
     /// This method searches through pending entries and updates their tracking status to DELETED
@@ -439,11 +519,75 @@ impl MetadataBuilder {
     /// * `Ok(())` on success
     /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
     ///
+    /// Delete a single entry from a leaf manifest by marking it as deleted via ManifestDV.
+    ///
+    /// This method creates or updates a ManifestDV entry that tracks which entries in the leaf
+    /// manifest are deleted. When all active entries are deleted, the manifest itself is marked
+    /// as deleted.
+    ///
+    /// # Arguments
+    /// * `leaf_file_path` - Path to the leaf manifest file
+    /// * `index` - Index of the entry to mark as deleted (0-based position in the manifest)
+    /// * `version` - Version for tracking info
+    /// * `snapshot_id` - Snapshot ID for tracking info
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
     #[allow(dead_code)]
     pub(crate) fn delete_from_leaf(
         &mut self,
         leaf_file_path: &str,
         index: u64,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        use roaring::RoaringTreemap;
+        let mut indices = RoaringTreemap::new();
+        indices.insert(index);
+        self.delete_indices_from_leaf(leaf_file_path, &indices, version, snapshot_id)
+    }
+
+    /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
+    ///
+    /// This is the bulk version of `delete_from_leaf` that accepts a Roaring bitmap of indices.
+    /// It's used by the transaction layer when processing manifest DVs from leaf writers.
+    ///
+    /// # Arguments
+    /// * `leaf_file_path` - Path to the leaf manifest file
+    /// * `indices` - Roaring bitmap containing indices to mark as deleted
+    /// * `version` - Version for tracking info
+    /// * `snapshot_id` - Snapshot ID for tracking info
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if the leaf manifest is not found, missing manifest_info, any index is out of bounds, or serialization fails
+    #[allow(dead_code)]
+    pub(crate) fn delete_multiple_from_leaf(
+        &mut self,
+        leaf_file_path: &str,
+        indices: &roaring::RoaringTreemap,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        self.delete_indices_from_leaf(leaf_file_path, indices, version, snapshot_id)
+    }
+
+    /// Core implementation for marking entries in a leaf manifest as deleted.
+    ///
+    /// This is the shared logic used by both `delete_from_leaf` and `delete_multiple_from_leaf`.
+    /// It creates or updates a ManifestDV entry for the specified leaf manifest.
+    ///
+    /// # Arguments
+    /// * `leaf_file_path` - Path to the leaf manifest file
+    /// * `indices` - Roaring bitmap containing indices to mark as deleted
+    /// * `version` - Version for tracking info
+    /// * `snapshot_id` - Snapshot ID for tracking info
+    #[allow(dead_code)]
+    fn delete_indices_from_leaf(
+        &mut self,
+        leaf_file_path: &str,
+        indices: &roaring::RoaringTreemap,
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
@@ -486,12 +630,14 @@ impl MetadataBuilder {
         let active_entry_count =
             manifest_info.added_files_count + manifest_info.existing_files_count;
 
-        // Validate that the index is within bounds (check against total)
-        if index >= total_entry_count as u64 {
-            return Err(Error::generic(format!(
-                "Index {} is out of bounds for manifest with {} entries",
-                index, total_entry_count
-            )));
+        // Validate that all indices are within bounds (check against total)
+        if let Some(max_index) = indices.max() {
+            if max_index >= total_entry_count as u64 {
+                return Err(Error::generic(format!(
+                    "Index {} is out of bounds for manifest with {} entries",
+                    max_index, total_entry_count
+                )));
+            }
         }
 
         // Find or create the ManifestDV entry for this leaf
@@ -521,8 +667,8 @@ impl MetadataBuilder {
                 RoaringTreemap::new()
             };
 
-            // Add the index to the bitmap
-            treemap.insert(index);
+            // Add all indices to the bitmap
+            treemap |= indices;
 
             // Serialize back to inline_content with magic number prefix
             let mut serialized = Vec::new();
@@ -548,8 +694,7 @@ impl MetadataBuilder {
             cardinality
         } else {
             // Create new ManifestDV entry
-            let mut treemap = RoaringTreemap::new();
-            treemap.insert(index);
+            let treemap = indices.clone();
 
             // Serialize the bitmap with magic number prefix
             let mut serialized = Vec::new();
@@ -2505,6 +2650,279 @@ mod tests {
             manifest_dv.record_count, 3,
             "ManifestDV should only track the 3 newly deleted entries"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_entries_by_file_path() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Add three entries with different file paths
+        let entry1 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}file1.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let entry2 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}file2.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let entry3 = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}file3.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(entry1);
+        builder.add_entry(entry2);
+        builder.add_entry(entry3);
+
+        assert_eq!(builder.pending_entries.len(), 3);
+
+        // Remove file1.parquet
+        builder.remove_data_file("file1.parquet")?;
+
+        // Should have 2 entries remaining
+        assert_eq!(builder.pending_entries.len(), 2);
+        assert!(builder.pending_entries.iter().any(|e| e
+            .location
+            .as_ref()
+            .unwrap()
+            .ends_with("file2.parquet")));
+        assert!(builder.pending_entries.iter().any(|e| e
+            .location
+            .as_ref()
+            .unwrap()
+            .ends_with("file3.parquet")));
+        assert!(!builder.pending_entries.iter().any(|e| e
+            .location
+            .as_ref()
+            .unwrap()
+            .ends_with("file1.parquet")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_entries_by_dv_path() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Add DV entry
+        let dv_entry = MetadataEntry {
+            content_type: DataContentType::PositionDeletes,
+            location: Some(format!("{}dv1.bin", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 10,
+            file_size_in_bytes: Some(128),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: Some(format!("{}data1.parquet", table_root)),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let data_entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data1.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(dv_entry);
+        builder.add_entry(data_entry);
+
+        assert_eq!(builder.pending_entries.len(), 2);
+
+        // Remove by DV path
+        builder.remove_dv("dv1.bin")?;
+
+        // Should have 1 entry remaining (the data entry)
+        assert_eq!(builder.pending_entries.len(), 1);
+        assert_eq!(
+            builder.pending_entries[0].content_type,
+            DataContentType::Data
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_entries_by_referenced_file() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Add DV entry that references a data file
+        let dv_entry = MetadataEntry {
+            content_type: DataContentType::PositionDeletes,
+            location: Some(format!("{}dv1.bin", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 10,
+            file_size_in_bytes: Some(128),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: Some(format!("{}data1.parquet", table_root)),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let data_entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data1.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(dv_entry);
+        builder.add_entry(data_entry);
+
+        assert_eq!(builder.pending_entries.len(), 2);
+
+        // Remove by data file path - should remove both the DV (which references it) and the data file itself
+        builder.remove_dv("data1.parquet")?; // Removes DV entry with referenced_file = data1.parquet
+        builder.remove_data_file("data1.parquet")?; // Removes data file entry
+
+        // Should have 0 entries remaining
+        assert_eq!(builder.pending_entries.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_entries_no_match() -> Result<(), Box<dyn std::error::Error>> {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+
+        // Add entry
+        let entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}file1.parquet", table_root)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            inline_content: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+
+        builder.add_entry(entry);
+
+        assert_eq!(builder.pending_entries.len(), 1);
+
+        // Try to remove non-existent file
+        builder.remove_data_file("nonexistent.parquet")?;
+
+        // Should still have 1 entry
+        assert_eq!(builder.pending_entries.len(), 1);
 
         Ok(())
     }

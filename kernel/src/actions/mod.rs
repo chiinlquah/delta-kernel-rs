@@ -632,7 +632,7 @@ pub(crate) struct CommitInfo {
 /// https://github.com/apache/iceberg-rust/blob/75be9c6a3b970079fdccc3d638b673aaaec68cb8/crates/iceberg/src/transaction/snapshot.rs#L164
 /// Which comes from Iceberg (Java):
 /// https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/SnapshotIdGeneratorUtil.java
-fn generate_snapshot_id() -> i64 {
+pub(crate) fn generate_snapshot_id() -> i64 {
     let (lhs, rhs) = uuid::Uuid::new_v4().as_u64_pair();
     let snapshot_id = (lhs ^ rhs) as i64;
     if snapshot_id < 0 {
@@ -648,6 +648,7 @@ impl CommitInfo {
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
+        snapshot_id: i64,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
@@ -657,7 +658,7 @@ impl CommitInfo {
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
-            snapshot_id: Some(generate_snapshot_id()),
+            snapshot_id: Some(snapshot_id),
         }
     }
 
@@ -869,6 +870,12 @@ pub(crate) struct ContentRoot {
 }
 
 impl ContentRoot {
+    /// Get the path of the content root
+    #[allow(dead_code, unreachable_pub)]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     #[internal_api]
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<ContentRoot>> {
         let mut visitor = ContentRootVisitor::default();
@@ -1650,7 +1657,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None, 0);
         let commit_info_txn_id = commit_info.txn_id.clone();
         let commit_info_snapshot_id = commit_info.snapshot_id;
 

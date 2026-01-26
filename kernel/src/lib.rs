@@ -154,6 +154,10 @@ pub(crate) mod history_manager;
 pub(crate) mod metadata;
 
 pub use action_reconciliation::ActionReconciliationIterator;
+// Export metadata types needed for testing
+pub use metadata::{DataContentType, Metadata, MetadataEntry, TrackingInfo, TrackingStatus};
+// Export metadata reader for testing
+pub use metadata::reader::MetadataEntryVisitor;
 
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;

@@ -985,8 +985,8 @@ impl LogSegment {
     /// Find the content root action and its version from the log.
     /// Returns the ContentRoot and the version of the commit where it was found.
     /// This is used to optimize file action reading by skipping commits before the content root.
-    #[allow(dead_code)]
-    pub(crate) fn content_root_with_version(
+    #[allow(dead_code, unreachable_pub)]
+    pub fn content_root_with_version(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<(ContentRoot, Version)>> {

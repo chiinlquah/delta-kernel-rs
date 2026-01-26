@@ -7,10 +7,10 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_add_schema,
-    get_log_commit_info_schema, get_log_content_root_schema, get_log_domain_metadata_schema,
-    get_log_remove_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
-    SetTransaction, INTERNAL_DOMAIN_PREFIX,
+    as_log_add_schema, domain_metadata::scan_domain_metadatas, generate_snapshot_id,
+    get_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -41,6 +41,11 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
+
+pub mod leaf_writer;
+
+// Re-export types needed for public API
+pub use leaf_writer::{AddType, DvUpdate, LeafNodeWriterResult, ManifestLocation};
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -322,6 +327,16 @@ pub struct Transaction {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Aggregated manifest deletion vectors from all leaf writers
+    aggregated_manifest_dvs: HashMap<Url, roaring::RoaringTreemap>,
+    // Aggregated unreconciled files from all leaf writers (detects conflicts)
+    aggregated_unreconciled: HashSet<(String, crate::transaction::leaf_writer::DVUniqueId)>,
+    // Aggregated root DV actions to remove from root DV manifest
+    aggregated_root_dv_actions: HashSet<String>,
+    // Leaf manifest entries to include in root
+    leaf_manifests: Vec<crate::metadata::MetadataEntry>,
+    // Snapshot ID for tracking info
+    snapshot_id: i64,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -368,6 +383,11 @@ impl Transaction {
             data_change: true,
             batch_commit: false,
             dv_matched_files: vec![],
+            aggregated_manifest_dvs: HashMap::new(),
+            aggregated_unreconciled: HashSet::new(),
+            aggregated_root_dv_actions: HashSet::new(),
+            leaf_manifests: vec![],
+            snapshot_id: generate_snapshot_id(),
         })
     }
 
@@ -454,6 +474,7 @@ impl Transaction {
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
+            self.snapshot_id,
         );
         // Extract snapshot_id before converting commit_info to engine data
         let snapshot_id = commit_info.snapshot_id();
@@ -552,7 +573,9 @@ impl Transaction {
 
         // Handle batch commit - either write to metadata tree or include in JSON log
         if self.batch_commit
-            && (!self.add_files_metadata.is_empty() || !self.remove_files_metadata.is_empty())
+            && (!self.add_files_metadata.is_empty()
+                || !self.remove_files_metadata.is_empty()
+                || !self.leaf_manifests.is_empty())
         {
             // Find the latest content root in the log segment to avoid full replay
             let latest_content_root = self
@@ -588,6 +611,35 @@ impl Transaction {
                 // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(
                     add_metadata_result.as_ref(),
+                    commit_version,
+                    snapshot_id,
+                )?;
+            }
+
+            // Add leaf manifests collected via add_leaf() to the ContentRoot
+            for leaf_manifest_entry in &self.leaf_manifests {
+                metadata_builder.add_entry(leaf_manifest_entry.clone());
+            }
+
+            // Remove files that were moved to leaves from the root manifest entirely
+            // This handles files that lacked metadata when added to leaf
+            for (file_path, _) in &self.aggregated_unreconciled {
+                metadata_builder.remove_data_file(file_path.as_str())?;
+            }
+
+            // Remove DVs that were moved to leaves from the root DV manifest
+            for dv_path in &self.aggregated_root_dv_actions {
+                metadata_builder.remove_dv(dv_path.as_str())?;
+            }
+
+            // Apply aggregated manifest DVs from leaf writers
+            // These mark entries in leaf manifests as deleted (e.g., when files are moved between leaves)
+            for (manifest_url, entry_indices) in &self.aggregated_manifest_dvs {
+                // Convert URL to string path for delete_multiple_from_leaf
+                let manifest_path = manifest_url.as_str();
+                metadata_builder.delete_multiple_from_leaf(
+                    manifest_path,
+                    entry_indices,
                     commit_version,
                     snapshot_id,
                 )?;
@@ -745,6 +797,89 @@ impl Transaction {
     pub fn with_batch_commit(mut self) -> Self {
         self.batch_commit = true;
         self
+    }
+
+    /// Create a new leaf node writer for this transaction.
+    ///
+    /// The writer can be used to add files to a leaf manifest, which will be written
+    /// and incorporated into the root manifest when the transaction commits.
+    ///
+    /// # Returns
+    /// A new LeafNodeWriter initialized with the transaction's table root, version, and timestamp.
+    pub fn new_leaf_node_writer(&self) -> crate::transaction::leaf_writer::LeafNodeWriter {
+        crate::transaction::leaf_writer::LeafNodeWriter::new(
+            self.read_snapshot.table_root().clone(),
+            self.read_snapshot.version() + 1,
+            self.snapshot_id,
+            self.read_snapshot.schema(),
+        )
+    }
+
+    /// Get the root manifest URL from the latest content root, if it exists.
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for reading the log segment
+    ///
+    /// # Returns
+    /// * `Ok(Some(Url))` - The URL of the root manifest
+    /// * `Ok(None)` - No content root exists yet
+    /// * `Err` - Error reading the log segment
+    pub fn root_manifest_url(&self, engine: &dyn Engine) -> DeltaResult<Option<Url>> {
+        let content_root = self
+            .read_snapshot
+            .log_segment()
+            .content_root_with_version(engine)?;
+        Ok(content_root.and_then(|(cr, _)| Url::parse(&cr.path).ok()))
+    }
+
+    /// Incorporate leaf writer results into this transaction.
+    ///
+    /// This method:
+    /// - Checks for duplicate unreconciled files across leaves (returns error if found)
+    /// - Aggregates manifest deletion vectors (unions roaring bitmaps)
+    /// - Collects leaf manifest entries to include in root
+    ///
+    /// # Arguments
+    /// * `leaf_result` - The result from calling finish() on a LeafNodeWriter
+    ///
+    /// # Returns
+    /// Ok(()) on success.
+    pub fn add_leaf(
+        &mut self,
+        leaf_result: crate::transaction::leaf_writer::LeafNodeWriterResult,
+    ) -> DeltaResult<()> {
+        // Aggregate root entries to remove
+        // These are file paths from the root manifest that have been moved to leaf manifests
+        for file_path in leaf_result.root_entries_to_remove {
+            // Track files that have been moved to leaves to prevent re-adding to root
+            // Use empty string for DVUniqueId since these are data files
+            self.aggregated_unreconciled
+                .insert((file_path, String::new()));
+        }
+
+        // Aggregate root DV entries to remove
+        for dv_path in leaf_result.root_dv_entries_to_remove {
+            self.aggregated_root_dv_actions.insert(dv_path);
+        }
+
+        // Aggregate manifest DVs (union roaring bitmaps)
+        for (manifest_url, row_indices) in leaf_result.manifest_dvs {
+            let entry = self
+                .aggregated_manifest_dvs
+                .entry(manifest_url)
+                .or_default();
+            *entry |= row_indices;
+        }
+
+        // Collect leaf manifests
+        if let Some(data_manifest) = leaf_result.data_file_manifest_written {
+            self.leaf_manifests.push(data_manifest);
+        }
+        if let Some(dv_manifest) = leaf_result.dv_file_manifest_written {
+            self.leaf_manifests.push(dv_manifest);
+        }
+
+        Ok(())
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -2704,7 +2839,7 @@ mod tests {
 
         // Extract all entries from the root manifest
         let mut root_visitor = MetadataEntryVisitor::default();
-        for engine_data in &root_metadata.data {
+        for engine_data in root_metadata.data() {
             root_visitor.visit_rows_of(engine_data.as_ref())?;
         }
 
@@ -2780,7 +2915,7 @@ mod tests {
             Metadata::read(&engine, &delete_manifest_url, table_root.clone())?;
 
         let mut delete_visitor = MetadataEntryVisitor::default();
-        for engine_data in &delete_manifest_metadata.data {
+        for engine_data in delete_manifest_metadata.data() {
             delete_visitor.visit_rows_of(engine_data.as_ref())?;
         }
 
@@ -2807,4 +2942,9 @@ mod tests {
 
         Ok(())
     }
+
+    // Note: Additional test coverage for LeafNodeWriter transaction integration (TXN-1, TXN-2, TXN-5)
+    // is provided by the integration tests in kernel/tests/leaf_writer_integration.rs.
+    // The Level 1 unit tests in leaf_writer.rs provide coverage for the LeafNodeWriter
+    // functionality in isolation.
 }

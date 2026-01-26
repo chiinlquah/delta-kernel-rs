@@ -13,8 +13,8 @@ use super::{
 /// Visitor that extracts MetadataEntry structs from EngineData
 #[derive(Default)]
 #[allow(dead_code)]
-pub(crate) struct MetadataEntryVisitor {
-    pub(crate) entries: Vec<MetadataEntry>,
+pub struct MetadataEntryVisitor {
+    pub entries: Vec<MetadataEntry>,
 }
 
 impl RowVisitor for MetadataEntryVisitor {

@@ -203,8 +203,8 @@ fn filter_entries_by_predicate(
 /// - The table root URL for resolving relative file paths
 /// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
 #[allow(dead_code)]
-pub(crate) struct Metadata {
-    pub(crate) data: Vec<Box<dyn EngineData>>,
+pub struct Metadata {
+    data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
     /// The location (path/URL) of this manifest file.
@@ -1010,8 +1010,8 @@ impl Metadata {
     ///
     /// # Returns
     /// A `Metadata` instance deserialized from the parquet file.
-    #[allow(dead_code)]
-    pub(crate) fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -1038,6 +1038,12 @@ impl Metadata {
             // This would need to be determined from the file path or stored in the metadata
             leaf: None,
         })
+    }
+
+    /// Get the engine data for testing purposes
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn data(&self) -> &[Box<dyn EngineData>] {
+        &self.data
     }
 
     /// Converts this Metadata into a MetadataBuilder for further modifications.
@@ -1744,7 +1750,7 @@ fn flatten_scalar(scalar: &Scalar, output: &mut Vec<Scalar>) {
 /// Type of content stored by the manifest entry
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum DataContentType {
+pub enum DataContentType {
     Data = 0,
     PositionDeletes = 1,
     EqualityDeletes = 2,
@@ -1815,7 +1821,7 @@ impl From<DataFileFormat> for Scalar {
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum TrackingStatus {
+pub enum TrackingStatus {
     Existed = 0,
     Added = 1,
     Deleted = 2,
@@ -1846,12 +1852,12 @@ pub(crate) struct ContentInfo {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct TrackingInfo {
+pub struct TrackingInfo {
     pub(crate) status: TrackingStatus,
 
     /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when null.
     /// Must be written in the root file.
-    pub(crate) snapshot_id: Option<i64>,
+    pub snapshot_id: Option<i64>,
 
     /// Data sequence number of the file. Inherited in when null and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
@@ -1865,6 +1871,13 @@ pub(crate) struct TrackingInfo {
     /// The _row_id for the first row in the data file if content_type is Data.
     /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
     pub(crate) first_row_id: Option<i64>,
+}
+
+impl TrackingInfo {
+    /// Get the tracking status
+    pub fn status(&self) -> TrackingStatus {
+        self.status
+    }
 }
 
 impl From<TrackingInfo> for Scalar {
@@ -1925,18 +1938,18 @@ impl From<ManifestStats> for Scalar {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub(crate) struct MetadataEntry {
+pub struct MetadataEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
-    pub(crate) content_type: DataContentType,
+    pub content_type: DataContentType,
 
     /// Optional if content_type is 5 and inline_content is not null, required otherwise
-    pub(crate) location: Option<String>,
+    pub location: Option<String>,
 
     /// avro, orc, parquet or puffin
     pub(crate) file_format: DataFileFormat,
 
-    pub(crate) tracking_info: Option<TrackingInfo>,
+    pub tracking_info: Option<TrackingInfo>,
 
     pub(crate) inline_content: Option<Bytes>,
 
@@ -1957,7 +1970,7 @@ pub(crate) struct MetadataEntry {
     /// Column-level statistics for the data file.
     /// The schema of this struct is dynamically generated based on the table schema
     /// using [`stats::stats_schema`]. When `None`, no statistics are available.
-    /// See: https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/
+    /// See: <https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/>
     pub(crate) content_stats: Option<StructData>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
@@ -1965,7 +1978,7 @@ pub(crate) struct MetadataEntry {
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
-    pub(crate) referenced_file: Option<String>,
+    pub referenced_file: Option<String>,
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
