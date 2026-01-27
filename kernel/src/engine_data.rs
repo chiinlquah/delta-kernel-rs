@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use crate::expressions::ArrayData;
+use crate::expressions::{ArrayData, StructData};
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::{AsAny, DeltaResult, Error};
@@ -174,6 +174,29 @@ impl<'a> MapItem<'a> {
     }
 }
 
+/// A trait that an engine exposes to give access to a struct
+pub trait EngineStruct {
+    /// Materialize the struct at the specified row_index into a [`StructData`]
+    fn materialize(&self, row_index: usize) -> DeltaResult<StructData>;
+}
+
+/// A struct item is useful if the Engine needs to know what row of raw data it needs to access to
+/// implement the [`EngineStruct`] trait. It simply wraps such a struct, and the row.
+pub struct StructItem<'a> {
+    struct_ref: &'a dyn EngineStruct,
+    row: usize,
+}
+
+impl<'a> StructItem<'a> {
+    pub fn new(struct_ref: &'a dyn EngineStruct, row: usize) -> StructItem<'a> {
+        StructItem { struct_ref, row }
+    }
+
+    pub fn materialize(&self) -> DeltaResult<StructData> {
+        self.struct_ref.materialize(self.row)
+    }
+}
+
 macro_rules! impl_default_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
@@ -198,7 +221,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct, StructItem<'a>)
     );
 }
 
@@ -220,7 +244,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct, StructItem<'a>)
     );
 }
 
@@ -255,7 +280,8 @@ impl_typed_get_data!(
     (get_str, &'a str),
     (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),
-    (get_map, MapItem<'a>)
+    (get_map, MapItem<'a>),
+    (get_struct, StructItem<'a>)
 );
 
 impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {
@@ -284,6 +310,15 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     ) -> DeltaResult<Option<HashMap<String, String>>> {
         let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(map_opt.map(|map| map.materialize()))
+    }
+}
+
+/// Provide an impl to get a struct field as a `StructData`. Note that this will materialize
+/// the entire struct into a new allocation 😭😭😭
+impl<'a> TypedGetData<'a, StructData> for dyn GetData<'a> + '_ {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<StructData>> {
+        let struct_opt: Option<StructItem<'_>> = self.get_opt(row_index, field_name)?;
+        struct_opt.map(|s| s.materialize()).transpose()
     }
 }
 
