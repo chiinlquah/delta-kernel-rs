@@ -18,14 +18,12 @@ use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType, ToSchema};
-use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, SchemaRef, SnapshotRef, Version,
-};
+use crate::{DeltaResult, Engine, Error, FileMeta, SchemaRef, SnapshotRef, Version};
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tracing::debug;
 use url::Url;
 
@@ -323,6 +321,11 @@ pub(crate) struct ManifestReference {
     pub(crate) affiliated_dv_manifests: Vec<FilteredManifest>,
 }
 
+/// Cached schema for reading MetadataEntry from parquet files.
+/// Computed once and reused across all read operations.
+static METADATA_ENTRY_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(MetadataEntry::to_schema()));
+
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
     ///
@@ -468,6 +471,9 @@ impl Metadata {
         let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
         let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
 
+        // Cache the table_root reference to avoid repeated parsing in the loop
+        let table_root_url = &self.table_root;
+
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
@@ -475,9 +481,9 @@ impl Metadata {
                 let manifest_path = self
                     .manifest_location
                     .as_ref()
-                    .map(|u| absolute_to_relative_path(u.as_str(), self.table_root.as_str()))
+                    .map(|u| absolute_to_relative_path(u.as_str(), table_root_url))
                     .unwrap_or_default();
-                entry_to_add_remove(entry, &dv_maps, i, self.table_root.as_str(), manifest_path)
+                entry_to_add_remove(entry, &dv_maps, i, table_root_url, manifest_path)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -486,19 +492,28 @@ impl Metadata {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        // Clone the schema for use in the closure
-        let schema_clone = schema.clone();
-
-        // Create an evaluation handler reference that we can use in the iterator
-        // We need to get it from the engine and keep it alive
+        // Create an evaluation handler reference
         let evaluation_handler = engine.evaluation_handler();
 
-        // Convert to iterator of single-row ActionsBatch
-        let iter = add_removes.into_iter().map(move |add_remove| {
-            add_remove_to_action_batch(add_remove, evaluation_handler.as_ref(), &schema_clone)
-        });
+        // Cache schemas to avoid repeated construction in the loop
+        let schemas = ActionSchemas::new();
 
-        Ok(Box::new(iter))
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
+
+        // Create multi-row EngineData in one call
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        // Wrap in ActionsBatch and return as iterator with single item
+        let actions_batch = ActionsBatch::new(engine_data, false);
+        Ok(Box::new(std::iter::once(Ok(actions_batch))))
     }
 
     /// Discovers child manifest references in the root manifest.
@@ -779,7 +794,7 @@ impl Metadata {
 
             // Convert absolute delete manifest path to relative
             let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root.as_str());
+                absolute_to_relative_path(&delete_manifest_location, table_root);
 
             merge_deletion_vectors(
                 &mut deletion_vector_map,
@@ -917,7 +932,7 @@ impl Metadata {
 
             // Convert absolute delete manifest path to relative
             let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root.as_str());
+                absolute_to_relative_path(&delete_manifest_location, table_root);
 
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
@@ -930,8 +945,7 @@ impl Metadata {
         let dv_maps = DeletionVectorMaps::new(shared_dv_map, &affiliated_dv_map);
 
         // Convert absolute manifest location to relative path
-        let relative_manifest_path =
-            absolute_to_relative_path(&data_manifest_location, table_root.as_str());
+        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering out non-data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -948,7 +962,7 @@ impl Metadata {
                     entry,
                     &dv_maps,
                     i,
-                    table_root.as_str(),
+                    table_root,
                     relative_manifest_path.clone(),
                 )
             })
@@ -959,18 +973,28 @@ impl Metadata {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        // Clone the schema for use in the closure
-        let schema_clone = schema.clone();
-
         // Create an evaluation handler reference
         let evaluation_handler = engine.evaluation_handler();
 
-        // Convert to iterator of single-row ActionsBatch
-        let iter = add_removes.into_iter().map(move |add_remove| {
-            add_remove_to_action_batch(add_remove, evaluation_handler.as_ref(), &schema_clone)
-        });
+        // Cache schemas to avoid repeated construction in the loop
+        let schemas = ActionSchemas::new();
 
-        Ok(Box::new(iter))
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
+
+        // Create multi-row EngineData in one call
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        // Wrap in ActionsBatch and return as iterator with single item
+        let actions_batch = ActionsBatch::new(engine_data, false);
+        Ok(Box::new(std::iter::once(Ok(actions_batch))))
     }
 
     /// Creates Metadata from a Delta table snapshot by replaying add actions from the transaction log.
@@ -1035,7 +1059,7 @@ impl Metadata {
 
         let read_result_iter = engine.parquet_handler().read_parquet_files(
             &[file],
-            Arc::new(MetadataEntry::to_schema()),
+            METADATA_ENTRY_SCHEMA.clone(),
             None,
         )?;
 
@@ -1391,12 +1415,12 @@ fn process_deletion_vector(
 /// );
 /// assert_eq!(relative, "data/file.parquet");
 /// ```
-pub(crate) fn absolute_to_relative_path(absolute_path: &str, table_root: &str) -> String {
-    // Try to parse both paths as URLs
-    if let (Ok(full_url), Ok(root_url)) = (Url::parse(absolute_path), Url::parse(table_root)) {
+pub(crate) fn absolute_to_relative_path(absolute_path: &str, table_root_url: &Url) -> String {
+    // Try to parse the absolute path as a URL
+    if let Ok(full_url) = Url::parse(absolute_path) {
         // Get the path components
         let full_path_str = full_url.path();
-        let root_path_str = root_url.path();
+        let root_path_str = table_root_url.path();
 
         // Remove the root prefix to get the relative path
         full_path_str
@@ -1423,7 +1447,7 @@ fn entry_to_add_remove(
     entry: MetadataEntry,
     dv_maps: &DeletionVectorMaps<'_>,
     entry_index: usize,
-    table_root: &str,
+    table_root_url: &Url,
     manifest_path: String,
 ) -> DeltaResult<AddRemove> {
     use std::collections::HashMap;
@@ -1437,7 +1461,7 @@ fn entry_to_add_remove(
 
     // Convert absolute path to relative path by removing the table root prefix
     // The path in entry.location is an absolute URL, but Add actions expect relative paths
-    let path = absolute_to_relative_path(&full_path, table_root);
+    let path = absolute_to_relative_path(&full_path, table_root_url);
     let sequence_number = entry
         .tracking_info
         .as_ref()
@@ -1568,19 +1592,51 @@ fn hashmap_option_to_scalar_matching_schema(
     Ok(map_data.into())
 }
 
-/// Converts an Add action to a Scalar representation
-fn add_to_scalar(add: &Add) -> DeltaResult<Scalar> {
-    use crate::expressions::StructData;
-    use crate::schema::ToSchema;
+/// Cached schemas and data types used for converting Add/Remove actions to Scalars.
+/// Caching these avoids expensive repeated construction and cloning when processing batches.
+struct ActionSchemas {
+    add_schema: StructType,
+    remove_schema: StructType,
 
-    let schema = Add::to_schema();
+    // Cached field vectors to avoid repeated cloning
+    add_fields: Vec<StructField>,
+    remove_fields: Vec<StructField>,
+
+    // Cached boxed data type for DeletionVectorDescriptor nulls
+    dv_null_type: DataType,
+}
+
+impl ActionSchemas {
+    fn new() -> Self {
+        use crate::actions::deletion_vector::DeletionVectorDescriptor;
+        use crate::schema::ToSchema;
+
+        let add_schema = Add::to_schema();
+        let remove_schema = Remove::to_schema();
+        let dv_schema = DeletionVectorDescriptor::to_schema();
+
+        Self {
+            add_fields: add_schema.fields().cloned().collect(),
+            remove_fields: remove_schema.fields().cloned().collect(),
+            dv_null_type: DataType::Struct(Box::new(dv_schema)),
+            add_schema,
+            remove_schema,
+        }
+    }
+}
+
+/// Converts an Add action to a Scalar representation
+fn add_to_scalar(add: &Add, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
+    use crate::expressions::StructData;
 
     // Get field types from schema to ensure correct map nullability
-    let partition_values_type = schema
+    let partition_values_type = schemas
+        .add_schema
         .field("partitionValues")
         .ok_or_else(|| Error::generic("Missing partitionValues field"))?
         .data_type();
-    let tags_type = schema
+    let tags_type = schemas
+        .add_schema
         .field("tags")
         .ok_or_else(|| Error::generic("Missing tags field"))?
         .data_type();
@@ -1593,18 +1649,14 @@ fn add_to_scalar(add: &Add) -> DeltaResult<Scalar> {
         None => Scalar::Null(tags_type.clone()),
     };
 
-    let fields = schema.into_fields().collect();
-
-    // Convert DeletionVectorDescriptor
+    // Convert DeletionVectorDescriptor, using cached boxed type for nulls
     let deletion_vector_scalar = match &add.deletion_vector {
         Some(dv) => deletion_vector_descriptor_to_scalar(dv),
-        None => {
-            use crate::actions::deletion_vector::DeletionVectorDescriptor;
-            Scalar::Null(DataType::Struct(Box::new(
-                DeletionVectorDescriptor::to_schema(),
-            )))
-        }
+        None => Scalar::Null(schemas.dv_null_type.clone()),
     };
+
+    // Use cached fields vector to avoid cloning from schema
+    let fields = schemas.add_fields.clone();
 
     let values = vec![
         Scalar::from(add.path.clone()),
@@ -1630,18 +1682,17 @@ fn add_to_scalar(add: &Add) -> DeltaResult<Scalar> {
 }
 
 /// Converts a Remove action to a Scalar representation
-fn remove_to_scalar(remove: &Remove) -> DeltaResult<Scalar> {
+fn remove_to_scalar(remove: &Remove, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
     use crate::expressions::StructData;
-    use crate::schema::ToSchema;
-
-    let schema = Remove::to_schema();
 
     // Get field types from schema to ensure correct map nullability
-    let partition_values_type = schema
+    let partition_values_type = schemas
+        .remove_schema
         .field("partitionValues")
         .ok_or_else(|| Error::generic("Missing partitionValues field"))?
         .data_type();
-    let tags_type = schema
+    let tags_type = schemas
+        .remove_schema
         .field("tags")
         .ok_or_else(|| Error::generic("Missing tags field"))?
         .data_type();
@@ -1656,18 +1707,14 @@ fn remove_to_scalar(remove: &Remove) -> DeltaResult<Scalar> {
         None => Scalar::Null(tags_type.clone()),
     };
 
-    let fields = schema.into_fields().collect();
-
-    // Convert DeletionVectorDescriptor
+    // Convert DeletionVectorDescriptor, using cached boxed type for nulls
     let deletion_vector_scalar = match &remove.deletion_vector {
         Some(dv) => deletion_vector_descriptor_to_scalar(dv),
-        None => {
-            use crate::actions::deletion_vector::DeletionVectorDescriptor;
-            Scalar::Null(DataType::Struct(Box::new(
-                DeletionVectorDescriptor::to_schema(),
-            )))
-        }
+        None => Scalar::Null(schemas.dv_null_type.clone()),
     };
+
+    // Use cached fields vector to avoid cloning from schema
+    let fields = schemas.remove_fields.clone();
 
     let values = vec![
         Scalar::from(remove.path.clone()),
@@ -1691,21 +1738,20 @@ fn remove_to_scalar(remove: &Remove) -> DeltaResult<Scalar> {
     Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
 }
 
-/// Converts a single AddRemove to a single-row ActionsBatch.
+/// Converts a single AddRemove to a vector of structured scalars.
 ///
 /// This function:
 /// - Checks which action fields (add/remove) are present in the schema
-/// - Creates a single row with the appropriate action fields
-/// - Wraps the result in an ActionsBatch
-fn add_remove_to_action_batch(
+/// - Creates a row of structured scalar values (one per top-level field)
+fn add_remove_to_scalars(
     add_remove: AddRemove,
-    evaluation_handler: &dyn EvaluationHandler,
     schema: &SchemaRef,
-) -> DeltaResult<ActionsBatch> {
+    schemas: &ActionSchemas,
+) -> DeltaResult<Vec<Scalar>> {
     use crate::actions::{ADD_NAME, REMOVE_NAME};
     use crate::expressions::Scalar;
 
-    // Build a vector of leaf scalars for the schema
+    // Build a vector of structured scalars for the schema (one per top-level field)
     let mut scalars = Vec::new();
 
     for field in schema.fields() {
@@ -1713,14 +1759,14 @@ fn add_remove_to_action_batch(
             name if name == ADD_NAME => {
                 // Convert Add to Scalar if present, otherwise null
                 match &add_remove {
-                    AddRemove::Add(add) => add_to_scalar(add)?,
+                    AddRemove::Add(add) => add_to_scalar(add, schemas)?,
                     AddRemove::Remove(_) => Scalar::Null(field.data_type().clone()),
                 }
             }
             name if name == REMOVE_NAME => {
                 // Convert Remove to Scalar if present, otherwise null
                 match &add_remove {
-                    AddRemove::Remove(remove) => remove_to_scalar(remove)?,
+                    AddRemove::Remove(remove) => remove_to_scalar(remove, schemas)?,
                     AddRemove::Add(_) => Scalar::Null(field.data_type().clone()),
                 }
             }
@@ -1730,15 +1776,11 @@ fn add_remove_to_action_batch(
             }
         };
 
-        // Flatten the scalar into leaf values
-        flatten_scalar(&scalar, &mut scalars);
+        // Keep the structured scalar (don't flatten)
+        scalars.push(scalar);
     }
 
-    // Use the create_one API to create a single-row EngineData
-    use crate::EvaluationHandlerExtension;
-    let engine_data = evaluation_handler.create_one(schema.clone(), &scalars)?;
-
-    Ok(ActionsBatch::new(engine_data, false))
+    Ok(scalars)
 }
 
 /// Flattens a scalar into leaf values, recursively handling nested structs.
@@ -2286,43 +2328,40 @@ mod tests {
     #[test]
     fn test_absolute_to_relative_path() {
         // Test with memory:// URLs
-        let result = absolute_to_relative_path("memory:///part-content-root.parquet", "memory:///");
+        let table_root = Url::parse("memory:///").unwrap();
+        let result = absolute_to_relative_path("memory:///part-content-root.parquet", &table_root);
         assert_eq!(result, "part-content-root.parquet");
 
         // Test with s3:// URLs
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
         let result = absolute_to_relative_path(
             "s3://my-bucket/my-table/data/part-00000.parquet",
-            "s3://my-bucket/my-table/",
+            &table_root,
         );
         assert_eq!(result, "data/part-00000.parquet");
 
         // Test with nested paths
+        let table_root = Url::parse("s3://bucket/table/").unwrap();
         let result = absolute_to_relative_path(
             "s3://bucket/table/year=2023/month=10/part.parquet",
-            "s3://bucket/table/",
+            &table_root,
         );
         assert_eq!(result, "year=2023/month=10/part.parquet");
 
         // Test with file:// URLs
-        let result = absolute_to_relative_path(
-            "file:///path/to/table/data/file.parquet",
-            "file:///path/to/table/",
-        );
+        let table_root = Url::parse("file:///path/to/table/").unwrap();
+        let result =
+            absolute_to_relative_path("file:///path/to/table/data/file.parquet", &table_root);
         assert_eq!(result, "data/file.parquet");
 
         // Test when path is already relative (URL parsing fails)
-        let result = absolute_to_relative_path("part-00000.parquet", "s3://bucket/table/");
+        let table_root = Url::parse("s3://bucket/table/").unwrap();
+        let result = absolute_to_relative_path("part-00000.parquet", &table_root);
         assert_eq!(result, "part-00000.parquet");
 
-        // Test when both URL parsing fails
-        let result = absolute_to_relative_path("not-a-url", "also-not-a-url");
-        assert_eq!(result, "not-a-url");
-
         // Test when root doesn't match (no common prefix)
-        let result = absolute_to_relative_path(
-            "s3://bucket-a/table-a/file.parquet",
-            "s3://bucket-b/table-b/",
-        );
+        let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
+        let result = absolute_to_relative_path("s3://bucket-a/table-a/file.parquet", &table_root);
         // Since there's no common prefix in the path part, it returns the path without leading slash
         assert_eq!(result, "table-a/file.parquet");
     }

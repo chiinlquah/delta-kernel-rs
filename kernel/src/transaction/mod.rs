@@ -693,14 +693,63 @@ impl Transaction {
             // This applies whether we loaded from an existing ContentRoot or built from snapshot
             if !self.remove_files_metadata.is_empty() {
                 use crate::actions::visitors::RemoveVisitor;
+                use crate::engine_data::GetData;
                 use crate::RowVisitor;
+
+                // Custom visitor that only collects selected Remove actions based on selection vector
+                struct SelectionFilteredRemoveVisitor<'a> {
+                    removes: Vec<crate::actions::Remove>,
+                    selection_vector: &'a [bool],
+                }
+
+                impl<'a> SelectionFilteredRemoveVisitor<'a> {
+                    fn new(selection_vector: &'a [bool]) -> Self {
+                        Self {
+                            removes: Vec::new(),
+                            selection_vector,
+                        }
+                    }
+                }
+
+                impl<'a> RowVisitor for SelectionFilteredRemoveVisitor<'a> {
+                    fn selected_column_names_and_types(
+                        &self,
+                    ) -> (&'static [ColumnName], &'static [DataType]) {
+                        RemoveVisitor::names_and_types()
+                    }
+
+                    fn visit<'b>(
+                        &mut self,
+                        row_count: usize,
+                        getters: &[&'b dyn GetData<'b>],
+                    ) -> DeltaResult<()> {
+                        for i in 0..row_count {
+                            // Check if this row is selected (true if index >= selection_vector.len() or selection_vector[index] is true)
+                            let is_selected =
+                                i >= self.selection_vector.len() || self.selection_vector[i];
+                            if !is_selected {
+                                continue;
+                            }
+
+                            // Since path column is required, use it to detect presence of a Remove action
+                            if let Some(path) = getters[0].get_opt(i, "remove.path")? {
+                                let remove = RemoveVisitor::visit_remove(i, path, getters)?;
+                                self.removes.push(remove);
+                            }
+                        }
+                        Ok(())
+                    }
+                }
 
                 // Process each remove batch and mark all files as deleted in the ContentRoot
                 for remove_action_result in
                     self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?
                 {
                     let remove_action = remove_action_result?;
-                    let mut visitor = RemoveVisitor::default();
+                    // Get the selection vector to pass to visitor
+                    let selection_vector = remove_action.selection_vector();
+                    let mut visitor = SelectionFilteredRemoveVisitor::new(selection_vector);
+                    // Visit the data, filtering by selection vector during visit
                     visitor.visit_rows_of(remove_action.data())?;
 
                     // Mark all removes as deleted in the ContentRoot
@@ -795,7 +844,7 @@ impl Transaction {
             // Convert absolute path to relative path
             let relative_path = crate::metadata::absolute_to_relative_path(
                 content_metadata_path.as_str(),
-                self.read_snapshot.table_root().as_str(),
+                self.read_snapshot.table_root(),
             );
 
             let content_root_action = ContentRoot {
@@ -2719,12 +2768,23 @@ mod tests {
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
-        // Remove file at scan batch index 2
-        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+        // Remove file at row index 2 within the scan batch
+        // With batched EngineData creation, all files are now in a single batch
+        let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
+        if let Some(res) = scan_metadata_iter.next() {
             let scan_data = res?;
-            if index == 2 {
-                txn.remove_files(scan_data.scan_files);
-                break;
+            let num_rows = scan_data.scan_files.data().len();
+
+            // Create a selection vector that selects only row 2
+            let mut selection_vector = vec![false; num_rows];
+            if num_rows > 2 {
+                selection_vector[2] = true;
+
+                // Extract the underlying data and create new filtered data with our selection
+                let (data, _old_selection) = scan_data.scan_files.into_parts();
+                let filtered_files = FilteredEngineData::try_new(data, selection_vector)?;
+
+                txn.remove_files(filtered_files);
             }
         }
 
@@ -2951,12 +3011,23 @@ mod tests {
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
-        // Remove file at scan batch index 2 (file-2.parquet which has a DV)
-        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+        // Remove file at row index 2 (file-2.parquet which has a DV)
+        // With batched EngineData creation, all files are now in a single batch
+        let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
+        if let Some(res) = scan_metadata_iter.next() {
             let scan_data = res?;
-            if index == 2 {
-                txn.remove_files(scan_data.scan_files);
-                break;
+            let num_rows = scan_data.scan_files.data().len();
+
+            // Create a selection vector that selects only row 2
+            let mut selection_vector = vec![false; num_rows];
+            if num_rows > 2 {
+                selection_vector[2] = true;
+
+                // Extract the underlying data and create new filtered data with our selection
+                let (data, _old_selection) = scan_data.scan_files.into_parts();
+                let filtered_files = FilteredEngineData::try_new(data, selection_vector)?;
+
+                txn.remove_files(filtered_files);
             }
         }
 

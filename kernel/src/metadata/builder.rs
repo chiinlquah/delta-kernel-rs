@@ -969,16 +969,16 @@ impl MetadataBuilder {
 
     /// Builds a root Metadata instance (leaf is `None`).
     pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {
@@ -1010,16 +1010,16 @@ impl MetadataBuilder {
 
     /// Builds a leaf Metadata instance with a generated UUID.
     pub(crate) fn build_leaf(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {
@@ -1038,16 +1038,16 @@ impl MetadataBuilder {
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
     ) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {
