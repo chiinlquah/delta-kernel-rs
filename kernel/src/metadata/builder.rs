@@ -519,7 +519,8 @@ impl MetadataBuilder {
         !self.pending_entries.is_empty()
     }
 
-    /// Remove data file entries by path.
+    /// Remove data file entries by path. Only used when moving values in the root
+    /// to the leaves (otherwise mark deleted it should be used.
     ///
     /// This removes entries where the location matches and there is no referenced_file
     /// (i.e., data file entries, not DV entries).
@@ -540,7 +541,8 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    /// Remove DV entries by DV location or referenced file.
+    /// Remove DV entries by DV location or referenced file. Only used when moving values in the root
+    /// to the leaves (otherwise mark deleted it should be used.
     ///
     /// This removes entries where the location OR referenced_file matches the given path.
     /// This handles both standalone DV entries and DV entries that reference data files.
@@ -559,6 +561,42 @@ impl MetadataBuilder {
 
         self.values_seen.remove(&absolute_path);
         Ok(())
+    }
+
+    /// Clears all data file and DV entries from the root manifest.
+    ///
+    /// This removes all entries where content_type is Data, PositionDeletes, or EqualityDeletes.
+    /// Leaf manifest references (DataManifest, DeleteManifest, ManifestDV) are preserved.
+    ///
+    /// This is used when the client takes control of root/leaf separation via
+    /// Transaction::release_root_and_delta_actions(). The client will re-add files
+    /// to the appropriate leaves, so we clear the root to avoid duplicates.
+    ///
+    /// Note: When metadata is loaded from a content root, it only contains entries for:
+    /// - Data files in the root manifest
+    /// - DVs in the root manifest
+    /// - Leaf manifest references (DataManifest, DeleteManifest, ManifestDV)
+    ///
+    /// Data files inside leaf manifests are not loaded into pending_entries - they're stored
+    /// in separate parquet files referenced by the manifest entries.
+    pub(crate) fn clear_root_data_and_dv_entries(&mut self) {
+        use crate::metadata::DataContentType;
+
+        self.pending_entries.retain(|entry| {
+            // Keep only manifest reference entries (these point to leaf manifests)
+            // Remove actual data/DV entries from root
+            matches!(
+                entry.content_type,
+                DataContentType::DataManifest
+                    | DataContentType::DeleteManifest
+                    | DataContentType::ManifestDV
+            )
+        });
+
+        // Clear values_seen since we removed root entries
+        // Note: We keep the HashSet structure but clear it because we want to track
+        // deduplication for entries added after this point
+        self.values_seen.clear();
     }
 
     /// Marks existing entries as DELETED based on a matching file path or deletion vector.
@@ -1055,16 +1093,16 @@ impl MetadataBuilder {
 
     /// Builds a root Metadata instance (leaf is `None`).
     pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {
@@ -1096,16 +1134,16 @@ impl MetadataBuilder {
 
     /// Builds a leaf Metadata instance with a generated UUID.
     pub(crate) fn build_leaf(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {
@@ -1124,16 +1162,16 @@ impl MetadataBuilder {
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
     ) -> DeltaResult<Metadata> {
-        use crate::schema::ToSchema;
+        use crate::schema::{SchemaRef, ToSchema};
         use crate::IntoEngineData;
+
+        // Cache schema to avoid repeated construction
+        let schema: SchemaRef = MetadataEntry::to_schema().into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
             .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), engine)
-            })
+            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
             .collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Metadata {

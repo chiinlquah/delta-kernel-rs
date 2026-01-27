@@ -337,6 +337,12 @@ pub struct Transaction {
     leaf_manifests: Vec<crate::metadata::MetadataEntry>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
+    /// Whether the root has been released to the client via release_root_and_delta_actions().
+    /// When true, leaf writers will not track root entries for removal.
+    root_released: bool,
+    /// Cached root manifest URL to avoid repeated lookups when creating leaf writers.
+    /// Initialized lazily on first access.
+    cached_root_manifest_url: std::cell::OnceCell<Option<Url>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -388,6 +394,8 @@ impl Transaction {
             aggregated_root_dv_actions: HashSet::new(),
             leaf_manifests: vec![],
             snapshot_id: generate_snapshot_id(),
+            root_released: false,
+            cached_root_manifest_url: std::cell::OnceCell::new(),
         })
     }
 
@@ -577,36 +585,71 @@ impl Transaction {
                 || !self.remove_files_metadata.is_empty()
                 || !self.leaf_manifests.is_empty())
         {
-            // Find the latest content root in the log segment to avoid full replay
+            // Find the latest content root in the log segment
             let latest_content_root = self
                 .read_snapshot
                 .log_segment()
                 .content_root_with_version(engine)?;
 
-            // Decide whether to load from content root or build from snapshot
-            let (metadata, root_manifest_path) =
-                if let Some((content_root_action, _version)) = latest_content_root {
+            let table_schema = self.read_snapshot.schema().as_ref().clone();
+            let table_root = self.read_snapshot.table_root().clone();
+            let current_version = self.read_snapshot.version();
+
+            // Load existing metadata and determine the version from which to replay delta log
+            let (mut metadata_builder, root_manifest_path, replay_from_version) =
+                if let Some((content_root_action, content_root_version)) = latest_content_root {
+                    // Load metadata from content root (gets root manifest + leaf references)
                     let root_path = content_root_action.path.clone();
                     let metadata = crate::metadata::Metadata::new_from_content_root(
                         engine,
                         &content_root_action,
-                        self.read_snapshot.table_root().clone(),
+                        table_root.clone(),
                     )?;
-                    (metadata, Some(root_path))
+                    // Use commit_version for the new metadata, not the old content root version
+                    let builder = metadata.to_builder(table_schema.clone(), commit_version);
+                    // Replay delta log from the version after the content root
+                    (builder, Some(root_path), content_root_version + 1)
                 } else {
-                    // No content root found, build from snapshot (full replay)
-                    // In this case, there's no existing root manifest, so all entries are conceptually in the root
-                    (
-                        crate::metadata::Metadata::new_from_snapshot(
-                            engine,
-                            self.read_snapshot.clone(),
-                        )?,
-                        None,
-                    )
+                    // No content root found, start with empty metadata
+                    // Use commit_version for the new metadata, not the current snapshot version
+                    let builder = crate::metadata::builder::MetadataBuilder::new_for(
+                        table_root.clone(),
+                        commit_version,
+                        table_schema.clone(),
+                    );
+                    // Replay all delta log commits from the beginning
+                    (builder, None, 0)
                 };
 
-            let table_schema = self.read_snapshot.schema().as_ref().clone();
-            let mut metadata_builder = metadata.to_builder(table_schema);
+            // If root was released to client control, clear all root data and DV entries
+            // The client will add them back via leaf manifests
+            if self.root_released {
+                metadata_builder.clear_root_data_and_dv_entries();
+
+                // TODO: Process incremental removes from delta log and mark them as DELETED
+                // in the appropriate leaf manifests. This requires:
+                // 1. Scanning delta log for Remove actions since the content root version
+                // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
+                // 3. Calling metadata_builder.delete_from_leaf() for each removed file
+                // This is deferred to future work as it requires a new delta log processor.
+            } else if replay_from_version <= current_version {
+                // Root not released: replay delta log commits to add incremental changes
+                // Create a scan of just root + delta log (skip leaves to avoid duplicates)
+                let scan = crate::scan::ScanBuilder::new(self.read_snapshot.clone())
+                    .skip_leaf_manifests(true)
+                    .build()?;
+                let scan_metadata_iter = scan.scan_metadata(engine)?;
+
+                for scan_metadata_result in scan_metadata_iter {
+                    let scan_metadata = scan_metadata_result?;
+                    let engine_data = scan_metadata.scan_files.data();
+
+                    // Add incremental actions from delta log to the metadata builder
+                    // Pass None for snapshot_id since we're replaying existing commits
+                    metadata_builder.add_from_scan_row_data(engine_data, current_version, None)?;
+                }
+            }
+
             for add_metadata_result in self.add_files_metadata.iter() {
                 // TODO: files might be re-added, they must be deduplicated here.
                 metadata_builder.add_from_engine_data_write(
@@ -650,14 +693,63 @@ impl Transaction {
             // This applies whether we loaded from an existing ContentRoot or built from snapshot
             if !self.remove_files_metadata.is_empty() {
                 use crate::actions::visitors::RemoveVisitor;
+                use crate::engine_data::GetData;
                 use crate::RowVisitor;
+
+                // Custom visitor that only collects selected Remove actions based on selection vector
+                struct SelectionFilteredRemoveVisitor<'a> {
+                    removes: Vec<crate::actions::Remove>,
+                    selection_vector: &'a [bool],
+                }
+
+                impl<'a> SelectionFilteredRemoveVisitor<'a> {
+                    fn new(selection_vector: &'a [bool]) -> Self {
+                        Self {
+                            removes: Vec::new(),
+                            selection_vector,
+                        }
+                    }
+                }
+
+                impl<'a> RowVisitor for SelectionFilteredRemoveVisitor<'a> {
+                    fn selected_column_names_and_types(
+                        &self,
+                    ) -> (&'static [ColumnName], &'static [DataType]) {
+                        RemoveVisitor::names_and_types()
+                    }
+
+                    fn visit<'b>(
+                        &mut self,
+                        row_count: usize,
+                        getters: &[&'b dyn GetData<'b>],
+                    ) -> DeltaResult<()> {
+                        for i in 0..row_count {
+                            // Check if this row is selected (true if index >= selection_vector.len() or selection_vector[index] is true)
+                            let is_selected =
+                                i >= self.selection_vector.len() || self.selection_vector[i];
+                            if !is_selected {
+                                continue;
+                            }
+
+                            // Since path column is required, use it to detect presence of a Remove action
+                            if let Some(path) = getters[0].get_opt(i, "remove.path")? {
+                                let remove = RemoveVisitor::visit_remove(i, path, getters)?;
+                                self.removes.push(remove);
+                            }
+                        }
+                        Ok(())
+                    }
+                }
 
                 // Process each remove batch and mark all files as deleted in the ContentRoot
                 for remove_action_result in
                     self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?
                 {
                     let remove_action = remove_action_result?;
-                    let mut visitor = RemoveVisitor::default();
+                    // Get the selection vector to pass to visitor
+                    let selection_vector = remove_action.selection_vector();
+                    let mut visitor = SelectionFilteredRemoveVisitor::new(selection_vector);
+                    // Visit the data, filtering by selection vector during visit
                     visitor.visit_rows_of(remove_action.data())?;
 
                     // Mark all removes as deleted in the ContentRoot
@@ -749,8 +841,14 @@ impl Transaction {
             let new_metadata = metadata_builder.build(engine)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
+            // Convert absolute path to relative path
+            let relative_path = crate::metadata::absolute_to_relative_path(
+                content_metadata_path.as_str(),
+                self.read_snapshot.table_root(),
+            );
+
             let content_root_action = ContentRoot {
-                path: content_metadata_path.to_string(),
+                path: relative_path,
                 // TODO: set size_in_bytes
                 size_in_bytes: 0,
             };
@@ -799,20 +897,152 @@ impl Transaction {
         self
     }
 
+    /// Returns a Scan that replays actions from both the root manifest (if present) and delta log.
+    ///
+    /// After calling this method, the transaction records that the root has been "released" to the
+    /// client. Any subsequent LeafNodeWriter instances created via `new_leaf_node_writer()` will NOT
+    /// track root entries for removal, since the client is now responsible for managing which
+    /// actions move from root to leaves.
+    ///
+    /// This is useful for partition-aware compaction workflows where the client wants to:
+    /// 1. Read all actions from root + delta log
+    /// 2. Process and partition them according to custom logic
+    /// 3. Write partitioned actions to leaf manifests
+    /// 4. Commit the transaction with only the leaf manifests (root stays unchanged)
+    ///
+    /// # Returns
+    ///
+    /// A Scan that will return all Add actions from:
+    /// - The root manifest (if present in the checkpoint) - entries where `dataManifestPath` is NULL
+    /// - All delta log files since the checkpoint - entries where `dataManifestPath` is NULL
+    ///
+    /// Note: The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is non-NULL)
+    /// using an internal skip mechanism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// txn = txn.with_batch_commit();
+    ///
+    /// // Get all actions from root + delta
+    /// let scan = txn.release_root_and_delta_actions()?;
+    ///
+    /// // Process actions and partition them
+    /// for action_batch in scan.scan_metadata(engine)? {
+    ///     let actions = process_and_partition(action_batch)?;
+    ///
+    ///     // Write to leaf manifests
+    ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
+    ///     for action in actions {
+    ///         leaf.add_existing_actions(action, AddType::DataFileAndDV)?;
+    ///     }
+    ///     let leaf_result = leaf.finish(engine)?;
+    ///     txn.add_leaf(leaf_result)?;
+    /// }
+    ///
+    /// // Commit the transaction
+    /// txn.commit(engine)?;
+    /// ```
+    pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
+        self.release_root_and_delta_actions_with_predicate(None)
+    }
+
+    /// Release control of the root and delta actions to the caller for manual leaf creation.
+    ///
+    /// This variant accepts an optional predicate. When a predicate is provided that references
+    /// certain columns, the resulting scan will include `stats_parsed` data for those columns
+    /// in the checkpoint, enabling efficient access to min/max statistics without parsing JSON.
+    ///
+    /// # Arguments
+    /// * `predicate` - Optional predicate to enable stats_parsed for referenced columns.
+    ///   The predicate is used only to determine which columns' statistics to expose;
+    ///   it does NOT filter the actions returned by the scan.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // To access stats_parsed for the 'id' column, use a predicate referencing it
+    /// let predicate = Expression::or(
+    ///     Expression::is_null(column_expr!("id")),
+    ///     Expression::not(Expression::is_null(column_expr!("id")))
+    /// );
+    /// let scan = txn.release_root_and_delta_actions_with_predicate(Some(predicate))?;
+    /// ```
+    pub fn release_root_and_delta_actions_with_predicate(
+        &mut self,
+        predicate: Option<crate::PredicateRef>,
+    ) -> DeltaResult<crate::scan::Scan> {
+        // Validation: must be in batch commit mode
+        if !self.batch_commit {
+            return Err(Error::generic(
+                "release_root_and_delta_actions() requires batch_commit mode. Call with_batch_commit() first."
+            ));
+        }
+
+        // Validation: can only be called once
+        if self.root_released {
+            return Err(Error::generic(
+                "release_root_and_delta_actions() can only be called once per transaction",
+            ));
+        }
+
+        // Mark root as released
+        self.root_released = true;
+
+        // TODO: we need custom replay here to:
+        // 1. Add it any currently added/removed actions to the log replay.
+        // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
+        //
+        // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
+        // If a predicate is provided, it will enable stats_parsed for the referenced columns
+        let scan_builder =
+            crate::scan::ScanBuilder::new(self.read_snapshot.clone()).skip_leaf_manifests(true);
+
+        let scan = if let Some(pred) = predicate {
+            scan_builder.with_predicate(pred).build()?
+        } else {
+            scan_builder.build()?
+        };
+
+        Ok(scan)
+    }
+
     /// Create a new leaf node writer for this transaction.
     ///
     /// The writer can be used to add files to a leaf manifest, which will be written
     /// and incorporated into the root manifest when the transaction commits.
     ///
+    /// # Arguments
+    /// * `engine` - The engine to use for fetching the root manifest URL (only on first call)
+    ///
     /// # Returns
-    /// A new LeafNodeWriter initialized with the transaction's table root, version, and timestamp.
-    pub fn new_leaf_node_writer(&self) -> crate::transaction::leaf_writer::LeafNodeWriter {
-        crate::transaction::leaf_writer::LeafNodeWriter::new(
+    /// A new LeafNodeWriter initialized with the transaction's table root, version, timestamp,
+    /// and root manifest URL. The root manifest URL is cached after the first lookup.
+    pub fn new_leaf_node_writer(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<crate::transaction::leaf_writer::LeafNodeWriter> {
+        // Get or fetch the root manifest URL (cached after first access)
+        let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
+            url.clone()
+        } else {
+            let url = self.root_manifest_url(engine)?;
+            let _ = self.cached_root_manifest_url.set(url.clone());
+            url
+        };
+
+        let track_root_removals = !self.root_released;
+
+        let writer = crate::transaction::leaf_writer::LeafNodeWriter::new(
             self.read_snapshot.table_root().clone(),
             self.read_snapshot.version() + 1,
             self.snapshot_id,
             self.read_snapshot.schema(),
-        )
+            track_root_removals,
+            root_manifest_url,
+        );
+
+        Ok(writer)
     }
 
     /// Get the root manifest URL from the latest content root, if it exists.
@@ -829,7 +1059,8 @@ impl Transaction {
             .read_snapshot
             .log_segment()
             .content_root_with_version(engine)?;
-        Ok(content_root.and_then(|(cr, _)| Url::parse(&cr.path).ok()))
+        let table_root = self.read_snapshot.table_root();
+        Ok(content_root.and_then(|(cr, _)| table_root.join(&cr.path).ok()))
     }
 
     /// Incorporate leaf writer results into this transaction.
@@ -2494,7 +2725,10 @@ mod tests {
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
         create_initial_table(&table_root)?;
@@ -2534,12 +2768,23 @@ mod tests {
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
-        // Remove file at scan batch index 2
-        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+        // Remove file at row index 2 within the scan batch
+        // With batched EngineData creation, all files are now in a single batch
+        let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
+        if let Some(res) = scan_metadata_iter.next() {
             let scan_data = res?;
-            if index == 2 {
-                txn.remove_files(scan_data.scan_files);
-                break;
+            let num_rows = scan_data.scan_files.data().len();
+
+            // Create a selection vector that selects only row 2
+            let mut selection_vector = vec![false; num_rows];
+            if num_rows > 2 {
+                selection_vector[2] = true;
+
+                // Extract the underlying data and create new filtered data with our selection
+                let (data, _old_selection) = scan_data.scan_files.into_parts();
+                let filtered_files = FilteredEngineData::try_new(data, selection_vector)?;
+
+                txn.remove_files(filtered_files);
             }
         }
 
@@ -2766,12 +3011,23 @@ mod tests {
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
-        // Remove file at scan batch index 2 (file-2.parquet which has a DV)
-        for (index, res) in scan.scan_metadata(&engine)?.enumerate() {
+        // Remove file at row index 2 (file-2.parquet which has a DV)
+        // With batched EngineData creation, all files are now in a single batch
+        let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
+        if let Some(res) = scan_metadata_iter.next() {
             let scan_data = res?;
-            if index == 2 {
-                txn.remove_files(scan_data.scan_files);
-                break;
+            let num_rows = scan_data.scan_files.data().len();
+
+            // Create a selection vector that selects only row 2
+            let mut selection_vector = vec![false; num_rows];
+            if num_rows > 2 {
+                selection_vector[2] = true;
+
+                // Extract the underlying data and create new filtered data with our selection
+                let (data, _old_selection) = scan_data.scan_files.into_parts();
+                let filtered_files = FilteredEngineData::try_new(data, selection_vector)?;
+
+                txn.remove_files(filtered_files);
             }
         }
 
@@ -2832,8 +3088,9 @@ mod tests {
             })
             .ok_or_else(|| Error::generic("No ContentRoot found in v2"))?;
 
-        // Read the root manifest
-        let root_manifest_url = Url::parse(&content_root_path)
+        // Read the root manifest (path is now relative, so join with table root)
+        let root_manifest_url = table_root
+            .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
         let root_metadata = Metadata::read(&engine, &root_manifest_url, table_root.clone())?;
 
@@ -2938,6 +3195,320 @@ mod tests {
                 .as_ref()
                 .is_some_and(|f| f.contains("file-2.parquet")),
             "Deleted DV entry should reference file-2.parquet"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_root_version_matches_commit() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use std::fs::read_dir;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table (v0) with Protocol + Metadata for content root support
+        // Create a table with metadataTree-experimental feature and column mapping
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use uuid::Uuid;
+
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 1,
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "id"
+                    }
+                },
+                {
+                    "name": "value",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 2,
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "value"
+                    }
+                }
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["columnMapping", "metadataTree-experimental"]
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        create_dir_all(&delta_log_path)
+            .map_err(|e| Error::generic(format!("Failed to create _delta_log: {e}")))?;
+
+        let file_path = delta_log_path.join("00000000000000000000.json");
+        write(&file_path, data)
+            .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
+
+        // Step 2: Create snapshot and transaction in batch_commit mode
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot
+            .transaction(committer)?
+            .with_batch_commit()
+            .with_operation("CREATE_CONTENT_ROOT".to_string());
+
+        // Step 3: Release root and delta actions
+        let scan = txn.release_root_and_delta_actions_with_predicate(None)?;
+
+        // Step 4: Create leaf writers and add files
+        let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
+        let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
+
+        // Helper to create add metadata for testing
+        fn create_test_add_metadata(paths: Vec<&str>) -> DeltaResult<Box<dyn crate::EngineData>> {
+            use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
+            use crate::arrow::buffer::OffsetBuffer;
+            use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+            use crate::arrow::record_batch::RecordBatch;
+            use crate::engine::arrow_data::ArrowEngineData;
+            use crate::schema::{DataType, MapType, StructField, StructType};
+
+            let num_files = paths.len();
+
+            // Create schema
+            let schema = Arc::new(StructType::new_unchecked(vec![
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null(
+                    "partitionValues",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("modificationTime", DataType::LONG),
+                StructField::nullable(
+                    "stats",
+                    DataType::struct_type_unchecked(vec![StructField::nullable(
+                        "numRecords",
+                        DataType::LONG,
+                    )]),
+                ),
+            ]));
+
+            let arrow_schema = Arc::new(
+                crate::engine::arrow_conversion::TryIntoArrow::try_into_arrow(schema.as_ref())?,
+            );
+
+            // Create arrays
+            let paths_array: ArrayRef =
+                Arc::new(StringArray::from_iter_values(paths.iter().copied()));
+            let size_array: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![1024; num_files]));
+            let mod_time_array: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![1000000; num_files]));
+
+            // Empty partition values
+            let entries_field = Arc::new(Field::new(
+                "key_value",
+                ArrowDataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                        Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            let empty_keys = StringArray::from(Vec::<&str>::new());
+            let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+            let empty_entries = StructArray::from(vec![
+                (
+                    Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                    Arc::new(empty_keys) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    Arc::new(empty_values) as ArrayRef,
+                ),
+            ]);
+            let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+            let partition_values: ArrayRef = Arc::new(MapArray::new(
+                entries_field,
+                offsets,
+                empty_entries,
+                None,
+                false,
+            ));
+
+            // Stats with numRecords
+            let num_records: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![100; num_files]));
+            let stats: ArrayRef = Arc::new(StructArray::new(
+                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+                vec![num_records],
+                None,
+            ));
+
+            let record_batch = RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    paths_array,
+                    partition_values,
+                    size_array,
+                    mod_time_array,
+                    stats,
+                ],
+            )?;
+
+            Ok(Box::new(ArrowEngineData::new(record_batch)))
+        }
+
+        // Add files to leaf1
+        let leaf1_metadata = create_test_add_metadata(vec![
+            "leaf1-file-0.parquet",
+            "leaf1-file-1.parquet",
+            "leaf1-file-2.parquet",
+        ])?;
+        leaf1.add_files(leaf1_metadata)?;
+
+        // Add files to leaf2
+        let leaf2_metadata =
+            create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
+        leaf2.add_files(leaf2_metadata)?;
+
+        // Step 5: Finish leaf writers and add to transaction
+        txn.add_leaf(leaf1.finish(&engine)?)?;
+        txn.add_leaf(leaf2.finish(&engine)?)?;
+
+        // Exhaust the scan (required before commit)
+        for _ in scan.scan_metadata(&engine)? {}
+
+        // Step 6: Commit the transaction (this should be version 1)
+        let committed = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(c) => c,
+            _ => panic!("Transaction should succeed"),
+        };
+
+        assert_eq!(
+            committed.commit_version(),
+            1,
+            "Commit should be at version 1"
+        );
+
+        // Step 7: Validate that all content manifest files are at version 1
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        let mut content_files: Vec<String> = read_dir(&delta_log_path)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".content.") && name.ends_with(".parquet"))
+            .collect();
+
+        content_files.sort();
+
+        // Should have exactly 3 content files: 1 root + 2 leaves
+        assert_eq!(
+            content_files.len(),
+            3,
+            "Expected 3 content manifest files (1 root + 2 leaves)"
+        );
+
+        // All content files should be at version 1 (00000000000000000001)
+        for file_name in &content_files {
+            assert!(
+                file_name.starts_with("00000000000000000001.content."),
+                "Content file {} should be at version 1",
+                file_name
+            );
+        }
+
+        // Step 8: Validate that the root manifest file exists (without UUID in name)
+        let root_manifest_exists = content_files
+            .iter()
+            .any(|name| name == "00000000000000000001.content.parquet");
+
+        assert!(
+            root_manifest_exists,
+            "Root manifest at version 1 should exist: 00000000000000000001.content.parquet"
+        );
+
+        // Step 9: Validate that the ContentRoot action points to the correct root manifest
+        use serde_json::Value;
+        use std::fs::read_to_string;
+
+        let commit_1_path = delta_log_path.join("00000000000000000001.json");
+        let commit_content = read_to_string(&commit_1_path)?;
+
+        // Parse each line as JSON and find the contentRoot action
+        let mut found_content_root = false;
+        for line in commit_content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let action: Value = serde_json::from_str(line)?;
+            if let Some(content_root) = action.get("contentRoot") {
+                if let Some(path) = content_root.get("path").and_then(|p| p.as_str()) {
+                    // The path should reference the version 1 root manifest
+                    assert!(
+                        path.contains("00000000000000000001.content.parquet"),
+                        "ContentRoot action should reference version 1 root manifest, got: {}",
+                        path
+                    );
+                    found_content_root = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            found_content_root,
+            "ContentRoot action should exist in version 1 commit"
         );
 
         Ok(())

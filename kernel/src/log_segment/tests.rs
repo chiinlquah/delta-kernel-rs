@@ -1177,7 +1177,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
         None,
-        None, // No data predicate for manifest-level skipping
+        None,  // No data predicate for manifest-level skipping
+        false, // Don't skip leaf manifests for tests
     )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1249,7 +1250,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
         None,
         None,
-        None, // No data predicate for manifest-level skipping
+        None,  // No data predicate for manifest-level skipping
+        false, // Don't skip leaf manifests for tests
     )?;
 
     // Assert the correctness of batches returned
@@ -1316,7 +1318,8 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
         None,
         None,
-        None, // No data predicate for manifest-level skipping
+        None,  // No data predicate for manifest-level skipping
+        false, // Don't skip leaf manifests for tests
     )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1372,7 +1375,8 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
         None,
-        None, // No data predicate for manifest-level skipping
+        None,  // No data predicate for manifest-level skipping
+        false, // Don't skip leaf manifests for tests
     )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1467,7 +1471,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
         None,
-        None, // No data predicate for manifest-level skipping
+        None,  // No data predicate for manifest-level skipping
+        false, // Don't skip leaf manifests for tests
     )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
