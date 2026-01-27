@@ -267,6 +267,66 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
+
+    /// Efficient implementation of create_many for Arrow that creates a multi-row EngineData
+    /// in a single pass by building columnar arrays directly.
+    ///
+    /// Each row should contain one structured scalar per top-level field in the schema.
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        if rows.is_empty() {
+            // Return empty EngineData (0 rows)
+            let null_row = self.null_row(schema.clone())?;
+            return null_row.apply_selection_vector(vec![]);
+        }
+
+        let num_rows = rows.len();
+        let num_fields = schema.as_ref().fields().len();
+
+        // Validate that all rows have the correct number of fields
+        for (row_idx, row) in rows.iter().enumerate() {
+            if row.len() != num_fields {
+                return Err(Error::generic(format!(
+                    "Row {} has {} fields, expected {}",
+                    row_idx,
+                    row.len(),
+                    num_fields
+                )));
+            }
+        }
+
+        // Convert the kernel schema to Arrow schema
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+
+        // Create builders for top-level fields
+        let mut builders: Vec<Box<dyn ArrayBuilder>> = arrow_schema
+            .fields()
+            .iter()
+            .map(|field| array::make_builder(field.data_type(), num_rows))
+            .collect();
+
+        // Column-major iteration: process all rows for each column
+        // This is better for cache locality and allows builders to batch operations
+        for (col_idx, builder) in builders.iter_mut().enumerate() {
+            for row in rows.iter() {
+                row[col_idx].append_to(builder.as_mut(), 1)?;
+            }
+        }
+
+        // Finish all builders to create arrays
+        let arrays: Vec<ArrayRef> = builders
+            .into_iter()
+            .map(|mut builder| builder.finish())
+            .collect();
+
+        // Create the RecordBatch
+        let batch = RecordBatch::try_new(arrow_schema, arrays)?;
+
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
 }
 
 #[derive(Debug)]
