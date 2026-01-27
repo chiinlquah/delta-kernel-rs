@@ -605,14 +605,16 @@ impl Transaction {
                         &content_root_action,
                         table_root.clone(),
                     )?;
-                    let builder = metadata.to_builder(table_schema.clone());
+                    // Use commit_version for the new metadata, not the old content root version
+                    let builder = metadata.to_builder(table_schema.clone(), commit_version);
                     // Replay delta log from the version after the content root
                     (builder, Some(root_path), content_root_version + 1)
                 } else {
                     // No content root found, start with empty metadata
+                    // Use commit_version for the new metadata, not the current snapshot version
                     let builder = crate::metadata::builder::MetadataBuilder::new_for(
                         table_root.clone(),
-                        current_version,
+                        commit_version,
                         table_schema.clone(),
                     );
                     // Replay all delta log commits from the beginning
@@ -790,8 +792,14 @@ impl Transaction {
             let new_metadata = metadata_builder.build(engine)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
 
+            // Convert absolute path to relative path
+            let relative_path = crate::metadata::absolute_to_relative_path(
+                content_metadata_path.as_str(),
+                self.read_snapshot.table_root().as_str(),
+            );
+
             let content_root_action = ContentRoot {
-                path: content_metadata_path.to_string(),
+                path: relative_path,
                 // TODO: set size_in_bytes
                 size_in_bytes: 0,
             };
@@ -888,6 +896,33 @@ impl Transaction {
     /// txn.commit(engine)?;
     /// ```
     pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
+        self.release_root_and_delta_actions_with_predicate(None)
+    }
+
+    /// Release control of the root and delta actions to the caller for manual leaf creation.
+    ///
+    /// This variant accepts an optional predicate. When a predicate is provided that references
+    /// certain columns, the resulting scan will include `stats_parsed` data for those columns
+    /// in the checkpoint, enabling efficient access to min/max statistics without parsing JSON.
+    ///
+    /// # Arguments
+    /// * `predicate` - Optional predicate to enable stats_parsed for referenced columns.
+    ///   The predicate is used only to determine which columns' statistics to expose;
+    ///   it does NOT filter the actions returned by the scan.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // To access stats_parsed for the 'id' column, use a predicate referencing it
+    /// let predicate = Expression::or(
+    ///     Expression::is_null(column_expr!("id")),
+    ///     Expression::not(Expression::is_null(column_expr!("id")))
+    /// );
+    /// let scan = txn.release_root_and_delta_actions_with_predicate(Some(predicate))?;
+    /// ```
+    pub fn release_root_and_delta_actions_with_predicate(
+        &mut self,
+        predicate: Option<crate::PredicateRef>,
+    ) -> DeltaResult<crate::scan::Scan> {
         // Validation: must be in batch commit mode
         if !self.batch_commit {
             return Err(Error::generic(
@@ -910,8 +945,15 @@ impl Transaction {
         // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
         //
         // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
-        let scan_builder = crate::scan::ScanBuilder::new(self.read_snapshot.clone());
-        let scan = scan_builder.skip_leaf_manifests(true).build()?;
+        // If a predicate is provided, it will enable stats_parsed for the referenced columns
+        let scan_builder =
+            crate::scan::ScanBuilder::new(self.read_snapshot.clone()).skip_leaf_manifests(true);
+
+        let scan = if let Some(pred) = predicate {
+            scan_builder.with_predicate(pred).build()?
+        } else {
+            scan_builder.build()?
+        };
 
         Ok(scan)
     }
@@ -968,7 +1010,8 @@ impl Transaction {
             .read_snapshot
             .log_segment()
             .content_root_with_version(engine)?;
-        Ok(content_root.and_then(|(cr, _)| Url::parse(&cr.path).ok()))
+        let table_root = self.read_snapshot.table_root();
+        Ok(content_root.and_then(|(cr, _)| table_root.join(&cr.path).ok()))
     }
 
     /// Incorporate leaf writer results into this transaction.
@@ -2633,7 +2676,10 @@ mod tests {
 
         let engine = SyncEngine::new();
         let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
         create_initial_table(&table_root)?;
@@ -2971,8 +3017,9 @@ mod tests {
             })
             .ok_or_else(|| Error::generic("No ContentRoot found in v2"))?;
 
-        // Read the root manifest
-        let root_manifest_url = Url::parse(&content_root_path)
+        // Read the root manifest (path is now relative, so join with table root)
+        let root_manifest_url = table_root
+            .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
         let root_metadata = Metadata::read(&engine, &root_manifest_url, table_root.clone())?;
 
@@ -3077,6 +3124,320 @@ mod tests {
                 .as_ref()
                 .is_some_and(|f| f.contains("file-2.parquet")),
             "Deleted DV entry should reference file-2.parquet"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_root_version_matches_commit() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use std::fs::read_dir;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        // Canonicalize the path to match what try_parse_uri does in real usage
+        // This ensures paths are consistent (e.g., /private/var instead of /var on macOS)
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table (v0) with Protocol + Metadata for content root support
+        // Create a table with metadataTree-experimental feature and column mapping
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use uuid::Uuid;
+
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 1,
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "id"
+                    }
+                },
+                {
+                    "name": "value",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 2,
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "value"
+                    }
+                }
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["columnMapping", "metadataTree-experimental"]
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        create_dir_all(&delta_log_path)
+            .map_err(|e| Error::generic(format!("Failed to create _delta_log: {e}")))?;
+
+        let file_path = delta_log_path.join("00000000000000000000.json");
+        write(&file_path, data)
+            .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
+
+        // Step 2: Create snapshot and transaction in batch_commit mode
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot
+            .transaction(committer)?
+            .with_batch_commit()
+            .with_operation("CREATE_CONTENT_ROOT".to_string());
+
+        // Step 3: Release root and delta actions
+        let scan = txn.release_root_and_delta_actions_with_predicate(None)?;
+
+        // Step 4: Create leaf writers and add files
+        let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
+        let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
+
+        // Helper to create add metadata for testing
+        fn create_test_add_metadata(paths: Vec<&str>) -> DeltaResult<Box<dyn crate::EngineData>> {
+            use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
+            use crate::arrow::buffer::OffsetBuffer;
+            use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+            use crate::arrow::record_batch::RecordBatch;
+            use crate::engine::arrow_data::ArrowEngineData;
+            use crate::schema::{DataType, MapType, StructField, StructType};
+
+            let num_files = paths.len();
+
+            // Create schema
+            let schema = Arc::new(StructType::new_unchecked(vec![
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null(
+                    "partitionValues",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("modificationTime", DataType::LONG),
+                StructField::nullable(
+                    "stats",
+                    DataType::struct_type_unchecked(vec![StructField::nullable(
+                        "numRecords",
+                        DataType::LONG,
+                    )]),
+                ),
+            ]));
+
+            let arrow_schema = Arc::new(
+                crate::engine::arrow_conversion::TryIntoArrow::try_into_arrow(schema.as_ref())?,
+            );
+
+            // Create arrays
+            let paths_array: ArrayRef =
+                Arc::new(StringArray::from_iter_values(paths.iter().copied()));
+            let size_array: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![1024; num_files]));
+            let mod_time_array: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![1000000; num_files]));
+
+            // Empty partition values
+            let entries_field = Arc::new(Field::new(
+                "key_value",
+                ArrowDataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                        Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            let empty_keys = StringArray::from(Vec::<&str>::new());
+            let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+            let empty_entries = StructArray::from(vec![
+                (
+                    Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                    Arc::new(empty_keys) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    Arc::new(empty_values) as ArrayRef,
+                ),
+            ]);
+            let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+            let partition_values: ArrayRef = Arc::new(MapArray::new(
+                entries_field,
+                offsets,
+                empty_entries,
+                None,
+                false,
+            ));
+
+            // Stats with numRecords
+            let num_records: ArrayRef =
+                Arc::new(Int64Array::from_iter_values(vec![100; num_files]));
+            let stats: ArrayRef = Arc::new(StructArray::new(
+                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+                vec![num_records],
+                None,
+            ));
+
+            let record_batch = RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    paths_array,
+                    partition_values,
+                    size_array,
+                    mod_time_array,
+                    stats,
+                ],
+            )?;
+
+            Ok(Box::new(ArrowEngineData::new(record_batch)))
+        }
+
+        // Add files to leaf1
+        let leaf1_metadata = create_test_add_metadata(vec![
+            "leaf1-file-0.parquet",
+            "leaf1-file-1.parquet",
+            "leaf1-file-2.parquet",
+        ])?;
+        leaf1.add_files(leaf1_metadata)?;
+
+        // Add files to leaf2
+        let leaf2_metadata =
+            create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
+        leaf2.add_files(leaf2_metadata)?;
+
+        // Step 5: Finish leaf writers and add to transaction
+        txn.add_leaf(leaf1.finish(&engine)?)?;
+        txn.add_leaf(leaf2.finish(&engine)?)?;
+
+        // Exhaust the scan (required before commit)
+        for _ in scan.scan_metadata(&engine)? {}
+
+        // Step 6: Commit the transaction (this should be version 1)
+        let committed = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(c) => c,
+            _ => panic!("Transaction should succeed"),
+        };
+
+        assert_eq!(
+            committed.commit_version(),
+            1,
+            "Commit should be at version 1"
+        );
+
+        // Step 7: Validate that all content manifest files are at version 1
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+
+        let mut content_files: Vec<String> = read_dir(&delta_log_path)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".content.") && name.ends_with(".parquet"))
+            .collect();
+
+        content_files.sort();
+
+        // Should have exactly 3 content files: 1 root + 2 leaves
+        assert_eq!(
+            content_files.len(),
+            3,
+            "Expected 3 content manifest files (1 root + 2 leaves)"
+        );
+
+        // All content files should be at version 1 (00000000000000000001)
+        for file_name in &content_files {
+            assert!(
+                file_name.starts_with("00000000000000000001.content."),
+                "Content file {} should be at version 1",
+                file_name
+            );
+        }
+
+        // Step 8: Validate that the root manifest file exists (without UUID in name)
+        let root_manifest_exists = content_files
+            .iter()
+            .any(|name| name == "00000000000000000001.content.parquet");
+
+        assert!(
+            root_manifest_exists,
+            "Root manifest at version 1 should exist: 00000000000000000001.content.parquet"
+        );
+
+        // Step 9: Validate that the ContentRoot action points to the correct root manifest
+        use serde_json::Value;
+        use std::fs::read_to_string;
+
+        let commit_1_path = delta_log_path.join("00000000000000000001.json");
+        let commit_content = read_to_string(&commit_1_path)?;
+
+        // Parse each line as JSON and find the contentRoot action
+        let mut found_content_root = false;
+        for line in commit_content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let action: Value = serde_json::from_str(line)?;
+            if let Some(content_root) = action.get("contentRoot") {
+                if let Some(path) = content_root.get("path").and_then(|p| p.as_str()) {
+                    // The path should reference the version 1 root manifest
+                    assert!(
+                        path.contains("00000000000000000001.content.parquet"),
+                        "ContentRoot action should reference version 1 root manifest, got: {}",
+                        path
+                    );
+                    found_content_root = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            found_content_root,
+            "ContentRoot action should exist in version 1 commit"
         );
 
         Ok(())

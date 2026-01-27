@@ -769,28 +769,22 @@ mod test {
                 create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // NOTE: The following cases should be updated if column mapping for writes is
-            // supported before cdc is.
+            // Column mapping for writes is now supported
             (
-                // Should fail since change data feed and column mapping features cannot both be
-                // present.
+                // Should succeed with change data feed and column mapping features both present
                 create_mock_table_config(
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
-                // The table does not require writing CDC files, so it is safe to write to it.
+                // Should succeed with column mapping enabled
                 create_mock_table_config(
                     &["delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled

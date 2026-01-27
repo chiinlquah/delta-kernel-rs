@@ -164,38 +164,50 @@ fn extract_deletion_vector_at<'a>(
     }
 }
 
+/// Context for tracking manifest entry deletions
+struct ManifestRemovalContext<'a> {
+    table_root: &'a Url,
+    root_manifest_url: &'a Option<Url>,
+    manifest_dvs: &'a mut HashMap<Url, RoaringTreemap>,
+    root_entries_to_remove: &'a mut HashSet<String>,
+    track_root_removals: bool,
+}
+
 /// Helper to track manifest entries for deletion
 /// Updates either data manifest DVs or root removal sets based on manifest location
 fn track_manifest_entry_for_removal(
     manifest_path: Option<String>,
     manifest_position: Option<i64>,
     path: String,
-    root_manifest_url: &Option<Url>,
-    manifest_dvs: &mut HashMap<Url, RoaringTreemap>,
-    root_entries_to_remove: &mut HashSet<String>,
-    track_root_removals: bool,
+    ctx: &mut ManifestRemovalContext<'_>,
 ) -> DeltaResult<()> {
     if let (Some(manifest_path_str), Some(position)) = (manifest_path, manifest_position) {
-        let manifest_url = Url::parse(&manifest_path_str)
-            .map_err(|e| Error::generic(format!("Invalid manifest URL: {}", e)))?;
+        // Convert relative path to absolute URL by joining with table root
+        let manifest_url = ctx.table_root.join(&manifest_path_str).map_err(|e| {
+            Error::generic(format!(
+                "Invalid manifest path '{}': {}",
+                manifest_path_str, e
+            ))
+        })?;
 
-        let is_from_root = root_manifest_url
+        let is_from_root = ctx
+            .root_manifest_url
             .as_ref()
             .map(|root_url| *root_url == manifest_url)
             .unwrap_or(false);
 
         if is_from_root {
-            if track_root_removals {
-                root_entries_to_remove.insert(path);
+            if ctx.track_root_removals {
+                ctx.root_entries_to_remove.insert(path);
             }
         } else {
-            let entry = manifest_dvs.entry(manifest_url).or_default();
+            let entry = ctx.manifest_dvs.entry(manifest_url).or_default();
             entry.insert(position as u64);
         }
     } else {
         // Files without manifest info are in root
-        if track_root_removals {
-            root_entries_to_remove.insert(path);
+        if ctx.track_root_removals {
+            ctx.root_entries_to_remove.insert(path);
         }
     }
     Ok(())
@@ -317,14 +329,18 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     .get_opt(i, "fileConstantValues.dataManifestPosition")?;
 
                 // Track data file manifest entry for removal
+                let mut ctx = ManifestRemovalContext {
+                    table_root: &self.leaf_writer.table_root,
+                    root_manifest_url: &self.root_manifest_url,
+                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
+                    root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
+                    track_root_removals: self.leaf_writer.track_root_removals,
+                };
                 track_manifest_entry_for_removal(
                     data_manifest_path,
                     data_manifest_position,
                     path.clone(),
-                    &self.root_manifest_url,
-                    &mut self.leaf_writer.manifest_dvs,
-                    &mut self.leaf_writer.root_entries_to_remove,
-                    self.leaf_writer.track_root_removals,
+                    &mut ctx,
                 )?;
 
                 let size: i64 = getters[SIZE_IDX].get(i, "size")?;
@@ -360,14 +376,18 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     getters[DELETE_MANIFEST_POSITION_IDX]
                         .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
                 // Track old DV manifest entry for removal
+                let mut ctx = ManifestRemovalContext {
+                    table_root: &self.leaf_writer.table_root,
+                    root_manifest_url: &self.root_manifest_url,
+                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
+                    root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
+                    track_root_removals: self.leaf_writer.track_root_removals,
+                };
                 track_manifest_entry_for_removal(
                     delete_manifest_path,
                     delete_manifest_position,
                     path.clone(),
-                    &self.root_manifest_url,
-                    &mut self.leaf_writer.manifest_dvs,
-                    &mut self.leaf_writer.root_dv_entries_to_remove,
-                    self.leaf_writer.track_root_removals,
+                    &mut ctx,
                 )?;
 
                 extract_deletion_vector_at(i, &getters[DV_START_IDX..])?

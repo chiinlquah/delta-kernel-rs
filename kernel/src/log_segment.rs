@@ -626,7 +626,8 @@ impl LogSegment {
         data_predicate: Option<PredicateRef>,
         skip_leaf_manifests: bool,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        let content_root_url = Url::parse(&content_root.path)
+        let content_root_url = table_root
+            .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
         let metadata =
             crate::metadata::Metadata::read(engine, &content_root_url, table_root.clone())?;

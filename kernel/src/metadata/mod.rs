@@ -475,8 +475,8 @@ impl Metadata {
                 let manifest_path = self
                     .manifest_location
                     .as_ref()
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|| self.table_root.to_string());
+                    .map(|u| absolute_to_relative_path(u.as_str(), self.table_root.as_str()))
+                    .unwrap_or_default();
                 entry_to_add_remove(entry, &dv_maps, i, self.table_root.as_str(), manifest_path)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
@@ -777,10 +777,14 @@ impl Metadata {
                 delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
             }
 
+            // Convert absolute delete manifest path to relative
+            let relative_delete_manifest_path =
+                absolute_to_relative_path(&delete_manifest_location, table_root.as_str());
+
             merge_deletion_vectors(
                 &mut deletion_vector_map,
                 delete_entries,
-                &delete_manifest_location,
+                &relative_delete_manifest_path,
             )?;
         }
 
@@ -911,15 +915,23 @@ impl Metadata {
                 delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
             }
 
+            // Convert absolute delete manifest path to relative
+            let relative_delete_manifest_path =
+                absolute_to_relative_path(&delete_manifest_location, table_root.as_str());
+
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
                 delete_entries,
-                &delete_manifest_location,
+                &relative_delete_manifest_path,
             )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
         let dv_maps = DeletionVectorMaps::new(shared_dv_map, &affiliated_dv_map);
+
+        // Convert absolute manifest location to relative path
+        let relative_manifest_path =
+            absolute_to_relative_path(&data_manifest_location, table_root.as_str());
 
         // Convert entries to AddRemove, filtering out non-data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -937,7 +949,7 @@ impl Metadata {
                     &dv_maps,
                     i,
                     table_root.as_str(),
-                    data_manifest_location.clone(),
+                    relative_manifest_path.clone(),
                 )
             })
             .collect::<DeltaResult<Vec<_>>>()?;
@@ -1058,12 +1070,22 @@ impl Metadata {
     /// # Returns
     /// A `MetadataBuilder` that can be used to add more entries or build a new Metadata.
     #[allow(dead_code)]
-    pub(crate) fn to_builder(&self, table_schema: StructType) -> MetadataBuilder {
+    /// Convert this metadata to a builder for modification.
+    ///
+    /// # Arguments
+    /// * `table_schema` - The table schema for metadata entry construction
+    /// * `new_version` - The version number for the new metadata being built.
+    ///   This should typically be the commit version, NOT the version of the existing metadata.
+    pub(crate) fn to_builder(
+        &self,
+        table_schema: StructType,
+        new_version: Version,
+    ) -> MetadataBuilder {
         use crate::metadata::reader::MetadataEntryVisitor;
         use crate::RowVisitor;
 
         let mut builder =
-            MetadataBuilder::new_for(self.table_root.clone(), self.version, table_schema);
+            MetadataBuilder::new_for(self.table_root.clone(), new_version, table_schema);
 
         // Copy existing entries from this metadata into the builder
         for engine_data in &self.data {
@@ -1097,7 +1119,8 @@ impl Metadata {
         table_root: Url,
     ) -> DeltaResult<Self> {
         // Parse and read from the content root file referenced by the ContentRoot action
-        let content_root_url = Url::parse(&content_root.path)
+        let content_root_url = table_root
+            .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
         Self::read(engine, &content_root_url, table_root)
     }
@@ -1368,7 +1391,7 @@ fn process_deletion_vector(
 /// );
 /// assert_eq!(relative, "data/file.parquet");
 /// ```
-fn absolute_to_relative_path(absolute_path: &str, table_root: &str) -> String {
+pub(crate) fn absolute_to_relative_path(absolute_path: &str, table_root: &str) -> String {
     // Try to parse both paths as URLs
     if let (Ok(full_url), Ok(root_url)) = (Url::parse(absolute_path), Url::parse(table_root)) {
         // Get the path components
