@@ -945,33 +945,6 @@ impl Transaction {
     /// txn.commit(engine)?;
     /// ```
     pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
-        self.release_root_and_delta_actions_with_predicate(None)
-    }
-
-    /// Release control of the root and delta actions to the caller for manual leaf creation.
-    ///
-    /// This variant accepts an optional predicate. When a predicate is provided that references
-    /// certain columns, the resulting scan will include `stats_parsed` data for those columns
-    /// in the checkpoint, enabling efficient access to min/max statistics without parsing JSON.
-    ///
-    /// # Arguments
-    /// * `predicate` - Optional predicate to enable stats_parsed for referenced columns.
-    ///   The predicate is used only to determine which columns' statistics to expose;
-    ///   it does NOT filter the actions returned by the scan.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // To access stats_parsed for the 'id' column, use a predicate referencing it
-    /// let predicate = Expression::or(
-    ///     Expression::is_null(column_expr!("id")),
-    ///     Expression::not(Expression::is_null(column_expr!("id")))
-    /// );
-    /// let scan = txn.release_root_and_delta_actions_with_predicate(Some(predicate))?;
-    /// ```
-    pub fn release_root_and_delta_actions_with_predicate(
-        &mut self,
-        predicate: Option<crate::PredicateRef>,
-    ) -> DeltaResult<crate::scan::Scan> {
         // Validation: must be in batch commit mode
         if !self.batch_commit {
             return Err(Error::generic(
@@ -994,15 +967,8 @@ impl Transaction {
         // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
         //
         // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
-        // If a predicate is provided, it will enable stats_parsed for the referenced columns
-        let scan_builder =
-            crate::scan::ScanBuilder::new(self.read_snapshot.clone()).skip_leaf_manifests(true);
-
-        let scan = if let Some(pred) = predicate {
-            scan_builder.with_predicate(pred).build()?
-        } else {
-            scan_builder.build()?
-        };
+        let scan_builder = crate::scan::ScanBuilder::new(self.read_snapshot.clone());
+        let scan = scan_builder.skip_leaf_manifests(true).build()?;
 
         Ok(scan)
     }
@@ -3299,7 +3265,7 @@ mod tests {
             .with_operation("CREATE_CONTENT_ROOT".to_string());
 
         // Step 3: Release root and delta actions
-        let scan = txn.release_root_and_delta_actions_with_predicate(None)?;
+        let scan = txn.release_root_and_delta_actions()?;
 
         // Step 4: Create leaf writers and add files
         let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
