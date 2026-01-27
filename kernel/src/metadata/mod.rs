@@ -284,6 +284,102 @@ impl<'a> DeletionVectorMaps<'a> {
     }
 }
 
+/// Streaming iterator for manifest action batches that owns the deletion vector maps.
+///
+/// This allows streaming actions from a manifest without materializing all entries
+/// into a Vec first. The iterator owns the affiliated deletion vector map and shares
+/// ownership of the shared deletion vector map via Arc.
+struct ManifestActionIterator {
+    /// Iterator over filtered metadata entries
+    entries: Box<dyn Iterator<Item = MetadataEntry> + Send>,
+    /// Shared DV map (shared ownership via Arc)
+    shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+    /// Affiliated DV map (owned by this iterator)
+    affiliated_dv_map: HashMap<String, DeletionVectorInfo>,
+    /// Schema for creating action batches
+    schema: SchemaRef,
+    /// Evaluation handler for expressions
+    evaluation_handler: Arc<dyn EvaluationHandler>,
+    /// Table root path for resolving relative paths
+    table_root: String,
+    /// Relative path to the manifest being processed
+    relative_manifest_path: String,
+    /// Current entry index
+    index: usize,
+}
+
+impl Iterator for ManifestActionIterator {
+    type Item = DeltaResult<ActionsBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Process entries one at a time, filtering and validating content types
+        loop {
+            let entry = self.entries.next()?;
+
+            // Only process Data entries; error on unsupported types
+            match entry.content_type {
+                DataContentType::Data => {
+                    // Valid data entry, continue processing
+                }
+                DataContentType::EqualityDeletes => {
+                    return Some(Err(Error::generic("Equality deletes are not supported")));
+                }
+                _ => {
+                    // Skip other entry types (PositionDeletes, manifests, etc.)
+                    continue;
+                }
+            }
+
+            // Create DV maps reference (borrows from both owned and shared maps)
+            let dv_maps = DeletionVectorMaps::new(&self.shared_dv_map, &self.affiliated_dv_map);
+
+            // Convert entry to AddRemove
+            let add_remove = match entry_to_add_remove(
+                entry,
+                &dv_maps,
+                self.index,
+                &self.table_root,
+                self.relative_manifest_path.clone(),
+            ) {
+                Ok(ar) => ar,
+                Err(e) => return Some(Err(e)),
+            };
+
+            self.index += 1;
+
+            // Convert AddRemove to ActionsBatch
+            return Some(add_remove_to_action_batch(
+                add_remove,
+                self.evaluation_handler.as_ref(),
+                &self.schema,
+            ));
+        }
+    }
+}
+
+impl ManifestActionIterator {
+    fn new(
+        entries: Box<dyn Iterator<Item = MetadataEntry> + Send>,
+        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+        affiliated_dv_map: HashMap<String, DeletionVectorInfo>,
+        schema: SchemaRef,
+        evaluation_handler: Arc<dyn EvaluationHandler>,
+        table_root: String,
+        relative_manifest_path: String,
+    ) -> Self {
+        Self {
+            entries,
+            shared_dv_map,
+            affiliated_dv_map,
+            schema,
+            evaluation_handler,
+            table_root,
+            relative_manifest_path,
+            index: 0,
+        }
+    }
+}
+
 /// State shared across all leaf manifests (child data manifests).
 ///
 /// This contains deletion information that applies globally:
@@ -405,23 +501,19 @@ impl Metadata {
         let mut deletion_vector_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
 
         // Separate entries into data files, deletion vectors, and manifest entries
-        // Data entries: Data and EqualityDeletes (will be converted to Add/Remove actions)
+        // Data entries: Data only (will be converted to Add/Remove actions)
         // DV entries: PositionDeletes (will be used to build deletion vector map)
         // Manifest entries: DataManifest, DeleteManifest, ManifestDV (handled by non_root_action_batches)
-        let (mut data_entries, dv_entries): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|entry| {
-                matches!(
-                    entry.content_type,
-                    DataContentType::Data | DataContentType::EqualityDeletes
-                )
-            });
-        // Filter out manifest-related entries from data_entries (though they should already be excluded by the partition)
-        data_entries.retain(|entry| {
-            matches!(
-                entry.content_type,
-                DataContentType::Data | DataContentType::EqualityDeletes
-            )
-        });
+        let (data_entries, dv_entries): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.content_type == DataContentType::Data);
+
+        // Validate that no unsupported entry types are present in dv_entries
+        for entry in &dv_entries {
+            if entry.content_type == DataContentType::EqualityDeletes {
+                return Err(Error::generic("Equality deletes are not supported"));
+            }
+        }
 
         // Apply predicate-based data skipping to filter out entries that cannot match
         let data_entries =
@@ -814,9 +906,12 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Build the shared DV map once
-        let shared_dv_map =
-            Self::build_shared_dv_map(&root_state.shared_state, engine, table_root)?;
+        // Build the shared DV map once and wrap in Arc for shared ownership
+        let shared_dv_map = Arc::new(Self::build_shared_dv_map(
+            &root_state.shared_state,
+            engine,
+            table_root,
+        )?);
 
         // Process each manifest reference
         let mut all_iters: Vec<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> =
@@ -825,7 +920,7 @@ impl Metadata {
         for manifest_refs in root_state.manifest_references {
             let iter = Self::manifest_to_action_batches(
                 manifest_refs,
-                &shared_dv_map,
+                shared_dv_map.clone(), // Clone the Arc (cheap), not the HashMap
                 engine,
                 schema,
                 table_root,
@@ -864,7 +959,7 @@ impl Metadata {
     /// - The shared_dv_map should be built once and reused for all child manifests
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
-        shared_dv_map: &HashMap<String, DeletionVectorInfo>,
+        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
         engine: &dyn Engine,
         schema: &SchemaRef,
         table_root: &Url,
@@ -926,49 +1021,26 @@ impl Metadata {
             )?;
         }
 
-        // Combine shared and affiliated DV maps (using references, no cloning)
-        let dv_maps = DeletionVectorMaps::new(shared_dv_map, &affiliated_dv_map);
-
         // Convert absolute manifest location to relative path
         let relative_manifest_path =
             absolute_to_relative_path(&data_manifest_location, table_root.as_str());
 
-        // Convert entries to AddRemove, filtering out non-data entries
-        let add_removes: Vec<AddRemove> = data_manifest_entries
-            .into_iter()
-            .filter(|entry| {
-                matches!(
-                    entry.content_type,
-                    DataContentType::Data | DataContentType::EqualityDeletes
-                )
-            })
-            .enumerate()
-            .map(|(i, entry)| {
-                entry_to_add_remove(
-                    entry,
-                    &dv_maps,
-                    i,
-                    table_root.as_str(),
-                    relative_manifest_path.clone(),
-                )
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        // Return empty iterator if no add_removes
-        if add_removes.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        // Clone the schema for use in the closure
+        // Clone the schema for use in the iterator
         let schema_clone = schema.clone();
 
         // Create an evaluation handler reference
         let evaluation_handler = engine.evaluation_handler();
 
-        // Convert to iterator of single-row ActionsBatch
-        let iter = add_removes.into_iter().map(move |add_remove| {
-            add_remove_to_action_batch(add_remove, evaluation_handler.as_ref(), &schema_clone)
-        });
+        // Create streaming iterator that owns affiliated_dv_map
+        let iter = ManifestActionIterator::new(
+            Box::new(data_manifest_entries.into_iter()),
+            shared_dv_map,
+            affiliated_dv_map,
+            schema_clone,
+            evaluation_handler,
+            table_root.as_str().to_string(),
+            relative_manifest_path,
+        );
 
         Ok(Box::new(iter))
     }
@@ -4179,11 +4251,11 @@ mod tests {
 
         // Process manifest to action batches (empty shared DV map)
         let schema = crate::actions::get_log_add_schema().clone();
-        let shared_dv_map = HashMap::new();
+        let shared_dv_map = Arc::new(HashMap::new());
         // No data skipping for this test
         let action_batches = Metadata::manifest_to_action_batches(
             manifest_refs,
-            &shared_dv_map,
+            shared_dv_map,
             &engine,
             &schema,
             &table_root_url,
