@@ -14,9 +14,9 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
-use crate::expressions::ArrayData;
-use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::engine_data::{EngineData, EngineList, EngineMap, EngineStruct, GetData, RowVisitor};
+use crate::expressions::{ArrayData, Scalar, StructData};
+use crate::schema::{ColumnName, DataType, SchemaRef, StructField};
 use crate::{DeltaResult, Error};
 
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
@@ -172,6 +172,186 @@ impl EngineMap for MapArray {
     }
 }
 
+/// Converts an Arrow array value at a given index to a Scalar.
+fn arrow_value_to_scalar(array: &dyn Array, row_index: usize) -> DeltaResult<Scalar> {
+    use crate::arrow::array::types::{Float32Type, Float64Type, Int16Type, Int8Type};
+    use crate::arrow::datatypes::DataType as ArrowDataType;
+
+    if !array.is_valid(row_index) {
+        let data_type = arrow_data_type_to_kernel_data_type(array.data_type())?;
+        return Ok(Scalar::Null(data_type));
+    }
+
+    match array.data_type() {
+        ArrowDataType::Boolean => {
+            let arr = array.as_boolean();
+            Ok(Scalar::Boolean(arr.value(row_index)))
+        }
+        ArrowDataType::Int8 => {
+            let arr = array.as_primitive::<Int8Type>();
+            Ok(Scalar::Byte(arr.value(row_index)))
+        }
+        ArrowDataType::Int16 => {
+            let arr = array.as_primitive::<Int16Type>();
+            Ok(Scalar::Short(arr.value(row_index)))
+        }
+        ArrowDataType::Int32 => {
+            let arr = array.as_primitive::<Int32Type>();
+            Ok(Scalar::Integer(arr.value(row_index)))
+        }
+        ArrowDataType::Int64 => {
+            let arr = array.as_primitive::<Int64Type>();
+            Ok(Scalar::Long(arr.value(row_index)))
+        }
+        ArrowDataType::Float32 => {
+            let arr = array.as_primitive::<Float32Type>();
+            Ok(Scalar::Float(arr.value(row_index)))
+        }
+        ArrowDataType::Float64 => {
+            let arr = array.as_primitive::<Float64Type>();
+            Ok(Scalar::Double(arr.value(row_index)))
+        }
+        ArrowDataType::Utf8 => {
+            let arr = array.as_string::<i32>();
+            Ok(Scalar::String(arr.value(row_index).to_string()))
+        }
+        ArrowDataType::Binary => {
+            let arr = array.as_binary::<i32>();
+            Ok(Scalar::Binary(arr.value(row_index).to_vec()))
+        }
+        ArrowDataType::Date32 => {
+            use crate::arrow::array::types::Date32Type;
+            let arr = array.as_primitive::<Date32Type>();
+            Ok(Scalar::Date(arr.value(row_index)))
+        }
+        ArrowDataType::Timestamp(unit, _) => {
+            use crate::arrow::array::types::{
+                TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+                TimestampSecondType,
+            };
+            use crate::arrow::datatypes::TimeUnit;
+            let micros = match unit {
+                TimeUnit::Second => {
+                    array.as_primitive::<TimestampSecondType>().value(row_index) * 1_000_000
+                }
+                TimeUnit::Millisecond => {
+                    array
+                        .as_primitive::<TimestampMillisecondType>()
+                        .value(row_index)
+                        * 1_000
+                }
+                TimeUnit::Microsecond => array
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(row_index),
+                TimeUnit::Nanosecond => {
+                    array
+                        .as_primitive::<TimestampNanosecondType>()
+                        .value(row_index)
+                        / 1_000
+                }
+            };
+            Ok(Scalar::Timestamp(micros))
+        }
+        ArrowDataType::Struct(_) => {
+            let struct_arr = array.as_struct();
+            struct_array_row_to_struct_data(struct_arr, row_index).map(Scalar::Struct)
+        }
+        other => Err(Error::generic(format!(
+            "Unsupported Arrow type for Scalar conversion: {:?}",
+            other
+        ))),
+    }
+}
+
+/// Converts an Arrow DataType to a kernel DataType.
+fn arrow_data_type_to_kernel_data_type(
+    arrow_type: &crate::arrow::datatypes::DataType,
+) -> DeltaResult<DataType> {
+    use crate::arrow::datatypes::DataType as ArrowDataType;
+    use crate::schema::{ArrayType, MapType, StructType};
+
+    match arrow_type {
+        ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
+        ArrowDataType::Int8 => Ok(DataType::BYTE),
+        ArrowDataType::Int16 => Ok(DataType::SHORT),
+        ArrowDataType::Int32 => Ok(DataType::INTEGER),
+        ArrowDataType::Int64 => Ok(DataType::LONG),
+        ArrowDataType::Float32 => Ok(DataType::FLOAT),
+        ArrowDataType::Float64 => Ok(DataType::DOUBLE),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
+        ArrowDataType::Binary | ArrowDataType::LargeBinary => Ok(DataType::BINARY),
+        ArrowDataType::Date32 => Ok(DataType::DATE),
+        ArrowDataType::Timestamp(_, Some(_)) => Ok(DataType::TIMESTAMP),
+        ArrowDataType::Timestamp(_, None) => Ok(DataType::TIMESTAMP_NTZ),
+        ArrowDataType::Struct(fields) => {
+            let kernel_fields: DeltaResult<Vec<StructField>> = fields
+                .iter()
+                .map(|f| {
+                    let dt = arrow_data_type_to_kernel_data_type(f.data_type())?;
+                    Ok(StructField::new(f.name(), dt, f.is_nullable()))
+                })
+                .collect();
+            Ok(DataType::Struct(Box::new(StructType::new_unchecked(
+                kernel_fields?,
+            ))))
+        }
+        ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
+            let element_type = arrow_data_type_to_kernel_data_type(field.data_type())?;
+            Ok(DataType::Array(Box::new(ArrayType::new(
+                element_type,
+                field.is_nullable(),
+            ))))
+        }
+        ArrowDataType::Map(field, _) => {
+            if let ArrowDataType::Struct(fields) = field.data_type() {
+                let key_type = arrow_data_type_to_kernel_data_type(fields[0].data_type())?;
+                let value_type = arrow_data_type_to_kernel_data_type(fields[1].data_type())?;
+                Ok(DataType::Map(Box::new(MapType::new(
+                    key_type,
+                    value_type,
+                    fields[1].is_nullable(),
+                ))))
+            } else {
+                Err(Error::generic("Map field must be a struct"))
+            }
+        }
+        ArrowDataType::Null => Ok(DataType::STRING), // Use STRING as a placeholder for null type
+        other => Err(Error::generic(format!(
+            "Unsupported Arrow type: {:?}",
+            other
+        ))),
+    }
+}
+
+/// Materializes a StructArray row at the given index into a StructData.
+fn struct_array_row_to_struct_data(
+    struct_array: &StructArray,
+    row_index: usize,
+) -> DeltaResult<StructData> {
+    let arrow_fields = struct_array.fields();
+    let columns = struct_array.columns();
+
+    let mut fields = Vec::with_capacity(arrow_fields.len());
+    let mut values = Vec::with_capacity(arrow_fields.len());
+
+    for (arrow_field, column) in arrow_fields.iter().zip(columns.iter()) {
+        let data_type = arrow_data_type_to_kernel_data_type(arrow_field.data_type())?;
+        let field = StructField::new(arrow_field.name(), data_type, arrow_field.is_nullable());
+        let value = arrow_value_to_scalar(column.as_ref(), row_index)?;
+
+        fields.push(field);
+        values.push(value);
+    }
+
+    StructData::try_new(fields, values)
+}
+
+impl EngineStruct for StructArray {
+    fn materialize(&self, row_index: usize) -> DeltaResult<StructData> {
+        struct_array_row_to_struct_data(self, row_index)
+    }
+}
+
 /// Helper trait that provides uniform access to columns and fields, so that our row visitor can use
 /// the same code to drill into a `RecordBatch` (initial case) or `StructArray` (nested case).
 trait ProvidesColumnsAndFields {
@@ -287,11 +467,25 @@ impl ArrowEngineData {
             path.push(field.name().to_string());
             if column_mask.contains(&path[..]) {
                 if let Some(struct_array) = column.as_struct_opt() {
-                    debug!(
-                        "Recurse into a struct array for {}",
-                        ColumnName::new(path.iter())
-                    );
-                    Self::extract_columns(path, getters, leaf_types, column_mask, struct_array)?;
+                    // Check if the expected type is Struct - if so, extract the struct as a whole
+                    // Otherwise, recurse into the struct to extract nested fields
+                    let expected_type = leaf_types.get(getters.len());
+                    if matches!(expected_type, Some(DataType::Struct(_))) {
+                        debug!("Pushing struct array for {}", ColumnName::new(path.iter()));
+                        getters.push(struct_array);
+                    } else {
+                        debug!(
+                            "Recurse into a struct array for {}",
+                            ColumnName::new(path.iter())
+                        );
+                        Self::extract_columns(
+                            path,
+                            getters,
+                            leaf_types,
+                            column_mask,
+                            struct_array,
+                        )?;
+                    }
                 } else if column.data_type() == &ArrowDataType::Null {
                     debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                     getters.push(&());
@@ -895,6 +1089,133 @@ mod tests {
             result,
             "Type mismatch on data: expected binary, got Int32",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_struct_extraction_via_get_data() -> DeltaResult<()> {
+        use crate::arrow::array::StructArray;
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData};
+        use crate::expressions::{ColumnName, StructData};
+        use std::sync::LazyLock;
+
+        // Create a struct array with nested data
+        let inner_fields = vec![
+            ArrowField::new("num_records", ArrowDataType::Int64, true),
+            ArrowField::new("flag", ArrowDataType::Boolean, true),
+        ];
+        let inner_struct_type = ArrowDataType::Struct(inner_fields.clone().into());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new("stats", inner_struct_type.clone(), true),
+        ]));
+
+        // Create the inner struct array
+        let num_records_array = crate::arrow::array::Int64Array::from(vec![
+            Some(100i64),
+            Some(200i64),
+            None, // null value
+        ]);
+        let flag_array =
+            crate::arrow::array::BooleanArray::from(vec![Some(true), Some(false), Some(true)]);
+
+        let stats_struct = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("num_records", ArrowDataType::Int64, true)),
+                Arc::new(num_records_array) as crate::arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("flag", ArrowDataType::Boolean, true)),
+                Arc::new(flag_array) as crate::arrow::array::ArrayRef,
+            ),
+        ]);
+
+        let path_array = StringArray::from(vec!["file1.parquet", "file2.parquet", "file3.parquet"]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(path_array) as crate::arrow::array::ArrayRef,
+                Arc::new(stats_struct) as crate::arrow::array::ArrayRef,
+            ],
+        )?;
+
+        let arrow_data = ArrowEngineData::new(batch);
+
+        // Create a visitor that extracts struct data
+        struct StructVisitor {
+            entries: Vec<(String, Option<StructData>)>,
+        }
+
+        impl RowVisitor for StructVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["path"]), ColumnName::new(["stats"])]);
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+                    vec![
+                        DataType::STRING,
+                        DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                            StructField::nullable("num_records", DataType::LONG),
+                            StructField::nullable("flag", DataType::BOOLEAN),
+                        ]))),
+                    ]
+                });
+                (&NAMES, &TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                assert_eq!(getters.len(), 2);
+                for i in 0..row_count {
+                    let path: String = getters[0].get(i, "path")?;
+                    let stats: Option<StructData> = getters[1].get_opt(i, "stats")?;
+                    self.entries.push((path, stats));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = StructVisitor { entries: vec![] };
+        arrow_data.visit_rows(
+            &[ColumnName::new(["path"]), ColumnName::new(["stats"])],
+            &mut visitor,
+        )?;
+
+        // Verify the extracted data
+        assert_eq!(visitor.entries.len(), 3);
+
+        // First row: file1.parquet with stats {num_records: 100, flag: true}
+        assert_eq!(visitor.entries[0].0, "file1.parquet");
+        let stats0 = visitor.entries[0]
+            .1
+            .as_ref()
+            .expect("stats should be present");
+        assert_eq!(stats0.fields().len(), 2);
+        assert_eq!(stats0.fields()[0].name(), "num_records");
+        assert_eq!(stats0.fields()[1].name(), "flag");
+
+        // Second row: file2.parquet with stats {num_records: 200, flag: false}
+        assert_eq!(visitor.entries[1].0, "file2.parquet");
+        let stats1 = visitor.entries[1]
+            .1
+            .as_ref()
+            .expect("stats should be present");
+        assert_eq!(stats1.fields().len(), 2);
+
+        // Third row: file3.parquet with stats {num_records: null, flag: true}
+        assert_eq!(visitor.entries[2].0, "file3.parquet");
+        let stats2 = visitor.entries[2]
+            .1
+            .as_ref()
+            .expect("stats should be present");
+        assert_eq!(stats2.fields().len(), 2);
 
         Ok(())
     }
