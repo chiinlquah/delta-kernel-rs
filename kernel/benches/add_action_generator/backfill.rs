@@ -54,6 +54,23 @@ struct Args {
     /// Number of actions per sidecar file
     #[arg(short = 'a', long, default_value_t = 50000)]
     actions_per_sidecar: usize,
+
+    /// Generate content root representation
+    #[arg(short = 'c', long, default_value_t = false)]
+    generate_content_root: bool,
+
+    /// Batch size for content root leaves (number of IDs per leaf).
+    /// If not specified, defaults to actions_per_sidecar to align leaf partitioning with sidecars.
+    #[arg(short = 'b', long)]
+    batch_size: Option<usize>,
+
+    /// Number of incremental commits to generate after the initial checkpoint
+    #[arg(long, default_value_t = 0)]
+    num_incremental_commits: usize,
+
+    /// Number of add actions per incremental commit
+    #[arg(long, default_value_t = 200)]
+    actions_per_commit: usize,
 }
 
 fn validate_percentage(s: &str) -> Result<f64, String> {
@@ -155,6 +172,16 @@ fn main() {
     println!("Random seed: {}", args.seed);
     println!("Number of sidecar files: {}", args.num_sidecars);
     println!("Actions per sidecar: {}", args.actions_per_sidecar);
+    println!("Generate content root: {}", args.generate_content_root);
+
+    // Default batch_size to actions_per_sidecar for aligned partitioning
+    let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
+    if args.generate_content_root {
+        println!("Batch size: {}", batch_size);
+    }
+
+    println!("Incremental commits: {}", args.num_incremental_commits);
+    println!("Actions per commit: {}", args.actions_per_commit);
     println!();
 
     if let Err(e) = run(&args) {
@@ -202,6 +229,40 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     generate_last_checkpoint(&delta_log_path, &sidecars, total_actions)?;
     println!("   ✓ Written: _last_checkpoint");
 
+    // Generate content root if requested
+    let mut current_version = 0;
+    if args.generate_content_root {
+        // Default batch_size to actions_per_sidecar for aligned partitioning
+        let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
+        println!("\n6. Generating content root representation...");
+        generate_content_root(&table_path, batch_size)?;
+        println!("   ✓ Content root generated");
+        current_version = 2; // Commit 0, Commit 1 (enable features), Commit 2 (content root)
+    }
+
+    // Generate incremental commits
+    if args.num_incremental_commits > 0 {
+        let starting_id = (args.num_sidecars * args.actions_per_sidecar) as i64;
+        let step_num = if args.generate_content_root { 7 } else { 6 };
+        println!(
+            "\n{}. Generating {} incremental commits...",
+            step_num, args.num_incremental_commits
+        );
+        generate_incremental_commits(
+            &delta_log_path,
+            args.num_incremental_commits,
+            args.actions_per_commit,
+            starting_id,
+            args.dv_percentage / 100.0,
+            args.seed,
+            current_version,
+        )?;
+        println!(
+            "   ✓ Generated {} incremental commits",
+            args.num_incremental_commits
+        );
+    }
+
     Ok(())
 }
 
@@ -209,33 +270,97 @@ fn generate_commit_0(delta_log_path: &Path) -> Result<(), Box<dyn std::error::Er
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     // Create table schema (matching the add_action_generator schema)
+    // Include column mapping metadata for each field (required for future column mapping enablement)
     let schema = json!({
         "type": "struct",
         "fields": [
-            {"name": "phonetic", "type": "string", "nullable": true, "metadata": {}},
-            {"name": "city", "type": "string", "nullable": true, "metadata": {}},
-            {"name": "state", "type": "string", "nullable": true, "metadata": {}},
-            {"name": "num1", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num2", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num3", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num4", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num5", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num6", "type": "double", "nullable": true, "metadata": {}},
-            {"name": "num7", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num8", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num9", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num10", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num11", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num12", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num13", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num14", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num15", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "num16", "type": "long", "nullable": true, "metadata": {}},
-            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "phonetic", "type": "string", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 1,
+                "delta.columnMapping.physicalName": "phonetic"
+            }},
+            {"name": "city", "type": "string", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 2,
+                "delta.columnMapping.physicalName": "city"
+            }},
+            {"name": "state", "type": "string", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 3,
+                "delta.columnMapping.physicalName": "state"
+            }},
+            {"name": "num1", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 4,
+                "delta.columnMapping.physicalName": "num1"
+            }},
+            {"name": "num2", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 5,
+                "delta.columnMapping.physicalName": "num2"
+            }},
+            {"name": "num3", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 6,
+                "delta.columnMapping.physicalName": "num3"
+            }},
+            {"name": "num4", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 7,
+                "delta.columnMapping.physicalName": "num4"
+            }},
+            {"name": "num5", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 8,
+                "delta.columnMapping.physicalName": "num5"
+            }},
+            {"name": "num6", "type": "double", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 9,
+                "delta.columnMapping.physicalName": "num6"
+            }},
+            {"name": "num7", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 10,
+                "delta.columnMapping.physicalName": "num7"
+            }},
+            {"name": "num8", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 11,
+                "delta.columnMapping.physicalName": "num8"
+            }},
+            {"name": "num9", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 12,
+                "delta.columnMapping.physicalName": "num9"
+            }},
+            {"name": "num10", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 13,
+                "delta.columnMapping.physicalName": "num10"
+            }},
+            {"name": "num11", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 14,
+                "delta.columnMapping.physicalName": "num11"
+            }},
+            {"name": "num12", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 15,
+                "delta.columnMapping.physicalName": "num12"
+            }},
+            {"name": "num13", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 16,
+                "delta.columnMapping.physicalName": "num13"
+            }},
+            {"name": "num14", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 17,
+                "delta.columnMapping.physicalName": "num14"
+            }},
+            {"name": "num15", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 18,
+                "delta.columnMapping.physicalName": "num15"
+            }},
+            {"name": "num16", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 19,
+                "delta.columnMapping.physicalName": "num16"
+            }},
+            {"name": "id", "type": "long", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 20,
+                "delta.columnMapping.physicalName": "id"
+            }},
         ]
     });
 
-    // Create metadata action
+    // Create metadata action with column mapping enabled
+    let mut configuration = HashMap::new();
+    configuration.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
     let metadata = Metadata {
         id: uuid::Uuid::new_v4().to_string(),
         name: Some("benchmark_table".to_string()),
@@ -244,15 +369,21 @@ fn generate_commit_0(delta_log_path: &Path) -> Result<(), Box<dyn std::error::Er
         schema_string: serde_json::to_string(&schema)?,
         partition_columns: vec![],
         created_time: Some(timestamp),
-        configuration: HashMap::new(),
+        configuration,
     };
 
-    // Create protocol action for V2 checkpoint (reader version 3, writer version 7)
+    // Create protocol action for V2 checkpoint with column mapping (reader version 3, writer version 7)
     let protocol = Protocol {
         min_reader_version: 3,
         min_writer_version: 7,
-        reader_features: Some(vec!["v2Checkpoint".to_string()]),
-        writer_features: Some(vec!["v2Checkpoint".to_string()]),
+        reader_features: Some(vec![
+            "v2Checkpoint".to_string(),
+            "columnMapping".to_string(),
+        ]),
+        writer_features: Some(vec![
+            "v2Checkpoint".to_string(),
+            "columnMapping".to_string(),
+        ]),
     };
 
     // Create commit info
@@ -468,4 +599,424 @@ fn generate_last_checkpoint(
     println!("   Total size: {} bytes", total_size_in_bytes);
 
     Ok(())
+}
+
+fn generate_incremental_commits(
+    delta_log_path: &Path,
+    num_commits: usize,
+    actions_per_commit: usize,
+    starting_id: i64,
+    dv_probability: f64,
+    seed: u64,
+    starting_version: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for commit_idx in 0..num_commits {
+        let version = starting_version + commit_idx + 1;
+        let commit_filename = format!("{:020}.json", version);
+        let commit_path = delta_log_path.join(&commit_filename);
+
+        // Calculate the starting ID for this commit
+        let commit_start_id = starting_id + (commit_idx * actions_per_commit) as i64;
+
+        // Use a different seed for each commit for variety
+        let commit_seed = seed + 1000 + (commit_idx as u64);
+
+        println!(
+            "   Generating commit {} (version {}) with {} actions (start_id={})...",
+            commit_idx + 1,
+            version,
+            actions_per_commit,
+            commit_start_id
+        );
+
+        // Generate add actions for this commit
+        let actions = generate_add_actions(
+            actions_per_commit,
+            dv_probability,
+            commit_start_id,
+            Some(commit_seed),
+        );
+
+        // Write commit file
+        let mut file = File::create(&commit_path)?;
+
+        // Write commit info
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let commit_info = CommitInfo {
+            timestamp,
+            operation: "WRITE".to_string(),
+            operation_parameters: HashMap::from([
+                ("mode".to_string(), "Append".to_string()),
+                ("numFiles".to_string(), actions_per_commit.to_string()),
+            ]),
+            is_blind_append: Some(true),
+            engine_info: Some("delta-kernel-rust backfill tool".to_string()),
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&json!({"commitInfo": commit_info}))?
+        )?;
+
+        // Write add actions
+        for action in actions {
+            // Convert stats to JSON string format
+            let stats_json = json!({
+                "numRecords": action.stats.num_records,
+                "minValues": {
+                    "phonetic": action.stats.phonetic_min,
+                    "city": action.stats.city_min,
+                    "state": action.stats.state_min,
+                    "num1": action.stats.num1_min,
+                    "num2": action.stats.num2_min,
+                    "num3": action.stats.num3_min,
+                    "num4": action.stats.num4_min,
+                    "num5": action.stats.num5_min,
+                    "num6": action.stats.num6_min,
+                    "num7": action.stats.num7_min,
+                    "num8": action.stats.num8_min,
+                    "num9": action.stats.num9_min,
+                    "num10": action.stats.num10_min,
+                    "num11": action.stats.num11_min,
+                    "num12": action.stats.num12_min,
+                    "num13": action.stats.num13_min,
+                    "num14": action.stats.num14_min,
+                    "num15": action.stats.num15_min,
+                    "num16": action.stats.num16_min,
+                    "id": action.stats.id_value
+                },
+                "maxValues": {
+                    "phonetic": action.stats.phonetic_max,
+                    "city": action.stats.city_max,
+                    "state": action.stats.state_max,
+                    "num1": action.stats.num1_max,
+                    "num2": action.stats.num2_max,
+                    "num3": action.stats.num3_max,
+                    "num4": action.stats.num4_max,
+                    "num5": action.stats.num5_max,
+                    "num6": action.stats.num6_max,
+                    "num7": action.stats.num7_max,
+                    "num8": action.stats.num8_max,
+                    "num9": action.stats.num9_max,
+                    "num10": action.stats.num10_max,
+                    "num11": action.stats.num11_max,
+                    "num12": action.stats.num12_max,
+                    "num13": action.stats.num13_max,
+                    "num14": action.stats.num14_max,
+                    "num15": action.stats.num15_max,
+                    "num16": action.stats.num16_max,
+                    "id": action.stats.id_value
+                },
+                "nullCount": {
+                    "phonetic": 0,
+                    "city": 0,
+                    "state": 0,
+                    "num1": 0,
+                    "num2": 0,
+                    "num3": 0,
+                    "num4": 0,
+                    "num5": 0,
+                    "num6": 0,
+                    "num7": 0,
+                    "num8": 0,
+                    "num9": 0,
+                    "num10": 0,
+                    "num11": 0,
+                    "num12": 0,
+                    "num13": 0,
+                    "num14": 0,
+                    "num15": 0,
+                    "num16": 0,
+                    "id": 0
+                }
+            });
+            let stats_string = serde_json::to_string(&stats_json)?;
+
+            // Convert AddActionMetadata to JSON-serializable format
+            let add_action = json!({
+                "path": action.path,
+                "size": action.size,
+                "modificationTime": action.modification_time,
+                "dataChange": true,
+                "stats": stats_string,
+                "deletionVector": action.deletion_vector.as_ref().map(|dv| {
+                    json!({
+                        "storageType": dv.storage_type.to_string(),
+                        "pathOrInlineDv": dv.path_or_inline_dv,
+                        "offset": dv.offset,
+                        "sizeInBytes": dv.size_in_bytes,
+                        "cardinality": dv.cardinality
+                    })
+                }),
+                "partitionValues": {},
+                "tags": null
+            });
+
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&json!({"add": add_action}))?
+            )?;
+        }
+
+        if (commit_idx + 1) % 5 == 0 {
+            println!("      ✓ Completed {} commits", commit_idx + 1);
+        }
+    }
+
+    Ok(())
+}
+
+fn generate_content_root(
+    table_path: &Path,
+    batch_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::committer::FileSystemCommitter;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::Snapshot;
+    use std::sync::Arc;
+
+    println!("   Step 6a: Enabling metadataTree-experimental feature...");
+
+    // Generate commit 1 to enable the experimental feature
+    enable_metadata_tree_feature(table_path)?;
+    println!("      ✓ Feature enabled via commit 1");
+
+    println!("   Step 6b: Creating transaction...");
+
+    // Create engine and open the table
+    let table_url =
+        url::Url::from_directory_path(table_path).map_err(|_| "Failed to create table URL")?;
+
+    let store = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(DefaultEngineBuilder::new(store).build());
+
+    // Open the table
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    println!("      ✓ Opened table at version {}", snapshot.version());
+
+    // Create transaction with batch_commit mode
+    println!("      Creating transaction...");
+
+    let committer = Box::new(FileSystemCommitter::new());
+    let mut txn = snapshot.transaction(committer)?;
+    txn = txn.with_batch_commit();
+
+    println!("      ✓ Transaction created in batch_commit mode");
+
+    println!("   Step 6c: Scanning existing actions...");
+
+    // Release root and delta actions (no predicate needed for counting approach)
+    let scan = txn.release_root_and_delta_actions()?;
+
+    println!("      ✓ Released root and delta actions");
+
+    println!(
+        "   Step 6d: Partitioning actions into leaves (every {} actions)...",
+        batch_size
+    );
+
+    // Process the scan and partition actions into leaves
+    let leaf_count = partition_actions_into_leaves(&mut txn, scan, engine.as_ref(), batch_size)?;
+
+    println!("      ✓ Created {} leaf manifests", leaf_count);
+
+    println!("   Step 6e: Committing transaction...");
+
+    // Commit the transaction
+    use delta_kernel::transaction::CommitResult;
+    let commit_result = txn.commit(engine.as_ref())?;
+
+    match commit_result {
+        CommitResult::CommittedTransaction(committed) => {
+            println!(
+                "      ✓ Committed at version {}",
+                committed.commit_version()
+            );
+        }
+        CommitResult::ConflictedTransaction(_) => {
+            return Err("Transaction conflicted during commit".into());
+        }
+        CommitResult::RetryableTransaction(_) => {
+            return Err("Transaction failed with retryable error".into());
+        }
+    }
+
+    Ok(())
+}
+
+fn enable_metadata_tree_feature(table_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let delta_log_path = table_path.join("_delta_log");
+    let commit_path = delta_log_path.join("00000000000000000001.json");
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+
+    // Read the existing metadata from commit 0
+    // Note: Column mapping is already enabled in commit 0, we just need to add metadataTree-experimental
+    let commit_0_path = delta_log_path.join("00000000000000000000.json");
+    let commit_0_content = fs::read_to_string(&commit_0_path)?;
+
+    let mut metadata: Option<Metadata> = None;
+    for line in commit_0_content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let action: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(m) = action.get("metaData") {
+            metadata = Some(serde_json::from_value(m.clone())?);
+        }
+    }
+
+    let metadata = metadata.ok_or("No metadata found in commit 0")?;
+
+    // Create updated protocol with columnMapping and metadataTree-experimental features
+    let protocol = Protocol {
+        min_reader_version: 3,
+        min_writer_version: 7,
+        reader_features: Some(vec![
+            "v2Checkpoint".to_string(),
+            "columnMapping".to_string(),
+            "metadataTree-experimental".to_string(),
+        ]),
+        writer_features: Some(vec![
+            "v2Checkpoint".to_string(),
+            "columnMapping".to_string(),
+            "metadataTree-experimental".to_string(),
+        ]),
+    };
+
+    // Create commit info
+    let commit_info = CommitInfo {
+        timestamp,
+        operation: "ENABLE_FEATURES".to_string(),
+        operation_parameters: HashMap::from([(
+            "features".to_string(),
+            "metadataTree-experimental".to_string(),
+        )]),
+        is_blind_append: Some(false),
+        engine_info: Some("delta-kernel-rust backfill tool".to_string()),
+    };
+
+    // Write commit 1
+    let mut file = File::create(commit_path)?;
+
+    // Write protocol action
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({"protocol": protocol}))?
+    )?;
+
+    // Write metadata action (unchanged from commit 0, but required for protocol update)
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({"metaData": metadata}))?
+    )?;
+
+    // Write commit info
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({"commitInfo": commit_info}))?
+    )?;
+
+    Ok(())
+}
+
+fn partition_actions_into_leaves(
+    txn: &mut delta_kernel::transaction::Transaction,
+    scan: delta_kernel::scan::Scan,
+    engine: &dyn delta_kernel::Engine,
+    batch_size: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::transaction::leaf_writer::AddType;
+
+    // TODO: Ideally this would be done with stats (stats_parsed.minValues.id) to partition
+    // actions by their actual ID values, but propagating stats through the scan is currently hard.
+    // Instead, we use a simple counting approach: create a new leaf for every N actions seen.
+    // Note: If a batch would span the N-action boundary, we finish the current leaf and start
+    // a new one with the entire batch (we don't split batches across leaves).
+
+    println!("      Scanning and partitioning actions...");
+    println!(
+        "      Creating a new leaf for approximately every {} actions",
+        batch_size
+    );
+
+    let mut current_leaf_writer: Option<delta_kernel::transaction::leaf_writer::LeafNodeWriter> =
+        None;
+    let mut actions_in_current_leaf: usize = 0;
+    let mut leaf_count: usize = 0;
+
+    // Scan metadata and count actions
+    let scan_iter = scan.scan_metadata(engine)?;
+
+    for scan_metadata_result in scan_iter {
+        let scan_metadata = scan_metadata_result?;
+
+        // Get the Arrow data to determine how many actions are in this batch
+        let arrow_data = scan_metadata
+            .scan_files
+            .data()
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| delta_kernel::Error::generic("Expected ArrowEngineData"))?;
+        let record_batch = arrow_data.record_batch();
+
+        let row_count = record_batch.num_rows();
+        let original_selection = scan_metadata.scan_files.selection_vector();
+
+        // Count how many actions are actually selected in this batch
+        let selected_count = if original_selection.is_empty() {
+            row_count
+        } else {
+            original_selection.iter().filter(|&&x| x).count()
+        };
+
+        // Check if this batch would exceed the target batch size
+        if actions_in_current_leaf > 0 && actions_in_current_leaf + selected_count > batch_size {
+            // Finish the current leaf before adding this batch
+            let finished_writer = current_leaf_writer.take().unwrap();
+            let leaf_result = finished_writer.finish(engine)?;
+            txn.add_leaf(leaf_result)?;
+            leaf_count += 1;
+            actions_in_current_leaf = 0;
+        }
+
+        // Add this batch to the current (or new) leaf
+        if current_leaf_writer.is_none() {
+            current_leaf_writer = Some(txn.new_leaf_node_writer(engine)?);
+        }
+
+        let leaf_writer = current_leaf_writer.as_mut().unwrap();
+        leaf_writer.add_existing_actions(scan_metadata.scan_files, AddType::DataFileAndDV)?;
+        actions_in_current_leaf += selected_count;
+
+        // If we've reached or exceeded batch_size, finish this leaf
+        if actions_in_current_leaf >= batch_size {
+            let finished_writer = current_leaf_writer.take().unwrap();
+            let leaf_result = finished_writer.finish(engine)?;
+            txn.add_leaf(leaf_result)?;
+            leaf_count += 1;
+            actions_in_current_leaf = 0;
+
+            if leaf_count % 10 == 0 {
+                println!("         Finished {} leaves...", leaf_count);
+            }
+        }
+    }
+
+    // Finish any remaining leaf
+    if let Some(writer) = current_leaf_writer {
+        let leaf_result = writer.finish(engine)?;
+        txn.add_leaf(leaf_result)?;
+        leaf_count += 1;
+    }
+
+    println!("      ✓ Partitioned actions into {} leaves", leaf_count);
+
+    Ok(leaf_count)
 }
