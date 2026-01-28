@@ -896,9 +896,11 @@ impl Metadata {
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Build the shared DV map once and wrap in Arc for shared ownership across manifests
-        let shared_dv_map = Arc::new(
-            Self::build_shared_dv_map(&root_state.shared_state, engine, table_root)?
-        );
+        let shared_dv_map = Arc::new(Self::build_shared_dv_map(
+            &root_state.shared_state,
+            engine,
+            table_root,
+        )?);
 
         // Capture the handlers we need (both are Arc, so cheap to clone)
         let parquet_handler = engine.parquet_handler();
@@ -1151,8 +1153,7 @@ impl Metadata {
         let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
 
         // Convert absolute manifest location to relative path
-        let relative_manifest_path =
-            absolute_to_relative_path(&data_manifest_location, table_root);
+        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -1273,11 +1274,8 @@ impl Metadata {
         let parsed =
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
-        let read_result_iter = parquet_handler.read_parquet_files(
-            &[file],
-            METADATA_ENTRY_SCHEMA.clone(),
-            None,
-        )?;
+        let read_result_iter =
+            parquet_handler.read_parquet_files(&[file], METADATA_ENTRY_SCHEMA.clone(), None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
