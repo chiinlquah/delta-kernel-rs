@@ -12,7 +12,7 @@ use crate::{
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 /// Composite identifier for deletion vectors.
@@ -487,19 +487,37 @@ impl LeafNodeWriter {
 
     /// Buffer net new files for writing to data manifest.
     ///
-    /// The add_metadata should have the same schemas as [`crate::transaction::Transaction::add_files_schema`]
+    /// This method is designed for batch commit scenarios where the data contains simple
+    /// write metadata (path, partitionValues, size, modificationTime, stats) rather than
+    /// full Add actions.
+    ///
+    /// The stats field is expected to be a StructData in content_stats format (matching the
+    /// stats schema generated from the table schema).
     ///
     /// # Arguments
-    /// * `add_metadata` - EngineData with write metadata format
+    /// * `add_metadata` - EngineData with write metadata format (path, partitionValues, size,
+    ///   modificationTime, stats as StructData)
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        // Delegate to MetadataBuilder's add_from_engine_data_write()
-        // This already handles extracting Add structs and converting to MetadataEntry
-        // Note, no DVs should be present this is just add files.
-        self.data_builder.add_from_engine_data_write(
-            add_metadata.as_ref(),
-            self.version,
-            Some(self.snapshot_id),
-        )
+        // Generate the stats schema from the table schema
+        let stats_schema = crate::metadata::stats::stats_schema(self.table_schema.as_ref())?;
+        let stats_schema_ref: SchemaRef = Arc::new(stats_schema);
+
+        let mut visitor =
+            crate::metadata::builder::WriteMetadataWithStatsVisitor::new(stats_schema_ref);
+        visitor.visit_rows_of(add_metadata.as_ref())?;
+
+        // Tuple: (path, partition_values, size, modification_time, content_stats)
+        for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
+            self.data_builder.add_file_with_dedup(
+                path,
+                size,
+                content_stats,
+                self.version,
+                Some(self.snapshot_id),
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Move existing files from tree/log into this leaf.

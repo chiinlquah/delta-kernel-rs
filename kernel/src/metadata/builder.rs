@@ -9,6 +9,7 @@ use crate::metadata::{
     TrackingStatus,
 };
 
+use crate::expressions::StructData;
 #[cfg(test)]
 use crate::metadata::ManifestStats;
 use crate::scan::state::Stats;
@@ -77,6 +78,41 @@ pub(crate) fn extract_deletion_vector_content(
             "Inline deletion vectors are not supported. They must be persisted first.".to_string(),
         )),
     }
+}
+
+/// Extracts record_count from content_stats by finding the first column's value_count.
+///
+/// In the content_stats format, each column has a stats struct containing value_count,
+/// which represents the number of records in the file. This value is the same for all
+/// columns in a properly formed stats struct.
+///
+/// # Arguments
+/// * `content_stats` - Optional reference to the content_stats StructData
+///
+/// # Returns
+/// The record count (value_count from the first column's stats), or 0 if not available.
+fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
+    use crate::expressions::Scalar;
+
+    let Some(stats) = content_stats else {
+        return 0;
+    };
+
+    // Iterate through the columns to find the first one with value_count
+    for value in stats.values() {
+        if let Scalar::Struct(column_stats) = value {
+            // Look for value_count field in the column's stats struct
+            for (field, field_value) in column_stats.fields().iter().zip(column_stats.values()) {
+                if field.name() == "value_count" {
+                    if let Scalar::Long(count) = field_value {
+                        return *count;
+                    }
+                }
+            }
+        }
+    }
+
+    0
 }
 
 /// Builder for creating [`Metadata`] instances based on V4 Metadata
@@ -155,6 +191,94 @@ impl MetadataBuilder {
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
+    }
+
+    /// Add a data file entry with deduplication, accepting pre-computed content_stats.
+    ///
+    /// This method accepts content_stats directly as a StructData, avoiding the need to
+    /// serialize/deserialize JSON stats.
+    ///
+    /// # Arguments
+    /// * `path` - The file path (relative to table root)
+    /// * `size` - The file size in bytes
+    /// * `content_stats` - Optional content_stats as StructData
+    /// * `version` - The version to use for tracking info
+    /// * `snapshot_id` - The snapshot ID for tracking info
+    #[allow(dead_code)]
+    pub(crate) fn add_file_with_dedup(
+        &mut self,
+        path: String,
+        size: i64,
+        content_stats: Option<StructData>,
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        let absolute_path = self.path_to_absolute(&path)?;
+
+        // Check for duplicates and skip if already seen
+        if !self.values_seen.insert(absolute_path.clone()) {
+            // Already seen this file path - skip it
+            return Ok(());
+        }
+
+        let status = if version == self.version {
+            TrackingStatus::Added
+        } else {
+            TrackingStatus::Existed
+        };
+
+        // Extract record_count from the content_stats (from any column's value_count)
+        let record_count = extract_record_count_from_stats(content_stats.as_ref());
+
+        let data_file_entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(absolute_path),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status,
+                snapshot_id,
+                sequence_number: Some(version as i64),
+                file_sequence_number: Some(version as i64),
+
+                // We could set it, but then we can't do fast-retries
+                // first_row_id: add.base_row_id,
+                first_row_id: None,
+            }),
+
+            // Data files don't have inline content
+            inline_content: None,
+
+            // Content info from deletion vector (if present)
+            content_info: None,
+
+            // TODO: Check how to set these based on uniform as a first iteration.
+            partition_spec_id: 0,
+            sort_order_id: None,
+
+            record_count,
+
+            file_size_in_bytes: Some(size),
+
+            // Content stats passed directly
+            content_stats,
+
+            manifest_info: None,
+
+            // Path to file where to apply the DV to
+            referenced_file: None,
+
+            // Encryption is not supported
+            key_metadata: None,
+
+            // Not tracked by the current Kernel implementation
+            split_offsets: None,
+
+            // Equality deletes are not supported, passing in null
+            equality_ids: None,
+        };
+
+        self.pending_entries.push(data_file_entry);
+        Ok(())
     }
 
     /// Add an entry with deduplication.
@@ -1057,6 +1181,80 @@ impl MetadataBuilder {
             manifest_location: None, // Will be set when written
             leaf: Some(leaf_uuid),
         })
+    }
+}
+
+/// Entry extracted by WriteMetadataWithStatsVisitor:
+/// (path, partition_values, size, modification_time, content_stats)
+pub(crate) type WriteMetadataEntry = (
+    String,
+    HashMap<String, String>,
+    i64,
+    i64,
+    Option<StructData>,
+);
+
+/// Visitor that extracts write metadata including stats as StructData.
+///
+/// This visitor reads the write metadata format (path, partitionValues, size,
+/// modificationTime, stats) where stats is expected to be a StructData (content_stats format).
+pub(crate) struct WriteMetadataWithStatsVisitor {
+    /// Entries: (path, partition_values, size, modification_time, content_stats)
+    pub entries: Vec<WriteMetadataEntry>,
+}
+
+impl WriteMetadataWithStatsVisitor {
+    pub(crate) fn new(_stats_schema: crate::schema::SchemaRef) -> WriteMetadataWithStatsVisitor {
+        WriteMetadataWithStatsVisitor { entries: vec![] }
+    }
+}
+
+impl RowVisitor for WriteMetadataWithStatsVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::{column_name, MapType, StructType};
+        // Note: This returns a static reference with an empty struct type placeholder.
+        // The actual type checking happens during extraction. This is a limitation of the
+        // RowVisitor interface which requires static references. The stats schema is used
+        // at extraction time to properly interpret the data.
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("path"),
+                column_name!("partitionValues"),
+                column_name!("size"),
+                column_name!("modificationTime"),
+                column_name!("stats"),
+            ];
+            let types = vec![
+                DataType::STRING,
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+                DataType::LONG,
+                DataType::LONG,
+                // Use an empty struct as a placeholder - the actual schema is determined at runtime
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![]))),
+            ];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(path) = getters[0].get_opt(i, "path")? {
+                let partition_values: HashMap<String, String> =
+                    getters[1].get(i, "partitionValues")?;
+                let size: i64 = getters[2].get(i, "size")?;
+                let modification_time: i64 = getters[3].get(i, "modificationTime")?;
+                let stats: Option<StructData> = getters[4].get_opt(i, "stats")?;
+
+                self.entries
+                    .push((path, partition_values, size, modification_time, stats));
+            }
+        }
+        Ok(())
     }
 }
 
