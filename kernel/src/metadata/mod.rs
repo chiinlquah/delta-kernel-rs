@@ -1,6 +1,6 @@
 pub(crate) mod builder;
 pub(crate) mod reader;
-mod stats;
+pub(crate) mod stats;
 pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
@@ -18,7 +18,10 @@ use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType, ToSchema};
-use crate::{DeltaResult, Engine, Error, FileMeta, SchemaRef, SnapshotRef, Version};
+use crate::{
+    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
+    SnapshotRef, Version,
+};
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::collections::HashMap;
@@ -279,6 +282,69 @@ impl<'a> DeletionVectorMaps<'a> {
     /// Probes the shared map first, then the affiliated map.
     pub(crate) fn get(&self, path: &str) -> Option<&DeletionVectorInfo> {
         self.shared.get(path).or_else(|| self.affiliated.get(path))
+    }
+}
+
+/// Lazy iterator that processes manifests one at a time for true streaming.
+///
+/// This enables manifest-level streaming by deferring all I/O and processing
+/// until `.next()` is called. It captures only the Arc handlers from Engine,
+/// avoiding lifetime issues.
+struct LazyManifestBatchIterator {
+    /// Remaining manifests to process
+    manifests: std::vec::IntoIter<ManifestReference>,
+    /// Shared DV map (via Arc)
+    shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+    /// Parquet handler for reading manifest files
+    parquet_handler: Arc<dyn ParquetHandler>,
+    /// Evaluation handler for creating batches
+    evaluation_handler: Arc<dyn EvaluationHandler>,
+    /// Schema for action batches
+    schema: SchemaRef,
+    /// Table root URL
+    table_root: Url,
+    /// Optional predicate for filtering
+    predicate: Option<PredicateRef>,
+    /// Current manifest's batch iterator (if any)
+    current_batch: Option<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>>,
+}
+
+impl Iterator for LazyManifestBatchIterator {
+    type Item = DeltaResult<ActionsBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Try to get next batch from current manifest
+            if let Some(ref mut batch_iter) = self.current_batch {
+                if let Some(batch) = batch_iter.next() {
+                    return Some(batch);
+                }
+                // Current manifest exhausted, clear it
+                self.current_batch = None;
+            }
+
+            // Get next manifest to process
+            let manifest_ref = self.manifests.next()?;
+
+            // Process this manifest NOW (lazy - only happens when we reach this point)
+            let result = Metadata::manifest_to_action_batches_with_handlers(
+                manifest_ref,
+                self.shared_dv_map.clone(),
+                self.parquet_handler.clone(),
+                self.evaluation_handler.clone(),
+                &self.schema,
+                &self.table_root,
+                self.predicate.as_ref(),
+            );
+
+            match result {
+                Ok(batch_iter) => {
+                    self.current_batch = Some(batch_iter);
+                    // Continue loop to pull from the new batch
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 }
 
@@ -831,30 +897,30 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Build the shared DV map once
-        let shared_dv_map =
-            Self::build_shared_dv_map(&root_state.shared_state, engine, table_root)?;
+        // Build the shared DV map once and wrap in Arc for shared ownership across manifests
+        let shared_dv_map = Arc::new(Self::build_shared_dv_map(
+            &root_state.shared_state,
+            engine,
+            table_root,
+        )?);
 
-        // Process each manifest reference
-        // Pre-allocate Vec with exact capacity to avoid reallocation
-        let num_manifests = root_state.manifest_references.len();
-        let mut all_iters: Vec<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> =
-            Vec::with_capacity(num_manifests);
+        // Capture the handlers we need (both are Arc, so cheap to clone)
+        let parquet_handler = engine.parquet_handler();
+        let evaluation_handler = engine.evaluation_handler();
 
-        for manifest_refs in root_state.manifest_references {
-            let iter = Self::manifest_to_action_batches(
-                manifest_refs,
-                &shared_dv_map,
-                engine,
-                schema,
-                table_root,
-                predicate,
-            )?;
-            all_iters.push(iter);
-        }
+        // Create lazy iterator - manifests will be processed one at a time as needed
+        let lazy_iter = LazyManifestBatchIterator {
+            manifests: root_state.manifest_references.into_iter(),
+            shared_dv_map,
+            parquet_handler,
+            evaluation_handler,
+            schema: schema.clone(),
+            table_root: table_root.clone(),
+            predicate: predicate.cloned(),
+            current_batch: None,
+        };
 
-        // Chain all iterators together
-        Ok(Box::new(all_iters.into_iter().flatten()))
+        Ok(Box::new(lazy_iter))
     }
 
     /// Processes a ManifestReference into action batches.
@@ -880,10 +946,11 @@ impl Metadata {
     ///
     /// # Notes
     /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
-    /// - The shared_dv_map should be built once and reused for all child manifests
+    /// - The shared_dv_map should be built once and reused for all child manifests (via Arc)
+    #[allow(dead_code)]
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
-        shared_dv_map: &HashMap<String, DeletionVectorInfo>,
+        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
         engine: &dyn Engine,
         schema: &SchemaRef,
         table_root: &Url,
@@ -948,20 +1015,25 @@ impl Metadata {
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
-        let dv_maps = DeletionVectorMaps::new(shared_dv_map, &affiliated_dv_map);
+        let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
 
         // Convert absolute manifest location to relative path
         let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
-        // Convert entries to AddRemove, filtering out non-data entries
+        // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
             .into_iter()
-            .filter(|entry| {
-                matches!(
-                    entry.content_type,
-                    DataContentType::Data | DataContentType::EqualityDeletes
-                )
+            .filter_map(|entry| {
+                match entry.content_type {
+                    DataContentType::Data => Some(Ok(entry)),
+                    DataContentType::EqualityDeletes => {
+                        Some(Err(Error::generic("Equality deletes are not supported")))
+                    }
+                    _ => None, // Skip other entry types
+                }
             })
+            .collect::<DeltaResult<Vec<_>>>()?
+            .into_iter()
             .enumerate()
             .map(|(i, entry)| {
                 entry_to_add_remove(
@@ -981,6 +1053,140 @@ impl Metadata {
 
         // Create an evaluation handler reference
         let evaluation_handler = engine.evaluation_handler();
+
+        // Cache schemas to avoid repeated construction in the loop
+        let schemas = ActionSchemas::new();
+
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
+
+        // Create multi-row EngineData in one call
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        // Wrap in ActionsBatch and return as iterator with single item
+        let actions_batch = ActionsBatch::new(engine_data, false);
+        Ok(Box::new(std::iter::once(Ok(actions_batch))))
+    }
+
+    /// Processes a ManifestReference into action batches using captured handlers.
+    ///
+    /// This is an internal version of `manifest_to_action_batches` that takes Arc handlers
+    /// instead of `&dyn Engine`, enabling it to be called from lazy iterators without
+    /// lifetime issues.
+    fn manifest_to_action_batches_with_handlers(
+        manifest_refs: ManifestReference,
+        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+        parquet_handler: Arc<dyn ParquetHandler>,
+        evaluation_handler: Arc<dyn EvaluationHandler>,
+        schema: &SchemaRef,
+        table_root: &Url,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Read the data manifest file
+        let data_manifest_location = manifest_refs
+            .data_manifest
+            .manifest
+            .location
+            .clone()
+            .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
+        let data_manifest_url = Url::parse(&data_manifest_location)
+            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+
+        // Read the data manifest entries using the handler
+        let mut data_manifest_entries = Metadata::read_with_handler(
+            parquet_handler.clone(),
+            &data_manifest_url,
+            table_root.clone(),
+        )?
+        .entries()?;
+
+        // Apply manifest DV if present
+        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        }
+
+        // Apply predicate-based data skipping to filter out entries that cannot match
+        let data_manifest_entries =
+            filter_entries_by_predicate(data_manifest_entries, predicate, "leaf data entries");
+
+        // Build a separate map for affiliated delete manifests (specific to this data manifest)
+        let mut affiliated_dv_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
+
+        // Process affiliated delete manifests for this specific data manifest
+        for filtered_manifest in manifest_refs.affiliated_dv_manifests.iter() {
+            let delete_manifest_location = filtered_manifest
+                .manifest
+                .location
+                .clone()
+                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
+            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
+                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
+            })?;
+
+            let mut delete_entries = Metadata::read_with_handler(
+                parquet_handler.clone(),
+                &delete_manifest_url,
+                table_root.clone(),
+            )?
+            .entries()?;
+
+            // Apply manifest DV if present
+            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            }
+
+            // Convert absolute delete manifest path to relative
+            let relative_delete_manifest_path =
+                absolute_to_relative_path(&delete_manifest_location, table_root);
+
+            merge_deletion_vectors(
+                &mut affiliated_dv_map,
+                delete_entries,
+                &relative_delete_manifest_path,
+            )?;
+        }
+
+        // Combine shared and affiliated DV maps (using references, no cloning)
+        let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
+
+        // Convert absolute manifest location to relative path
+        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
+
+        // Convert entries to AddRemove, filtering to only Data entries
+        let add_removes: Vec<AddRemove> = data_manifest_entries
+            .into_iter()
+            .filter_map(|entry| match entry.content_type {
+                DataContentType::Data => Some(Ok(entry)),
+                DataContentType::EqualityDeletes => {
+                    Some(Err(Error::generic("Equality deletes are not supported")))
+                }
+                _ => None, // Skip other entry types
+            })
+            .collect::<DeltaResult<Vec<_>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                entry_to_add_remove(
+                    entry,
+                    &dv_maps,
+                    i,
+                    table_root,
+                    relative_manifest_path.clone(),
+                )
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Return empty iterator if no add_removes
+        if add_removes.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
 
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
@@ -1054,6 +1260,15 @@ impl Metadata {
     /// A `Metadata` instance deserialized from the parquet file.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
+        Self::read_with_handler(engine.parquet_handler(), path, table_root)
+    }
+
+    /// Read metadata using a parquet handler directly (for lazy streaming).
+    fn read_with_handler(
+        parquet_handler: Arc<dyn ParquetHandler>,
+        path: &Url,
+        table_root: Url,
+    ) -> DeltaResult<Self> {
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -1063,11 +1278,8 @@ impl Metadata {
         let parsed =
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
-        let read_result_iter = engine.parquet_handler().read_parquet_files(
-            &[file],
-            METADATA_ENTRY_SCHEMA.clone(),
-            None,
-        )?;
+        let read_result_iter =
+            parquet_handler.read_parquet_files(&[file], METADATA_ENTRY_SCHEMA.clone(), None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -4236,11 +4448,11 @@ mod tests {
 
         // Process manifest to action batches (empty shared DV map)
         let schema = crate::actions::get_log_add_schema().clone();
-        let shared_dv_map = HashMap::new();
+        let shared_dv_map = Arc::new(HashMap::new());
         // No data skipping for this test
         let action_batches = Metadata::manifest_to_action_batches(
             manifest_refs,
-            &shared_dv_map,
+            shared_dv_map,
             &engine,
             &schema,
             &table_root_url,

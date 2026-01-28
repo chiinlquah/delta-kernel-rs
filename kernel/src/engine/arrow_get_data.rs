@@ -1,11 +1,11 @@
 use crate::arrow::array::{
     types::{GenericBinaryType, GenericStringType, Int32Type, Int64Type},
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
-    PrimitiveArray,
+    PrimitiveArray, StructArray,
 };
 
 use crate::{
-    engine_data::{GetData, ListItem, MapItem},
+    engine_data::{GetData, ListItem, MapItem, StructItem},
     DeltaResult,
 };
 
@@ -82,6 +82,20 @@ impl<'a> GetData<'a> for MapArray {
     fn get_map(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
         if self.is_valid(row_index) {
             Ok(Some(MapItem::new(self, row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<'a> GetData<'a> for StructArray {
+    fn get_struct(
+        &'a self,
+        row_index: usize,
+        _field_name: &str,
+    ) -> DeltaResult<Option<StructItem<'a>>> {
+        if self.is_valid(row_index) {
+            Ok(Some(StructItem::new(self, row_index)))
         } else {
             Ok(None)
         }

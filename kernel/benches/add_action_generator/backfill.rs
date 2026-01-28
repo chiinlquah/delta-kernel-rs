@@ -63,6 +63,14 @@ struct Args {
     /// If not specified, defaults to actions_per_sidecar to align leaf partitioning with sidecars.
     #[arg(short = 'b', long)]
     batch_size: Option<usize>,
+
+    /// Number of incremental commits to generate after the initial checkpoint
+    #[arg(long, default_value_t = 0)]
+    num_incremental_commits: usize,
+
+    /// Number of add actions per incremental commit
+    #[arg(long, default_value_t = 200)]
+    actions_per_commit: usize,
 }
 
 fn validate_percentage(s: &str) -> Result<f64, String> {
@@ -171,6 +179,9 @@ fn main() {
     if args.generate_content_root {
         println!("Batch size: {}", batch_size);
     }
+
+    println!("Incremental commits: {}", args.num_incremental_commits);
+    println!("Actions per commit: {}", args.actions_per_commit);
     println!();
 
     if let Err(e) = run(&args) {
@@ -219,12 +230,37 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ Written: _last_checkpoint");
 
     // Generate content root if requested
+    let mut current_version = 0;
     if args.generate_content_root {
         // Default batch_size to actions_per_sidecar for aligned partitioning
         let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
         println!("\n6. Generating content root representation...");
         generate_content_root(&table_path, batch_size)?;
         println!("   ✓ Content root generated");
+        current_version = 2; // Commit 0, Commit 1 (enable features), Commit 2 (content root)
+    }
+
+    // Generate incremental commits
+    if args.num_incremental_commits > 0 {
+        let starting_id = (args.num_sidecars * args.actions_per_sidecar) as i64;
+        let step_num = if args.generate_content_root { 7 } else { 6 };
+        println!(
+            "\n{}. Generating {} incremental commits...",
+            step_num, args.num_incremental_commits
+        );
+        generate_incremental_commits(
+            &delta_log_path,
+            args.num_incremental_commits,
+            args.actions_per_commit,
+            starting_id,
+            args.dv_percentage / 100.0,
+            args.seed,
+            current_version,
+        )?;
+        println!(
+            "   ✓ Generated {} incremental commits",
+            args.num_incremental_commits
+        );
     }
 
     Ok(())
@@ -561,6 +597,172 @@ fn generate_last_checkpoint(
 
     println!("   Total actions: {}", total_actions);
     println!("   Total size: {} bytes", total_size_in_bytes);
+
+    Ok(())
+}
+
+fn generate_incremental_commits(
+    delta_log_path: &Path,
+    num_commits: usize,
+    actions_per_commit: usize,
+    starting_id: i64,
+    dv_probability: f64,
+    seed: u64,
+    starting_version: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for commit_idx in 0..num_commits {
+        let version = starting_version + commit_idx + 1;
+        let commit_filename = format!("{:020}.json", version);
+        let commit_path = delta_log_path.join(&commit_filename);
+
+        // Calculate the starting ID for this commit
+        let commit_start_id = starting_id + (commit_idx * actions_per_commit) as i64;
+
+        // Use a different seed for each commit for variety
+        let commit_seed = seed + 1000 + (commit_idx as u64);
+
+        println!(
+            "   Generating commit {} (version {}) with {} actions (start_id={})...",
+            commit_idx + 1,
+            version,
+            actions_per_commit,
+            commit_start_id
+        );
+
+        // Generate add actions for this commit
+        let actions = generate_add_actions(
+            actions_per_commit,
+            dv_probability,
+            commit_start_id,
+            Some(commit_seed),
+        );
+
+        // Write commit file
+        let mut file = File::create(&commit_path)?;
+
+        // Write commit info
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let commit_info = CommitInfo {
+            timestamp,
+            operation: "WRITE".to_string(),
+            operation_parameters: HashMap::from([
+                ("mode".to_string(), "Append".to_string()),
+                ("numFiles".to_string(), actions_per_commit.to_string()),
+            ]),
+            is_blind_append: Some(true),
+            engine_info: Some("delta-kernel-rust backfill tool".to_string()),
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&json!({"commitInfo": commit_info}))?
+        )?;
+
+        // Write add actions
+        for action in actions {
+            // Convert stats to JSON string format
+            let stats_json = json!({
+                "numRecords": action.stats.num_records,
+                "minValues": {
+                    "phonetic": action.stats.phonetic_min,
+                    "city": action.stats.city_min,
+                    "state": action.stats.state_min,
+                    "num1": action.stats.num1_min,
+                    "num2": action.stats.num2_min,
+                    "num3": action.stats.num3_min,
+                    "num4": action.stats.num4_min,
+                    "num5": action.stats.num5_min,
+                    "num6": action.stats.num6_min,
+                    "num7": action.stats.num7_min,
+                    "num8": action.stats.num8_min,
+                    "num9": action.stats.num9_min,
+                    "num10": action.stats.num10_min,
+                    "num11": action.stats.num11_min,
+                    "num12": action.stats.num12_min,
+                    "num13": action.stats.num13_min,
+                    "num14": action.stats.num14_min,
+                    "num15": action.stats.num15_min,
+                    "num16": action.stats.num16_min,
+                    "id": action.stats.id_value
+                },
+                "maxValues": {
+                    "phonetic": action.stats.phonetic_max,
+                    "city": action.stats.city_max,
+                    "state": action.stats.state_max,
+                    "num1": action.stats.num1_max,
+                    "num2": action.stats.num2_max,
+                    "num3": action.stats.num3_max,
+                    "num4": action.stats.num4_max,
+                    "num5": action.stats.num5_max,
+                    "num6": action.stats.num6_max,
+                    "num7": action.stats.num7_max,
+                    "num8": action.stats.num8_max,
+                    "num9": action.stats.num9_max,
+                    "num10": action.stats.num10_max,
+                    "num11": action.stats.num11_max,
+                    "num12": action.stats.num12_max,
+                    "num13": action.stats.num13_max,
+                    "num14": action.stats.num14_max,
+                    "num15": action.stats.num15_max,
+                    "num16": action.stats.num16_max,
+                    "id": action.stats.id_value
+                },
+                "nullCount": {
+                    "phonetic": 0,
+                    "city": 0,
+                    "state": 0,
+                    "num1": 0,
+                    "num2": 0,
+                    "num3": 0,
+                    "num4": 0,
+                    "num5": 0,
+                    "num6": 0,
+                    "num7": 0,
+                    "num8": 0,
+                    "num9": 0,
+                    "num10": 0,
+                    "num11": 0,
+                    "num12": 0,
+                    "num13": 0,
+                    "num14": 0,
+                    "num15": 0,
+                    "num16": 0,
+                    "id": 0
+                }
+            });
+            let stats_string = serde_json::to_string(&stats_json)?;
+
+            // Convert AddActionMetadata to JSON-serializable format
+            let add_action = json!({
+                "path": action.path,
+                "size": action.size,
+                "modificationTime": action.modification_time,
+                "dataChange": true,
+                "stats": stats_string,
+                "deletionVector": action.deletion_vector.as_ref().map(|dv| {
+                    json!({
+                        "storageType": dv.storage_type.to_string(),
+                        "pathOrInlineDv": dv.path_or_inline_dv,
+                        "offset": dv.offset,
+                        "sizeInBytes": dv.size_in_bytes,
+                        "cardinality": dv.cardinality
+                    })
+                }),
+                "partitionValues": {},
+                "tags": null
+            });
+
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&json!({"add": add_action}))?
+            )?;
+        }
+
+        if (commit_idx + 1) % 5 == 0 {
+            println!("      ✓ Completed {} commits", commit_idx + 1);
+        }
+    }
 
     Ok(())
 }

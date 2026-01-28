@@ -31,6 +31,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
 
+/// Context for counting scan files using the callback pattern
+struct ScanFileCounter {
+    num_files: usize,
+}
+
+/// Callback function to count each scan file
+fn count_scan_file(context: &mut ScanFileCounter, _scan_file: delta_kernel::scan::state::ScanFile) {
+    context.num_files += 1;
+}
+
 /// Full table scan - list all scan tasks with no filters
 pub fn scan(
     table_url: Url,
@@ -56,20 +66,20 @@ pub fn scan(
     let first_task = metadata_iter.next();
     let time_to_first_task = first_task_start.elapsed();
 
-    // Count first task if it exists
+    // Count first task if it exists using visit_scan_files callback
     let mut num_tasks = if first_task.is_some() { 1 } else { 0 };
-    let mut num_files = 0;
+    let mut context = ScanFileCounter { num_files: 0 };
 
-    // Count files in first task
+    // Visit files in first task using callback pattern
     if let Some(Ok(metadata)) = first_task {
-        num_files += metadata.scan_files.data().len();
+        context = metadata.visit_scan_files(context, count_scan_file)?;
     }
 
-    // Enumerate remaining tasks and count files
+    // Enumerate remaining tasks and visit files using callback pattern
     for result in metadata_iter {
         let metadata = result?;
         num_tasks += 1;
-        num_files += metadata.scan_files.data().len();
+        context = metadata.visit_scan_files(context, count_scan_file)?;
     }
 
     let time_to_enumerate_all = first_task_start.elapsed();
@@ -79,7 +89,7 @@ pub fn scan(
         time_to_first_task,
         time_to_enumerate_all,
         num_tasks,
-        num_files,
+        context.num_files,
         0, // total_bytes not easily available from scan_metadata
     );
 
