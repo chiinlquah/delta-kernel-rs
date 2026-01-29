@@ -57,6 +57,8 @@ uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 rand = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+# Unity Catalog - only used by benchmark binaries, not exposed as a feature
+uc-client = { path = "../uc-client", optional = true }
 
 # optional deps
 futures = { version = "0.3", optional = true }
@@ -166,9 +168,9 @@ required-features = ["arrow", "default-engine-rustls", "rand", "clap"]
 [[bin]]
 name = "benchmark-runner"
 path = "benches/benchmark_runner/main.rs"
-required-features = ["arrow", "default-engine-rustls", "clap"]
+required-features = ["arrow", "default-engine-rustls", "clap", "internal-api", "uc-client"]
 
 [[bin]]
 name = "backfill-delta-table"
 path = "benches/add_action_generator/backfill.rs"
-required-features = ["arrow", "default-engine-rustls", "rand", "clap"]
+required-features = ["arrow", "default-engine-rustls", "rand", "clap", "internal-api", "uc-client"]
