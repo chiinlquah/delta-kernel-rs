@@ -2736,8 +2736,7 @@ mod tests {
         create_initial_table(&table_root)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
-        let mut leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
@@ -2745,8 +2744,7 @@ mod tests {
         }
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
-        let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2987,8 +2985,7 @@ mod tests {
         let delete_leaf_entry = delete_leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Create root manifest with both data and delete leaf manifests
-        let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(data_leaf_entry);
         root_builder.add_entry(delete_leaf_entry);
         let root_url = root_builder.write_root(&engine)?;

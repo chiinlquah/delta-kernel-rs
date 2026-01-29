@@ -800,9 +800,7 @@ mod tests {
     /// Helper to create add files metadata for testing.
     /// Note: stats are set to None (null) because proper content_stats requires matching
     /// the table schema's stats format, which is complex to construct in tests.
-    fn create_test_add_metadata(
-        files: Vec<(&str, i64, i64)>,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    fn create_test_add_metadata(files: Vec<(&str, i64, i64)>) -> DeltaResult<Box<dyn EngineData>> {
         use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
         use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
         use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -833,8 +831,7 @@ mod tests {
         // Build arrays for each file
         let path_array = StringArray::from(files.iter().map(|(p, _, _)| *p).collect::<Vec<_>>());
         let size_array = Int64Array::from(files.iter().map(|(_, s, _)| *s).collect::<Vec<_>>());
-        let mod_time_array =
-            Int64Array::from(files.iter().map(|(_, _, m)| *m).collect::<Vec<_>>());
+        let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m)| *m).collect::<Vec<_>>());
 
         // Create empty map for partitionValues
         let entries_field = Arc::new(Field::new(
@@ -871,7 +868,10 @@ mod tests {
 
         // Create all-null struct array for stats (empty struct with no fields)
         // Use new_empty_fields for struct arrays with no child fields
-        let stats_array = StructArray::new_empty_fields(num_files, Some(NullBuffer::from(vec![false; num_files])));
+        let stats_array = StructArray::new_empty_fields(
+            num_files,
+            Some(NullBuffer::from(vec![false; num_files])),
+        );
 
         let batch = RecordBatch::try_new(
             Arc::new(TryFromKernel::try_from_kernel(schema.as_ref())?),
