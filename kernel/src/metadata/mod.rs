@@ -566,15 +566,20 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars
-        let scalar_rows: Vec<Vec<Scalar>> = add_removes
-            .into_iter()
-            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Convert all AddRemove entries to rows of scalars using a single buffer
+        // This eliminates per-row Vec allocations
+        let num_rows = add_removes.len();
+        let fields_per_row = schema.fields().len();
+        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
 
-        // Convert to slices for the create_many API
-        let scalar_row_refs: Vec<&[Scalar]> =
-            scalar_rows.iter().map(|row| row.as_slice()).collect();
+        for add_remove in add_removes {
+            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
+        }
+
+        // Create slice references for each row from the flat buffer
+        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
+            .chunks(fields_per_row)
+            .collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -1057,15 +1062,20 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars
-        let scalar_rows: Vec<Vec<Scalar>> = add_removes
-            .into_iter()
-            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Convert all AddRemove entries to rows of scalars using a single buffer
+        // This eliminates per-row Vec allocations
+        let num_rows = add_removes.len();
+        let fields_per_row = schema.fields().len();
+        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
 
-        // Convert to slices for the create_many API
-        let scalar_row_refs: Vec<&[Scalar]> =
-            scalar_rows.iter().map(|row| row.as_slice()).collect();
+        for add_remove in add_removes {
+            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
+        }
+
+        // Create slice references for each row from the flat buffer
+        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
+            .chunks(fields_per_row)
+            .collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -1191,15 +1201,20 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars
-        let scalar_rows: Vec<Vec<Scalar>> = add_removes
-            .into_iter()
-            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Convert all AddRemove entries to rows of scalars using a single buffer
+        // This eliminates per-row Vec allocations
+        let num_rows = add_removes.len();
+        let fields_per_row = schema.fields().len();
+        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
 
-        // Convert to slices for the create_many API
-        let scalar_row_refs: Vec<&[Scalar]> =
-            scalar_rows.iter().map(|row| row.as_slice()).collect();
+        for add_remove in add_removes {
+            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
+        }
+
+        // Create slice references for each row from the flat buffer
+        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
+            .chunks(fields_per_row)
+            .collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -1994,22 +2009,19 @@ fn remove_to_scalar(remove: &Remove, schemas: &ActionSchemas) -> DeltaResult<Sca
     Ok(Scalar::Struct(StructData::new_arc_unchecked(fields, values)))
 }
 
-/// Converts a single AddRemove to a vector of structured scalars.
+/// Converts a single AddRemove to structured scalars, writing directly into the output buffer.
 ///
 /// This function:
 /// - Checks which action fields (add/remove) are present in the schema
-/// - Creates a row of structured scalar values (one per top-level field)
+/// - Appends structured scalar values (one per top-level field) to the output buffer
 fn add_remove_to_scalars(
     add_remove: AddRemove,
     schema: &SchemaRef,
     schemas: &ActionSchemas,
-) -> DeltaResult<Vec<Scalar>> {
+    output: &mut Vec<Scalar>,
+) -> DeltaResult<()> {
     use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
     use crate::expressions::Scalar;
-
-    // Build a vector of structured scalars for the schema (one per top-level field)
-    // Pre-allocate with exact capacity since we know the field count
-    let mut scalars = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
         let scalar = match field.name() {
@@ -2037,11 +2049,11 @@ fn add_remove_to_scalars(
             }
         };
 
-        // Keep the structured scalar (don't flatten)
-        scalars.push(scalar);
+        // Append the structured scalar directly to output (don't flatten)
+        output.push(scalar);
     }
 
-    Ok(scalars)
+    Ok(())
 }
 
 /// Flattens a scalar into leaf values, recursively handling nested structs.
