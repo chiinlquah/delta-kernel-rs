@@ -8,10 +8,31 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use crate::{EngineData, Snapshot};
 
 use super::*;
+
+/// Helper function to create a minimal table schema for tests.
+/// This schema has the required parquet.field.id metadata for content_stats generation.
+fn test_table_schema() -> StructType {
+    StructType::new_unchecked([
+        StructField::new("value", DataType::INTEGER, true).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-value".to_string()),
+            ),
+        ]),
+    ])
+}
 
 #[test]
 fn test_static_skipping() {
@@ -538,10 +559,9 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
-        use crate::schema::StructType;
 
         let mut builder =
-            MetadataBuilder::new_for(table_root.clone(), 3, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 3, test_table_schema());
 
         // Add the action that should be in content_root
         let add = Add {
@@ -746,10 +766,9 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         use crate::actions::Add;
         use crate::metadata::builder::MetadataBuilder;
         use crate::metadata::writer::MetadataWriter;
-        use crate::schema::StructType;
 
         let mut builder =
-            MetadataBuilder::new_for(table_root.clone(), 10, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 10, test_table_schema());
 
         // Add the action that should be in content_root
         let add = Add {

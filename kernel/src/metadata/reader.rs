@@ -1,5 +1,5 @@
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, Error};
 use bytes::Bytes;
 use std::str::FromStr;
@@ -20,7 +20,7 @@ pub struct MetadataEntryVisitor {
 impl RowVisitor for MetadataEntryVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| MetadataEntry::to_schema().leaves(None::<&str>));
+            LazyLock::new(|| MetadataEntry::base_schema().leaves(None::<&str>));
         NAMES_AND_TYPES.as_ref()
     }
 
