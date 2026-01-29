@@ -13,27 +13,88 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-use delta_kernel::transaction::{AddType, CommitResult, DvUpdate, ManifestLocation};
-use delta_kernel::{DeltaResult, Snapshot};
-
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::{GetData, TypedGetData};
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::RowVisitor;
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
+use delta_kernel::transaction::{AddType, CommitResult, DvUpdate, ManifestLocation};
+use delta_kernel::{DeltaResult, RowVisitor, Snapshot};
+use object_store::ObjectStore;
 use std::collections::{HashMap, HashSet};
-use test_utils::{create_add_files_metadata, setup_test_tables};
+use test_utils::create_add_files_metadata;
+use url::Url;
 
-/// Create the standard test schema (id INTEGER, value STRING) with parquet field IDs
+/// Helper to setup test tables with column mapping enabled (id mode)
+async fn setup_test_tables_with_column_mapping(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    table_base_name: &str,
+) -> Result<
+    Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<dyn ObjectStore>,
+        &'static str,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    use test_utils::{create_table, engine_store_setup};
+
+    let table_name_37 = format!("{table_base_name}_37");
+    let (store_37, engine_37, table_location_37) = engine_store_setup(table_name_37.as_str(), None);
+
+    Ok(vec![(
+        create_table(
+            store_37.clone(),
+            table_location_37,
+            schema.clone(),
+            partition_columns,
+            true,
+            vec!["columnMapping"],
+            vec!["columnMapping"],
+        )
+        .await?,
+        engine_37,
+        store_37,
+        "test_table_37_with_column_mapping",
+    )])
+}
+
+/// Create the standard test schema (id INTEGER, value STRING) with column mapping for id mode
+/// TODO: Both mapping IDs should not be needed here, look at flow more closely.
 fn create_test_schema() -> Result<Arc<StructType>, Box<dyn std::error::Error>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER).with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(1),
-        )]),
-        StructField::nullable("value", DataType::STRING).with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(2),
-        )]),
+        StructField::nullable("id", DataType::INTEGER).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-1".to_string()),
+            ),
+        ]),
+        StructField::nullable("value", DataType::STRING).with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-2".to_string()),
+            ),
+        ]),
     ])?))
 }
 
@@ -579,7 +640,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_basic").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_basic").await?
     {
         // Step 1: Create transaction with batch commit enabled
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -632,7 +693,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_multi_leaves").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_multi_leaves").await?
     {
         // Create transaction with batch commit enabled
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -696,7 +757,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_sequential").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_sequential").await?
     {
         // Commit transaction 1 with files A, B
         {
@@ -806,7 +867,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_affiliated_dvs").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_affiliated_dvs").await?
     {
         // Commit 0: Add files to a leaf WITHOUT DVs
         {
@@ -1023,7 +1084,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_unaffiliated_dvs").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_unaffiliated_dvs").await?
     {
         // Commit 0: Add fileA to leaf1 AND fileB to leaf2 in the SAME commit
         // This tests that multiple leaves can be added in one transaction
@@ -1270,7 +1331,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_move_root_to_leaf").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_move_root_to_leaf").await?
     {
         // Commit 0: Create files WITHOUT leaf writer (files go to root manifest)
         {
@@ -1479,7 +1540,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_move_leaf_to_leaf").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_move_leaf_to_leaf").await?
     {
         // Commit 0: Create files in a leaf (leaf A)
         let _data_manifest_url = {
@@ -1598,7 +1659,7 @@ async fn test_dv_update_marks_root_dv_deleted() -> Result<(), Box<dyn std::error
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_root_dv_deletion").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_root_dv_deletion").await?
     {
         // Commit 0: Add files WITHOUT leaf writer (files go to root manifest)
         {
@@ -1666,7 +1727,7 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
     let schema = create_test_schema()?;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_root_dv_error").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_root_dv_error").await?
     {
         // Commit 0: Add files WITHOUT leaf writer (files go to root manifest)
         {
@@ -1755,7 +1816,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
     const DV_FILE_B_CARDINALITY: i64 = 8;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_add_type_modes").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_add_type_modes").await?
     {
         // Step 1: Create two leaf nodes with files that have affiliated DVs
         // Leaf 1 will have fileA.parquet with DV, Leaf 2 will have fileB.parquet with DV
@@ -1949,7 +2010,8 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
     const DV_CARDINALITY: i64 = 5;
 
     for (table_url, engine, _store, _name) in
-        setup_test_tables(schema.clone(), &[], None, "txn_dvonly_unaffiliated").await?
+        setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_dvonly_unaffiliated")
+            .await?
     {
         // Commit 0: Create a leaf with fileA (no DV yet)
         {

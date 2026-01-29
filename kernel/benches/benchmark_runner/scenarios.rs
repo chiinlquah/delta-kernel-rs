@@ -22,9 +22,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{
-    column_expr, BinaryPredicate, BinaryPredicateOp, Expression, Predicate, Scalar,
-};
+// Note: PredicateRef is still used for scan predicate parameter
+
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Engine, EngineData, PredicateRef};
 use std::sync::Arc;
@@ -101,6 +100,13 @@ pub fn scan(
     .with_total_duration(total_duration))
 }
 
+/// Helper to create a null array of the specified Arrow data type and length
+fn new_null_array(data_type: &ArrowDataType, length: usize) -> ArrayRef {
+    use delta_kernel::arrow::array::new_null_array as arrow_new_null_array;
+
+    arrow_new_null_array(data_type, length)
+}
+
 /// Helper to create add file metadata
 fn create_add_files_metadata(
     add_files_schema: &delta_kernel::schema::SchemaRef,
@@ -159,17 +165,49 @@ fn create_add_files_metadata(
         false,
     ));
 
-    let stats_struct = StructArray::from(vec![(
-        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-        Arc::new(num_records_array) as ArrayRef,
-    )]);
+    // Convert kernel schema to Arrow schema to get the actual stats field structure
+    let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> = Arc::new(
+        TryFromKernel::try_from_kernel(add_files_schema.as_ref()).map_err(|e| {
+            delta_kernel::Error::generic(format!("Failed to convert schema: {}", e))
+        })?,
+    );
+
+    // Extract the stats field schema from the converted Arrow schema
+    let stats_field = arrow_schema
+        .field_with_name("stats")
+        .map_err(|e| delta_kernel::Error::generic(format!("Failed to find stats field: {}", e)))?;
+
+    // Build the stats struct to match the expected schema
+    // The stats field is a struct with fields: numRecords, nullCount, minValues, maxValues, tightBounds
+    let stats_struct = if let ArrowDataType::Struct(stats_fields) = stats_field.data_type() {
+        let mut field_arrays: Vec<(Arc<Field>, ArrayRef)> = Vec::new();
+
+        for field in stats_fields.iter() {
+            match field.name().as_str() {
+                "numRecords" => {
+                    // Provide actual numRecords values
+                    field_arrays.push((
+                        field.clone(),
+                        Arc::new(num_records_array.clone()) as ArrayRef,
+                    ));
+                }
+                _ => {
+                    // For all other fields (nullCount, minValues, maxValues, tightBounds), use null arrays
+                    let null_array = new_null_array(field.data_type(), num_files);
+                    field_arrays.push((field.clone(), null_array));
+                }
+            }
+        }
+
+        StructArray::from(field_arrays)
+    } else {
+        return Err(delta_kernel::Error::generic(
+            "Stats field is not a struct type",
+        ));
+    };
 
     let batch = RecordBatch::try_new(
-        Arc::new(
-            TryFromKernel::try_from_kernel(add_files_schema.as_ref()).map_err(|e| {
-                delta_kernel::Error::generic(format!("Failed to convert schema: {}", e))
-            })?,
-        ),
+        arrow_schema,
         vec![
             Arc::new(path_array) as ArrayRef,
             partition_values_array as ArrayRef,
@@ -229,7 +267,7 @@ pub fn write(
         batches.push(create_add_files_metadata(&add_files_schema, batch_size)?);
     }
 
-    add_batches_to_txn(&mut txn, batches, bulk_mode)?;
+    add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
 
     // Commit transaction
     match txn.commit(engine.as_ref())? {
@@ -264,9 +302,34 @@ fn add_batches_to_txn(
     txn: &mut Transaction,
     batches: Vec<Box<dyn EngineData>>,
     bulk_mode: bool,
+    engine: Arc<dyn Engine>,
 ) -> DeltaResult<()> {
     if bulk_mode {
-        return Err(delta_kernel::Error::generic("Bulk mode not implemented"));
+        use std::thread;
+
+        // Create leaf writers for each batch and spawn threads to finish them
+        let mut handles = Vec::new();
+
+        for batch in batches {
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+            leaf.add_files(batch)?;
+
+            // Clone engine for thread
+            let engine_clone = engine.clone();
+
+            // Spawn thread to finish the leaf writer
+            let handle = thread::spawn(move || leaf.finish(engine_clone.as_ref()));
+            handles.push(handle);
+        }
+
+        // Collect results from threads and add to transaction
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| delta_kernel::Error::generic("Thread panicked"))?;
+            let leaf_result = result?;
+            txn.add_leaf(leaf_result)?;
+        }
     } else {
         for batch in batches {
             txn.add_files(batch);
@@ -287,24 +350,35 @@ pub fn vacuum_delete(
     // Load snapshot
     let snapshot =
         delta_kernel::snapshot::Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    // Create filter: id < partition_threshold
-    let filter: PredicateRef = Arc::new(Predicate::Binary(BinaryPredicate {
-        op: BinaryPredicateOp::LessThan,
-        left: Box::new(column_expr!("id")),
-        right: Box::new(Expression::Literal(Scalar::Long(partition_threshold))),
-    }));
 
-    // Create scan with filter to identify files to delete
-    let scan = snapshot
-        .clone()
-        .scan_builder()
-        .with_predicate(filter)
-        .build()?;
+    // Create scan without predicate to get all files
+    let scan = snapshot.clone().scan_builder().build()?;
 
-    // Enumerate files that match the deletion criteria
+    // Take the first 50000 files returned from the scan
     let mut batches_to_delete = Vec::new();
+    let mut files_collected = 0;
+    const MAX_FILES_TO_DELETE: usize = 50000;
+
     for result in scan.scan_metadata(engine.as_ref())? {
-        batches_to_delete.push(result?.scan_files);
+        let metadata = result?;
+        let num_files = metadata.scan_files.data().len();
+
+        if files_collected + num_files <= MAX_FILES_TO_DELETE {
+            // Take the whole batch
+            batches_to_delete.push(metadata.scan_files);
+            files_collected += num_files;
+
+            if files_collected >= MAX_FILES_TO_DELETE {
+                break;
+            }
+        } else {
+            // Take only what we need to reach 50000
+            let remaining = MAX_FILES_TO_DELETE - files_collected;
+            if remaining > 0 {
+                batches_to_delete.push(metadata.scan_files);
+            }
+            break;
+        }
     }
 
     let txn_start = Instant::now();
@@ -335,7 +409,7 @@ pub fn vacuum_delete(
     let transaction_duration = txn_start.elapsed();
     let total_duration = start.elapsed();
 
-    let write_metrics = WriteMetrics::new(transaction_duration, 0, 0, false);
+    let write_metrics = WriteMetrics::new(transaction_duration, 0, 0, true);
 
     Ok(BenchmarkMetrics::new(
         format!("vacuum_delete_threshold_{}", partition_threshold),

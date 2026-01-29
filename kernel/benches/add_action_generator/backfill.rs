@@ -357,9 +357,9 @@ fn generate_commit_0(delta_log_path: &Path) -> Result<(), Box<dyn std::error::Er
         ]
     });
 
-    // Create metadata action with column mapping enabled
+    // Create metadata action with column mapping enabled (Id mode)
     let mut configuration = HashMap::new();
-    configuration.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+    configuration.insert("delta.columnMapping.mode".to_string(), "id".to_string());
 
     let metadata = Metadata {
         id: uuid::Uuid::new_v4().to_string(),

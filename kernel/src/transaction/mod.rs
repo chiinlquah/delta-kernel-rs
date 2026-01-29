@@ -999,11 +999,23 @@ impl Transaction {
 
         let track_root_removals = !self.root_released;
 
+        // Get physical schema with parquet.field.id for adaptive metadata tree
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
+        let physical_schema = Arc::new(
+            self.read_snapshot
+                .schema()
+                .as_ref()
+                .make_physical(column_mapping_mode),
+        );
+
         let writer = crate::transaction::leaf_writer::LeafNodeWriter::new(
             self.read_snapshot.table_root().clone(),
             self.read_snapshot.version() + 1,
             self.snapshot_id,
-            self.read_snapshot.schema(),
+            physical_schema,
             track_root_removals,
             root_manifest_url,
         );
@@ -3194,7 +3206,6 @@ mod tests {
                     "type": "integer",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 1,
                         "delta.columnMapping.id": 1,
                         "delta.columnMapping.physicalName": "id"
                     }
@@ -3204,7 +3215,6 @@ mod tests {
                     "type": "string",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 2,
                         "delta.columnMapping.id": 2,
                         "delta.columnMapping.physicalName": "value"
                     }
@@ -3231,7 +3241,7 @@ mod tests {
                 "schemaString": schema.to_string(),
                 "partitionColumns": [],
                 "configuration": {
-                    "delta.columnMapping.mode": "name"
+                    "delta.columnMapping.mode": "id"
                 },
                 "createdTime": 1677811175819u64
             }

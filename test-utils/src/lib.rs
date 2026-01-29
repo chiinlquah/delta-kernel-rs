@@ -281,7 +281,17 @@ pub async fn create_table(
     writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
-    let schema = serde_json::to_string(&schema)?;
+
+    // Check if the schema has column mapping IDs before converting to string
+    // Column mapping ID determines whether to use "id" or "name" mode
+    // Note: parquet.field.id is derived from column mapping ID by make_physical()
+    let has_column_mapping_ids = schema.fields().any(|field| {
+        field
+            .get_config_value(&delta_kernel::schema::ColumnMetadataKey::ColumnMappingId)
+            .is_some()
+    });
+
+    let schema_string = serde_json::to_string(&schema)?;
 
     let protocol = if use_37_protocol {
         json!({
@@ -305,7 +315,9 @@ pub async fn create_table(
         let mut config = serde_json::Map::new();
 
         if reader_features.contains(&"columnMapping") {
-            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            // Use "id" mode if schema has column mapping IDs, otherwise use "name" mode
+            let mode = if has_column_mapping_ids { "id" } else { "name" };
+            config.insert("delta.columnMapping.mode".to_string(), json!(mode));
         }
         if writer_features.contains(&"rowTracking") {
             config.insert(
@@ -342,7 +354,7 @@ pub async fn create_table(
                 "provider": "parquet",
                 "options": {}
             },
-            "schemaString": schema,
+            "schemaString": schema_string,
             "partitionColumns": partition_columns,
             "configuration": configuration,
             "createdTime": 1677811175819u64
