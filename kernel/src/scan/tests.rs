@@ -15,19 +15,19 @@ use super::*;
 
 #[test]
 fn test_static_skipping() {
-    const NULL: Pred = Pred::null_literal();
+    let null_pred = Pred::null_literal();
     let test_cases = [
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (true, null_pred.clone()),
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (true, Pred::and(null_pred.clone(), column_pred!("a"))),
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(

@@ -1975,7 +1975,7 @@ impl RowVisitor for DvMatchVisitor<'_> {
             // Skip rows with null paths (these are rows that were deselected by the selection vector,
             // but still appear in the EngineData since visitors operate on the full EngineData)
             let Some(path) = path_opt else {
-                self.new_dv_entries.push(Scalar::Null(DataType::from(
+                self.new_dv_entries.push(Scalar::null(DataType::from(
                     DeletionVectorDescriptor::to_schema(),
                 )));
                 continue;
@@ -1996,7 +1996,7 @@ impl RowVisitor for DvMatchVisitor<'_> {
                 )?));
                 self.matched_file_indexes.push(i);
             } else {
-                self.new_dv_entries.push(Scalar::Null(DataType::from(
+                self.new_dv_entries.push(Scalar::null(DataType::from(
                     DeletionVectorDescriptor::to_schema(),
                 )));
             }

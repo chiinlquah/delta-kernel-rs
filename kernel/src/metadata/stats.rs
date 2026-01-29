@@ -573,7 +573,7 @@ fn build_column_stats(
         };
 
         // Use null for missing values
-        let scalar = scalar.unwrap_or_else(|| Scalar::Null(stats_field.data_type().clone()));
+        let scalar = scalar.unwrap_or_else(|| Scalar::null(stats_field.data_type().clone()));
         values.push(scalar);
     }
 
@@ -617,7 +617,7 @@ fn build_struct_stats(
                         );
                         Scalar::Struct(nested_data)
                     } else {
-                        Scalar::Null(stats_field.data_type().clone())
+                        Scalar::null(stats_field.data_type().clone())
                     }
                 }
                 _ => {
@@ -634,12 +634,12 @@ fn build_struct_stats(
                         );
                         Scalar::Struct(column_stats)
                     } else {
-                        Scalar::Null(stats_field.data_type().clone())
+                        Scalar::null(stats_field.data_type().clone())
                     }
                 }
             }
         } else {
-            Scalar::Null(stats_field.data_type().clone())
+            Scalar::null(stats_field.data_type().clone())
         };
 
         values.push(scalar);
@@ -726,7 +726,7 @@ fn aggregate_column_stats(field: &StructField, values: &[&Scalar]) -> Scalar {
                     .collect();
 
                 if inner_stats.is_empty() {
-                    return Scalar::Null(field.data_type().clone());
+                    return Scalar::null(field.data_type().clone());
                 }
 
                 let inner_fields: Vec<StructField> = inner_struct.fields().cloned().collect();
@@ -743,7 +743,7 @@ fn aggregate_column_stats(field: &StructField, values: &[&Scalar]) -> Scalar {
         }
         _ => {
             // Not a struct, shouldn't happen in well-formed stats
-            Scalar::Null(field.data_type().clone())
+            Scalar::null(field.data_type().clone())
         }
     }
 }
@@ -760,7 +760,7 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
         .collect();
 
     if struct_values.is_empty() {
-        return Scalar::Null(DataType::Struct(Box::new(stats_struct.clone())));
+        return Scalar::null(DataType::Struct(Box::new(stats_struct.clone())));
     }
 
     let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
@@ -787,9 +787,9 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
             // AND of all exact_bounds
             "exact_bounds" => and_boolean_scalars(&field_scalars),
             // Skip avg_value_size (would need weighted average, not straightforward)
-            "avg_value_size" => Scalar::Null(field.data_type().clone()),
+            "avg_value_size" => Scalar::null(field.data_type().clone()),
             // Unknown field - preserve as null
-            _ => Scalar::Null(field.data_type().clone()),
+            _ => Scalar::null(field.data_type().clone()),
         };
 
         aggregated_values.push(aggregated);
@@ -813,7 +813,7 @@ fn sum_long_scalars(scalars: &[&Scalar]) -> Scalar {
     if has_value {
         Scalar::Long(sum)
     } else {
-        Scalar::Null(DataType::LONG)
+        Scalar::null(DataType::LONG)
     }
 }
 
@@ -828,7 +828,7 @@ fn max_long_scalars(scalars: &[&Scalar]) -> Scalar {
     }
 
     max.map(Scalar::Long)
-        .unwrap_or_else(|| Scalar::Null(DataType::LONG))
+        .unwrap_or_else(|| Scalar::null(DataType::LONG))
 }
 
 /// Takes the minimum scalar value, ignoring nulls.
@@ -851,7 +851,7 @@ fn min_scalar(scalars: &[&Scalar], data_type: &DataType) -> Scalar {
     }
 
     min.cloned()
-        .unwrap_or_else(|| Scalar::Null(data_type.clone()))
+        .unwrap_or_else(|| Scalar::null(data_type.clone()))
 }
 
 /// Takes the maximum scalar value, ignoring nulls.
@@ -874,7 +874,7 @@ fn max_scalar(scalars: &[&Scalar], data_type: &DataType) -> Scalar {
     }
 
     max.cloned()
-        .unwrap_or_else(|| Scalar::Null(data_type.clone()))
+        .unwrap_or_else(|| Scalar::null(data_type.clone()))
 }
 
 /// ANDs boolean scalars. Returns false if any is false, true if all are true, null otherwise.
@@ -891,7 +891,7 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 
     result
         .map(Scalar::Boolean)
-        .unwrap_or_else(|| Scalar::Null(DataType::BOOLEAN))
+        .unwrap_or_else(|| Scalar::null(DataType::BOOLEAN))
 }
 
 /// Converts Delta Protocol JSON stats to content_stats StructData format.

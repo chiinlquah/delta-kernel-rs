@@ -158,7 +158,7 @@ fn test_eval_binary_comparisons() {
     const FIVE: Scalar = Scalar::Integer(5);
     const TEN: Scalar = Scalar::Integer(10);
     const FIFTEEN: Scalar = Scalar::Integer(15);
-    const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
+    let null_val = Scalar::null(DataType::INTEGER);
 
     let predicates = [
         Pred::lt(column_expr!("x"), Expr::literal(10)),
@@ -183,8 +183,8 @@ fn test_eval_binary_comparisons() {
     //
     // NOTE: missing min or max stat produces NULL output if the expression needed it.
     do_test(TEN, TEN, &[FALSE, TRUE, TRUE, FALSE, FALSE, TRUE]);
-    do_test(NULL_VAL, TEN, &[NULL, NULL, NULL, NULL, FALSE, TRUE]);
-    do_test(TEN, NULL_VAL, &[FALSE, TRUE, NULL, NULL, NULL, NULL]);
+    do_test(null_val.clone(), TEN, &[NULL, NULL, NULL, NULL, FALSE, TRUE]);
+    do_test(TEN, null_val, &[FALSE, TRUE, NULL, NULL, NULL, NULL]);
 
     // min = max < value (5..5 = 10, 5..5 <= 10, etc)
     do_test(FIVE, FIVE, &[TRUE, TRUE, FALSE, TRUE, FALSE, FALSE]);

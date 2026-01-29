@@ -179,7 +179,7 @@ fn arrow_value_to_scalar(array: &dyn Array, row_index: usize) -> DeltaResult<Sca
 
     if !array.is_valid(row_index) {
         let data_type = arrow_data_type_to_kernel_data_type(array.data_type())?;
-        return Ok(Scalar::Null(data_type));
+        return Ok(Scalar::null(data_type));
     }
 
     match array.data_type() {

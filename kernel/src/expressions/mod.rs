@@ -653,8 +653,8 @@ impl Expression {
     }
 
     /// Creates a NULL literal expression
-    pub const fn null_literal(data_type: DataType) -> Self {
-        Self::Literal(Scalar::Null(data_type))
+    pub fn null_literal(data_type: DataType) -> Self {
+        Self::Literal(Scalar::null(data_type))
     }
 
     /// Wraps a predicate as a boolean-valued expression
@@ -799,8 +799,8 @@ impl Predicate {
     }
 
     /// Creates a NULL literal boolean value
-    pub const fn null_literal() -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
+    pub fn null_literal() -> Self {
+        Self::BooleanExpression(Expression::Literal(Scalar::null(DataType::BOOLEAN)))
     }
 
     /// Converts a boolean-valued expression into a predicate

@@ -61,10 +61,10 @@ fn test_default_eval_scalar() {
         (Scalar::Boolean(false), true, Some(true)),
         (Scalar::Long(1), false, None),
         (Scalar::Long(1), true, None),
-        (Scalar::Null(DataType::BOOLEAN), false, None),
-        (Scalar::Null(DataType::BOOLEAN), true, None),
-        (Scalar::Null(DataType::LONG), false, None),
-        (Scalar::Null(DataType::LONG), true, None),
+        (Scalar::null(DataType::BOOLEAN), false, None),
+        (Scalar::null(DataType::BOOLEAN), true, None),
+        (Scalar::null(DataType::LONG), false, None),
+        (Scalar::null(DataType::LONG), true, None),
     ];
     for (value, inverted, expect) in test_cases.into_iter() {
         assert_eq!(
@@ -95,7 +95,7 @@ fn test_default_partial_cmp_scalars() {
         Date(1),
         Binary(vec![1]),
         Scalar::decimal(1, 10, 10).unwrap(),
-        Null(DataType::LONG),
+        Scalar::null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
@@ -113,7 +113,7 @@ fn test_default_partial_cmp_scalars() {
         Date(10),
         Binary(vec![10]),
         Scalar::decimal(10, 10, 10).unwrap(),
-        Null(DataType::LONG),
+        Scalar::null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
@@ -453,7 +453,7 @@ fn test_eval_column() {
     let test_cases = [
         (Scalar::from(true), Some(true)),
         (Scalar::from(false), Some(false)),
-        (Scalar::Null(DataType::BOOLEAN), None),
+        (Scalar::null(DataType::BOOLEAN), None),
         (Scalar::from(1), None),
     ];
     let col = &column_name!("x");
@@ -474,7 +474,7 @@ fn test_eval_not() {
     let test_cases = [
         (Scalar::Boolean(true), Some(false)),
         (Scalar::Boolean(false), Some(true)),
-        (Scalar::Null(DataType::BOOLEAN), None),
+        (Scalar::null(DataType::BOOLEAN), None),
         (Scalar::Long(1), None),
     ];
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
@@ -523,7 +523,7 @@ fn test_eval_is_null() {
 fn test_eval_distinct() {
     let one = &Scalar::from(1);
     let two = &Scalar::from(2);
-    let null = &Scalar::Null(DataType::INTEGER);
+    let null = &Scalar::null(DataType::INTEGER);
     let filter = DefaultKernelPredicateEvaluator::from(one.clone());
     let col = &column_name!("x");
     expect_eq!(
@@ -671,7 +671,7 @@ impl OpaqueExpressionOp for OpaqueLessThanOp {
     ) -> DeltaResult<Scalar> {
         let result = match self.eval_expr_scalar(eval_expr, exprs, false) {
             Some(value) => Scalar::from(value),
-            None => Scalar::Null(DataType::BOOLEAN),
+            None => Scalar::null(DataType::BOOLEAN),
         };
         Ok(result)
     }
@@ -862,7 +862,7 @@ fn test_eval_opaque_predicate() {
     assert_eq!(filter.eval(&pred), Some(false), "AND(x, TRUE)");
     assert_eq!(filter.eval(&skipping_pred), Some(false), "AND(x, TRUE)");
 
-    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::BOOLEAN));
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::null(DataType::BOOLEAN));
     assert_eq!(filter.eval(&pred), None, "AND(x, TRUE)");
     assert_eq!(filter.eval(&skipping_pred), None, "AND(x, TRUE)");
 
@@ -873,7 +873,7 @@ fn test_eval_opaque_predicate() {
     let filter = OneStatsValue(Scalar::from(false));
     assert_eq!(filter.eval(&pred), Some(false), "AND(x, TRUE)");
 
-    let filter = OneStatsValue(Scalar::Null(DataType::BOOLEAN));
+    let filter = OneStatsValue(Scalar::null(DataType::BOOLEAN));
     assert_eq!(filter.eval(&pred), None, "AND(x, TRUE)");
 }
 
@@ -931,7 +931,7 @@ fn test_eval_unknown() {
 struct NullColumnResolver;
 impl ResolveColumnAsScalar for NullColumnResolver {
     fn resolve_column(&self, _col: &ColumnName) -> Option<Scalar> {
-        Some(Scalar::Null(DataType::INTEGER))
+        Some(Scalar::null(DataType::INTEGER))
     }
 }
 
@@ -940,7 +940,7 @@ fn test_sql_where() {
     let col = &column_expr!("x");
     let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Pred = Pred::null_literal();
+    let null_pred = Pred::null_literal();
     const FALSE: Pred = Pred::literal(false);
     const TRUE: Pred = Pred::literal(true);
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
@@ -1000,7 +1000,7 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let pred = &Pred::distinct(NULL, col.clone());
+    let pred = &Pred::distinct(null_pred.clone(), col.clone());
     expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
@@ -1012,7 +1012,7 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // NULL allows static skipping under SQL semantics
-    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
+    let pred = &Pred::and(null_pred.clone(), Pred::lt(col.clone(), VAL));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");

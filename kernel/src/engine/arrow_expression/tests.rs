@@ -128,7 +128,7 @@ fn test_literal_complex_type_array() {
             vec![
                 Scalar::from(1),
                 Scalar::from(2),
-                Scalar::Null(KernelDataType::INTEGER),
+                Scalar::null(KernelDataType::INTEGER),
                 Scalar::from(3),
             ],
         )
@@ -146,7 +146,7 @@ fn test_literal_complex_type_array() {
                 ("array".to_string(), array_value.clone()),
                 (
                     "null_array".to_string(),
-                    Scalar::Null(array_type.clone().into()),
+                    Scalar::null(array_type.clone().into()),
                 ),
             ],
         )
@@ -166,9 +166,9 @@ fn test_literal_complex_type_array() {
             vec![
                 Scalar::Integer(42),
                 array_value,
-                Scalar::Null(array_type.clone().into()),
+                Scalar::null(array_type.clone().into()),
                 map_value,
-                Scalar::Null(map_type.clone().into()),
+                Scalar::null(map_type.clone().into()),
             ],
         )
         .unwrap(),
@@ -179,7 +179,7 @@ fn test_literal_complex_type_array() {
             nested_array_type.clone(),
             vec![
                 struct_value.clone(),
-                Scalar::Null(struct_type.clone().into()),
+                Scalar::null(struct_type.clone().into()),
                 struct_value.clone(),
             ],
         )
@@ -706,7 +706,7 @@ fn test_create_one() {
         1.into(),
         "B".into(),
         3.into(),
-        Scalar::Null(KernelDataType::INTEGER),
+        Scalar::null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new_unchecked([
         StructField::nullable("a", KernelDataType::INTEGER),
@@ -774,7 +774,7 @@ fn test_create_one_nested() {
 
 #[test]
 fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
+    let values: &[Scalar] = &[Scalar::null(KernelDataType::INTEGER), 1.into()];
     let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
         KernelDataType::struct_type_unchecked([
@@ -830,8 +830,8 @@ fn test_create_one_not_null_struct() {
     // Creating a NOT NULL struct field with null values should error.
     // The error comes from Arrow's RecordBatch validation (non-nullable column has nulls).
     let values: &[Scalar] = &[
-        Scalar::Null(KernelDataType::INTEGER),
-        Scalar::Null(KernelDataType::INTEGER),
+        Scalar::null(KernelDataType::INTEGER),
+        Scalar::null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
@@ -855,7 +855,7 @@ fn test_create_one_top_level_null() {
     // - Some versions validate and return an error for null values in non-nullable columns
     // - Some versions skip validation and allow the null row
     // Both behaviors are acceptable - the key is that we don't panic.
-    let values = &[Scalar::Null(KernelDataType::INTEGER)];
+    let values = &[Scalar::null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
     let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
@@ -923,7 +923,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
-    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
+    let null_scalar_map = Scalar::null(KernelDataType::Map(Box::new(map_type)));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
