@@ -563,12 +563,8 @@ fn build_column_stats(
                 // exact_bounds reflects Delta's tightBounds field:
                 // - true: bounds are exact (all rows in file satisfy min <= value <= max)
                 // - false: bounds may be wider (e.g., deletion vectors have removed some rows)
-                // Only set if we have bounds to report
-                if min_value.is_some() || max_value.is_some() {
-                    Some(Scalar::Boolean(tight_bounds))
-                } else {
-                    None
-                }
+                // Always report this field - defaults to true in Delta JSON when absent
+                Some(Scalar::Boolean(tight_bounds))
             }
             _ => None,
         };
@@ -1066,206 +1062,13 @@ pub(crate) fn delta_json_stats_to_content_stats(
         return Ok(None);
     };
 
-    // Build the content_stats StructData in Delta JSON format
-    let content_stats = build_delta_json_stats(table_schema, &delta_stats);
+    // Generate the AMT-style stats schema
+    let stats_struct = stats_schema(table_schema)?;
+
+    // Build the content_stats StructData in AMT format
+    let content_stats = build_struct_stats(table_schema, &stats_struct, &delta_stats, "");
 
     Ok(Some(content_stats))
-}
-
-/// Builds a StructData in Delta JSON stats format from parsed JSON stats.
-fn build_delta_json_stats(table_schema: &StructType, delta_stats: &DeltaJsonStats) -> StructData {
-    let mut fields = Vec::with_capacity(5);
-    let mut values = Vec::with_capacity(5);
-
-    // numRecords: always present
-    fields.push(StructField::nullable("numRecords", DataType::LONG));
-    values.push(
-        delta_stats
-            .num_records
-            .map(Scalar::Long)
-            .unwrap_or(Scalar::Null(DataType::LONG)),
-    );
-
-    // Build nullCount struct
-    let null_count_data = build_null_count_struct(table_schema, &delta_stats.null_count, "");
-    if let Some((nc_fields, nc_values)) = null_count_data {
-        let nc_schema = StructType::new_unchecked(nc_fields.clone());
-        fields.push(StructField::nullable(
-            "nullCount",
-            DataType::Struct(Box::new(nc_schema)),
-        ));
-        values.push(Scalar::Struct(StructData::new_unchecked(
-            nc_fields, nc_values,
-        )));
-    }
-
-    // Build minValues struct
-    let min_values_data = build_min_max_struct(table_schema, &delta_stats.min_values, "");
-    if let Some((mv_fields, mv_values)) = min_values_data {
-        let mv_schema = StructType::new_unchecked(mv_fields.clone());
-        fields.push(StructField::nullable(
-            "minValues",
-            DataType::Struct(Box::new(mv_schema)),
-        ));
-        values.push(Scalar::Struct(StructData::new_unchecked(
-            mv_fields, mv_values,
-        )));
-    }
-
-    // Build maxValues struct
-    let max_values_data = build_min_max_struct(table_schema, &delta_stats.max_values, "");
-    if let Some((mx_fields, mx_values)) = max_values_data {
-        let mx_schema = StructType::new_unchecked(mx_fields.clone());
-        fields.push(StructField::nullable(
-            "maxValues",
-            DataType::Struct(Box::new(mx_schema)),
-        ));
-        values.push(Scalar::Struct(StructData::new_unchecked(
-            mx_fields, mx_values,
-        )));
-    }
-
-    // tightBounds: always present
-    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
-    values.push(Scalar::Boolean(delta_stats.tight_bounds));
-
-    StructData::new_unchecked(fields, values)
-}
-
-/// Builds the nullCount struct from the table schema and null count values.
-/// Returns (fields, values) tuple to allow creating both schema and StructData.
-fn build_null_count_struct(
-    table_schema: &StructType,
-    null_count: &HashMap<String, i64>,
-    prefix: &str,
-) -> Option<(Vec<StructField>, Vec<Scalar>)> {
-    let mut fields = Vec::new();
-    let mut values = Vec::new();
-
-    for field in table_schema.fields() {
-        let column_name = if prefix.is_empty() {
-            field.name().to_string()
-        } else {
-            format!("{}.{}", prefix, field.name())
-        };
-
-        match field.data_type() {
-            DataType::Struct(inner) => {
-                // Recursively build nested struct
-                if let Some((nested_fields, nested_values)) =
-                    build_null_count_struct(inner, null_count, &column_name)
-                {
-                    let nested_schema = StructType::new_unchecked(nested_fields.clone());
-                    fields.push(StructField::nullable(
-                        field.name(),
-                        DataType::Struct(Box::new(nested_schema)),
-                    ));
-                    values.push(Scalar::Struct(StructData::new_unchecked(
-                        nested_fields,
-                        nested_values,
-                    )));
-                }
-            }
-            DataType::Primitive(_)
-            | DataType::Array(_)
-            | DataType::Map(_)
-            | DataType::Variant(_) => {
-                // All types get a LONG null count
-                fields.push(StructField::nullable(field.name(), DataType::LONG));
-                let value = null_count
-                    .get(&column_name)
-                    .copied()
-                    .map(Scalar::Long)
-                    .unwrap_or(Scalar::Null(DataType::LONG));
-                values.push(value);
-            }
-        }
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some((fields, values))
-    }
-}
-
-/// Builds the minValues or maxValues struct from the table schema and values.
-/// Returns (fields, values) tuple to allow creating both schema and StructData.
-fn build_min_max_struct(
-    table_schema: &StructType,
-    values_map: &HashMap<String, JsonValue>,
-    prefix: &str,
-) -> Option<(Vec<StructField>, Vec<Scalar>)> {
-    let mut fields = Vec::new();
-    let mut values = Vec::new();
-
-    for field in table_schema.fields() {
-        let column_name = if prefix.is_empty() {
-            field.name().to_string()
-        } else {
-            format!("{}.{}", prefix, field.name())
-        };
-
-        match field.data_type() {
-            DataType::Struct(inner) => {
-                // Recursively build nested struct
-                if let Some((nested_fields, nested_values)) =
-                    build_min_max_struct(inner, values_map, &column_name)
-                {
-                    let nested_schema = StructType::new_unchecked(nested_fields.clone());
-                    fields.push(StructField::nullable(
-                        field.name(),
-                        DataType::Struct(Box::new(nested_schema)),
-                    ));
-                    values.push(Scalar::Struct(StructData::new_unchecked(
-                        nested_fields,
-                        nested_values,
-                    )));
-                }
-            }
-            DataType::Primitive(ptype) => {
-                // Only include types eligible for min/max
-                if is_min_max_eligible(ptype) {
-                    fields.push(StructField::nullable(
-                        field.name(),
-                        field.data_type().clone(),
-                    ));
-                    let value = values_map
-                        .get(&column_name)
-                        .and_then(|v| json_value_to_scalar(v, field.data_type()))
-                        .unwrap_or(Scalar::Null(field.data_type().clone()));
-                    values.push(value);
-                }
-            }
-            // Arrays, Maps, and Variants are not eligible for min/max
-            DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {}
-        }
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some((fields, values))
-    }
-}
-
-/// Checks if a primitive type is eligible for min/max data skipping statistics.
-fn is_min_max_eligible(ptype: &PrimitiveType) -> bool {
-    matches!(
-        ptype,
-        PrimitiveType::Byte
-            | PrimitiveType::Short
-            | PrimitiveType::Integer
-            | PrimitiveType::Long
-            | PrimitiveType::Float
-            | PrimitiveType::Double
-            | PrimitiveType::Date
-            | PrimitiveType::Timestamp
-            | PrimitiveType::TimestampNtz
-            | PrimitiveType::String
-            | PrimitiveType::Binary
-            | PrimitiveType::Decimal(_)
-    )
 }
 
 #[cfg(test)]
@@ -1648,14 +1451,15 @@ mod tests {
             .map(|idx| &data.values()[idx])
     }
 
-    /// Helper function to get a nested field value from Delta JSON stats format
-    fn get_nested_value<'a>(
+    /// Helper function to get a column's stats field value in AMT format
+    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound, exact_bounds}}
+    fn get_column_stat<'a>(
         stats: &'a StructData,
-        top_field: &str,
         column: &str,
+        stat_field: &str,
     ) -> Option<&'a Scalar> {
-        if let Some(Scalar::Struct(inner)) = get_struct_field(stats, top_field) {
-            get_struct_field(inner, column)
+        if let Some(Scalar::Struct(col_stats)) = get_struct_field(stats, column) {
+            get_struct_field(col_stats, stat_field)
         } else {
             None
         }
@@ -1680,42 +1484,42 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // Delta JSON format has: numRecords, nullCount, minValues, maxValues, tightBounds
-        assert!(content_stats.fields().len() >= 4); // At least numRecords + 3 structs
+        // AMT format has one field per column: {id: {...}, name: {...}}
+        assert_eq!(content_stats.fields().len(), 2);
 
-        // Check numRecords
+        // Check id column stats (non-nullable LONG, so no null_value_count)
         assert_eq!(
-            get_struct_field(&content_stats, "numRecords"),
+            get_column_stat(&content_stats, "id", "value_count"),
             Some(&Scalar::Long(100))
         );
-
-        // Check nullCount for each column
         assert_eq!(
-            get_nested_value(&content_stats, "nullCount", "id"),
-            Some(&Scalar::Long(0))
-        );
-        assert_eq!(
-            get_nested_value(&content_stats, "nullCount", "name"),
-            Some(&Scalar::Long(5))
-        );
-
-        // Check minValues
-        assert_eq!(
-            get_nested_value(&content_stats, "minValues", "id"),
+            get_column_stat(&content_stats, "id", "lower_bound"),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_nested_value(&content_stats, "minValues", "name"),
-            Some(&Scalar::String("alice".to_string()))
-        );
-
-        // Check maxValues
-        assert_eq!(
-            get_nested_value(&content_stats, "maxValues", "id"),
+            get_column_stat(&content_stats, "id", "upper_bound"),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_nested_value(&content_stats, "maxValues", "name"),
+            get_column_stat(&content_stats, "id", "exact_bounds"),
+            Some(&Scalar::Boolean(true))
+        );
+
+        // Check name column stats (nullable STRING, so has null_value_count)
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "value_count"),
+            Some(&Scalar::Long(100))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "null_value_count"),
+            Some(&Scalar::Long(5))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "lower_bound"),
+            Some(&Scalar::String("alice".to_string()))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "upper_bound"),
             Some(&Scalar::String("zoe".to_string()))
         );
     }
@@ -1754,18 +1558,18 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // Delta JSON format has: numRecords, tightBounds (min/max/null structs not present when empty)
-        assert!(content_stats.fields().len() >= 2);
+        // AMT format has one field per column
+        assert_eq!(content_stats.fields().len(), 1);
 
-        // numRecords should be populated
+        // value_count should be populated from numRecords
         assert_eq!(
-            get_struct_field(&content_stats, "numRecords"),
+            get_column_stat(&content_stats, "id", "value_count"),
             Some(&Scalar::Long(50))
         );
 
-        // tightBounds should default to true
+        // exact_bounds should default to true
         assert_eq!(
-            get_struct_field(&content_stats, "tightBounds"),
+            get_column_stat(&content_stats, "id", "exact_bounds"),
             Some(&Scalar::Boolean(true))
         );
     }
@@ -1791,26 +1595,26 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // Delta JSON format: numRecords, minValues, maxValues, tightBounds
-        assert!(content_stats.fields().len() >= 4);
+        // AMT format: one field per column
+        assert_eq!(content_stats.fields().len(), 5);
 
-        // Verify int_col min/max
+        // Verify int_col lower/upper bounds
         assert_eq!(
-            get_nested_value(&content_stats, "minValues", "int_col"),
+            get_column_stat(&content_stats, "int_col", "lower_bound"),
             Some(&Scalar::Integer(-100))
         );
         assert_eq!(
-            get_nested_value(&content_stats, "maxValues", "int_col"),
+            get_column_stat(&content_stats, "int_col", "upper_bound"),
             Some(&Scalar::Integer(100))
         );
 
-        // Verify double_col min/max
+        // Verify double_col lower/upper bounds
         assert_eq!(
-            get_nested_value(&content_stats, "minValues", "double_col"),
+            get_column_stat(&content_stats, "double_col", "lower_bound"),
             Some(&Scalar::Double(0.5))
         );
         assert_eq!(
-            get_nested_value(&content_stats, "maxValues", "double_col"),
+            get_column_stat(&content_stats, "double_col", "upper_bound"),
             Some(&Scalar::Double(99.9))
         );
     }
@@ -1833,11 +1637,11 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // tightBounds is a top-level field in Delta JSON format
+        // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_struct_field(&content_stats, "tightBounds"),
+            get_column_stat(&content_stats, "value", "exact_bounds"),
             Some(&Scalar::Boolean(true)),
-            "tightBounds should be true"
+            "exact_bounds should be true"
         );
     }
 
@@ -1859,11 +1663,11 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // tightBounds is a top-level field in Delta JSON format
+        // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_struct_field(&content_stats, "tightBounds"),
+            get_column_stat(&content_stats, "value", "exact_bounds"),
             Some(&Scalar::Boolean(false)),
-            "tightBounds should be false"
+            "exact_bounds should be false"
         );
     }
 
@@ -1884,11 +1688,11 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // tightBounds defaults to true when absent
+        // In AMT format, exact_bounds defaults to true when tightBounds is absent
         assert_eq!(
-            get_struct_field(&content_stats, "tightBounds"),
+            get_column_stat(&content_stats, "value", "exact_bounds"),
             Some(&Scalar::Boolean(true)),
-            "tightBounds should default to true when absent"
+            "exact_bounds should default to true when tightBounds is absent"
         );
     }
 
@@ -1910,9 +1714,9 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // Get timestamp from minValues struct
-        let min_ts = get_nested_value(&content_stats, "minValues", "ts")
-            .expect("should have ts in minValues");
+        // Get timestamp from lower_bound in AMT format
+        let min_ts = get_column_stat(&content_stats, "ts", "lower_bound")
+            .expect("should have lower_bound for ts");
 
         // Verify it's a valid timestamp
         match min_ts {
@@ -1947,11 +1751,11 @@ mod tests {
             .expect("should convert stats")
             .expect("should have stats");
 
-        // Get date from minValues and maxValues structs
-        let min_date = get_nested_value(&content_stats, "minValues", "date_col")
-            .expect("should have date_col in minValues");
-        let max_date = get_nested_value(&content_stats, "maxValues", "date_col")
-            .expect("should have date_col in maxValues");
+        // Get date from lower_bound and upper_bound in AMT format
+        let min_date = get_column_stat(&content_stats, "date_col", "lower_bound")
+            .expect("should have lower_bound for date_col");
+        let max_date = get_column_stat(&content_stats, "date_col", "upper_bound")
+            .expect("should have upper_bound for date_col");
 
         // 2023-01-15 is 19372 days since 1970-01-01
         // 2023-12-31 is 19722 days since 1970-01-01
@@ -1959,14 +1763,14 @@ mod tests {
             Scalar::Date(days) => {
                 assert_eq!(*days, 19372, "2023-01-15 should be 19372 days since epoch");
             }
-            other => panic!("Expected Date scalar for minValues, got {:?}", other),
+            other => panic!("Expected Date scalar for lower_bound, got {:?}", other),
         }
 
         match max_date {
             Scalar::Date(days) => {
                 assert_eq!(*days, 19722, "2023-12-31 should be 19722 days since epoch");
             }
-            other => panic!("Expected Date scalar for maxValues, got {:?}", other),
+            other => panic!("Expected Date scalar for upper_bound, got {:?}", other),
         }
     }
 
@@ -2004,48 +1808,43 @@ mod tests {
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // Delta JSON format aggregation:
-        // - numRecords: 100 + 150 = 250
-        // - minValues.id: min(1, 40) = 1
-        // - maxValues.id: max(50, 100) = 100
-        // - minValues.name: min("alice", "bob") = "alice"
-        // - maxValues.name: max("mike", "zoe") = "zoe"
-        // - nullCount.id: 0 + 0 = 0
-        // - nullCount.name: 5 + 10 = 15
+        // AMT format aggregation:
+        // - id.value_count: 100 + 150 = 250
+        // - id.lower_bound: min(1, 40) = 1
+        // - id.upper_bound: max(50, 100) = 100
+        // - name.value_count: 100 + 150 = 250
+        // - name.null_value_count: 5 + 10 = 15
+        // - name.lower_bound: min("alice", "bob") = "alice"
+        // - name.upper_bound: max("mike", "zoe") = "zoe"
 
         assert_eq!(
-            get_struct_field(&aggregated, "numRecords"),
+            get_column_stat(&aggregated, "id", "value_count"),
             Some(&Scalar::Long(250))
         );
-
-        // Check minValues
         assert_eq!(
-            get_nested_value(&aggregated, "minValues", "id"),
+            get_column_stat(&aggregated, "id", "lower_bound"),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_nested_value(&aggregated, "minValues", "name"),
-            Some(&Scalar::String("alice".to_string()))
-        );
-
-        // Check maxValues
-        assert_eq!(
-            get_nested_value(&aggregated, "maxValues", "id"),
+            get_column_stat(&aggregated, "id", "upper_bound"),
             Some(&Scalar::Long(100))
         );
-        assert_eq!(
-            get_nested_value(&aggregated, "maxValues", "name"),
-            Some(&Scalar::String("zoe".to_string()))
-        );
 
-        // Check nullCount
         assert_eq!(
-            get_nested_value(&aggregated, "nullCount", "id"),
-            Some(&Scalar::Long(0))
+            get_column_stat(&aggregated, "name", "value_count"),
+            Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_nested_value(&aggregated, "nullCount", "name"),
+            get_column_stat(&aggregated, "name", "null_value_count"),
             Some(&Scalar::Long(15))
+        );
+        assert_eq!(
+            get_column_stat(&aggregated, "name", "lower_bound"),
+            Some(&Scalar::String("alice".to_string()))
+        );
+        assert_eq!(
+            get_column_stat(&aggregated, "name", "upper_bound"),
+            Some(&Scalar::String("zoe".to_string()))
         );
     }
 
@@ -2070,15 +1869,15 @@ mod tests {
 
         // Should have the same values as the single input
         assert_eq!(
-            get_struct_field(&aggregated, "numRecords"),
+            get_column_stat(&aggregated, "id", "value_count"),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_nested_value(&aggregated, "minValues", "id"),
+            get_column_stat(&aggregated, "id", "lower_bound"),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_nested_value(&aggregated, "maxValues", "id"),
+            get_column_stat(&aggregated, "id", "upper_bound"),
             Some(&Scalar::Long(50))
         );
     }
@@ -2099,7 +1898,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_content_stats_exact_bounds() {
-        // Test that tightBounds is AND'ed across all entries
+        // Test that exact_bounds is AND'ed across all entries
         let table_schema =
             StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
 
@@ -2125,21 +1924,21 @@ mod tests {
             .expect("should convert")
             .expect("should have stats");
 
-        // Aggregate - tightBounds should be false because one input is false
+        // Aggregate - exact_bounds should be false because one input is false
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // tightBounds is a top-level field in Delta JSON format
+        // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_struct_field(&aggregated, "tightBounds"),
+            get_column_stat(&aggregated, "value", "exact_bounds"),
             Some(&Scalar::Boolean(false)),
-            "tightBounds should be false when any input is false"
+            "exact_bounds should be false when any input is false"
         );
     }
 
     #[test]
     fn test_aggregate_content_stats_all_exact_bounds_true() {
-        // Test that tightBounds is true when all inputs are true
+        // Test that exact_bounds is true when all inputs are true
         let table_schema =
             StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
 
@@ -2166,17 +1965,17 @@ mod tests {
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // tightBounds is a top-level field in Delta JSON format
+        // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_struct_field(&aggregated, "tightBounds"),
+            get_column_stat(&aggregated, "value", "exact_bounds"),
             Some(&Scalar::Boolean(true)),
-            "tightBounds should be true when all inputs are true"
+            "exact_bounds should be true when all inputs are true"
         );
     }
 
     #[test]
     fn test_aggregate_content_stats_nested_struct() {
-        // Test aggregation with nested struct columns using Delta JSON format
+        // Test aggregation with nested struct columns using AMT format
         let inner_struct = StructType::new_unchecked([
             field_with_id("nested_id", DataType::LONG, false, 2),
             field_with_id("nested_name", DataType::STRING, true, 3),
@@ -2212,27 +2011,48 @@ mod tests {
         let aggregated = aggregate_content_stats([Some(&stats1), Some(&stats2)].into_iter())
             .expect("should aggregate");
 
-        // Delta JSON format aggregation for nested structs:
-        // numRecords: 100 + 150 = 250
-        assert_eq!(
-            get_struct_field(&aggregated, "numRecords"),
-            Some(&Scalar::Long(250))
-        );
+        // AMT format aggregation for nested structs:
+        // outer.nested_id.value_count: 100 + 150 = 250
+        // outer.nested_id.lower_bound: min(1, 40) = 1
+        // outer.nested_id.upper_bound: max(50, 100) = 100
 
-        // For nested fields, the aggregation preserves the nested structure
-        // minValues: outer.nested_id min(1, 40) = 1
-        // maxValues: outer.nested_id max(50, 100) = 100
-        // Note: The nested stats are stored with dot-notation keys
-        if let Some(Scalar::Struct(min_values)) = get_struct_field(&aggregated, "minValues") {
-            // Check if we have outer.nested_id
-            if let Some(nested_id_val) = get_struct_field(min_values, "outer.nested_id") {
-                assert_eq!(nested_id_val, &Scalar::Long(1));
+        // In AMT format, nested structs preserve the hierarchy
+        // {outer: {nested_id: {value_count, lower_bound, ...}, nested_name: {...}}}
+        if let Some(Scalar::Struct(outer_stats)) = get_struct_field(&aggregated, "outer") {
+            // Check nested_id stats
+            if let Some(Scalar::Struct(nested_id_stats)) =
+                get_struct_field(outer_stats, "nested_id")
+            {
+                assert_eq!(
+                    get_struct_field(nested_id_stats, "value_count"),
+                    Some(&Scalar::Long(250))
+                );
+                assert_eq!(
+                    get_struct_field(nested_id_stats, "lower_bound"),
+                    Some(&Scalar::Long(1))
+                );
+                assert_eq!(
+                    get_struct_field(nested_id_stats, "upper_bound"),
+                    Some(&Scalar::Long(100))
+                );
             }
-        }
 
-        if let Some(Scalar::Struct(max_values)) = get_struct_field(&aggregated, "maxValues") {
-            if let Some(nested_id_val) = get_struct_field(max_values, "outer.nested_id") {
-                assert_eq!(nested_id_val, &Scalar::Long(100));
+            // Check nested_name stats
+            if let Some(Scalar::Struct(nested_name_stats)) =
+                get_struct_field(outer_stats, "nested_name")
+            {
+                assert_eq!(
+                    get_struct_field(nested_name_stats, "null_value_count"),
+                    Some(&Scalar::Long(15))
+                );
+                assert_eq!(
+                    get_struct_field(nested_name_stats, "lower_bound"),
+                    Some(&Scalar::String("alice".to_string()))
+                );
+                assert_eq!(
+                    get_struct_field(nested_name_stats, "upper_bound"),
+                    Some(&Scalar::String("zoe".to_string()))
+                );
             }
         }
     }

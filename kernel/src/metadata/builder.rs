@@ -1251,7 +1251,10 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
                     getters[1].get(i, "partitionValues")?;
                 let size: i64 = getters[2].get(i, "size")?;
                 let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-                let stats: Option<StructData> = getters[4].get_opt(i, "stats")?;
+                // TODO: Stats extraction is disabled because the input stats format (Delta JSON)
+                // differs from the expected output format (AMT). A proper conversion is needed.
+                // For now, content_stats is None and will be populated from JSON stats if available.
+                let stats: Option<StructData> = None;
 
                 self.entries
                     .push((path, partition_values, size, modification_time, stats));
@@ -1812,49 +1815,43 @@ mod tests {
                 .map(|idx| &data.values()[idx])
         }
 
-        // Helper function to get a nested field value
-        fn get_nested_value<'a>(
+        // Helper function to get a column's stats field value in AMT format
+        fn get_column_stat<'a>(
             stats: &'a crate::expressions::StructData,
-            top_field: &str,
             column: &str,
+            stat_field: &str,
         ) -> Option<&'a Scalar> {
-            if let Some(Scalar::Struct(inner)) = get_struct_field(stats, top_field) {
-                get_struct_field(inner, column)
+            if let Some(Scalar::Struct(col_stats)) = get_struct_field(stats, column) {
+                get_struct_field(col_stats, stat_field)
             } else {
                 None
             }
         }
 
-        // Delta JSON format has: numRecords, nullCount, minValues, maxValues, tightBounds
-        assert!(content_stats.fields().len() >= 4);
+        // AMT format has one field per column: {id: {...}, name: {...}}
+        assert_eq!(content_stats.fields().len(), 2);
 
-        // Check numRecords
+        // Check id stats
         assert_eq!(
-            get_struct_field(&content_stats, "numRecords"),
+            get_column_stat(&content_stats, "id", "value_count"),
             Some(&Scalar::Long(100))
         );
-
-        // Check minValues for 'id'
         assert_eq!(
-            get_nested_value(&content_stats, "minValues", "id"),
+            get_column_stat(&content_stats, "id", "lower_bound"),
             Some(&Scalar::Long(1))
         );
-
-        // Check maxValues for 'id'
         assert_eq!(
-            get_nested_value(&content_stats, "maxValues", "id"),
+            get_column_stat(&content_stats, "id", "upper_bound"),
             Some(&Scalar::Long(100))
         );
 
-        // Check nullCount for 'name'
+        // Check name stats
         assert_eq!(
-            get_nested_value(&content_stats, "nullCount", "name"),
+            get_column_stat(&content_stats, "name", "null_value_count"),
             Some(&Scalar::Long(5))
         );
-
-        // Check minValues for 'name'
         assert_eq!(
-            get_nested_value(&content_stats, "minValues", "name"),
+            get_column_stat(&content_stats, "name", "lower_bound"),
             Some(&Scalar::String("alice".to_string()))
         );
 
@@ -1902,19 +1899,19 @@ mod tests {
         // Verify the builder has the entry
         assert_eq!(builder.pending_entries.len(), 1);
 
-        // With test_table_schema (one "id" column), content_stats should have Delta JSON format
-        // with fields: numRecords, tightBounds (and possibly nullCount/minValues/maxValues if present)
+        // With test_table_schema (one "id" column), content_stats should have AMT format
+        // with fields: {id: {value_count, ...}}
         let content_stats = &builder.pending_entries[0].content_stats;
         if let Some(stats) = content_stats {
-            // Delta JSON format has at least numRecords and tightBounds
+            // AMT format has one field per column
             assert!(
-                stats.fields().len() >= 2,
-                "Delta JSON stats should have at least numRecords and tightBounds, got {} fields",
+                !stats.fields().is_empty(),
+                "AMT stats should have at least one column stats field, got {} fields",
                 stats.fields().len()
             );
-            // Check that numRecords is present
-            let has_num_records = stats.fields().iter().any(|f| f.name() == "numRecords");
-            assert!(has_num_records, "should have numRecords field");
+            // Check that id column stats are present
+            let has_id = stats.fields().iter().any(|f| f.name() == "id");
+            assert!(has_id, "should have id column stats field");
         }
         // content_stats can also be None if stats JSON parsing returned None
 
@@ -2031,49 +2028,47 @@ mod tests {
                 .map(|idx| &data.values()[idx])
         }
 
-        // Helper function to get a nested field value
-        fn get_nested_value<'a>(
+        // Helper function to get a column's stats field value in AMT format
+        fn get_column_stat<'a>(
             stats: &'a crate::expressions::StructData,
-            top_field: &str,
             column: &str,
+            stat_field: &str,
         ) -> Option<&'a Scalar> {
-            if let Some(Scalar::Struct(inner)) = get_struct_field(stats, top_field) {
-                get_struct_field(inner, column)
+            if let Some(Scalar::Struct(col_stats)) = get_struct_field(stats, column) {
+                get_struct_field(col_stats, stat_field)
             } else {
                 None
             }
         }
 
-        // Verify the aggregated stats are in Delta JSON format
-        assert!(aggregated_stats.fields().len() >= 4); // numRecords, minValues, maxValues, nullCount, tightBounds
+        // Verify the aggregated stats are in AMT format: {id: {...}, name: {...}}
+        assert_eq!(aggregated_stats.fields().len(), 2);
 
-        // Check numRecords: 100 + 150 = 250
+        // Check id stats: value_count=250, lower_bound=1, upper_bound=100
         assert_eq!(
-            get_struct_field(aggregated_stats, "numRecords"),
+            get_column_stat(aggregated_stats, "id", "value_count"),
             Some(&Scalar::Long(250))
         );
-
-        // Check id stats: min=1, max=100
         assert_eq!(
-            get_nested_value(aggregated_stats, "minValues", "id"),
+            get_column_stat(aggregated_stats, "id", "lower_bound"),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_nested_value(aggregated_stats, "maxValues", "id"),
+            get_column_stat(aggregated_stats, "id", "upper_bound"),
             Some(&Scalar::Long(100))
         );
 
-        // Check name stats: nullCount=15, min="alice", max="zoe"
+        // Check name stats: null_value_count=15, lower_bound="alice", upper_bound="zoe"
         assert_eq!(
-            get_nested_value(aggregated_stats, "nullCount", "name"),
+            get_column_stat(aggregated_stats, "name", "null_value_count"),
             Some(&Scalar::Long(15)) // 5 + 10
         );
         assert_eq!(
-            get_nested_value(aggregated_stats, "minValues", "name"),
+            get_column_stat(aggregated_stats, "name", "lower_bound"),
             Some(&Scalar::String("alice".to_string()))
         );
         assert_eq!(
-            get_nested_value(aggregated_stats, "maxValues", "name"),
+            get_column_stat(aggregated_stats, "name", "upper_bound"),
             Some(&Scalar::String("zoe".to_string()))
         );
 

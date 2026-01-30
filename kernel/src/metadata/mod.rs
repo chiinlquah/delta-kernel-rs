@@ -17,9 +17,7 @@ use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{
-    derive_macro_utils::ToDataType, DataType, PrimitiveType, StructField, StructType,
-};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
     SnapshotRef, Version,
@@ -2374,9 +2372,9 @@ impl MetadataEntry {
     ) -> DeltaResult<StructType> {
         use crate::schema::derive_macro_utils::GetStructField as _;
 
-        // Generate Delta JSON stats schema format:
-        // {numRecords: LONG, nullCount: {col: LONG, ...}, minValues: {col: <type>, ...}, maxValues: {col: <type>, ...}, tightBounds: BOOLEAN}
-        let stats_struct = delta_json_stats_schema(table_schema);
+        // Generate AMT-style stats schema format:
+        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
+        let stats_struct = stats::stats_schema(table_schema)?;
 
         Ok(StructType::new_unchecked([
             DataContentType::get_struct_field("contentType"),
@@ -2389,7 +2387,7 @@ impl MetadataEntry {
             Option::<i64>::get_struct_field("sortOrderId"),
             i64::get_struct_field("recordCount"),
             Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats - dynamic based on table schema (Delta JSON stats format)
+            // content_stats - dynamic based on table schema (AMT stats format)
             StructField::new(
                 "contentStats",
                 DataType::Struct(Box::new(stats_struct)),
@@ -2402,127 +2400,6 @@ impl MetadataEntry {
             // equality_ids intentionally excluded - not used by Delta today
         ]))
     }
-}
-
-/// Generates a stats schema in Delta JSON format based on the table schema.
-///
-/// This produces the same format as `expected_stats_schema` from `scan/data_skipping/stats_schema.rs`
-/// but without needing TableProperties - it includes all columns.
-///
-/// Format: {numRecords: LONG, nullCount: {...}, minValues: {...}, maxValues: {...}, tightBounds: BOOLEAN}
-fn delta_json_stats_schema(table_schema: &StructType) -> StructType {
-    let mut fields = Vec::with_capacity(5);
-
-    // numRecords: always present
-    fields.push(StructField::nullable("numRecords", DataType::LONG));
-
-    // Generate nullable schema for nullCount (all leaf fields as LONG)
-    let null_count_schema = null_count_stats_schema(table_schema);
-    if null_count_schema.fields().next().is_some() {
-        fields.push(StructField::nullable(
-            "nullCount",
-            DataType::Struct(Box::new(null_count_schema)),
-        ));
-    }
-
-    // Generate schema for minValues/maxValues (only eligible types)
-    let min_max_schema = min_max_stats_schema(table_schema);
-    if min_max_schema.fields().next().is_some() {
-        fields.push(StructField::nullable(
-            "minValues",
-            DataType::Struct(Box::new(min_max_schema.clone())),
-        ));
-        fields.push(StructField::nullable(
-            "maxValues",
-            DataType::Struct(Box::new(min_max_schema)),
-        ));
-    }
-
-    // tightBounds: always present
-    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
-
-    StructType::new_unchecked(fields)
-}
-
-/// Generates null count stats schema where all leaf primitive fields become LONG type.
-fn null_count_stats_schema(table_schema: &StructType) -> StructType {
-    let fields: Vec<StructField> = table_schema.fields().filter_map(null_count_field).collect();
-    StructType::new_unchecked(fields)
-}
-
-fn null_count_field(field: &StructField) -> Option<StructField> {
-    match &field.data_type {
-        DataType::Primitive(_) => {
-            // All primitive fields become nullable LONG for null counts
-            Some(StructField::nullable(field.name(), DataType::LONG))
-        }
-        DataType::Struct(inner) => {
-            let inner_schema = null_count_stats_schema(inner);
-            if inner_schema.fields().next().is_none() {
-                None
-            } else {
-                Some(StructField::nullable(
-                    field.name(),
-                    DataType::Struct(Box::new(inner_schema)),
-                ))
-            }
-        }
-        DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {
-            // These types get a single LONG for their null count
-            Some(StructField::nullable(field.name(), DataType::LONG))
-        }
-    }
-}
-
-/// Generates min/max stats schema with only data-skipping eligible types.
-fn min_max_stats_schema(table_schema: &StructType) -> StructType {
-    let fields: Vec<StructField> = table_schema.fields().filter_map(min_max_field).collect();
-    StructType::new_unchecked(fields)
-}
-
-fn min_max_field(field: &StructField) -> Option<StructField> {
-    match &field.data_type {
-        DataType::Primitive(ptype) => {
-            // Only include types eligible for min/max stats
-            if is_min_max_eligible(ptype) {
-                Some(StructField::nullable(field.name(), field.data_type.clone()))
-            } else {
-                None
-            }
-        }
-        DataType::Struct(inner) => {
-            let inner_schema = min_max_stats_schema(inner);
-            if inner_schema.fields().next().is_none() {
-                None
-            } else {
-                Some(StructField::nullable(
-                    field.name(),
-                    DataType::Struct(Box::new(inner_schema)),
-                ))
-            }
-        }
-        // Arrays, Maps, and Variants are not eligible for min/max
-        DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => None,
-    }
-}
-
-/// Checks if a primitive type is eligible for min/max data skipping statistics.
-fn is_min_max_eligible(ptype: &PrimitiveType) -> bool {
-    matches!(
-        ptype,
-        PrimitiveType::Byte
-            | PrimitiveType::Short
-            | PrimitiveType::Integer
-            | PrimitiveType::Long
-            | PrimitiveType::Float
-            | PrimitiveType::Double
-            | PrimitiveType::Date
-            | PrimitiveType::Timestamp
-            | PrimitiveType::TimestampNtz
-            | PrimitiveType::String
-            | PrimitiveType::Binary
-            | PrimitiveType::Decimal(_)
-    )
 }
 
 impl crate::IntoEngineData for MetadataEntry {
@@ -2738,13 +2615,26 @@ mod tests {
 
     #[test]
     fn test_to_schema_with_content_stats() -> DeltaResult<()> {
-        use crate::schema::StructType;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
 
-        // Create a simple table schema with a few fields
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
+        // Create a simple table schema with field IDs (required for AMT stats schema)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("value", DataType::DOUBLE, true),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+            field_with_id("value", DataType::DOUBLE, true, 3),
         ]);
 
         // Generate schema with content_stats
@@ -2759,151 +2649,168 @@ mod tests {
             .expect("contentStats field should exist");
         assert!(content_stats_field.nullable);
 
-        // Verify contentStats is a struct with Delta JSON stats format:
-        // {numRecords, nullCount, minValues, maxValues, tightBounds}
+        // Verify contentStats is a struct with AMT stats format:
+        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected contentStats to be a struct"),
         };
 
-        // Should have 5 fields: numRecords, nullCount, minValues, maxValues, tightBounds
-        assert_eq!(content_stats_struct.fields().count(), 5);
-        assert!(content_stats_struct.field("numRecords").is_some());
-        assert!(content_stats_struct.field("nullCount").is_some());
-        assert!(content_stats_struct.field("minValues").is_some());
-        assert!(content_stats_struct.field("maxValues").is_some());
-        assert!(content_stats_struct.field("tightBounds").is_some());
+        // Should have 3 fields: id, name, value (one per column)
+        assert_eq!(content_stats_struct.fields().count(), 3);
+        assert!(content_stats_struct.field("id").is_some());
+        assert!(content_stats_struct.field("name").is_some());
+        assert!(content_stats_struct.field("value").is_some());
 
-        // Verify numRecords is LONG
-        let num_records_field = content_stats_struct.field("numRecords").unwrap();
-        assert_eq!(num_records_field.data_type(), &DataType::LONG);
-
-        // Verify nullCount struct has fields for each column (all LONG)
-        let null_count_struct = match content_stats_struct.field("nullCount").unwrap().data_type() {
+        // Verify each column has a stats struct
+        // id: non-nullable INTEGER -> {value_count, lower_bound, upper_bound, exact_bounds}
+        let id_stats = match content_stats_struct.field("id").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected nullCount to be a struct"),
+            _ => panic!("Expected id stats to be a struct"),
         };
-        assert_eq!(null_count_struct.fields().count(), 3);
+        assert!(id_stats.field("value_count").is_some());
+        assert!(id_stats.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(id_stats.field("lower_bound").is_some());
+        assert!(id_stats.field("upper_bound").is_some());
+        assert!(id_stats.field("exact_bounds").is_some());
         assert_eq!(
-            null_count_struct.field("id").unwrap().data_type(),
-            &DataType::LONG
-        );
-        assert_eq!(
-            null_count_struct.field("name").unwrap().data_type(),
-            &DataType::LONG
-        );
-        assert_eq!(
-            null_count_struct.field("value").unwrap().data_type(),
-            &DataType::LONG
-        );
-
-        // Verify minValues struct has fields for eligible columns (original types)
-        let min_values_struct = match content_stats_struct.field("minValues").unwrap().data_type() {
-            DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected minValues to be a struct"),
-        };
-        assert_eq!(min_values_struct.fields().count(), 3);
-        assert_eq!(
-            min_values_struct.field("id").unwrap().data_type(),
+            id_stats.field("lower_bound").unwrap().data_type(),
             &DataType::INTEGER
         );
+
+        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("Expected name stats to be a struct"),
+        };
+        assert!(name_stats.field("value_count").is_some());
+        assert!(name_stats.field("null_value_count").is_some()); // nullable
+        assert!(name_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("max_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("lower_bound").is_some());
+        assert!(name_stats.field("upper_bound").is_some());
+        assert!(name_stats.field("exact_bounds").is_some());
         assert_eq!(
-            min_values_struct.field("name").unwrap().data_type(),
+            name_stats.field("lower_bound").unwrap().data_type(),
             &DataType::STRING
         );
+
+        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("Expected value stats to be a struct"),
+        };
+        assert!(value_stats.field("value_count").is_some());
+        assert!(value_stats.field("null_value_count").is_some()); // nullable
+        assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
+        assert!(value_stats.field("lower_bound").is_some());
+        assert!(value_stats.field("upper_bound").is_some());
+        assert!(value_stats.field("exact_bounds").is_some());
         assert_eq!(
-            min_values_struct.field("value").unwrap().data_type(),
+            value_stats.field("lower_bound").unwrap().data_type(),
             &DataType::DOUBLE
         );
-
-        // Verify tightBounds is BOOLEAN
-        let tight_bounds_field = content_stats_struct.field("tightBounds").unwrap();
-        assert_eq!(tight_bounds_field.data_type(), &DataType::BOOLEAN);
 
         Ok(())
     }
 
     #[test]
     fn test_into_engine_data_with_content_stats() -> DeltaResult<()> {
-        use crate::schema::StructType;
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
         use crate::IntoEngineData;
+
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
 
         let engine = SyncEngine::new();
 
-        // Create a simple table schema
+        // Create a simple table schema with field IDs
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("value", DataType::DOUBLE, true),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("value", DataType::DOUBLE, true, 2),
         ]);
 
         // Generate the schema with content_stats
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats in Delta JSON format:
-        // {numRecords, nullCount: {id, value}, minValues: {id, value}, maxValues: {id, value}, tightBounds}
+        // Create content_stats in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
 
-        // Build nullCount struct
-        let null_count = StructData::try_new(
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
+        let id_stats = StructData::try_new(
             vec![
-                StructField::nullable("id", DataType::LONG),
-                StructField::nullable("value", DataType::LONG),
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::INTEGER),
+                StructField::nullable("upper_bound", DataType::INTEGER),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
             ],
-            vec![Scalar::Long(0), Scalar::Long(5)],
+            vec![
+                Scalar::Long(100),
+                Scalar::Integer(1),
+                Scalar::Integer(1000),
+                Scalar::Boolean(true),
+            ],
         )?;
 
-        // Build minValues struct
-        let min_values = StructData::try_new(
+        // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
+        let value_stats = StructData::try_new(
             vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("value", DataType::DOUBLE),
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("null_value_count", DataType::LONG),
+                StructField::nullable("nan_value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::DOUBLE),
+                StructField::nullable("upper_bound", DataType::DOUBLE),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
             ],
-            vec![Scalar::Integer(1), Scalar::Double(0.0)],
-        )?;
-
-        // Build maxValues struct
-        let max_values = StructData::try_new(
             vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("value", DataType::DOUBLE),
+                Scalar::Long(100),
+                Scalar::Long(5),
+                Scalar::Long(0),
+                Scalar::Double(0.0),
+                Scalar::Double(100.0),
+                Scalar::Boolean(true),
             ],
-            vec![Scalar::Integer(1000), Scalar::Double(100.0)],
         )?;
 
         // Build the content_stats struct
         let content_stats = StructData::try_new(
             vec![
-                StructField::nullable("numRecords", DataType::LONG),
                 StructField::nullable(
-                    "nullCount",
+                    "id",
                     DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("id", DataType::LONG),
-                        StructField::nullable("value", DataType::LONG),
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::INTEGER),
+                        StructField::nullable("upper_bound", DataType::INTEGER),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
                     ]))),
                 ),
                 StructField::nullable(
-                    "minValues",
+                    "value",
                     DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("id", DataType::INTEGER),
-                        StructField::nullable("value", DataType::DOUBLE),
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("null_value_count", DataType::LONG),
+                        StructField::nullable("nan_value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::DOUBLE),
+                        StructField::nullable("upper_bound", DataType::DOUBLE),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
                     ]))),
                 ),
-                StructField::nullable(
-                    "maxValues",
-                    DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("id", DataType::INTEGER),
-                        StructField::nullable("value", DataType::DOUBLE),
-                    ]))),
-                ),
-                StructField::nullable("tightBounds", DataType::BOOLEAN),
             ],
-            vec![
-                Scalar::Long(100),
-                Scalar::Struct(null_count),
-                Scalar::Struct(min_values),
-                Scalar::Struct(max_values),
-                Scalar::Boolean(true),
-            ],
+            vec![Scalar::Struct(id_stats), Scalar::Struct(value_stats)],
         )?;
 
         // Create a MetadataEntry with content_stats
@@ -3054,68 +2961,64 @@ mod tests {
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats data in Delta JSON format:
-        // {numRecords: LONG, nullCount: {id: LONG, name: LONG}, minValues: {id: INT, name: STRING},
-        //  maxValues: {id: INT, name: STRING}, tightBounds: BOOLEAN}
+        // Create content_stats data in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
 
-        // Build nullCount struct: {id: LONG, name: LONG}
-        let null_count_fields = vec![
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("name", DataType::LONG),
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count)
+        let id_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::INTEGER),
+            StructField::nullable("upper_bound", DataType::INTEGER),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
         ];
-        let null_count = StructData::try_new(
-            null_count_fields.clone(),
-            vec![Scalar::Long(0), Scalar::Long(10)],
+        let id_stats = StructData::try_new(
+            id_stats_fields.clone(),
+            vec![
+                Scalar::Long(500),
+                Scalar::Integer(1),
+                Scalar::Integer(500),
+                Scalar::Boolean(true),
+            ],
         )?;
 
-        // Build minValues struct: {id: INT, name: STRING}
-        let min_values_fields = vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
+        // Build name stats struct (nullable STRING, so has null_value_count and size stats)
+        let name_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("null_value_count", DataType::LONG),
+            StructField::nullable("avg_value_size", DataType::LONG),
+            StructField::nullable("max_value_size", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::STRING),
+            StructField::nullable("upper_bound", DataType::STRING),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
         ];
-        let min_values = StructData::try_new(
-            min_values_fields.clone(),
-            vec![Scalar::Integer(1), Scalar::String("aardvark".to_string())],
+        let name_stats = StructData::try_new(
+            name_stats_fields.clone(),
+            vec![
+                Scalar::Long(500),
+                Scalar::Long(10),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
+                Scalar::String("aardvark".to_string()),
+                Scalar::String("zebra".to_string()),
+                Scalar::Boolean(true),
+            ],
         )?;
 
-        // Build maxValues struct: {id: INT, name: STRING}
-        let max_values_fields = vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ];
-        let max_values = StructData::try_new(
-            max_values_fields,
-            vec![Scalar::Integer(500), Scalar::String("zebra".to_string())],
-        )?;
-
-        // Build the content_stats struct in Delta JSON format
+        // Build the content_stats struct in AMT format
         let content_stats_fields = vec![
-            StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable(
-                "nullCount",
-                DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
+                "id",
+                DataType::Struct(Box::new(StructType::new_unchecked(id_stats_fields))),
             ),
             StructField::nullable(
-                "minValues",
-                DataType::Struct(Box::new(StructType::new_unchecked(
-                    min_values_fields.clone(),
-                ))),
+                "name",
+                DataType::Struct(Box::new(StructType::new_unchecked(name_stats_fields))),
             ),
-            StructField::nullable(
-                "maxValues",
-                DataType::Struct(Box::new(StructType::new_unchecked(min_values_fields))),
-            ),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ];
         let content_stats = StructData::try_new(
             content_stats_fields,
-            vec![
-                Scalar::Long(500), // numRecords
-                Scalar::Struct(null_count),
-                Scalar::Struct(min_values),
-                Scalar::Struct(max_values),
-                Scalar::Boolean(true), // tightBounds
-            ],
+            vec![Scalar::Struct(id_stats), Scalar::Struct(name_stats)],
         )?;
 
         // Create a MetadataEntry with content_stats
