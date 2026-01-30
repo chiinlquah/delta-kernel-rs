@@ -1801,78 +1801,62 @@ mod tests {
         let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?
             .expect("content_stats should be populated");
 
-        // Verify the structure has stats for both columns
-        assert_eq!(content_stats.fields().len(), 2);
-
-        // Check 'id' stats
-        let id_field_idx = content_stats
-            .fields()
-            .iter()
-            .position(|f| f.name() == "id")
-            .expect("id field should exist");
-
-        if let Scalar::Struct(id_stats) = &content_stats.values()[id_field_idx] {
-            // Find and verify value_count
-            let value_count_idx = id_stats
-                .fields()
+        // Helper function to get a field's value from a StructData by field name
+        fn get_struct_field<'a>(
+            data: &'a crate::expressions::StructData,
+            name: &str,
+        ) -> Option<&'a Scalar> {
+            data.fields()
                 .iter()
-                .position(|f| f.name() == "value_count");
-            if let Some(idx) = value_count_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
-            }
-
-            // Find and verify lower_bound
-            let lower_bound_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound");
-            if let Some(idx) = lower_bound_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(1));
-            }
-
-            // Find and verify upper_bound
-            let upper_bound_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound");
-            if let Some(idx) = upper_bound_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
-            }
-        } else {
-            panic!("Expected id stats to be a Struct");
+                .position(|f| f.name() == name)
+                .map(|idx| &data.values()[idx])
         }
 
-        // Check 'name' stats
-        let name_field_idx = content_stats
-            .fields()
-            .iter()
-            .position(|f| f.name() == "name")
-            .expect("name field should exist");
-
-        if let Scalar::Struct(name_stats) = &content_stats.values()[name_field_idx] {
-            // Find and verify null_value_count
-            let null_count_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "null_value_count");
-            if let Some(idx) = null_count_idx {
-                assert_eq!(name_stats.values()[idx], Scalar::Long(5));
+        // Helper function to get a nested field value
+        fn get_nested_value<'a>(
+            stats: &'a crate::expressions::StructData,
+            top_field: &str,
+            column: &str,
+        ) -> Option<&'a Scalar> {
+            if let Some(Scalar::Struct(inner)) = get_struct_field(stats, top_field) {
+                get_struct_field(inner, column)
+            } else {
+                None
             }
-
-            // Find and verify lower_bound
-            let lower_bound_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound");
-            if let Some(idx) = lower_bound_idx {
-                assert_eq!(
-                    name_stats.values()[idx],
-                    Scalar::String("alice".to_string())
-                );
-            }
-        } else {
-            panic!("Expected name stats to be a Struct");
         }
+
+        // Delta JSON format has: numRecords, nullCount, minValues, maxValues, tightBounds
+        assert!(content_stats.fields().len() >= 4);
+
+        // Check numRecords
+        assert_eq!(
+            get_struct_field(&content_stats, "numRecords"),
+            Some(&Scalar::Long(100))
+        );
+
+        // Check minValues for 'id'
+        assert_eq!(
+            get_nested_value(&content_stats, "minValues", "id"),
+            Some(&Scalar::Long(1))
+        );
+
+        // Check maxValues for 'id'
+        assert_eq!(
+            get_nested_value(&content_stats, "maxValues", "id"),
+            Some(&Scalar::Long(100))
+        );
+
+        // Check nullCount for 'name'
+        assert_eq!(
+            get_nested_value(&content_stats, "nullCount", "name"),
+            Some(&Scalar::Long(5))
+        );
+
+        // Check minValues for 'name'
+        assert_eq!(
+            get_nested_value(&content_stats, "minValues", "name"),
+            Some(&Scalar::String("alice".to_string()))
+        );
 
         // Verify the builder has the entry with content_stats populated
         // Note: When serialized to EngineData and read back, content_stats is not preserved
@@ -1918,16 +1902,19 @@ mod tests {
         // Verify the builder has the entry
         assert_eq!(builder.pending_entries.len(), 1);
 
-        // With test_table_schema (one "id" column), content_stats should have one field for "id"
-        // but since the JSON stats don't contain min/max for "id", only value_count will be set
+        // With test_table_schema (one "id" column), content_stats should have Delta JSON format
+        // with fields: numRecords, tightBounds (and possibly nullCount/minValues/maxValues if present)
         let content_stats = &builder.pending_entries[0].content_stats;
         if let Some(stats) = content_stats {
-            // Should have one field for the "id" column
-            assert_eq!(
-                stats.fields().len(),
-                1,
-                "test schema with one column should produce content_stats with one field"
+            // Delta JSON format has at least numRecords and tightBounds
+            assert!(
+                stats.fields().len() >= 2,
+                "Delta JSON stats should have at least numRecords and tightBounds, got {} fields",
+                stats.fields().len()
             );
+            // Check that numRecords is present
+            let has_num_records = stats.fields().iter().any(|f| f.name() == "numRecords");
+            assert!(has_num_records, "should have numRecords field");
         }
         // content_stats can also be None if stats JSON parsing returned None
 
@@ -2033,64 +2020,62 @@ mod tests {
 
         let aggregated_stats = leaf_manifest_entry.content_stats.as_ref().unwrap();
 
-        // Verify the aggregated stats
-        assert_eq!(aggregated_stats.fields().len(), 2);
-
-        // Check id stats: value_count=250, lower=1, upper=100
-        if let Scalar::Struct(id_stats) = &aggregated_stats.values()[0] {
-            let value_count_idx = id_stats
-                .fields()
+        // Helper function to get a field's value from a StructData by field name
+        fn get_struct_field<'a>(
+            data: &'a crate::expressions::StructData,
+            name: &str,
+        ) -> Option<&'a Scalar> {
+            data.fields()
                 .iter()
-                .position(|f| f.name() == "value_count")
-                .expect("should have value_count");
-            let lower_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound")
-                .expect("should have lower_bound");
-            let upper_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound")
-                .expect("should have upper_bound");
-
-            assert_eq!(id_stats.values()[value_count_idx], Scalar::Long(250));
-            assert_eq!(id_stats.values()[lower_idx], Scalar::Long(1));
-            assert_eq!(id_stats.values()[upper_idx], Scalar::Long(100));
-        } else {
-            panic!("Expected id stats to be a Struct");
+                .position(|f| f.name() == name)
+                .map(|idx| &data.values()[idx])
         }
 
-        // Check name stats: null_value_count=15, lower="alice", upper="zoe"
-        if let Scalar::Struct(name_stats) = &aggregated_stats.values()[1] {
-            let null_count_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "null_value_count")
-                .expect("should have null_value_count");
-            let lower_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound")
-                .expect("should have lower_bound");
-            let upper_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound")
-                .expect("should have upper_bound");
-
-            assert_eq!(name_stats.values()[null_count_idx], Scalar::Long(15)); // 5 + 10
-            assert_eq!(
-                name_stats.values()[lower_idx],
-                Scalar::String("alice".to_string())
-            );
-            assert_eq!(
-                name_stats.values()[upper_idx],
-                Scalar::String("zoe".to_string())
-            );
-        } else {
-            panic!("Expected name stats to be a Struct");
+        // Helper function to get a nested field value
+        fn get_nested_value<'a>(
+            stats: &'a crate::expressions::StructData,
+            top_field: &str,
+            column: &str,
+        ) -> Option<&'a Scalar> {
+            if let Some(Scalar::Struct(inner)) = get_struct_field(stats, top_field) {
+                get_struct_field(inner, column)
+            } else {
+                None
+            }
         }
+
+        // Verify the aggregated stats are in Delta JSON format
+        assert!(aggregated_stats.fields().len() >= 4); // numRecords, minValues, maxValues, nullCount, tightBounds
+
+        // Check numRecords: 100 + 150 = 250
+        assert_eq!(
+            get_struct_field(aggregated_stats, "numRecords"),
+            Some(&Scalar::Long(250))
+        );
+
+        // Check id stats: min=1, max=100
+        assert_eq!(
+            get_nested_value(aggregated_stats, "minValues", "id"),
+            Some(&Scalar::Long(1))
+        );
+        assert_eq!(
+            get_nested_value(aggregated_stats, "maxValues", "id"),
+            Some(&Scalar::Long(100))
+        );
+
+        // Check name stats: nullCount=15, min="alice", max="zoe"
+        assert_eq!(
+            get_nested_value(aggregated_stats, "nullCount", "name"),
+            Some(&Scalar::Long(15)) // 5 + 10
+        );
+        assert_eq!(
+            get_nested_value(aggregated_stats, "minValues", "name"),
+            Some(&Scalar::String("alice".to_string()))
+        );
+        assert_eq!(
+            get_nested_value(aggregated_stats, "maxValues", "name"),
+            Some(&Scalar::String("zoe".to_string()))
+        );
 
         Ok(())
     }
