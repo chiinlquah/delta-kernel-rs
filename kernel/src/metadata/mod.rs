@@ -223,34 +223,20 @@ enum AddRemove {
     Remove(Remove),
 }
 
-/// A manifest entry paired with an optional manifest deletion vector that applies to it.
+/// A manifest entry wrapper.
 ///
-/// According to the Iceberg Single File Commits spec, manifest deletion vectors (ManifestDV)
+/// According to the Iceberg Single File Commits spec, manifest deletion vectors
 /// can filter out entries from a manifest by ordinal position without rewriting the manifest file.
 #[derive(Debug, Clone)]
 pub(crate) struct FilteredManifest {
     /// The manifest entry (can be DataManifest or DeleteManifest)
     pub(crate) manifest: MetadataEntry,
-    /// Optional manifest deletion vector that applies to entries in this manifest
-    /// If present, contains either inline deletion vector data or a reference to a puffin file
-    pub(crate) manifest_dv: Option<MetadataEntry>,
 }
 
 impl FilteredManifest {
-    /// Creates a new FilteredManifest with no deletion vector
+    /// Creates a new FilteredManifest
     pub(crate) fn new(manifest: MetadataEntry) -> Self {
-        Self {
-            manifest,
-            manifest_dv: None,
-        }
-    }
-
-    /// Creates a new FilteredManifest with a deletion vector
-    pub(crate) fn with_dv(manifest: MetadataEntry, manifest_dv: MetadataEntry) -> Self {
-        Self {
-            manifest,
-            manifest_dv: Some(manifest_dv),
-        }
+        Self { manifest }
     }
 }
 
@@ -632,7 +618,6 @@ impl Metadata {
         // Separate entries by type
         let mut data_manifest_entries = Vec::new();
         let mut delete_manifest_entries = Vec::new();
-        let mut manifest_dv_entries = Vec::new();
         let mut position_delete_entries = Vec::new();
         let mut data_file_entries = Vec::new();
 
@@ -640,7 +625,6 @@ impl Metadata {
             match entry.content_type {
                 DataContentType::DataManifest => data_manifest_entries.push(entry),
                 DataContentType::DeleteManifest => delete_manifest_entries.push(entry),
-                DataContentType::ManifestDV => manifest_dv_entries.push(entry),
                 DataContentType::PositionDeletes => position_delete_entries.push(entry),
                 DataContentType::Data => data_file_entries.push(entry),
                 DataContentType::EqualityDeletes => {
@@ -654,35 +638,6 @@ impl Metadata {
             .iter()
             .filter_map(|entry| entry.location.clone())
             .collect();
-
-        // Build a map of manifest DVs by their referenced manifest file
-        // Key: referenced_file path (the manifest being filtered)
-        // Value: The ManifestDV entry
-        let mut manifest_dv_map: HashMap<String, MetadataEntry> = HashMap::new();
-        for manifest_dv_entry in manifest_dv_entries {
-            if let Some(ref referenced_file) = manifest_dv_entry.referenced_file {
-                // If multiple DVs reference the same manifest, keep the one with highest sequence number
-                let sequence_number = manifest_dv_entry
-                    .tracking_info
-                    .as_ref()
-                    .and_then(|ti| ti.sequence_number)
-                    .unwrap_or(0);
-
-                manifest_dv_map
-                    .entry(referenced_file.clone())
-                    .and_modify(|existing| {
-                        let existing_seq = existing
-                            .tracking_info
-                            .as_ref()
-                            .and_then(|ti| ti.sequence_number)
-                            .unwrap_or(0);
-                        if sequence_number > existing_seq {
-                            *existing = manifest_dv_entry.clone();
-                        }
-                    })
-                    .or_insert(manifest_dv_entry);
-            }
-        }
 
         // Build a map of unmatched deletion vectors (DVs that reference files not in root)
         // These need to be passed through to child manifests
@@ -738,21 +693,10 @@ impl Metadata {
             }
         }
 
-        // Convert unaffiliated deletes to FilteredManifest, pairing with DVs from the map
+        // Convert unaffiliated deletes to FilteredManifest
         let unaffiliated_dv_manifests: Vec<FilteredManifest> = unaffiliated_deletes
             .into_iter()
-            .map(|manifest_entry| {
-                let manifest_dv = manifest_entry
-                    .location
-                    .as_ref()
-                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
-
-                if let Some(dv) = manifest_dv {
-                    FilteredManifest::with_dv(manifest_entry, dv)
-                } else {
-                    FilteredManifest::new(manifest_entry)
-                }
-            })
+            .map(FilteredManifest::new)
             .collect();
 
         // Apply manifest-level data skipping if a predicate is provided
@@ -768,32 +712,17 @@ impl Metadata {
                     .clone()
                     .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
-                // Check if there's a manifest DV for this data manifest
-                let data_manifest_dv = manifest_dv_map.get(&location).cloned();
-                let data_manifest = if let Some(dv) = data_manifest_dv {
-                    FilteredManifest::with_dv(data_entry, dv)
-                } else {
-                    FilteredManifest::new(data_entry)
-                };
+                // DV is now stored inline on the manifest entry itself
+                let data_manifest = FilteredManifest::new(data_entry);
 
-                // Get affiliated delete manifests for this data manifest and wrap with DVs
+                // Get affiliated delete manifests for this data manifest
+                // DV is stored inline on each manifest entry
                 let affiliated_dv_manifests: Vec<FilteredManifest> = affiliated_deletes
                     .get(&location)
                     .map(|entries| {
                         entries
                             .iter()
-                            .map(|manifest_entry| {
-                                let manifest_dv = manifest_entry
-                                    .location
-                                    .as_ref()
-                                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
-
-                                if let Some(dv) = manifest_dv {
-                                    FilteredManifest::with_dv(manifest_entry.clone(), dv)
-                                } else {
-                                    FilteredManifest::new(manifest_entry.clone())
-                                }
-                            })
+                            .map(|manifest_entry| FilteredManifest::new(manifest_entry.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -850,9 +779,9 @@ impl Metadata {
             let mut delete_entries =
                 Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
             // Convert absolute delete manifest path to relative
@@ -965,9 +894,9 @@ impl Metadata {
         let mut data_manifest_entries =
             Metadata::read(engine, &data_manifest_url, table_root.clone())?.entries()?;
 
-        // Apply manifest DV if present
-        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
-            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        // Apply manifest DV if present (stored inline on the manifest entry)
+        if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, dv_bytes)?;
         }
 
         // Apply predicate-based data skipping to filter out entries that cannot match
@@ -993,9 +922,9 @@ impl Metadata {
             let mut delete_entries =
                 Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
             // Convert absolute delete manifest path to relative
@@ -1102,9 +1031,9 @@ impl Metadata {
         )?
         .entries()?;
 
-        // Apply manifest DV if present
-        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
-            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        // Apply manifest DV if present (stored inline on the manifest entry)
+        if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, dv_bytes)?;
         }
 
         // Apply predicate-based data skipping to filter out entries that cannot match
@@ -1132,9 +1061,9 @@ impl Metadata {
             )?
             .entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
             // Convert absolute delete manifest path to relative
@@ -1409,43 +1338,32 @@ struct ProcessedDeletionVector {
 /// A filtered list of entries with deleted positions removed.
 ///
 /// # Implementation Notes
-/// Currently only supports inline deletion vectors (stored in `inline_content`).
-/// External deletion vectors (referenced via `location`) are not yet supported.
+/// Applies a manifest deletion vector to filter entries by position.
+///
+/// Takes deletion vector bytes (stored inline on manifest entries in the `manifest_dv` field)
+/// and filters out entries at positions specified in the DV.
+///
+/// The DV format is: 4-byte magic number + RoaringTreemap portable serialization
 #[allow(dead_code)]
 pub(crate) fn apply_manifest_dv(
     entries: Vec<MetadataEntry>,
-    manifest_dv: &MetadataEntry,
+    dv_bytes: &Bytes,
 ) -> DeltaResult<Vec<MetadataEntry>> {
     use roaring::RoaringTreemap;
 
-    // Check if we have inline content
-    let inline_content = match &manifest_dv.inline_content {
-        Some(content) if !content.is_empty() => content,
-        _ => {
-            // No inline content, check if external is specified
-            if manifest_dv.location.is_some() {
-                return Err(Error::generic(
-                    "External (persisted) manifest deletion vectors are not yet supported",
-                ));
-            }
-            // No DV data at all, return entries unfiltered
-            return Ok(entries);
-        }
-    };
+    // Check if we have DV data
+    if dv_bytes.is_empty() {
+        return Ok(entries);
+    }
 
     // Parse the magic number from the first 4 bytes
-    if inline_content.len() < 4 {
+    if dv_bytes.len() < 4 {
         return Err(Error::generic(
-            "Inline deletion vector is too small (less than 4 bytes)",
+            "Manifest deletion vector is too small (less than 4 bytes)",
         ));
     }
 
-    let magic = u32::from_be_bytes([
-        inline_content[0],
-        inline_content[1],
-        inline_content[2],
-        inline_content[3],
-    ]);
+    let magic = u32::from_be_bytes([dv_bytes[0], dv_bytes[1], dv_bytes[2], dv_bytes[3]]);
 
     // Magic numbers from the deletion vector format
     const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
@@ -1453,7 +1371,7 @@ pub(crate) fn apply_manifest_dv(
 
     // Deserialize the RoaringTreemap
     let deleted_positions = match magic {
-        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&inline_content[4..])
+        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&dv_bytes[4..])
             .map_err(|err| Error::generic(format!("Failed to deserialize manifest DV: {}", err)))?,
         ROARING_BITMAP_NATIVE_MAGIC => {
             return Err(Error::generic(
@@ -1562,7 +1480,9 @@ fn metadata_entry_to_deletion_vector_info(
     })?);
 
     // Convert size_in_bytes from i64 to i32
-    let size_in_bytes_i32: i32 = content_info.size_in_bytes.try_into().map_err(|_| {
+    // Subtract 8 bytes to convert from Iceberg's size (full blob) back to Delta's size (bitmap only)
+    // Iceberg includes 4-byte size prefix + 4-byte CRC, Delta doesn't
+    let size_in_bytes_i32: i32 = (content_info.size_in_bytes - 8).try_into().map_err(|_| {
         Error::generic(format!(
             "Size in bytes for {} is too large to convert to i32",
             location
@@ -2055,7 +1975,6 @@ pub enum DataContentType {
     // Types below are only allowed in the root
     DataManifest = 3,
     DeleteManifest = 4,
-    ManifestDV = 5,
 }
 
 // ToDataType implementations for enums
@@ -2169,6 +2088,11 @@ pub struct TrackingInfo {
     /// The _row_id for the first row in the data file if content_type is Data.
     /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
     pub(crate) first_row_id: Option<i64>,
+
+    /// Deletion vector tracking changes made in the current commit for manifest entries.
+    /// Only used when content_type is DataManifest or DeleteManifest.
+    /// This field tracks what was added/changed in the current commit and is cleared between commits.
+    pub(crate) changes_dv: Option<Bytes>,
 }
 
 impl TrackingInfo {
@@ -2241,15 +2165,13 @@ pub struct MetadataEntry {
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
     pub content_type: DataContentType,
 
-    /// Optional if content_type is 5 and inline_content is not null, required otherwise
+    /// Location of the file. Required for most content types.
     pub location: Option<String>,
 
     /// avro, orc, parquet or puffin
     pub(crate) file_format: DataFileFormat,
 
     pub tracking_info: Option<TrackingInfo>,
-
-    pub(crate) inline_content: Option<Bytes>,
 
     pub(crate) content_info: Option<ContentInfo>,
 
@@ -2291,6 +2213,9 @@ pub struct MetadataEntry {
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     pub(crate) equality_ids: Option<Vec<i32>>,
+
+    /// DV that applies to the manifest linked to from this entry.
+    pub(crate) manifest_dv: Option<Bytes>,
 }
 
 impl MetadataEntry {
@@ -2336,7 +2261,6 @@ impl MetadataEntry {
             Option::<String>::get_struct_field("location"),
             DataFileFormat::get_struct_field("fileFormat"),
             TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<Bytes>::get_struct_field("inlineContent"),
             Option::<ContentInfo>::get_struct_field("contentInfo"),
             i64::get_struct_field("partitionSpecId"),
             Option::<i64>::get_struct_field("sortOrderId"),
@@ -2346,6 +2270,7 @@ impl MetadataEntry {
             // Use `to_schema_with_content_stats(table_schema)` when writing
             Option::<ManifestStats>::get_struct_field("manifestStats"),
             Option::<String>::get_struct_field("referencedFile"),
+            Option::<Bytes>::get_struct_field("manifestDv"),
             // key_metadata intentionally excluded - binary type not supported
             // split_offsets intentionally excluded - not used by Delta today
             // equality_ids intentionally excluded - not used by Delta today
@@ -2381,7 +2306,6 @@ impl MetadataEntry {
             Option::<String>::get_struct_field("location"),
             DataFileFormat::get_struct_field("fileFormat"),
             TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<Bytes>::get_struct_field("inlineContent"),
             Option::<ContentInfo>::get_struct_field("contentInfo"),
             i64::get_struct_field("partitionSpecId"),
             Option::<i64>::get_struct_field("sortOrderId"),
@@ -2395,6 +2319,7 @@ impl MetadataEntry {
             ),
             Option::<ManifestStats>::get_struct_field("manifestStats"),
             Option::<String>::get_struct_field("referencedFile"),
+            Option::<Bytes>::get_struct_field("manifestDv"),
             // key_metadata intentionally excluded - binary type not supported
             // split_offsets intentionally excluded - not used by Delta today
             // equality_ids intentionally excluded - not used by Delta today
@@ -2422,7 +2347,7 @@ impl crate::IntoEngineData for MetadataEntry {
             Scalar::from(self.file_format),  // file_format (STRING)
         ]);
 
-        // Fields 3-7: tracking_info struct (5 fields)
+        // Fields 3-8: tracking_info struct (6 fields)
         flat_values.extend(match &self.tracking_info {
             Some(ti) => [
                 Scalar::from(ti.status),
@@ -2430,6 +2355,7 @@ impl crate::IntoEngineData for MetadataEntry {
                 Scalar::from(ti.sequence_number),
                 Scalar::from(ti.file_sequence_number),
                 Scalar::from(ti.first_row_id),
+                Scalar::from(ti.changes_dv.clone()),
             ],
             None => [
                 Scalar::Null(DataType::INTEGER),
@@ -2437,11 +2363,9 @@ impl crate::IntoEngineData for MetadataEntry {
                 Scalar::Null(DataType::LONG),
                 Scalar::Null(DataType::LONG),
                 Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::BINARY),
             ],
         });
-
-        // Field 8: inline_content
-        flat_values.push(Scalar::from(self.inline_content.clone()));
 
         // Fields 9-10: content_info struct (2 fields)
         flat_values.extend(match &self.content_info {
@@ -2498,7 +2422,11 @@ impl crate::IntoEngineData for MetadataEntry {
 
         // Field: referenced_file
         flat_values.push(Scalar::from(self.referenced_file)); // referenced_file (STRING)
-                                                              // key_metadata, split_offsets, equality_ids are intentionally excluded
+
+        // Field: manifest_dv
+        flat_values.push(Scalar::from(self.manifest_dv.clone()));
+
+        // key_metadata, split_offsets, equality_ids are intentionally excluded
 
         let evaluator = engine.evaluation_handler();
         evaluator.create_one(schema, &flat_values)
@@ -2531,8 +2459,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2541,6 +2469,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2603,14 +2532,17 @@ mod tests {
         let schema = MetadataEntry::base_schema();
 
         // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
+        // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
+        // recordCount, fileSizeInBytes, manifestStats, referencedFile, manifestDv
         assert_eq!(schema.fields().len(), 12);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // Schema should have all the leaf fields (23 = flattened count, excluding key_metadata, split_offsets, equality_ids)
-        assert_eq!(leaf_names.len(), 23);
+        // Schema should have all the leaf fields (24 = flattened count, excluding key_metadata, split_offsets, equality_ids)
+        // Added 2 fields (manifestDv, manifestDeltaDv), removed 1 (inlineContent), so 23 + 1 = 24
+        assert_eq!(leaf_names.len(), 24);
     }
 
     #[test]
@@ -2824,8 +2756,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2834,6 +2766,7 @@ mod tests {
             content_stats: Some(content_stats),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2890,8 +2823,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2900,6 +2833,7 @@ mod tests {
             content_stats: None, // Explicitly None
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3032,8 +2966,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3042,6 +2976,7 @@ mod tests {
             content_stats: Some(content_stats),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3142,8 +3077,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3152,6 +3087,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3170,8 +3106,8 @@ mod tests {
                 sequence_number: Some(500),
                 file_sequence_number: Some(600),
                 first_row_id: Some(5000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 1,
             sort_order_id: Some(1),
@@ -3180,20 +3116,21 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         }
     }
 
-    // Helper function to create a MetadataEntry with inline content
+    // Helper function to create a MetadataEntry with manifest DV
     fn create_metadata_entry_with_inline_dv() -> MetadataEntry {
-        // Create some sample inline content data
+        // Create some sample inline DV data
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
 
         MetadataEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/path/to/data.parquet".to_string()),
+            content_type: DataContentType::DataManifest,
+            location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -3201,8 +3138,8 @@ mod tests {
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
+                changes_dv: None,
             }),
-            inline_content: Some(Bytes::from(inline_data)),
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3211,6 +3148,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: Some(Bytes::from(inline_data)),
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3229,8 +3167,8 @@ mod tests {
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 2,
             sort_order_id: Some(2),
@@ -3247,6 +3185,7 @@ mod tests {
                 min_sequence_number: 100,
             }),
             referenced_file: Some("s3://bucket/path/to/referenced.parquet".to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3293,10 +3232,15 @@ mod tests {
             _ => panic!("tracking_info presence mismatch"),
         }
 
-        // Compare inline_content
+        // Compare manifest_dv and changes_dv
         assert_eq!(
-            expected.inline_content, actual.inline_content,
-            "inline_content mismatch"
+            expected.manifest_dv, actual.manifest_dv,
+            "manifest_dv mismatch"
+        );
+        assert_eq!(
+            expected.tracking_info.as_ref().map(|t| &t.changes_dv),
+            actual.tracking_info.as_ref().map(|t| &t.changes_dv),
+            "changes_dv mismatch"
         );
 
         assert_eq!(
@@ -3488,23 +3432,23 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_metadata_entry_eq(&original_entry, &entries[0]);
 
-        // Verify inline_content specifically
+        // Verify manifest_dv specifically
         let read_entry = &entries[0];
         assert!(
-            read_entry.inline_content.is_some(),
-            "inline_content should be present"
+            read_entry.manifest_dv.is_some(),
+            "manifest_dv should be present"
         );
-        let read_bytes = read_entry.inline_content.as_ref().unwrap();
-        let orig_bytes = original_entry.inline_content.as_ref().unwrap();
+        let read_bytes = read_entry.manifest_dv.as_ref().unwrap();
+        let orig_bytes = original_entry.manifest_dv.as_ref().unwrap();
         assert_eq!(
             read_bytes.len(),
             orig_bytes.len(),
-            "inline_content length must match"
+            "manifest_dv length must match"
         );
         assert_eq!(
             read_bytes.as_ref(),
             orig_bytes.as_ref(),
-            "inline_content bytes must match"
+            "manifest_dv bytes must match"
         );
 
         Ok(())
@@ -3574,7 +3518,6 @@ mod tests {
             DataContentType::EqualityDeletes,
             DataContentType::DataManifest,
             DataContentType::DeleteManifest,
-            DataContentType::ManifestDV,
         ];
 
         let entries: Vec<MetadataEntry> = content_types
@@ -3590,8 +3533,8 @@ mod tests {
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: i as i64,
                 sort_order_id: Some(i as i64),
@@ -3600,6 +3543,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3665,8 +3609,8 @@ mod tests {
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: Some(0),
@@ -3675,6 +3619,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3731,8 +3676,8 @@ mod tests {
                 sequence_number: None,      // None
                 file_sequence_number: None, // None
                 first_row_id: None,         // None
+                changes_dv: None,
             }),
-            inline_content: None, // None
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3741,6 +3686,7 @@ mod tests {
             content_stats: None,   // None
             manifest_info: None,   // None
             referenced_file: None, // None
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3775,7 +3721,8 @@ mod tests {
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
         assert!(ti.first_row_id.is_none());
-        assert!(actual.inline_content.is_none());
+        assert!(ti.changes_dv.is_none());
+        assert!(actual.manifest_dv.is_none());
         assert!(actual.manifest_info.is_none());
         assert!(actual.referenced_file.is_none());
 
@@ -3799,8 +3746,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3809,6 +3756,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3852,8 +3800,8 @@ mod tests {
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3862,6 +3810,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3884,8 +3833,8 @@ mod tests {
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 100,
@@ -3897,6 +3846,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(referenced_file.to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -4051,34 +4001,34 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_content_not_dropped_in_serialization() -> DeltaResult<()> {
-        // This test verifies that inline_content survives the into_engine_data conversion
+    fn test_manifest_dv_not_dropped_in_serialization() -> DeltaResult<()> {
+        // This test verifies that manifest_dv survives the into_engine_data conversion
         // even when not read back through the full reader path
         let engine = SyncEngine::new();
 
-        // Create a metadata entry with inline content
+        // Create a metadata entry with manifest DV
         let inline_dv_entry = create_metadata_entry_with_inline_dv();
-        let original_inline_bytes = inline_dv_entry.inline_content.as_ref().unwrap().clone();
+        let original_dv_bytes = inline_dv_entry.manifest_dv.as_ref().unwrap().clone();
 
         // Convert to engine data
         let engine_data = inline_dv_entry
             .clone()
             .into_engine_data(test_metadata_entry_schema(), &engine)?;
 
-        // The inline_content should be in the engine data
+        // The manifest_dv should be in the engine data
         // We can't easily extract it without the full visitor, but we can verify
         // that the conversion succeeded and the data was included
         assert!(!engine_data.is_empty(), "Engine data should not be empty");
 
         // Verify the original bytes are not empty
         assert!(
-            !original_inline_bytes.is_empty(),
-            "Original inline content should not be empty"
+            !original_dv_bytes.is_empty(),
+            "Original manifest DV should not be empty"
         );
         assert_eq!(
-            original_inline_bytes.len(),
+            original_dv_bytes.len(),
             8,
-            "Expected 8 bytes of inline content"
+            "Expected 8 bytes of manifest DV"
         );
 
         Ok(())
@@ -4220,8 +4170,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4238,6 +4188,7 @@ mod tests {
                 min_sequence_number: 50,
             }),
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -4259,8 +4210,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4277,6 +4228,7 @@ mod tests {
                 min_sequence_number: 75,
             }),
             referenced_file: referenced_file.map(String::from),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -4334,7 +4286,7 @@ mod tests {
             refs.data_manifest.manifest.location.as_ref().unwrap(),
             "memory:///data-manifest.parquet"
         );
-        assert!(refs.data_manifest.manifest_dv.is_none());
+        assert!(refs.data_manifest.manifest.manifest_dv.is_none());
 
         // Verify affiliated delete manifest
         assert_eq!(refs.affiliated_dv_manifests.len(), 1);
@@ -4346,7 +4298,10 @@ mod tests {
                 .unwrap(),
             "memory:///delete-manifest.parquet"
         );
-        assert!(refs.affiliated_dv_manifests[0].manifest_dv.is_none());
+        assert!(refs.affiliated_dv_manifests[0]
+            .manifest
+            .manifest_dv
+            .is_none());
 
         // Verify unaffiliated delete manifest (now in shared_state)
         assert_eq!(root_state.shared_state.unaffiliated_dv_manifests.len(), 1);
@@ -4359,6 +4314,7 @@ mod tests {
             "memory:///unaffiliated-delete.parquet"
         );
         assert!(root_state.shared_state.unaffiliated_dv_manifests[0]
+            .manifest
             .manifest_dv
             .is_none());
 
@@ -4551,34 +4507,11 @@ mod tests {
             .serialize_into(&mut serialized)
             .expect("Failed to serialize roaring bitmap");
 
-        // Create a ManifestDV entry with inline content
-        let manifest_dv = MetadataEntry {
-            content_type: DataContentType::ManifestDV,
-            location: None,
-            file_format: DataFileFormat::Puffin,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: None,
-            }),
-            inline_content: Some(Bytes::from(serialized)),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 2, // 2 deleted positions
-            file_size_in_bytes: None,
-            content_stats: None,
-            manifest_info: None,
-            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        // Create DV bytes
+        let dv_bytes = Bytes::from(serialized);
 
         // Apply the manifest DV
-        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
 
         // Verify we have 3 entries left (positions 0, 2, 4)
         assert_eq!(filtered_entries.len(), 3);
@@ -4608,28 +4541,11 @@ mod tests {
             create_data_entry("memory:///file1.parquet", 60),
         ];
 
-        // Create a ManifestDV entry with NO inline content (no deletions)
-        let manifest_dv = MetadataEntry {
-            content_type: DataContentType::ManifestDV,
-            location: None,
-            file_format: DataFileFormat::Puffin,
-            tracking_info: None,
-            inline_content: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 0,
-            file_size_in_bytes: None,
-            content_stats: None,
-            manifest_info: None,
-            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        // Empty DV bytes (no deletions)
+        let dv_bytes = Bytes::new();
 
         // Apply the manifest DV (should return all entries)
-        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
 
         // Verify all entries remain
         assert_eq!(filtered_entries.len(), 2);
@@ -4927,8 +4843,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4937,6 +4853,7 @@ mod tests {
             content_stats: Some(create_id_content_stats(min_id, max_id)?),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5051,8 +4968,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -5061,6 +4978,7 @@ mod tests {
             content_stats: None, // No stats!
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5190,8 +5108,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -5208,6 +5126,7 @@ mod tests {
                 min_sequence_number: 100,
             }),
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5312,6 +5231,384 @@ mod tests {
             "manifest1.parquet",
             "Only manifest1 should match id<100"
         );
+
+        Ok(())
+    }
+
+    /// End-to-end integration test for DV size conversion through the metadata tree.
+    ///
+    /// This test creates a table with deletion vectors using the Transaction API and bulk mode,
+    /// then verifies that:
+    /// 1. PositionDeletes entries in persisted manifests have Iceberg format sizes (Delta size + 8 bytes)
+    /// 2. The size conversion happens at write time in extract_deletion_vector_content
+    #[test]
+    fn test_dv_size_conversion_through_metadata_tree() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::deletion_vector::{
+            DeletionVectorDescriptor, DeletionVectorStorageType,
+        };
+        use crate::arrow::array::{
+            new_null_array, ArrayRef, BooleanArray, Int64Array, MapArray, StringArray, StructArray,
+        };
+        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::arrow_conversion::TryFromKernel;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::engine::sync::SyncEngine;
+        use crate::snapshot::Snapshot;
+        use crate::transaction::{CommitResult, DvUpdate, ManifestLocation};
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use url::Url;
+        use uuid::Uuid;
+
+        let engine = Arc::new(SyncEngine::new());
+        let temp_dir = tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_url = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table with DV support (v0)
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 1,
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "id"
+                    }
+                },
+                {
+                    "name": "value",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 2,
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "value"
+                    }
+                }
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"]
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableDeletionVectors": "true",
+                    "delta.columnMapping.mode": "id"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_url
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| crate::Error::generic("Cannot convert URL to file path"))?;
+
+        create_dir_all(&delta_log_path)?;
+        write(delta_log_path.join("00000000000000000000.json"), data)?;
+
+        // Step 2: Add files to a leaf WITHOUT DVs (v1)
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+            let mut txn = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()))?
+                .with_operation("WRITE".to_string())
+                .with_batch_commit();
+
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+            let add_files_schema = txn.add_files_schema();
+
+            // Create add files metadata inline using arrow
+            let files = [
+                ("file1.parquet", 1000, 1000000, 50),
+                ("file2.parquet", 2000, 1000001, 75),
+            ];
+            let num_files = files.len();
+
+            let path_array =
+                StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+            let size_array =
+                Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+            let mod_time_array =
+                Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+            let num_records_array =
+                Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+            // Create empty partition values
+            let entries_field = std::sync::Arc::new(Field::new(
+                "key_value",
+                ArrowDataType::Struct(
+                    vec![
+                        std::sync::Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                        std::sync::Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            let empty_entries = StructArray::from(vec![
+                (
+                    std::sync::Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                    std::sync::Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    std::sync::Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as ArrayRef,
+                ),
+            ]);
+            let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+            let partition_values_array = std::sync::Arc::new(MapArray::new(
+                entries_field,
+                offsets,
+                empty_entries,
+                None,
+                false,
+            ));
+
+            // Build stats struct
+            let arrow_schema: ArrowSchema =
+                TryFromKernel::try_from_kernel(add_files_schema.as_ref())?;
+            let stats_field = arrow_schema
+                .field_with_name("stats")
+                .expect("stats field should exist");
+            let stats_arrow_schema = match stats_field.data_type() {
+                ArrowDataType::Struct(fields) => fields.clone(),
+                _ => panic!("stats field should be a struct"),
+            };
+
+            let mut stats_fields = Vec::new();
+            for field in stats_arrow_schema.iter() {
+                let array: ArrayRef = match field.name().as_str() {
+                    "numRecords" => std::sync::Arc::new(num_records_array.clone()),
+                    "tightBounds" => {
+                        std::sync::Arc::new(BooleanArray::from(vec![Some(true); num_files]))
+                    }
+                    _ => std::sync::Arc::new(new_null_array(field.data_type(), num_files)),
+                };
+                stats_fields.push((field.clone(), array));
+            }
+            let stats_struct = StructArray::from(stats_fields);
+
+            let batch = RecordBatch::try_new(
+                std::sync::Arc::new(arrow_schema),
+                vec![
+                    std::sync::Arc::new(path_array) as ArrayRef,
+                    partition_values_array as ArrayRef,
+                    std::sync::Arc::new(size_array) as ArrayRef,
+                    std::sync::Arc::new(mod_time_array) as ArrayRef,
+                    std::sync::Arc::new(stats_struct) as ArrayRef,
+                ],
+            )?;
+
+            let metadata_engine_data: Box<dyn crate::EngineData> =
+                Box::new(ArrowEngineData::new(batch));
+            leaf.add_files(metadata_engine_data)?;
+
+            let result = leaf.finish(engine.as_ref())?;
+            txn.add_leaf(result)?;
+
+            match txn.commit(engine.as_ref())? {
+                CommitResult::CommittedTransaction(_) => {}
+                other => panic!("Expected success, got {:?}", other),
+            };
+        }
+
+        // Step 3: Scan to find where files landed (manifest URL + indices)
+        let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot_v1.clone().scan_builder().build()?;
+
+        // Use scan callback to collect file locations - much simpler than RowVisitor!
+        fn collect_locations(
+            locations: &mut Vec<(String, String, i64)>,
+            scan_file: crate::scan::state::ScanFile,
+        ) {
+            if let (Some(manifest_path), Some(index)) = (
+                scan_file.data_manifest_path,
+                scan_file.data_manifest_position,
+            ) {
+                locations.push((scan_file.path, manifest_path, index));
+            }
+        }
+
+        let mut file_locations = Vec::new();
+        for scan_metadata_result in scan.scan_metadata(engine.as_ref())? {
+            let scan_metadata = scan_metadata_result?;
+            file_locations = scan_metadata.visit_scan_files(file_locations, collect_locations)?;
+        }
+
+        // Step 4: Add DVs for the files using a known size (v2)
+        let known_dv_size_in_bytes: i32 = 42; // The Delta format size (what we'll test for conversion)
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+            let mut txn = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()))?
+                .with_operation("UPDATE".to_string())
+                .with_batch_commit();
+
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+
+            let mut dv_updates = vec![];
+            for (i, (path, manifest_path, index)) in file_locations.iter().enumerate() {
+                // Use a different UUID for each file
+                let uuid_str = if i == 0 {
+                    "12345678-1234-1234-1234-123456789abc"
+                } else {
+                    "87654321-4321-4321-4321-cba987654321"
+                };
+
+                let dv_descriptor = DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: uuid_str.to_string(),
+                    offset: Some(0),
+                    size_in_bytes: known_dv_size_in_bytes,
+                    cardinality: 5,
+                };
+
+                // manifest_path is relative, so join with table_url
+                let manifest_url = table_url.join(manifest_path)?;
+                dv_updates.push(DvUpdate {
+                    data_file_path: path.clone(),
+                    dv_descriptor,
+                    data_file_location: ManifestLocation {
+                        manifest_path: manifest_url,
+                        index: *index,
+                    },
+                    previous_delete_file_location: None,
+                });
+            }
+
+            leaf.update_deletion_vectors(dv_updates)?;
+
+            let result = leaf.finish(engine.as_ref())?;
+            txn.add_leaf(result)?;
+
+            match txn.commit(engine.as_ref())? {
+                CommitResult::CommittedTransaction(_) => {}
+                other => panic!("Expected success, got {:?}", other),
+            };
+        }
+
+        // Step 5: Read the ContentRoot file directly to verify persisted sizes
+        let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let content_root_result = snapshot_v2
+            .log_segment()
+            .content_root_with_version(engine.as_ref())?;
+
+        assert!(
+            content_root_result.is_some(),
+            "Table should have ContentRoot after batch commit"
+        );
+
+        let content_root_info = content_root_result.unwrap().0;
+        let root_manifest_url = table_url.join(content_root_info.path())?;
+
+        let root_metadata = Metadata::read(engine.as_ref(), &root_manifest_url, table_url.clone())?;
+        let root_entries = root_metadata.entries()?;
+
+        // The root might have DeleteManifest entries that contain the PositionDeletes
+        // Let's find all manifests and read them to find PositionDeletes
+        let mut found_position_deletes_count = 0;
+
+        // First check if PositionDeletes are directly in the root
+        for entry in &root_entries {
+            if matches!(entry.content_type, DataContentType::PositionDeletes) {
+                let content_info = entry
+                    .content_info
+                    .as_ref()
+                    .expect("PositionDeletes should have content_info");
+
+                let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
+                assert_eq!(
+                    content_info.size_in_bytes, expected_iceberg_size,
+                    "Persisted size should be {} (Delta {} + 8 framing), but got {}",
+                    expected_iceberg_size, known_dv_size_in_bytes, content_info.size_in_bytes
+                );
+                found_position_deletes_count += 1;
+            }
+        }
+
+        // If not in root, check DeleteManifests
+        if found_position_deletes_count == 0 {
+            for entry in &root_entries {
+                if matches!(entry.content_type, DataContentType::DeleteManifest) {
+                    let manifest_path = entry
+                        .location
+                        .as_ref()
+                        .expect("Manifest should have location");
+                    let manifest_url = Url::parse(manifest_path)?;
+                    let manifest_metadata =
+                        Metadata::read(engine.as_ref(), &manifest_url, table_url.clone())?;
+                    let manifest_entries = manifest_metadata.entries()?;
+
+                    for manifest_entry in manifest_entries {
+                        if matches!(
+                            manifest_entry.content_type,
+                            DataContentType::PositionDeletes
+                        ) {
+                            // We found the PositionDeletes in a leaf manifest
+                            // Verify the size here
+                            let content_info = manifest_entry
+                                .content_info
+                                .as_ref()
+                                .expect("PositionDeletes should have content_info");
+
+                            let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
+                            assert_eq!(
+                                content_info.size_in_bytes,
+                                expected_iceberg_size,
+                                "Persisted size should be {} (Delta {} + 8 framing), but got {}",
+                                expected_iceberg_size,
+                                known_dv_size_in_bytes,
+                                content_info.size_in_bytes
+                            );
+                            found_position_deletes_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_position_deletes_count > 0,
+            "Should have PositionDeletes entries in root or leaf manifests"
+        );
+
+        // The test successfully proves:
+        // 1. Persisted manifests have PositionDeletes with Iceberg sizes (Delta + 8)
+        //    - We verified the content_info.size_in_bytes = 42 + 8 = 50
+        // 2. The size conversion happens at write time in:
+        //    - extract_deletion_vector_content (+8): builder.rs:98
+        // 3. On read, metadata_entry_to_deletion_vector_info would subtract 8 bytes (metadata/mod.rs:1488)
+        //    but we don't test that here since we'd need actual DV files
 
         Ok(())
     }

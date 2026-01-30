@@ -722,6 +722,10 @@ impl LeafNodeWriter {
                 })?
                 .to_string();
 
+            // content_info already has the +8 conversion applied by extract_deletion_vector_content
+            // TODO: Should this at least be offset + size_in_bytes.
+            let file_size = content_info.size_in_bytes;
+
             let dv_entry = MetadataEntry {
                 content_type: DataContentType::PositionDeletes,
                 location: Some(location),
@@ -732,16 +736,17 @@ impl LeafNodeWriter {
                     sequence_number: Some(self.version as i64),
                     file_sequence_number: Some(self.version as i64),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: Some(content_info),
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: dv_descriptor.cardinality,
-                file_size_in_bytes: Some(dv_descriptor.size_in_bytes as i64),
+                file_size_in_bytes: Some(file_size),
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: Some(absolute_data_file_path),
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,

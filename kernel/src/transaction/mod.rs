@@ -677,6 +677,7 @@ impl Transaction {
 
             // Apply aggregated manifest DVs from leaf writers
             // These mark entries in leaf manifests as deleted (e.g., when files are moved between leaves)
+            // set_changes_dv=false because this is leaf reorganization, not actual user-facing deletion
             for (manifest_url, entry_indices) in &self.aggregated_manifest_dvs {
                 // Convert URL to string path for delete_multiple_from_leaf
                 let manifest_path = manifest_url.as_str();
@@ -685,6 +686,7 @@ impl Transaction {
                     entry_indices,
                     commit_version,
                     snapshot_id,
+                    false, // Don't set changes_dv for leaf reorganization
                 )?;
             }
 
@@ -2929,8 +2931,8 @@ mod tests {
                 sequence_number: Some(2),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 108, // 100 + 8
@@ -2942,6 +2944,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(format!("{}data/file-2.parquet", table_root)),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2961,8 +2964,8 @@ mod tests {
                 sequence_number: Some(2),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 108,
@@ -2974,6 +2977,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(format!("{}data/file-3.parquet", table_root)),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3112,43 +3116,22 @@ mod tests {
             .clone()
             .ok_or_else(|| Error::generic("Delete manifest has no location"))?;
 
-        // Verify that ManifestDVs were created for both manifests
-        let manifest_dvs: Vec<&MetadataEntry> = root_visitor
-            .entries
-            .iter()
-            .filter(|entry| entry.content_type == DataContentType::ManifestDV)
-            .collect();
+        // Verify that manifest DV is stored inline on the delete manifest
+        // (No separate ManifestDV entries anymore)
 
-        assert_eq!(
-            manifest_dvs.len(),
-            2,
-            "Expected 2 ManifestDVs (one for data manifest, one for delete manifest)"
-        );
+        // Check the delete manifest has a manifest_dv field
+        let manifest_dv_bytes = delete_manifest
+            .manifest_dv
+            .as_ref()
+            .ok_or_else(|| Error::generic("Delete manifest has no manifest_dv"))?;
 
-        // Find the ManifestDV for the delete manifest
-        let delete_manifest_dv = manifest_dvs
-            .iter()
-            .find(|dv| dv.referenced_file.as_ref() == Some(&delete_manifest_path))
-            .ok_or_else(|| Error::generic("No ManifestDV found for delete manifest"))?;
-
-        // Verify the ManifestDV has cardinality 1 (one deleted DV entry)
-        assert_eq!(
-            delete_manifest_dv.record_count, 1,
-            "Delete manifest ManifestDV should have cardinality 1"
-        );
+        if manifest_dv_bytes.len() < 4 {
+            return Err(Box::new(Error::generic("manifest_dv bytes too short")));
+        }
 
         // Decode the roaring bitmap to verify the deleted index
         use roaring::RoaringTreemap;
-        let inline_content = delete_manifest_dv
-            .inline_content
-            .as_ref()
-            .ok_or_else(|| Error::generic("ManifestDV has no inline content"))?;
-
-        if inline_content.len() < 4 {
-            return Err(Box::new(Error::generic(
-                "ManifestDV inline content too short",
-            )));
-        }
+        let inline_content = manifest_dv_bytes;
         let deleted_indices =
             RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
                 Box::new(Error::generic(format!(

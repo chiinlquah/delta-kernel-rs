@@ -21,6 +21,33 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
+/// Helper function to serialize a RoaringTreemap with the portable magic number prefix.
+fn serialize_roaring_treemap(treemap: &roaring::RoaringTreemap) -> DeltaResult<Bytes> {
+    let mut serialized = Vec::new();
+    // Magic number for portable format
+    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+    serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+    treemap.serialize_into(&mut serialized).map_err(|e| {
+        Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
+    })?;
+    Ok(Bytes::from(serialized))
+}
+
+/// Helper function to deserialize a RoaringTreemap from bytes with magic number prefix.
+fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTreemap> {
+    if bytes.len() < 4 {
+        return Err(Error::generic(
+            "Invalid manifest DV: bytes too small (less than 4 bytes)",
+        ));
+    }
+    roaring::RoaringTreemap::deserialize_from(&bytes[4..]).map_err(|e| {
+        Error::generic(format!(
+            "Failed to deserialize deletion vector bitmap: {}",
+            e
+        ))
+    })
+}
+
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
 /// This function decodes the `path_or_inline_dv` field based on the storage type:
@@ -243,10 +270,10 @@ impl MetadataBuilder {
                 // We could set it, but then we can't do fast-retries
                 // first_row_id: add.base_row_id,
                 first_row_id: None,
+                changes_dv: None,
             }),
 
             // Data files don't have inline content
-            inline_content: None,
 
             // Content info from deletion vector (if present)
             content_info: None,
@@ -266,6 +293,9 @@ impl MetadataBuilder {
 
             // Path to file where to apply the DV to
             referenced_file: None,
+
+            // Manifest DVs stored inline on manifest entries
+            manifest_dv: None,
 
             // Encryption is not supported
             key_metadata: None,
@@ -348,10 +378,10 @@ impl MetadataBuilder {
                 // We could set it, but then we can't do fast-retries
                 // first_row_id: add.base_row_id,
                 first_row_id: None,
+                changes_dv: None,
             }),
 
             // Data files don't have inline content
-            inline_content: None,
 
             // Content info from deletion vector (if present)
             content_info,
@@ -371,6 +401,9 @@ impl MetadataBuilder {
 
             // Path to file where to apply the DV to
             referenced_file,
+
+            // Manifest DVs stored inline on manifest entries
+            manifest_dv: None,
 
             // Encryption is not supported
             key_metadata: None,
@@ -509,7 +542,17 @@ impl MetadataBuilder {
     ///
     /// This is useful when copying entries from existing metadata.
     #[allow(dead_code)]
-    pub(crate) fn add_entry(&mut self, entry: MetadataEntry) {
+    pub(crate) fn add_entry(&mut self, mut entry: MetadataEntry) {
+        // Clear changes_dv when adding manifest entries from a previous commit
+        // This ensures changes_dv only tracks changes from the current commit
+        if matches!(
+            entry.content_type,
+            DataContentType::DataManifest | DataContentType::DeleteManifest
+        ) {
+            if let Some(ref mut tracking_info) = entry.tracking_info {
+                tracking_info.changes_dv = None;
+            }
+        }
         self.pending_entries.push(entry);
     }
 
@@ -587,9 +630,7 @@ impl MetadataBuilder {
             // Remove actual data/DV entries from root
             matches!(
                 entry.content_type,
-                DataContentType::DataManifest
-                    | DataContentType::DeleteManifest
-                    | DataContentType::ManifestDV
+                DataContentType::DataManifest | DataContentType::DeleteManifest
             )
         });
 
@@ -652,6 +693,7 @@ impl MetadataBuilder {
                         sequence_number: Some(version as i64),
                         file_sequence_number: Some(version as i64),
                         first_row_id: None,
+                        changes_dv: None,
                     });
                 }
             }
@@ -707,7 +749,7 @@ impl MetadataBuilder {
         use roaring::RoaringTreemap;
         let mut indices = RoaringTreemap::new();
         indices.insert(index);
-        self.delete_indices_from_leaf(leaf_file_path, &indices, version, snapshot_id)
+        self.delete_indices_from_leaf(leaf_file_path, &indices, version, snapshot_id, true)
     }
 
     /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
@@ -720,6 +762,8 @@ impl MetadataBuilder {
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
     /// * `version` - Version for tracking info
     /// * `snapshot_id` - Snapshot ID for tracking info
+    /// * `set_changes_dv` - If true, sets tracking_info.changes_dv (for actual deletions).
+    ///   If false, only updates manifest_dv (for leaf reorganization).
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -731,20 +775,29 @@ impl MetadataBuilder {
         indices: &roaring::RoaringTreemap,
         version: Version,
         snapshot_id: Option<i64>,
+        set_changes_dv: bool,
     ) -> DeltaResult<()> {
-        self.delete_indices_from_leaf(leaf_file_path, indices, version, snapshot_id)
+        self.delete_indices_from_leaf(
+            leaf_file_path,
+            indices,
+            version,
+            snapshot_id,
+            set_changes_dv,
+        )
     }
 
     /// Core implementation for marking entries in a leaf manifest as deleted.
     ///
     /// This is the shared logic used by both `delete_from_leaf` and `delete_multiple_from_leaf`.
-    /// It creates or updates a ManifestDV entry for the specified leaf manifest.
+    /// It updates the manifest entry's DV fields to mark entries as deleted.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
     /// * `version` - Version for tracking info
     /// * `snapshot_id` - Snapshot ID for tracking info
+    /// * `set_changes_dv` - If true, sets tracking_info.changes_dv to track this as an actual deletion.
+    ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
     #[allow(dead_code)]
     fn delete_indices_from_leaf(
         &mut self,
@@ -752,17 +805,16 @@ impl MetadataBuilder {
         indices: &roaring::RoaringTreemap,
         version: Version,
         snapshot_id: Option<i64>,
+        set_changes_dv: bool,
     ) -> DeltaResult<()> {
-        use roaring::RoaringTreemap;
-
         // Convert leaf path to absolute
         let absolute_leaf_path = self.path_to_absolute(leaf_file_path)?;
 
-        // Find the leaf manifest entry and get entry count from manifest_info
-        let leaf_manifest = self
+        // Find the manifest entry
+        let manifest_position = self
             .pending_entries
             .iter()
-            .find(|entry| {
+            .position(|entry| {
                 (entry.content_type == DataContentType::DataManifest
                     || entry.content_type == DataContentType::DeleteManifest)
                     && entry.location.as_ref() == Some(&absolute_leaf_path)
@@ -774,25 +826,27 @@ impl MetadataBuilder {
                 ))
             })?;
 
-        // Get the entry counts from manifest_info
-        let manifest_info = leaf_manifest.manifest_info.as_ref().ok_or_else(|| {
-            Error::generic(format!(
-                "Leaf manifest missing manifest_info: {}",
-                absolute_leaf_path
-            ))
-        })?;
+        // Get the entry counts from manifest_info for bounds checking
+        let manifest_info = self.pending_entries[manifest_position]
+            .manifest_info
+            .as_ref()
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "Leaf manifest missing manifest_info: {}",
+                    absolute_leaf_path
+                ))
+            })?;
 
         // Total entry count includes all entries (added + existing + deleted) for bounds checking
         let total_entry_count = manifest_info.added_files_count
             + manifest_info.existing_files_count
             + manifest_info.deletes_files_count;
 
-        // Active entry count only includes non-deleted entries (added + existing)
-        // for determining if the manifest should be marked as deleted
+        // Calculate active entry count before getting mutable reference
         let active_entry_count =
             manifest_info.added_files_count + manifest_info.existing_files_count;
 
-        // Validate that all indices are within bounds (check against total)
+        // Validate that all indices are within bounds
         if let Some(max_index) = indices.max() {
             if max_index >= total_entry_count as u64 {
                 return Err(Error::generic(format!(
@@ -802,135 +856,73 @@ impl MetadataBuilder {
             }
         }
 
-        // Find or create the ManifestDV entry for this leaf
-        let manifest_dv_position = self.pending_entries.iter().position(|entry| {
-            entry.content_type == DataContentType::ManifestDV
-                && entry.referenced_file.as_ref() == Some(&absolute_leaf_path)
-        });
+        // Get mutable reference to the manifest entry
+        let manifest_entry = &mut self.pending_entries[manifest_position];
 
-        let cardinality = if let Some(pos) = manifest_dv_position {
-            // Update existing ManifestDV
-            let manifest_dv = &mut self.pending_entries[pos];
-
-            // Deserialize the existing roaring bitmap (skip the 4-byte magic number prefix)
-            let mut treemap = if let Some(ref inline_content) = manifest_dv.inline_content {
-                if inline_content.len() < 4 {
-                    return Err(Error::generic(
-                        "Invalid manifest DV: inline content too small",
-                    ));
-                }
-                RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
-                    Error::generic(format!(
-                        "Failed to deserialize deletion vector bitmap: {}",
-                        e
-                    ))
-                })?
-            } else {
-                RoaringTreemap::new()
-            };
-
-            // Add all indices to the bitmap
-            treemap |= indices;
-
-            // Serialize back to inline_content with magic number prefix
-            let mut serialized = Vec::new();
-            // Magic number for portable format
-            const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-            serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
-            treemap.serialize_into(&mut serialized).map_err(|e| {
-                Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
-            })?;
-
-            let cardinality = treemap.len();
-
-            // Update the entry
-            manifest_dv.inline_content = Some(Bytes::from(serialized));
-            manifest_dv.record_count = cardinality as i64;
-
-            // Update tracking info to reflect the new version
-            if let Some(ref mut tracking_info) = manifest_dv.tracking_info {
-                tracking_info.sequence_number = Some(version as i64);
-                tracking_info.snapshot_id = snapshot_id;
-            }
-
-            cardinality
+        // Deserialize existing manifest_dv (cumulative DV)
+        let mut combined_bitmap = if let Some(ref existing_dv) = manifest_entry.manifest_dv {
+            deserialize_roaring_treemap(existing_dv)?
         } else {
-            // Create new ManifestDV entry
-            let treemap = indices.clone();
-
-            // Serialize the bitmap with magic number prefix
-            let mut serialized = Vec::new();
-            // Magic number for portable format
-            const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-            serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
-            treemap.serialize_into(&mut serialized).map_err(|e| {
-                Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
-            })?;
-
-            let cardinality = treemap.len();
-
-            let manifest_dv_entry = MetadataEntry {
-                content_type: DataContentType::ManifestDV,
-                location: None,                       // ManifestDVs use inline content
-                file_format: DataFileFormat::Parquet, // Not actually used for inline content
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id,
-                    sequence_number: Some(version as i64),
-                    file_sequence_number: Some(version as i64),
-                    first_row_id: None,
-                }),
-                inline_content: Some(Bytes::from(serialized)),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: cardinality as i64,
-                file_size_in_bytes: None,
-                content_stats: None,
-                manifest_info: None,
-                referenced_file: Some(absolute_leaf_path.clone()),
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
-
-            self.pending_entries.push(manifest_dv_entry);
-
-            cardinality
+            use roaring::RoaringTreemap;
+            RoaringTreemap::new()
         };
 
-        // If all active (non-deleted) entries are deleted, mark the manifest as deleted
-        if cardinality as i64 == active_entry_count {
-            let manifest_position = self
-                .pending_entries
-                .iter()
-                .position(|entry| {
-                    (entry.content_type == DataContentType::DataManifest
-                        || entry.content_type == DataContentType::DeleteManifest)
-                        && entry.location.as_ref() == Some(&absolute_leaf_path)
-                })
-                .ok_or_else(|| {
-                    Error::generic(format!(
-                        "Manifest entry not found at path: {}",
-                        absolute_leaf_path
-                    ))
-                })?;
-
-            let manifest_entry = &mut self.pending_entries[manifest_position];
-
-            if let Some(ref mut tracking_info) = manifest_entry.tracking_info {
-                tracking_info.status = TrackingStatus::Deleted;
-                tracking_info.snapshot_id = snapshot_id;
-                tracking_info.sequence_number = Some(version as i64);
+        // Deserialize existing changes_dv to accumulate deletions from current commit
+        let mut delta_bitmap = if let Some(ref tracking_info) = manifest_entry.tracking_info {
+            if let Some(ref existing_changes_dv) = tracking_info.changes_dv {
+                deserialize_roaring_treemap(existing_changes_dv)?
             } else {
-                manifest_entry.tracking_info = Some(TrackingInfo {
-                    status: TrackingStatus::Deleted,
-                    snapshot_id,
-                    sequence_number: Some(version as i64),
-                    file_sequence_number: Some(version as i64),
-                    first_row_id: None,
-                });
+                use roaring::RoaringTreemap;
+                RoaringTreemap::new()
             }
+        } else {
+            use roaring::RoaringTreemap;
+            RoaringTreemap::new()
+        };
+
+        // Add new indices to both bitmaps
+        combined_bitmap |= indices;
+        delta_bitmap |= indices;
+
+        let cardinality = combined_bitmap.len() as i64;
+
+        // Serialize cumulative DV
+        manifest_entry.manifest_dv = Some(serialize_roaring_treemap(&combined_bitmap)?);
+
+        // Update tracking info to reflect the new version and optionally set changes_dv
+        // (active_entry_count was calculated earlier before getting mutable reference)
+        let serialized_delta = if set_changes_dv {
+            Some(serialize_roaring_treemap(&delta_bitmap)?)
+        } else {
+            None
+        };
+
+        if let Some(ref mut tracking_info) = manifest_entry.tracking_info {
+            tracking_info.sequence_number = Some(version as i64);
+            tracking_info.snapshot_id = snapshot_id;
+
+            // Only set changes_dv for actual deletions, not leaf reorganization
+            if set_changes_dv {
+                tracking_info.changes_dv = serialized_delta;
+            }
+
+            // If all active entries are deleted, mark the manifest as deleted
+            if cardinality == active_entry_count {
+                tracking_info.status = TrackingStatus::Deleted;
+            }
+        } else {
+            manifest_entry.tracking_info = Some(TrackingInfo {
+                status: if cardinality == active_entry_count {
+                    TrackingStatus::Deleted
+                } else {
+                    TrackingStatus::Added
+                },
+                snapshot_id,
+                sequence_number: Some(version as i64),
+                file_sequence_number: Some(version as i64),
+                first_row_id: None,
+                changes_dv: serialized_delta,
+            });
         }
 
         Ok(())
@@ -1055,10 +1047,10 @@ impl MetadataBuilder {
                 file_sequence_number: None,
                 // Maybe later
                 first_row_id: None,
+                changes_dv: None,
             }),
 
             // Data files don't have inline content
-            inline_content: None,
 
             // Content info from deletion vector (if present)
             content_info: None,
@@ -1079,6 +1071,9 @@ impl MetadataBuilder {
 
             // Path to file where to apply the DV to
             referenced_file: None,
+
+            // Manifest DVs stored inline on manifest entries
+            manifest_dv: None,
 
             // Encryption is not supported
             key_metadata: None,
@@ -1959,8 +1954,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -1969,6 +1964,7 @@ mod tests {
             content_stats: content_stats_1,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -1988,8 +1984,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -1998,6 +1994,7 @@ mod tests {
             content_stats: content_stats_2,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2099,8 +2096,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2109,6 +2106,7 @@ mod tests {
             content_stats: None, // No stats
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2292,8 +2290,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2302,6 +2300,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2317,8 +2316,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2327,6 +2326,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2420,8 +2420,8 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
@@ -2430,6 +2430,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2450,39 +2451,41 @@ mod tests {
         // Step 3: Write the root
         let root_url = root_builder.write_root(&engine)?;
 
-        // Step 4: Read back the root and verify ManifestDV entry exists
+        // Step 4: Read back the root and verify manifest DV is stored inline
         let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
 
-        // Should have: 1 DataManifest + 1 ManifestDV
-        assert_eq!(root_entries.len(), 2);
+        // Should have: 1 DataManifest (DV is now inline on this entry)
+        assert_eq!(root_entries.len(), 1);
 
-        let manifest_dv = root_entries
+        let data_manifest = root_entries
             .iter()
-            .find(|e| e.content_type == DataContentType::ManifestDV)
-            .expect("ManifestDV should exist");
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
 
-        assert_eq!(manifest_dv.referenced_file.as_ref(), Some(&leaf_path));
-        assert_eq!(manifest_dv.record_count, 1);
+        assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
-        // Verify the inline content contains the deleted index (skip magic number)
-        let inline_content = manifest_dv
-            .inline_content
+        // Verify the manifest_dv field contains the deleted index
+        let manifest_dv_bytes = data_manifest
+            .manifest_dv
             .as_ref()
-            .expect("inline_content should exist");
-        assert!(inline_content.len() >= 4, "Should have magic number prefix");
-        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+            .expect("manifest_dv should exist");
+        assert!(
+            manifest_dv_bytes.len() >= 4,
+            "Should have magic number prefix"
+        );
+        let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(5));
         assert_eq!(treemap.len(), 1);
 
-        // Step 5: Read the leaf and apply ManifestDV to verify filtering
+        // Step 5: Read the leaf and apply manifest DV to verify filtering
         let leaf_url = Url::parse(&leaf_path)?;
         let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root.clone())?;
         let leaf_entries = leaf_metadata.entries()?;
         assert_eq!(leaf_entries.len(), 10); // Original 10 entries
 
-        // Apply the ManifestDV
-        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv)?;
+        // Apply the manifest DV
+        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv_bytes)?;
         assert_eq!(filtered_entries.len(), 9); // 1 deleted, 9 remaining
 
         Ok(())
@@ -2511,8 +2514,8 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
@@ -2521,6 +2524,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2544,26 +2548,26 @@ mod tests {
         // Read back and verify
         let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
-        assert_eq!(root_entries.len(), 2); // DataManifest + ManifestDV
+        assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
 
-        let manifest_dv = root_entries
+        let data_manifest = root_entries
             .iter()
-            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
-        assert_eq!(manifest_dv.record_count, 3);
 
-        // Verify all deleted indices
-        let inline_content = manifest_dv.inline_content.as_ref().unwrap();
-        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+        // Verify all deleted indices in manifest_dv field
+        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(2));
         assert!(treemap.contains(5));
         assert!(treemap.contains(7));
+        assert_eq!(treemap.len(), 3);
 
-        // Apply ManifestDV and verify filtering
+        // Apply manifest DV and verify filtering
         let leaf_url = Url::parse(&leaf_path)?;
         let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root)?;
         let leaf_entries = leaf_metadata.entries()?;
-        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv)?;
+        let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv_bytes)?;
         assert_eq!(filtered_entries.len(), 7); // 3 deleted, 7 remaining
 
         Ok(())
@@ -2591,8 +2595,8 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
@@ -2601,6 +2605,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2664,8 +2669,8 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
@@ -2674,6 +2679,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2741,8 +2747,8 @@ mod tests {
                     sequence_number: Some(1),
                     file_sequence_number: Some(1),
                     first_row_id: None,
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
@@ -2751,6 +2757,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2773,20 +2780,20 @@ mod tests {
 
         let root_url = root_builder.write_root(&engine)?;
 
-        // Read back and verify ManifestDV references absolute path
+        // Read back and verify manifest location is absolute
         let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
         let root_entries = root_metadata.entries()?;
 
-        let manifest_dv = root_entries
+        let data_manifest = root_entries
             .iter()
-            .find(|e| e.content_type == DataContentType::ManifestDV)
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
             .unwrap();
 
-        assert_eq!(manifest_dv.referenced_file.as_ref(), Some(&leaf_path));
+        assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
-        // Verify the deletion was recorded
-        let inline_content = manifest_dv.inline_content.as_ref().unwrap();
-        let treemap = RoaringTreemap::deserialize_from(&inline_content[4..])?;
+        // Verify the deletion was recorded in manifest_dv
+        let manifest_dv_bytes = data_manifest.manifest_dv.as_ref().unwrap();
+        let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert!(treemap.contains(3));
 
         Ok(())
@@ -2796,6 +2803,7 @@ mod tests {
     fn test_delete_from_leaf_with_existing_deleted_entries(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -2821,8 +2829,8 @@ mod tests {
                 sequence_number: Some(1),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2839,6 +2847,7 @@ mod tests {
                 min_sequence_number: 1,
             }),
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2878,15 +2887,388 @@ mod tests {
              even if some entries were already deleted"
         );
 
-        // Verify ManifestDV has cardinality 3 (not 5)
-        let manifest_dv = root_entries
-            .iter()
-            .find(|e| e.content_type == DataContentType::ManifestDV)
-            .expect("ManifestDV should exist");
+        // Verify manifest_dv has cardinality 3 (not 5)
+        let manifest_dv_bytes = leaf_manifest
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
 
+        let treemap = RoaringTreemap::deserialize_from(&manifest_dv_bytes[4..])?;
         assert_eq!(
-            manifest_dv.record_count, 3,
-            "ManifestDV should only track the 3 newly deleted entries"
+            treemap.len(),
+            3,
+            "manifest_dv should only track the 3 newly deleted entries"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tracking_info_changes_dv_clearing() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Step 1: Create a leaf with 10 data entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        for i in 0..10 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                }),
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                manifest_dv: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Step 2: Create root and delete entries 2 and 5 (first commit)
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        root_builder.add_entry(leaf_manifest_entry.clone());
+        root_builder.delete_from_leaf(&leaf_path, 2, 1, Some(1))?;
+        root_builder.delete_from_leaf(&leaf_path, 5, 1, Some(1))?;
+
+        let root_url_v1 = root_builder.write_root(&engine)?;
+
+        // Step 3: Read back and verify changes_dv from first commit
+        let root_metadata_v1 = Metadata::read(&engine, &root_url_v1, table_root.clone())?;
+        let entries_v1 = root_metadata_v1.entries()?;
+        let manifest_v1 = entries_v1
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        // Verify manifest_dv contains both deletions (2 and 5)
+        let manifest_dv_v1 = manifest_v1
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
+        let cumulative_v1 = RoaringTreemap::deserialize_from(&manifest_dv_v1[4..])?;
+        assert!(cumulative_v1.contains(2));
+        assert!(cumulative_v1.contains(5));
+        assert_eq!(cumulative_v1.len(), 2);
+
+        // Verify changes_dv contains both deletions from this commit (2 and 5)
+        let changes_dv_v1 = manifest_v1
+            .tracking_info
+            .as_ref()
+            .unwrap()
+            .changes_dv
+            .as_ref()
+            .expect("changes_dv should exist");
+        let delta_v1 = RoaringTreemap::deserialize_from(&changes_dv_v1[4..])?;
+        assert!(delta_v1.contains(2));
+        assert!(delta_v1.contains(5));
+        assert_eq!(delta_v1.len(), 2);
+
+        // Step 4: Start a new commit (v2) by loading v1 entries
+        // Note: changes_dv is automatically cleared when entries are added
+        let mut root_builder_v2 =
+            MetadataBuilder::new_for(table_root.clone(), 2, test_table_schema());
+        for entry in entries_v1 {
+            root_builder_v2.add_entry(entry);
+        }
+
+        // Step 5: Add new deletions (entries 3 and 7) in the second commit
+        root_builder_v2.delete_from_leaf(&leaf_path, 3, 2, Some(2))?;
+        root_builder_v2.delete_from_leaf(&leaf_path, 7, 2, Some(2))?;
+
+        let root_url_v2 = root_builder_v2.write_root(&engine)?;
+
+        // Step 7: Read back and verify changes_dv only contains NEW deletions
+        let root_metadata_v2 = Metadata::read(&engine, &root_url_v2, table_root.clone())?;
+        let entries_v2 = root_metadata_v2.entries()?;
+        let manifest_v2 = entries_v2
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
+        let manifest_dv_v2 = manifest_v2
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
+        let cumulative_v2 = RoaringTreemap::deserialize_from(&manifest_dv_v2[4..])?;
+        assert!(cumulative_v2.contains(2));
+        assert!(cumulative_v2.contains(3));
+        assert!(cumulative_v2.contains(5));
+        assert!(cumulative_v2.contains(7));
+        assert_eq!(cumulative_v2.len(), 4);
+
+        // Verify changes_dv ONLY contains NEW deletions from v2 (3 and 7)
+        let changes_dv_v2 = manifest_v2
+            .tracking_info
+            .as_ref()
+            .unwrap()
+            .changes_dv
+            .as_ref()
+            .expect("changes_dv should exist");
+        let delta_v2 = RoaringTreemap::deserialize_from(&changes_dv_v2[4..])?;
+        assert!(
+            !delta_v2.contains(2),
+            "Old deletion (2) should NOT be in delta"
+        );
+        assert!(delta_v2.contains(3), "New deletion (3) should be in delta");
+        assert!(
+            !delta_v2.contains(5),
+            "Old deletion (5) should NOT be in delta"
+        );
+        assert!(delta_v2.contains(7), "New deletion (7) should be in delta");
+        assert_eq!(
+            delta_v2.len(),
+            2,
+            "Delta should only contain 2 new deletions"
+        );
+
+        // Step 8: Start a new commit (v3) by loading v2 entries
+        // Note: changes_dv is automatically cleared when entries are added
+        let mut root_builder_v3 =
+            MetadataBuilder::new_for(table_root.clone(), 3, test_table_schema());
+        for entry in entries_v2 {
+            root_builder_v3.add_entry(entry);
+        }
+
+        // Step 9: Delete one additional record (entry 8) in the third commit
+        root_builder_v3.delete_from_leaf(&leaf_path, 8, 3, Some(3))?;
+
+        let root_url_v3 = root_builder_v3.write_root(&engine)?;
+
+        // Step 10: Read back and verify changes_dv only contains NEW deletion
+        let root_metadata_v3 = Metadata::read(&engine, &root_url_v3, table_root.clone())?;
+        let entries_v3 = root_metadata_v3.entries()?;
+        let manifest_v3 = entries_v3
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
+        let manifest_dv_v3 = manifest_v3
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
+        let cumulative_v3 = RoaringTreemap::deserialize_from(&manifest_dv_v3[4..])?;
+        assert!(cumulative_v3.contains(2));
+        assert!(cumulative_v3.contains(3));
+        assert!(cumulative_v3.contains(5));
+        assert!(cumulative_v3.contains(7));
+        assert!(cumulative_v3.contains(8));
+        assert_eq!(cumulative_v3.len(), 5);
+
+        // Verify changes_dv ONLY contains NEW deletion from v3 (8)
+        let changes_dv_v3 = manifest_v3
+            .tracking_info
+            .as_ref()
+            .unwrap()
+            .changes_dv
+            .as_ref()
+            .expect("changes_dv should exist");
+        let delta_v3 = RoaringTreemap::deserialize_from(&changes_dv_v3[4..])?;
+        assert!(
+            !delta_v3.contains(2),
+            "Old deletion (2) should NOT be in delta"
+        );
+        assert!(
+            !delta_v3.contains(3),
+            "Old deletion (3) should NOT be in delta"
+        );
+        assert!(
+            !delta_v3.contains(5),
+            "Old deletion (5) should NOT be in delta"
+        );
+        assert!(
+            !delta_v3.contains(7),
+            "Old deletion (7) should NOT be in delta"
+        );
+        assert!(delta_v3.contains(8), "New deletion (8) should be in delta");
+        assert_eq!(
+            delta_v3.len(),
+            1,
+            "Delta should only contain 1 new deletion"
+        );
+
+        // Step 11: Start a new commit (v4) by loading v3 entries
+        // Note: changes_dv is automatically cleared when entries are added
+        let mut root_builder_v4 =
+            MetadataBuilder::new_for(table_root.clone(), 4, test_table_schema());
+        for entry in entries_v3 {
+            root_builder_v4.add_entry(entry);
+        }
+
+        // Step 12: Make an unrelated change - add a new data entry (no deletions)
+        let new_data_entry = MetadataEntry {
+            content_type: DataContentType::Data,
+            location: Some(format!("{}data/part-{:05}.parquet", table_root, 100)),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: Some(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(4),
+                sequence_number: Some(4),
+                file_sequence_number: Some(4),
+                first_row_id: None,
+                changes_dv: None,
+            }),
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 100,
+            file_size_in_bytes: Some(1024),
+            content_stats: None,
+            manifest_info: None,
+            referenced_file: None,
+            manifest_dv: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        root_builder_v4.add_entry(new_data_entry);
+
+        let root_url_v4 = root_builder_v4.write_root(&engine)?;
+
+        // Step 13: Read back and verify changes_dv is None (no deletions)
+        let root_metadata_v4 = Metadata::read(&engine, &root_url_v4, table_root.clone())?;
+        let entries_v4 = root_metadata_v4.entries()?;
+        let manifest_v4 = entries_v4
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
+        let manifest_dv_v4 = manifest_v4
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
+        let cumulative_v4 = RoaringTreemap::deserialize_from(&manifest_dv_v4[4..])?;
+        assert_eq!(
+            cumulative_v4.len(),
+            5,
+            "manifest_dv should still have 5 deletions"
+        );
+
+        // Verify changes_dv is None since no deletions were made in v4
+        assert!(
+            manifest_v4
+                .tracking_info
+                .as_ref()
+                .unwrap()
+                .changes_dv
+                .is_none(),
+            "changes_dv should be None when no deletions are made"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_leaf_reorganization_does_not_set_changes_dv() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Step 1: Create a leaf with 5 data entries
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        for i in 0..5 {
+            let data_entry = MetadataEntry {
+                content_type: DataContentType::Data,
+                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                }),
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count: 100,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_info: None,
+                referenced_file: None,
+                manifest_dv: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            };
+            leaf_builder.add_entry(data_entry);
+        }
+
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
+
+        // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
+        // with set_changes_dv=false (simulating moving entries to a different leaf)
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        root_builder.add_entry(leaf_manifest_entry.clone());
+
+        let mut indices = RoaringTreemap::new();
+        indices.insert(2);
+        indices.insert(3);
+
+        // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, 1, Some(1), false)?;
+
+        let root_url = root_builder.write_root(&engine)?;
+
+        // Step 3: Read back and verify changes_dv is NOT set for leaf reorganization
+        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let entries = root_metadata.entries()?;
+        let manifest = entries
+            .iter()
+            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .expect("DataManifest should exist");
+
+        // Verify manifest_dv contains the deletions (for internal tracking)
+        let manifest_dv = manifest
+            .manifest_dv
+            .as_ref()
+            .expect("manifest_dv should exist");
+        let cumulative = RoaringTreemap::deserialize_from(&manifest_dv[4..])?;
+        assert!(cumulative.contains(2));
+        assert!(cumulative.contains(3));
+        assert_eq!(cumulative.len(), 2);
+
+        // Verify changes_dv is NOT set since this was leaf reorganization, not actual deletion
+        assert!(
+            manifest
+                .tracking_info
+                .as_ref()
+                .unwrap()
+                .changes_dv
+                .is_none(),
+            "changes_dv should NOT be set for leaf reorganization (set_changes_dv=false)"
         );
 
         Ok(())
@@ -2910,7 +3292,6 @@ mod tests {
             location: Some(format!("{}file1.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2919,6 +3300,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2928,7 +3310,6 @@ mod tests {
             location: Some(format!("{}file2.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2937,6 +3318,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2946,7 +3328,6 @@ mod tests {
             location: Some(format!("{}file3.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -2955,6 +3336,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3008,7 +3390,6 @@ mod tests {
             location: Some(format!("{}dv1.bin", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -3017,6 +3398,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(format!("{}data1.parquet", table_root)),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3026,7 +3408,6 @@ mod tests {
             location: Some(format!("{}data1.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -3035,6 +3416,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3076,7 +3458,6 @@ mod tests {
             location: Some(format!("{}dv1.bin", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -3085,6 +3466,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(format!("{}data1.parquet", table_root)),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3094,7 +3476,6 @@ mod tests {
             location: Some(format!("{}data1.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -3103,6 +3484,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3138,7 +3520,6 @@ mod tests {
             location: Some(format!("{}file1.parquet", table_root)),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -3147,6 +3528,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
