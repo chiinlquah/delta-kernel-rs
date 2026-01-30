@@ -537,6 +537,7 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
 /// * `max_value` - The maximum value (upper_bound)
 /// * `null_count` - The count of null values
 /// * `tight_bounds` - Whether the bounds are tight/exact (from Delta's `tightBounds` field)
+#[allow(dead_code)]
 fn build_column_stats(
     field: &StructField,
     stats_struct: &StructType,
@@ -582,6 +583,7 @@ fn build_column_stats(
 }
 
 /// Recursively builds content_stats StructData for a struct field.
+#[allow(dead_code)]
 fn build_struct_stats(
     table_struct: &StructType,
     stats_struct: &StructType,

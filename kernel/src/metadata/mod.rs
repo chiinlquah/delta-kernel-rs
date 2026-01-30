@@ -2448,7 +2448,7 @@ fn delta_json_stats_schema(table_schema: &StructType) -> StructType {
 fn null_count_stats_schema(table_schema: &StructType) -> StructType {
     let fields: Vec<StructField> = table_schema
         .fields()
-        .filter_map(|field| null_count_field(field))
+        .filter_map(null_count_field)
         .collect();
     StructType::new_unchecked(fields)
 }
@@ -2481,7 +2481,7 @@ fn null_count_field(field: &StructField) -> Option<StructField> {
 fn min_max_stats_schema(table_schema: &StructType) -> StructType {
     let fields: Vec<StructField> = table_schema
         .fields()
-        .filter_map(|field| min_max_field(field))
+        .filter_map(min_max_field)
         .collect();
     StructType::new_unchecked(fields)
 }
