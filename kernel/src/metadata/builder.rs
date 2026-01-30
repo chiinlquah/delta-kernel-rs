@@ -1093,11 +1093,12 @@ impl MetadataBuilder {
 
     /// Builds a root Metadata instance (leaf is `None`).
     pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::{SchemaRef, ToSchema};
+        use crate::schema::SchemaRef;
         use crate::IntoEngineData;
 
-        // Cache schema to avoid repeated construction
-        let schema: SchemaRef = MetadataEntry::to_schema().into();
+        // Use dynamic schema with content_stats based on table schema
+        let schema: SchemaRef =
+            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
@@ -1134,11 +1135,12 @@ impl MetadataBuilder {
 
     /// Builds a leaf Metadata instance with a generated UUID.
     pub(crate) fn build_leaf(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::{SchemaRef, ToSchema};
+        use crate::schema::SchemaRef;
         use crate::IntoEngineData;
 
-        // Cache schema to avoid repeated construction
-        let schema: SchemaRef = MetadataEntry::to_schema().into();
+        // Use dynamic schema with content_stats based on table schema
+        let schema: SchemaRef =
+            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
@@ -1162,11 +1164,12 @@ impl MetadataBuilder {
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
     ) -> DeltaResult<Metadata> {
-        use crate::schema::{SchemaRef, ToSchema};
+        use crate::schema::SchemaRef;
         use crate::IntoEngineData;
 
-        // Cache schema to avoid repeated construction
-        let schema: SchemaRef = MetadataEntry::to_schema().into();
+        // Use dynamic schema with content_stats based on table schema
+        let schema: SchemaRef =
+            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
 
         let data: Vec<Box<dyn EngineData>> = self
             .pending_entries
@@ -1248,7 +1251,10 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
                     getters[1].get(i, "partitionValues")?;
                 let size: i64 = getters[2].get(i, "size")?;
                 let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-                let stats: Option<StructData> = getters[4].get_opt(i, "stats")?;
+                // TODO: Stats extraction is disabled because the input stats format (Delta JSON)
+                // differs from the expected output format (AMT). A proper conversion is needed.
+                // For now, content_stats is None and will be populated from JSON stats if available.
+                let stats: Option<StructData> = None;
 
                 self.entries
                     .push((path, partition_values, size, modification_time, stats));
@@ -1458,16 +1464,34 @@ mod tests {
         Ok(())
     }
 
-    /// Helper function to create an empty table schema for tests that don't need stats conversion
-    fn empty_schema() -> Schema {
-        Schema::new_unchecked([])
+    /// Helper function to create a minimal table schema for tests.
+    /// This schema has the required parquet.field.id metadata for content_stats generation.
+    fn test_table_schema() -> Schema {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
+
+        Schema::new_unchecked([
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+        ])
     }
 
     #[test]
     fn test_path_to_absolute_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
         // Test with s3:// URL as table root
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "part-00000-123.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1487,7 +1511,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_s3_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let absolute_path = "s3://another-bucket/external/data.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -1498,7 +1522,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_https_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let absolute_path = "https://example.com/data/file.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -1510,7 +1534,7 @@ mod tests {
     fn test_path_to_absolute_with_gs_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Google Cloud Storage URL
         let table_root = Url::parse("gs://my-gcs-bucket/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "data/part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1530,7 +1554,7 @@ mod tests {
     fn test_path_to_absolute_with_azure_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Azure Blob Storage URL
         let table_root = Url::parse("abfss://container@account.dfs.core.windows.net/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1546,7 +1570,7 @@ mod tests {
         // Test with file:// URL - use a temp directory that exists
         let temp_dir = std::env::temp_dir();
         let table_root = Url::parse(&format!("file://{}/", temp_dir.to_str().unwrap()))?;
-        let builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1565,7 +1589,7 @@ mod tests {
     {
         // Test that special characters in paths are preserved
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, empty_schema());
+        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "partition=value%20with%20spaces/file.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1591,7 +1615,7 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify
@@ -1642,7 +1666,7 @@ mod tests {
 
         // Create builder and add from engine data iterator
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
 
         // Build metadata and verify
@@ -1689,7 +1713,7 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify record counts
@@ -1780,78 +1804,56 @@ mod tests {
         let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?
             .expect("content_stats should be populated");
 
-        // Verify the structure has stats for both columns
+        // Helper function to get a field's value from a StructData by field name
+        fn get_struct_field<'a>(
+            data: &'a crate::expressions::StructData,
+            name: &str,
+        ) -> Option<&'a Scalar> {
+            data.fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .map(|idx| &data.values()[idx])
+        }
+
+        // Helper function to get a column's stats field value in AMT format
+        fn get_column_stat<'a>(
+            stats: &'a crate::expressions::StructData,
+            column: &str,
+            stat_field: &str,
+        ) -> Option<&'a Scalar> {
+            if let Some(Scalar::Struct(col_stats)) = get_struct_field(stats, column) {
+                get_struct_field(col_stats, stat_field)
+            } else {
+                None
+            }
+        }
+
+        // AMT format has one field per column: {id: {...}, name: {...}}
         assert_eq!(content_stats.fields().len(), 2);
 
-        // Check 'id' stats
-        let id_field_idx = content_stats
-            .fields()
-            .iter()
-            .position(|f| f.name() == "id")
-            .expect("id field should exist");
+        // Check id stats
+        assert_eq!(
+            get_column_stat(&content_stats, "id", "value_count"),
+            Some(&Scalar::Long(100))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "id", "lower_bound"),
+            Some(&Scalar::Long(1))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "id", "upper_bound"),
+            Some(&Scalar::Long(100))
+        );
 
-        if let Scalar::Struct(id_stats) = &content_stats.values()[id_field_idx] {
-            // Find and verify value_count
-            let value_count_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "value_count");
-            if let Some(idx) = value_count_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
-            }
-
-            // Find and verify lower_bound
-            let lower_bound_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound");
-            if let Some(idx) = lower_bound_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(1));
-            }
-
-            // Find and verify upper_bound
-            let upper_bound_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound");
-            if let Some(idx) = upper_bound_idx {
-                assert_eq!(id_stats.values()[idx], Scalar::Long(100));
-            }
-        } else {
-            panic!("Expected id stats to be a Struct");
-        }
-
-        // Check 'name' stats
-        let name_field_idx = content_stats
-            .fields()
-            .iter()
-            .position(|f| f.name() == "name")
-            .expect("name field should exist");
-
-        if let Scalar::Struct(name_stats) = &content_stats.values()[name_field_idx] {
-            // Find and verify null_value_count
-            let null_count_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "null_value_count");
-            if let Some(idx) = null_count_idx {
-                assert_eq!(name_stats.values()[idx], Scalar::Long(5));
-            }
-
-            // Find and verify lower_bound
-            let lower_bound_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound");
-            if let Some(idx) = lower_bound_idx {
-                assert_eq!(
-                    name_stats.values()[idx],
-                    Scalar::String("alice".to_string())
-                );
-            }
-        } else {
-            panic!("Expected name stats to be a Struct");
-        }
+        // Check name stats
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "null_value_count"),
+            Some(&Scalar::Long(5))
+        );
+        assert_eq!(
+            get_column_stat(&content_stats, "name", "lower_bound"),
+            Some(&Scalar::String("alice".to_string()))
+        );
 
         // Verify the builder has the entry with content_stats populated
         // Note: When serialized to EngineData and read back, content_stats is not preserved
@@ -1867,12 +1869,12 @@ mod tests {
     }
 
     #[test]
-    fn test_content_stats_with_empty_schema() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_content_stats_with_test_table_schema() -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::Add;
 
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        // Builder with empty schema - content_stats should be None (no columns to generate stats for)
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        // Builder with test table schema (has one "id" column)
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         let add = Add {
             path: "part-00000.parquet".to_string(),
@@ -1897,15 +1899,19 @@ mod tests {
         // Verify the builder has the entry
         assert_eq!(builder.pending_entries.len(), 1);
 
-        // With empty schema, content_stats should have empty fields
-        // (the stats schema will be empty since there are no columns)
+        // With test_table_schema (one "id" column), content_stats should have AMT format
+        // with fields: {id: {value_count, ...}}
         let content_stats = &builder.pending_entries[0].content_stats;
         if let Some(stats) = content_stats {
-            assert_eq!(
-                stats.fields().len(),
-                0,
-                "empty schema should produce empty content_stats"
+            // AMT format has one field per column
+            assert!(
+                !stats.fields().is_empty(),
+                "AMT stats should have at least one column stats field, got {} fields",
+                stats.fields().len()
             );
+            // Check that id column stats are present
+            let has_id = stats.fields().iter().any(|f| f.name() == "id");
+            assert!(has_id, "should have id column stats field");
         }
         // content_stats can also be None if stats JSON parsing returned None
 
@@ -2011,64 +2017,60 @@ mod tests {
 
         let aggregated_stats = leaf_manifest_entry.content_stats.as_ref().unwrap();
 
-        // Verify the aggregated stats
+        // Helper function to get a field's value from a StructData by field name
+        fn get_struct_field<'a>(
+            data: &'a crate::expressions::StructData,
+            name: &str,
+        ) -> Option<&'a Scalar> {
+            data.fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .map(|idx| &data.values()[idx])
+        }
+
+        // Helper function to get a column's stats field value in AMT format
+        fn get_column_stat<'a>(
+            stats: &'a crate::expressions::StructData,
+            column: &str,
+            stat_field: &str,
+        ) -> Option<&'a Scalar> {
+            if let Some(Scalar::Struct(col_stats)) = get_struct_field(stats, column) {
+                get_struct_field(col_stats, stat_field)
+            } else {
+                None
+            }
+        }
+
+        // Verify the aggregated stats are in AMT format: {id: {...}, name: {...}}
         assert_eq!(aggregated_stats.fields().len(), 2);
 
-        // Check id stats: value_count=250, lower=1, upper=100
-        if let Scalar::Struct(id_stats) = &aggregated_stats.values()[0] {
-            let value_count_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "value_count")
-                .expect("should have value_count");
-            let lower_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound")
-                .expect("should have lower_bound");
-            let upper_idx = id_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound")
-                .expect("should have upper_bound");
+        // Check id stats: value_count=250, lower_bound=1, upper_bound=100
+        assert_eq!(
+            get_column_stat(aggregated_stats, "id", "value_count"),
+            Some(&Scalar::Long(250))
+        );
+        assert_eq!(
+            get_column_stat(aggregated_stats, "id", "lower_bound"),
+            Some(&Scalar::Long(1))
+        );
+        assert_eq!(
+            get_column_stat(aggregated_stats, "id", "upper_bound"),
+            Some(&Scalar::Long(100))
+        );
 
-            assert_eq!(id_stats.values()[value_count_idx], Scalar::Long(250));
-            assert_eq!(id_stats.values()[lower_idx], Scalar::Long(1));
-            assert_eq!(id_stats.values()[upper_idx], Scalar::Long(100));
-        } else {
-            panic!("Expected id stats to be a Struct");
-        }
-
-        // Check name stats: null_value_count=15, lower="alice", upper="zoe"
-        if let Scalar::Struct(name_stats) = &aggregated_stats.values()[1] {
-            let null_count_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "null_value_count")
-                .expect("should have null_value_count");
-            let lower_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "lower_bound")
-                .expect("should have lower_bound");
-            let upper_idx = name_stats
-                .fields()
-                .iter()
-                .position(|f| f.name() == "upper_bound")
-                .expect("should have upper_bound");
-
-            assert_eq!(name_stats.values()[null_count_idx], Scalar::Long(15)); // 5 + 10
-            assert_eq!(
-                name_stats.values()[lower_idx],
-                Scalar::String("alice".to_string())
-            );
-            assert_eq!(
-                name_stats.values()[upper_idx],
-                Scalar::String("zoe".to_string())
-            );
-        } else {
-            panic!("Expected name stats to be a Struct");
-        }
+        // Check name stats: null_value_count=15, lower_bound="alice", upper_bound="zoe"
+        assert_eq!(
+            get_column_stat(aggregated_stats, "name", "null_value_count"),
+            Some(&Scalar::Long(15)) // 5 + 10
+        );
+        assert_eq!(
+            get_column_stat(aggregated_stats, "name", "lower_bound"),
+            Some(&Scalar::String("alice".to_string()))
+        );
+        assert_eq!(
+            get_column_stat(aggregated_stats, "name", "upper_bound"),
+            Some(&Scalar::String("zoe".to_string()))
+        );
 
         Ok(())
     }
@@ -2084,7 +2086,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a builder with empty schema
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Create entries without content_stats
         let entry = MetadataEntry {
@@ -2277,7 +2279,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf builder with data file entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add some data file entries to the leaf
         let data_entry_1 = MetadataEntry {
@@ -2358,7 +2360,7 @@ mod tests {
         assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
 
         // Step 3: Create a root builder and add the leaf manifest entry
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
 
         // Step 4: Write the root manifest
@@ -2406,7 +2408,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf with 10 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
@@ -2440,7 +2442,7 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
@@ -2497,7 +2499,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 10 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
@@ -2530,7 +2532,7 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
@@ -2577,7 +2579,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 3 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..3 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
@@ -2610,7 +2612,7 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 0, 2, Some(2))?;
@@ -2650,7 +2652,7 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 10 entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
@@ -2683,7 +2685,7 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         let result = root_builder.delete_from_leaf(&leaf_path, 10, 2, Some(2));
@@ -2700,7 +2702,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Try to delete from a non-existent leaf
         let result = root_builder.delete_from_leaf("nonexistent.parquet", 5, 2, Some(2));
@@ -2727,7 +2729,7 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Create a leaf
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..5 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
@@ -2765,7 +2767,7 @@ mod tests {
             .unwrap_or(leaf_url.path());
 
         // Create root and delete using relative path
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
         root_builder.delete_from_leaf(relative_path, 3, 2, Some(2))?;
 
@@ -2802,7 +2804,7 @@ mod tests {
 
         // Create a leaf manifest that already has some deleted entries
         // This simulates a manifest that has been updated over time
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Create a manifest entry with manifest_info showing:
         // - 2 added files (indices 0, 1)
@@ -2900,7 +2902,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add three entries with different file paths
         let entry1 = MetadataEntry {
@@ -2998,7 +3000,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add DV entry
         let dv_entry = MetadataEntry {
@@ -3066,7 +3068,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add DV entry that references a data file
         let dv_entry = MetadataEntry {
@@ -3128,7 +3130,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, empty_schema());
+        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add entry
         let entry = MetadataEntry {

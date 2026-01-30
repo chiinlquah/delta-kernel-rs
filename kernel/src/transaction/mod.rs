@@ -2194,8 +2194,25 @@ pub struct RetryableTransaction {
 mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::Snapshot;
     use std::path::PathBuf;
+
+    /// Helper function to create a test table schema for tests.
+    /// This schema has the required parquet.field.id metadata for content_stats generation.
+    /// It matches the schema created by create_initial_table().
+    fn test_table_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new("value", DataType::STRING, true).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+        ])
+    }
 
     /// Sets up a snapshot for a table with deletion vector support at version 1
     fn setup_dv_enabled_table() -> (SyncEngine, Arc<Snapshot>) {
@@ -2579,11 +2596,18 @@ mod tests {
         use uuid::Uuid;
 
         let table_id = Uuid::new_v4().to_string();
+        // Schema with parquet.field.id metadata required for content_stats generation
+        // Note: Only include parquet.field.id, not column mapping metadata since column
+        // mapping isn't enabled for this test table
         let schema = json!({
             "type": "struct",
             "fields": [
-                {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
-                {"name": "value", "type": "string", "nullable": true, "metadata": {}}
+                {"name": "id", "type": "integer", "nullable": true, "metadata": {
+                    "parquet.field.id": 1
+                }},
+                {"name": "value", "type": "string", "nullable": true, "metadata": {
+                    "parquet.field.id": 2
+                }}
             ]
         });
 
@@ -2712,8 +2736,7 @@ mod tests {
         create_initial_table(&table_root)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
-        let mut leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
@@ -2721,8 +2744,7 @@ mod tests {
         }
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
-        let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2848,7 +2870,7 @@ mod tests {
 
         // Create data leaf manifest with 5 data files
         let mut data_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Files without DV
         data_leaf_builder.add(
@@ -2891,7 +2913,7 @@ mod tests {
 
         // Create delete leaf manifest with PositionDeletes entries for the DVs
         let mut delete_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // DV entry for file-2.parquet
         let dv_entry_2 = MetadataEntry {
@@ -2963,8 +2985,7 @@ mod tests {
         let delete_leaf_entry = delete_leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Create root manifest with both data and delete leaf manifests
-        let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(data_leaf_entry);
         root_builder.add_entry(delete_leaf_entry);
         let root_url = root_builder.write_root(&engine)?;
@@ -3206,6 +3227,7 @@ mod tests {
                     "type": "integer",
                     "nullable": true,
                     "metadata": {
+                        "parquet.field.id": 1,
                         "delta.columnMapping.id": 1,
                         "delta.columnMapping.physicalName": "id"
                     }
@@ -3215,6 +3237,7 @@ mod tests {
                     "type": "string",
                     "nullable": true,
                     "metadata": {
+                        "parquet.field.id": 2,
                         "delta.columnMapping.id": 2,
                         "delta.columnMapping.physicalName": "value"
                     }
@@ -3282,9 +3305,11 @@ mod tests {
         let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
 
         // Helper to create add metadata for testing
+        // Note: stats are set to null (empty struct) because proper content_stats requires
+        // matching the table schema's stats format
         fn create_test_add_metadata(paths: Vec<&str>) -> DeltaResult<Box<dyn crate::EngineData>> {
             use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
-            use crate::arrow::buffer::OffsetBuffer;
+            use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
             use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
             use crate::arrow::record_batch::RecordBatch;
             use crate::engine::arrow_data::ArrowEngineData;
@@ -3292,7 +3317,7 @@ mod tests {
 
             let num_files = paths.len();
 
-            // Create schema
+            // Create schema with empty stats struct
             let schema = Arc::new(StructType::new_unchecked(vec![
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
@@ -3305,13 +3330,7 @@ mod tests {
                 ),
                 StructField::not_null("size", DataType::LONG),
                 StructField::not_null("modificationTime", DataType::LONG),
-                StructField::nullable(
-                    "stats",
-                    DataType::struct_type_unchecked(vec![StructField::nullable(
-                        "numRecords",
-                        DataType::LONG,
-                    )]),
-                ),
+                StructField::nullable("stats", DataType::struct_type_unchecked(vec![])),
             ]));
 
             let arrow_schema = Arc::new(
@@ -3359,13 +3378,10 @@ mod tests {
                 false,
             ));
 
-            // Stats with numRecords
-            let num_records: ArrayRef =
-                Arc::new(Int64Array::from_iter_values(vec![100; num_files]));
-            let stats: ArrayRef = Arc::new(StructArray::new(
-                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
-                vec![num_records],
-                None,
+            // All-null stats (empty struct with null buffer)
+            let stats: ArrayRef = Arc::new(StructArray::new_empty_fields(
+                num_files,
+                Some(NullBuffer::from(vec![false; num_files])),
             ));
 
             let record_batch = RecordBatch::try_new(

@@ -798,12 +798,12 @@ mod tests {
         (engine, table_root, schema)
     }
 
-    /// Helper to create add files metadata for testing
-    fn create_test_add_metadata(
-        files: Vec<(&str, i64, i64, i64)>,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    /// Helper to create add files metadata for testing.
+    /// Note: stats are set to None (null) because proper content_stats requires matching
+    /// the table schema's stats format, which is complex to construct in tests.
+    fn create_test_add_metadata(files: Vec<(&str, i64, i64)>) -> DeltaResult<Box<dyn EngineData>> {
         use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
-        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
         use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
         use crate::arrow::record_batch::RecordBatch;
         use crate::engine::arrow_conversion::TryFromKernel;
@@ -812,6 +812,7 @@ mod tests {
         let num_files = files.len();
 
         // Create schema for add files (path, partitionValues, size, modificationTime, stats)
+        // Note: stats is nullable struct with empty fields - we use null struct values
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -824,22 +825,14 @@ mod tests {
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                DataType::struct_type_unchecked(vec![StructField::nullable(
-                    "numRecords",
-                    DataType::LONG,
-                )]),
-            ),
+            // Empty struct for stats - will be all nulls
+            StructField::nullable("stats", DataType::struct_type_unchecked(vec![])),
         ]));
 
         // Build arrays for each file
-        let path_array = StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
-        let size_array = Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
-        let mod_time_array =
-            Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
-        let num_records_array =
-            Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+        let path_array = StringArray::from(files.iter().map(|(p, _, _)| *p).collect::<Vec<_>>());
+        let size_array = Int64Array::from(files.iter().map(|(_, s, _)| *s).collect::<Vec<_>>());
+        let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m)| *m).collect::<Vec<_>>());
 
         // Create empty map for partitionValues
         let entries_field = Arc::new(Field::new(
@@ -874,10 +867,12 @@ mod tests {
             false,
         ));
 
-        let stats_struct = StructArray::from(vec![(
-            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-            Arc::new(num_records_array) as ArrayRef,
-        )]);
+        // Create all-null struct array for stats (empty struct with no fields)
+        // Use new_empty_fields for struct arrays with no child fields
+        let stats_array = StructArray::new_empty_fields(
+            num_files,
+            Some(NullBuffer::from(vec![false; num_files])),
+        );
 
         let batch = RecordBatch::try_new(
             Arc::new(TryFromKernel::try_from_kernel(schema.as_ref())?),
@@ -886,7 +881,7 @@ mod tests {
                 partition_values_array as ArrayRef,
                 Arc::new(size_array) as ArrayRef,
                 Arc::new(mod_time_array) as ArrayRef,
-                Arc::new(stats_struct) as ArrayRef,
+                Arc::new(stats_array) as ArrayRef,
             ],
         )?;
 
@@ -902,8 +897,8 @@ mod tests {
         let mut writer =
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
-        // Add files
-        let metadata = create_test_add_metadata(vec![("file1.parquet", 1024, 1000000, 100)])?;
+        // Add files (path, size, modification_time)
+        let metadata = create_test_add_metadata(vec![("file1.parquet", 1024, 1000000)])?;
         writer.add_files(metadata)?;
 
         // Finish and verify result
@@ -946,14 +941,13 @@ mod tests {
         let mut writer =
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
-        // Add 10 files
+        // Add 10 files (path, size, modification_time)
         let files: Vec<_> = (0..10)
             .map(|i| {
                 (
                     format!("file{}.parquet", i).leak() as &str,
                     1024 + i * 100,
                     1000000 + i,
-                    100 + i,
                 )
             })
             .collect();

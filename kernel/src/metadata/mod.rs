@@ -17,7 +17,7 @@ use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType, ToSchema};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
     SnapshotRef, Version,
@@ -26,7 +26,7 @@ use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use tracing::debug;
 use url::Url;
 
@@ -386,11 +386,6 @@ pub(crate) struct ManifestReference {
     /// Delete manifest entries affiliated with this specific data manifest (via referenced_file)
     pub(crate) affiliated_dv_manifests: Vec<FilteredManifest>,
 }
-
-/// Cached schema for reading MetadataEntry from parquet files.
-/// Computed once and reused across all read operations.
-static METADATA_ENTRY_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(MetadataEntry::to_schema()));
 
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
@@ -1264,11 +1259,19 @@ impl Metadata {
     }
 
     /// Read metadata using a parquet handler directly (for lazy streaming).
+    ///
+    /// Uses `MetadataEntry::base_schema()` for reading, which excludes content_stats.
+    /// The visitor extracts all fields except content_stats which requires table schema.
     fn read_with_handler(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
         table_root: Url,
     ) -> DeltaResult<Self> {
+        // Cached schema for reading MetadataEntry from parquet files.
+        // Uses base_schema which excludes content_stats (requires table schema).
+        static READ_SCHEMA: LazyLock<SchemaRef> =
+            LazyLock::new(|| Arc::new(MetadataEntry::base_schema()));
+
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -1279,7 +1282,7 @@ impl Metadata {
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
         let read_result_iter =
-            parquet_handler.read_parquet_files(&[file], METADATA_ENTRY_SCHEMA.clone(), None)?;
+            parquet_handler.read_parquet_files(&[file], READ_SCHEMA.clone(), None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -2290,14 +2293,43 @@ pub struct MetadataEntry {
     pub(crate) equality_ids: Option<Vec<i32>>,
 }
 
-// Manual implementation of ToSchema to exclude fields that are not supported or not used by Delta:
-// - content_stats (requires table schema - use `to_schema_with_content_stats` instead)
-// - key_metadata (binary type not supported)
-// - split_offsets (not used by Delta today)
-// - equality_ids (not used by Delta today)
-impl crate::schema::ToSchema for MetadataEntry {
-    fn to_schema() -> crate::schema::StructType {
-        use crate::schema::{derive_macro_utils::GetStructField as _, StructType};
+impl MetadataEntry {
+    /// Returns MetadataEntry schema augmented with metadata columns for tracking.
+    /// Adds:
+    /// - RowIndex: 0-based position of entry within source manifest file
+    /// - FilePath: URL of the source manifest file
+    ///
+    /// # Arguments
+    /// * `table_schema` - The table's data schema to generate content_stats schema from
+    #[allow(dead_code)]
+    pub(crate) fn to_schema_with_metadata_columns(
+        table_schema: &StructType,
+    ) -> DeltaResult<SchemaRef> {
+        use crate::schema::MetadataColumnSpec;
+
+        let base_schema = Self::to_schema_with_content_stats(table_schema)?;
+        let mut schema_with_tracking = base_schema;
+
+        schema_with_tracking = schema_with_tracking
+            .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)?;
+
+        schema_with_tracking = schema_with_tracking
+            .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)?;
+
+        Ok(Arc::new(schema_with_tracking))
+    }
+
+    /// Returns a base MetadataEntry schema that excludes content_stats.
+    ///
+    /// This is used for reading metadata entries back from parquet files where
+    /// we don't need the table-schema-dependent content_stats field. The visitor
+    /// pattern requires static schema references, so we use this fixed schema
+    /// for reading rather than the dynamic `to_schema_with_content_stats`.
+    ///
+    /// Note: When reading metadata entries using this schema, content_stats will
+    /// always be None since it's not included in this schema.
+    pub(crate) fn base_schema() -> StructType {
+        use crate::schema::derive_macro_utils::GetStructField as _;
 
         StructType::new_unchecked([
             DataContentType::get_struct_field("contentType"),
@@ -2311,7 +2343,7 @@ impl crate::schema::ToSchema for MetadataEntry {
             i64::get_struct_field("recordCount"),
             Option::<i64>::get_struct_field("fileSizeInBytes"),
             // content_stats intentionally excluded - requires table schema
-            // Use `to_schema_with_content_stats(table_schema)` to include it
+            // Use `to_schema_with_content_stats(table_schema)` when writing
             Option::<ManifestStats>::get_struct_field("manifestStats"),
             Option::<String>::get_struct_field("referencedFile"),
             // key_metadata intentionally excluded - binary type not supported
@@ -2319,42 +2351,12 @@ impl crate::schema::ToSchema for MetadataEntry {
             // equality_ids intentionally excluded - not used by Delta today
         ])
     }
-}
-
-impl MetadataEntry {
-    /// Returns MetadataEntry schema augmented with metadata columns for tracking.
-    /// Adds:
-    /// - RowIndex: 0-based position of entry within source manifest file
-    /// - FilePath: URL of the source manifest file
-    #[allow(dead_code)]
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn to_schema_with_metadata_columns() -> SchemaRef {
-        use crate::schema::{MetadataColumnSpec, ToSchema};
-
-        static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-        SCHEMA
-            .get_or_init(|| {
-                let base_schema = Self::to_schema();
-                let mut schema_with_tracking = base_schema;
-
-                schema_with_tracking = schema_with_tracking
-                    .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)
-                    .unwrap();
-
-                schema_with_tracking = schema_with_tracking
-                    .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)
-                    .unwrap();
-
-                Arc::new(schema_with_tracking)
-            })
-            .clone()
-    }
 
     /// Returns MetadataEntry schema with content_stats based on the given table schema.
     ///
-    /// The content_stats field schema is dynamically generated using [`stats::stats_schema`]
-    /// based on the table's data schema. This allows storing per-column statistics
-    /// (min/max bounds, null counts, etc.) that match the structure of the table.
+    /// The content_stats field schema is dynamically generated in Delta JSON stats format
+    /// (numRecords, nullCount, minValues, maxValues, tightBounds) matching the format
+    /// used by [`Transaction::add_files_schema`].
     ///
     /// # Arguments
     ///
@@ -2363,15 +2365,16 @@ impl MetadataEntry {
     /// # Returns
     ///
     /// Returns `Ok(StructType)` containing the full MetadataEntry schema with content_stats,
-    /// or an error if stats schema generation fails (e.g., missing field IDs).
+    /// or an error if stats schema generation fails.
     #[allow(dead_code)]
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
     ) -> DeltaResult<StructType> {
-        use crate::metadata::stats::stats_schema;
         use crate::schema::derive_macro_utils::GetStructField as _;
 
-        let stats_struct = stats_schema(table_schema)?;
+        // Generate AMT-style stats schema format:
+        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
+        let stats_struct = stats::stats_schema(table_schema)?;
 
         Ok(StructType::new_unchecked([
             DataContentType::get_struct_field("contentType"),
@@ -2384,7 +2387,7 @@ impl MetadataEntry {
             Option::<i64>::get_struct_field("sortOrderId"),
             i64::get_struct_field("recordCount"),
             Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats - dynamic based on table schema
+            // content_stats - dynamic based on table schema (AMT stats format)
             StructField::new(
                 "contentStats",
                 DataType::Struct(Box::new(stats_struct)),
@@ -2505,7 +2508,6 @@ impl crate::IntoEngineData for MetadataEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ToSchema;
     use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
 
@@ -2515,7 +2517,6 @@ mod tests {
 
     #[test]
     fn test_simple_into_engine_data() -> DeltaResult<()> {
-        use crate::schema::ToSchema;
         use crate::IntoEngineData;
         let engine = SyncEngine::new();
 
@@ -2545,7 +2546,7 @@ mod tests {
             equality_ids: None,
         };
 
-        let schema = MetadataEntry::to_schema().into();
+        let schema = test_metadata_entry_schema();
         let result = entry.into_engine_data(schema, &engine);
         if let Err(e) = &result {
             eprintln!("Error in test_simple_into_engine_data: {:?}", e);
@@ -2597,10 +2598,9 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_entry_schema_fields() {
-        use crate::schema::ToSchema;
-        // Verify the schema has the expected structure
-        let schema = MetadataEntry::to_schema();
+    fn test_metadata_entry_base_schema_fields() {
+        // Verify the base schema has the expected structure (excludes content_stats)
+        let schema = MetadataEntry::base_schema();
 
         // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
         assert_eq!(schema.fields().len(), 12);
@@ -2617,52 +2617,24 @@ mod tests {
     fn test_to_schema_with_content_stats() -> DeltaResult<()> {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
 
-        // Create a simple table schema with a few fields
-        // We need to add parquet.field.id and column mapping metadata to each field
-        // (column mapping is required when metadata tree feature is enabled)
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
+        // Create a simple table schema with field IDs (required for AMT stats schema)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-id".to_string()),
-                ),
-            ]),
-            StructField::new("name", DataType::STRING, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-name".to_string()),
-                ),
-            ]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-value".to_string()),
-                ),
-            ]),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+            field_with_id("value", DataType::DOUBLE, true, 3),
         ]);
 
         // Generate schema with content_stats
@@ -2677,52 +2649,69 @@ mod tests {
             .expect("contentStats field should exist");
         assert!(content_stats_field.nullable);
 
-        // Verify contentStats is a struct with stats for each table column
+        // Verify contentStats is a struct with AMT stats format:
+        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected contentStats to be a struct"),
         };
 
-        // Should have stats for each table column
+        // Should have 3 fields: id, name, value (one per column)
         assert_eq!(content_stats_struct.fields().count(), 3);
         assert!(content_stats_struct.field("id").is_some());
         assert!(content_stats_struct.field("name").is_some());
         assert!(content_stats_struct.field("value").is_some());
 
-        // Verify stats structure for 'id' (non-nullable int - 4 stats fields)
-        let id_stats = content_stats_struct.field("id").unwrap();
-        let id_stats_struct = match id_stats.data_type() {
+        // Verify each column has a stats struct
+        // id: non-nullable INTEGER -> {value_count, lower_bound, upper_bound, exact_bounds}
+        let id_stats = match content_stats_struct.field("id").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected id stats to be a struct"),
         };
-        assert_eq!(id_stats_struct.fields().count(), 4); // value_count, lower_bound, upper_bound, exact_bounds
-        assert!(id_stats_struct.field("value_count").is_some());
-        assert!(id_stats_struct.field("lower_bound").is_some());
-        assert!(id_stats_struct.field("upper_bound").is_some());
-        assert!(id_stats_struct.field("exact_bounds").is_some());
-        assert!(id_stats_struct.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("value_count").is_some());
+        assert!(id_stats.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(id_stats.field("lower_bound").is_some());
+        assert!(id_stats.field("upper_bound").is_some());
+        assert!(id_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            id_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::INTEGER
+        );
 
-        // Verify stats structure for 'name' (nullable string - 7 stats fields)
-        let name_stats = content_stats_struct.field("name").unwrap();
-        let name_stats_struct = match name_stats.data_type() {
+        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
         };
-        assert_eq!(name_stats_struct.fields().count(), 7); // includes null_value_count and size stats
-        assert!(name_stats_struct.field("null_value_count").is_some()); // nullable
-        assert!(name_stats_struct.field("avg_value_size").is_some()); // string type
-        assert!(name_stats_struct.field("max_value_size").is_some()); // string type
+        assert!(name_stats.field("value_count").is_some());
+        assert!(name_stats.field("null_value_count").is_some()); // nullable
+        assert!(name_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("max_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("lower_bound").is_some());
+        assert!(name_stats.field("upper_bound").is_some());
+        assert!(name_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            name_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::STRING
+        );
 
-        // Verify stats structure for 'value' (nullable double - 6 stats fields)
-        let value_stats = content_stats_struct.field("value").unwrap();
-        let value_stats_struct = match value_stats.data_type() {
+        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
         };
-        assert_eq!(value_stats_struct.fields().count(), 6); // includes null_value_count and nan_value_count
-        assert!(value_stats_struct.field("null_value_count").is_some()); // nullable
-        assert!(value_stats_struct.field("nan_value_count").is_some()); // double type
-        assert!(value_stats_struct.field("avg_value_size").is_none()); // fixed-length
+        assert!(value_stats.field("value_count").is_some());
+        assert!(value_stats.field("null_value_count").is_some()); // nullable
+        assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
+        assert!(value_stats.field("lower_bound").is_some());
+        assert!(value_stats.field("upper_bound").is_some());
+        assert!(value_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            value_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::DOUBLE
+        );
 
         Ok(())
     }
@@ -2732,88 +2721,95 @@ mod tests {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
         use crate::IntoEngineData;
 
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
         let engine = SyncEngine::new();
 
-        // Create a simple table schema with parquet field IDs and column mapping annotations
-        // (column mapping is required when metadata tree feature is enabled)
+        // Create a simple table schema with field IDs
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-id".to_string()),
-                ),
-            ]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-value".to_string()),
-                ),
-            ]),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("value", DataType::DOUBLE, true, 2),
         ]);
 
         // Generate the schema with content_stats
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats data
-        // For the 'id' field (non-nullable int): value_count, lower_bound, upper_bound, exact_bounds
-        // For the 'value' field (nullable double): value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds
-        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
-        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
+        // Create content_stats in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
 
-        // Build the 'id' stats struct (4 fields)
-        let id_stats_schema = match content_stats_fields[0].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
         let id_stats = StructData::try_new(
-            id_stats_fields,
             vec![
-                Scalar::Long(100),     // value_count
-                Scalar::Integer(1),    // lower_bound
-                Scalar::Integer(1000), // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::INTEGER),
+                StructField::nullable("upper_bound", DataType::INTEGER),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            ],
+            vec![
+                Scalar::Long(100),
+                Scalar::Integer(1),
+                Scalar::Integer(1000),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the 'value' stats struct (6 fields)
-        let value_stats_schema = match content_stats_fields[1].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let value_stats_fields: Vec<_> = value_stats_schema.into_fields().collect();
+        // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
         let value_stats = StructData::try_new(
-            value_stats_fields,
             vec![
-                Scalar::Long(100),      // value_count
-                Scalar::Long(5),        // null_value_count
-                Scalar::Long(0),        // nan_value_count
-                Scalar::Double(0.0),    // lower_bound
-                Scalar::Double(100.0),  // upper_bound
-                Scalar::Boolean(false), // exact_bounds
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("null_value_count", DataType::LONG),
+                StructField::nullable("nan_value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::DOUBLE),
+                StructField::nullable("upper_bound", DataType::DOUBLE),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            ],
+            vec![
+                Scalar::Long(100),
+                Scalar::Long(5),
+                Scalar::Long(0),
+                Scalar::Double(0.0),
+                Scalar::Double(100.0),
+                Scalar::Boolean(true),
             ],
         )?;
 
         // Build the content_stats struct
         let content_stats = StructData::try_new(
-            content_stats_fields,
+            vec![
+                StructField::nullable(
+                    "id",
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::INTEGER),
+                        StructField::nullable("upper_bound", DataType::INTEGER),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                    ]))),
+                ),
+                StructField::nullable(
+                    "value",
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("null_value_count", DataType::LONG),
+                        StructField::nullable("nan_value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::DOUBLE),
+                        StructField::nullable("upper_bound", DataType::DOUBLE),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                    ]))),
+                ),
+            ],
             vec![Scalar::Struct(id_stats), Scalar::Struct(value_stats)],
         )?;
 
@@ -2965,46 +2961,61 @@ mod tests {
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats data
-        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
-        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
+        // Create content_stats data in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
 
-        // Build the 'id' stats struct (4 fields for non-nullable int)
-        let id_stats_schema = match content_stats_fields[0].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count)
+        let id_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::INTEGER),
+            StructField::nullable("upper_bound", DataType::INTEGER),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+        ];
         let id_stats = StructData::try_new(
-            id_stats_fields,
+            id_stats_fields.clone(),
             vec![
-                Scalar::Long(500),     // value_count
-                Scalar::Integer(1),    // lower_bound
-                Scalar::Integer(500),  // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Long(500),
+                Scalar::Integer(1),
+                Scalar::Integer(500),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the 'name' stats struct (7 fields for nullable string)
-        let name_stats_schema = match content_stats_fields[1].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let name_stats_fields: Vec<_> = name_stats_schema.into_fields().collect();
+        // Build name stats struct (nullable STRING, so has null_value_count and size stats)
+        let name_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("null_value_count", DataType::LONG),
+            StructField::nullable("avg_value_size", DataType::LONG),
+            StructField::nullable("max_value_size", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::STRING),
+            StructField::nullable("upper_bound", DataType::STRING),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+        ];
         let name_stats = StructData::try_new(
-            name_stats_fields,
+            name_stats_fields.clone(),
             vec![
-                Scalar::Long(500),                      // value_count
-                Scalar::Long(10),                       // null_value_count
-                Scalar::Long(5),                        // avg_value_size
-                Scalar::Long(100),                      // max_value_size
-                Scalar::String("aardvark".to_string()), // lower_bound
-                Scalar::String("zebra".to_string()),    // upper_bound
-                Scalar::Boolean(false),                 // exact_bounds
+                Scalar::Long(500),
+                Scalar::Long(10),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
+                Scalar::String("aardvark".to_string()),
+                Scalar::String("zebra".to_string()),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the content_stats struct
+        // Build the content_stats struct in AMT format
+        let content_stats_fields = vec![
+            StructField::nullable(
+                "id",
+                DataType::Struct(Box::new(StructType::new_unchecked(id_stats_fields))),
+            ),
+            StructField::nullable(
+                "name",
+                DataType::Struct(Box::new(StructType::new_unchecked(name_stats_fields))),
+            ),
+        ];
         let content_stats = StructData::try_new(
             content_stats_fields,
             vec![Scalar::Struct(id_stats), Scalar::Struct(name_stats)],
@@ -3085,6 +3096,38 @@ mod tests {
         let bytes = Bytes::from(vec![1, 2, 3, 4]);
         let scalar: Scalar = bytes.into();
         assert!(matches!(scalar, Scalar::Binary(ref v) if v == &vec![1, 2, 3, 4]));
+    }
+
+    /// Helper function to create a simple test table schema with parquet field IDs.
+    /// This is used for tests that need to generate content_stats schema.
+    fn test_table_schema() -> StructType {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+        StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+        ])
+    }
+
+    /// Helper function to get the test schema for MetadataEntry with content_stats.
+    /// Uses `test_table_schema()` to generate the dynamic schema.
+    fn test_metadata_entry_schema() -> SchemaRef {
+        Arc::new(
+            MetadataEntry::to_schema_with_content_stats(&test_table_schema())
+                .expect("test schema should be valid"),
+        )
     }
 
     // Helper function to create a simple MetadataEntry for testing
@@ -3327,7 +3370,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3360,7 +3403,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3393,7 +3436,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3426,7 +3469,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 3,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3483,16 +3526,16 @@ mod tests {
             data: vec![
                 entry1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry4
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 3,
             table_root: table_root_url.clone(),
@@ -3567,7 +3610,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+                    .into_engine_data(test_metadata_entry_schema(), &engine)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -3642,7 +3685,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+                    .into_engine_data(test_metadata_entry_schema(), &engine)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -3706,7 +3749,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3774,7 +3817,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -3880,10 +3923,10 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -3931,10 +3974,10 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -3980,7 +4023,7 @@ mod tests {
         let metadata = Metadata {
             data: vec![data_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
             manifest_location: None,
@@ -4020,7 +4063,7 @@ mod tests {
         // Convert to engine data
         let engine_data = inline_dv_entry
             .clone()
-            .into_engine_data(MetadataEntry::to_schema().into(), &engine)?;
+            .into_engine_data(test_metadata_entry_schema(), &engine)?;
 
         // The inline_content should be in the engine data
         // We can't easily extract it without the full visitor, but we can verify
@@ -4069,16 +4112,16 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4134,10 +4177,10 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4264,13 +4307,13 @@ mod tests {
             data: vec![
                 data_manifest
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 unaffiliated_delete
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4347,16 +4390,16 @@ mod tests {
             data: vec![
                 data_manifest_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_manifest_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4422,10 +4465,10 @@ mod tests {
             data: vec![
                 data_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4622,13 +4665,13 @@ mod tests {
             data: vec![
                 root_data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 unmatched_dv
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 matched_dv
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4669,10 +4712,10 @@ mod tests {
             data: vec![
                 dv_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4734,10 +4777,10 @@ mod tests {
             data: vec![
                 data_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
@@ -4756,10 +4799,10 @@ mod tests {
             data: vec![
                 data_entry_3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_4
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 1, // Use different version to avoid filename collision
             table_root: table_root_url.clone(),
@@ -4778,10 +4821,10 @@ mod tests {
             data: vec![
                 data_manifest_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_manifest_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
