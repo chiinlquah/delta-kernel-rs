@@ -2446,10 +2446,7 @@ fn delta_json_stats_schema(table_schema: &StructType) -> StructType {
 
 /// Generates null count stats schema where all leaf primitive fields become LONG type.
 fn null_count_stats_schema(table_schema: &StructType) -> StructType {
-    let fields: Vec<StructField> = table_schema
-        .fields()
-        .filter_map(null_count_field)
-        .collect();
+    let fields: Vec<StructField> = table_schema.fields().filter_map(null_count_field).collect();
     StructType::new_unchecked(fields)
 }
 
@@ -2479,10 +2476,7 @@ fn null_count_field(field: &StructField) -> Option<StructField> {
 
 /// Generates min/max stats schema with only data-skipping eligible types.
 fn min_max_stats_schema(table_schema: &StructType) -> StructType {
-    let fields: Vec<StructField> = table_schema
-        .fields()
-        .filter_map(min_max_field)
-        .collect();
+    let fields: Vec<StructField> = table_schema.fields().filter_map(min_max_field).collect();
     StructType::new_unchecked(fields)
 }
 
