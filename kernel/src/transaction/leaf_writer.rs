@@ -773,11 +773,12 @@ mod tests {
     /// Helper to create a test engine, table root URL, and schema
     fn test_setup() -> (Arc<dyn Engine>, Url, SchemaRef) {
         use crate::engine::default::DefaultEngineBuilder;
-        use object_store::memory::InMemory;
+        use object_store::local::LocalFileSystem;
 
-        let store = Arc::new(InMemory::new());
+        let temp_path = tempfile::tempdir().unwrap().keep();
+        let store = Arc::new(LocalFileSystem::new_with_prefix(&temp_path).unwrap());
         let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
-        let table_root = Url::parse("memory:///test_table/").unwrap();
+        let table_root = Url::from_directory_path(&temp_path).unwrap();
 
         // Create a simple test schema with parquet field IDs
         let schema = Arc::new(
