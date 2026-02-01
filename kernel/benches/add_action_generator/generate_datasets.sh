@@ -25,6 +25,7 @@ echo ""
 
 # Array of DV percentages to generate
 DV_PERCENTAGES=(0 50 100)
+FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
 
 # Generate datasets for each DV percentage
 for dv_pct in "${DV_PERCENTAGES[@]}"; do
@@ -35,7 +36,7 @@ for dv_pct in "${DV_PERCENTAGES[@]}"; do
     echo -e "${GREEN}[1/2] Creating dataset: ${TABLE_DIR}${NC}"
     # Clean up any existing directory to avoid conflicts
     if ! AWS_LC_SYS_CMAKE_BUILDER=1 cargo run --release --bin backfill-delta-table \
-        --features "arrow,default-engine-rustls,rand,clap" \
+        --features "${FEATURES}" \
         -- \
         --table-dir "${TABLE_DIR}" \
         --dv-percentage "${dv_pct}" \
@@ -52,7 +53,7 @@ for dv_pct in "${DV_PERCENTAGES[@]}"; do
     echo -e "${GREEN}[2/2] Creating dataset with content root: ${TABLE_DIR}${NC}"
     # Clean up any existing directory to avoid conflicts
     if ! AWS_LC_SYS_CMAKE_BUILDER=1 cargo run --release --bin backfill-delta-table \
-        --features "arrow,default-engine-rustls,rand,clap" \
+        --features "${FEATURES}" \
         -- \
         --table-dir "${TABLE_DIR}" \
         --dv-percentage "${dv_pct}" \

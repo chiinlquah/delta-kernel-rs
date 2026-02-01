@@ -37,9 +37,9 @@ pub(crate) fn create_dv_unique_id(
 /// This is an opaque type - use it by passing to [`crate::transaction::Transaction::add_leaf`].
 #[derive(Debug)]
 pub struct LeafNodeWriterResult {
-    /// Map of manifest URLs to roaring bitmaps indicating which entries are deleted.
+    /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries are deleted.
     /// These are manifest deletion vectors that need to be applied to existing manifests.
-    pub(crate) manifest_dvs: HashMap<Url, RoaringTreemap>,
+    pub(crate) manifest_dvs: HashMap<String, RoaringTreemap>,
 
     /// Written data file manifest (if any data files were added).
     pub(crate) data_file_manifest_written: Option<MetadataEntry>,
@@ -77,7 +77,7 @@ pub struct LeafNodeWriter {
     table_schema: SchemaRef,
 
     /// Manifest deletion vectors: which entries to mark deleted in existing manifests
-    manifest_dvs: HashMap<Url, RoaringTreemap>,
+    manifest_dvs: HashMap<String, RoaringTreemap>,
 
     root_entries_to_remove: HashSet<String>,
 
@@ -89,14 +89,16 @@ pub struct LeafNodeWriter {
 
     /// Temporary tracking for DV writes. Value is (data_file_path, dv_descriptor, data_manifest_url).
     /// data_manifest_url is used to determine affiliation (all DVs reference same manifest = affiliated).
-    deletion_vectors: HashMap<DVUniqueId, (String, DeletionVectorDescriptor, Option<Url>)>,
+    /// HashMap of DVUniqueId -> (data_file_path, dv_descriptor, data_manifest_path)
+    /// data_manifest_path is the relative path to the manifest containing the data file
+    deletion_vectors: HashMap<DVUniqueId, (String, DeletionVectorDescriptor, Option<String>)>,
 
     /// Track if any DVs were added via DvOnly mode. If true, forces unaffiliated DV manifest.
     has_dv_only_entries: bool,
 
-    /// Optional root manifest URL for validation
+    /// Optional root manifest relative path for validation
     /// Used to prevent updating DVs for files still in the root manifest
-    root_manifest_url: Option<Url>,
+    root_manifest_path: Option<String>,
 
     /// Whether to track root entries for removal.
     /// Set to false when Transaction has released root to client control.
@@ -117,7 +119,8 @@ pub enum AddType {
 /// Location of a file in a manifest.
 #[derive(Debug, Clone)]
 pub struct ManifestLocation {
-    pub manifest_path: Url,
+    /// Relative path to the manifest file (e.g., "_metadata_root/...")
+    pub manifest_path: String,
     pub index: i64,
 }
 
@@ -166,9 +169,8 @@ fn extract_deletion_vector_at<'a>(
 
 /// Context for tracking manifest entry deletions
 struct ManifestRemovalContext<'a> {
-    table_root: &'a Url,
-    root_manifest_url: &'a Option<Url>,
-    manifest_dvs: &'a mut HashMap<Url, RoaringTreemap>,
+    root_manifest_path: Option<String>,
+    manifest_dvs: &'a mut HashMap<String, RoaringTreemap>,
     root_entries_to_remove: &'a mut HashSet<String>,
     track_root_removals: bool,
 }
@@ -182,26 +184,16 @@ fn track_manifest_entry_for_removal(
     ctx: &mut ManifestRemovalContext<'_>,
 ) -> DeltaResult<()> {
     if let (Some(manifest_path_str), Some(position)) = (manifest_path, manifest_position) {
-        // Convert relative path to absolute URL by joining with table root
-        let manifest_url = ctx.table_root.join(&manifest_path_str).map_err(|e| {
-            Error::generic(format!(
-                "Invalid manifest path '{}': {}",
-                manifest_path_str, e
-            ))
-        })?;
-
-        let is_from_root = ctx
-            .root_manifest_url
-            .as_ref()
-            .map(|root_url| *root_url == manifest_url)
-            .unwrap_or(false);
+        // Check if this is the root manifest by comparing relative paths
+        let is_from_root = ctx.root_manifest_path.as_deref() == Some(manifest_path_str.as_str());
 
         if is_from_root {
             if ctx.track_root_removals {
                 ctx.root_entries_to_remove.insert(path);
             }
         } else {
-            let entry = ctx.manifest_dvs.entry(manifest_url).or_default();
+            // Store the relative path directly
+            let entry = ctx.manifest_dvs.entry(manifest_path_str).or_default();
             entry.insert(position as u64);
         }
     } else {
@@ -216,7 +208,6 @@ fn track_manifest_entry_for_removal(
 /// Helper visitor to extract Add actions from scan rows and add them to a leaf
 struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
-    root_manifest_url: Option<Url>,
     add_type: AddType,
     selection_vector: Vec<bool>,
 }
@@ -300,6 +291,9 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
         );
         let should_extract_dv = matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
 
+        // Use the pre-computed root manifest path passed from the transaction
+        let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
+
         for i in 0..row_count {
             // Skip rows that are not selected according to the selection vector
             // If selection vector is shorter than row_count, remaining rows are assumed selected
@@ -330,8 +324,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
 
                 // Track data file manifest entry for removal
                 let mut ctx = ManifestRemovalContext {
-                    table_root: &self.leaf_writer.table_root,
-                    root_manifest_url: &self.root_manifest_url,
+                    root_manifest_path: root_manifest_path.clone(),
                     manifest_dvs: &mut self.leaf_writer.manifest_dvs,
                     root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
                     track_root_removals: self.leaf_writer.track_root_removals,
@@ -377,8 +370,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                         .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
                 // Track old DV manifest entry for removal
                 let mut ctx = ManifestRemovalContext {
-                    table_root: &self.leaf_writer.table_root,
-                    root_manifest_url: &self.root_manifest_url,
+                    root_manifest_path: root_manifest_path.clone(),
                     manifest_dvs: &mut self.leaf_writer.manifest_dvs,
                     root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
                     track_root_removals: self.leaf_writer.track_root_removals,
@@ -463,7 +455,7 @@ impl LeafNodeWriter {
         snapshot_id: i64,
         table_schema: SchemaRef,
         track_root_removals: bool,
-        root_manifest_url: Option<Url>,
+        root_manifest_path: Option<String>,
     ) -> Self {
         Self {
             data_builder: MetadataBuilder::new_for(
@@ -480,7 +472,7 @@ impl LeafNodeWriter {
             snapshot_id,
             deletion_vectors: HashMap::new(),
             has_dv_only_entries: false,
-            root_manifest_url,
+            root_manifest_path,
             track_root_removals,
         }
     }
@@ -546,13 +538,9 @@ impl LeafNodeWriter {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
-        // Clone root_manifest_url before creating visitor to avoid borrow conflicts
-        let root_manifest_url = self.root_manifest_url.clone();
-
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
-            root_manifest_url,
             add_type,
             selection_vector,
         };
@@ -579,8 +567,8 @@ impl LeafNodeWriter {
         for dv_update in new_dv_updates {
             // Enhancement #2: Error if trying to update DVs for files still in the root manifest
             // Leaf writers should only manage DVs for files that have been moved to leaves
-            if let Some(root_url) = &self.root_manifest_url {
-                if &dv_update.data_file_location.manifest_path == root_url {
+            if let Some(root_path) = &self.root_manifest_path {
+                if &dv_update.data_file_location.manifest_path == root_path {
                     return Err(crate::Error::generic(format!(
                         "Cannot update deletion vector for file '{}' that is still in the root manifest. \
                         Files must be moved to a leaf manifest before their DVs can be managed by a leaf writer.",
@@ -613,7 +601,7 @@ impl LeafNodeWriter {
             if let Some(prev_dv_loc) = dv_update.previous_delete_file_location {
                 let prev_entry = self
                     .manifest_dvs
-                    .entry(prev_dv_loc.manifest_path)
+                    .entry(prev_dv_loc.manifest_path.to_string())
                     .or_default();
                 prev_entry.insert(prev_dv_loc.index as u64);
             }
@@ -671,7 +659,7 @@ impl LeafNodeWriter {
         // Determine affiliation by checking if all DVs reference files in the SAME manifest
         let this_leaf_data_manifest_url = data_manifest_entry
             .and_then(|e| e.location.as_ref())
-            .and_then(|loc| Url::parse(loc).ok());
+            .cloned();
 
         // Collect all unique manifest URLs that our DVs' data files are in
         let mut manifest_urls: std::collections::HashSet<Option<String>> =
@@ -691,7 +679,7 @@ impl LeafNodeWriter {
             // Safety: We know there's exactly one element
             if let Some(single_url) = manifest_urls.iter().next() {
                 match single_url {
-                    None => this_leaf_data_manifest_url.as_ref().map(|u| u.to_string()),
+                    None => this_leaf_data_manifest_url,
                     Some(url) => Some(url.clone()),
                 }
             } else {
@@ -704,24 +692,10 @@ impl LeafNodeWriter {
         // Convert DV descriptors to MetadataEntry
         for (data_file_path, dv_descriptor, _) in self.deletion_vectors.values() {
             let (content_info, location) =
-                crate::metadata::builder::extract_deletion_vector_content(
-                    dv_descriptor,
-                    &self.table_root,
-                )?;
+                crate::metadata::builder::extract_deletion_vector_content(dv_descriptor)?;
 
-            // Convert relative data file path to absolute URL
-            // This is needed for DV lookups during scan, which use absolute URLs
-            let absolute_data_file_path = self
-                .table_root
-                .join(data_file_path)
-                .map_err(|e| {
-                    crate::Error::generic(format!(
-                        "Failed to create absolute path for {}: {}",
-                        data_file_path, e
-                    ))
-                })?
-                .to_string();
-
+            // Use relative path for referenced_file to match data file paths in manifests
+            // Data file paths are stored as relative, so DV references must also be relative
             // content_info already has the +8 conversion applied by extract_deletion_vector_content
             // TODO: Should this at least be offset + size_in_bytes.
             let file_size = content_info.size_in_bytes;
@@ -745,7 +719,7 @@ impl LeafNodeWriter {
                 file_size_in_bytes: Some(file_size),
                 content_stats: None,
                 manifest_info: None,
-                referenced_file: Some(absolute_data_file_path),
+                referenced_file: Some(data_file_path.to_string()),
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -1306,8 +1280,14 @@ mod tests {
         use crate::metadata::reader::MetadataEntryVisitor;
         use crate::metadata::Metadata;
 
-        let manifest_url = Url::parse(manifest_location)?;
-        let manifest_metadata = Metadata::read(engine.as_ref(), &manifest_url, table_root.clone())?;
+        // manifest_location is now a relative path, join with table_root
+        let manifest_url = table_root.join(manifest_location)?;
+        let manifest_metadata = Metadata::read(
+            engine.as_ref(),
+            &manifest_url,
+            manifest_location.to_string(),
+            table_root.clone(),
+        )?;
 
         // Use MetadataEntryVisitor to extract all entries
         let mut visitor = MetadataEntryVisitor::default();
@@ -1324,18 +1304,14 @@ mod tests {
         );
 
         // Extract the location (file path) from the entries
-        // These will be absolute URLs, so we need to extract just the filename
+        // These are now relative paths, so we can use them directly
         let paths: Vec<String> = visitor
             .entries
             .iter()
             .filter_map(|entry| {
-                entry.location.as_ref().and_then(|loc| {
-                    // Extract just the filename from the URL
-                    Url::parse(loc).ok().and_then(|url| {
-                        url.path_segments()
-                            .and_then(|mut segments| segments.next_back())
-                            .map(|s| s.to_string())
-                    })
+                entry.location.as_ref().map(|loc| {
+                    // Extract just the filename from the path (handles both relative paths and URLs)
+                    loc.rsplit('/').next().unwrap_or(loc).to_string()
                 })
             })
             .collect();

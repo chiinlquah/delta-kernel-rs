@@ -248,7 +248,7 @@ async fn main() {
         setup.path_prefix
     };
 
-    if let Err(e) = run(&args, setup.table_url, store, path_prefix).await {
+    if let Err(e) = run(&args, setup.table_url, engine.clone(), store, path_prefix).await {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
@@ -259,6 +259,7 @@ async fn main() {
 async fn run(
     args: &Args,
     table_url: url::Url,
+    engine: std::sync::Arc<dyn delta_kernel::Engine>,
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     path_prefix: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -301,7 +302,7 @@ async fn run(
         // Default batch_size to actions_per_sidecar for aligned partitioning
         let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
         println!("\n6. Generating content root representation...");
-        generate_content_root(&table_url, &store, &path_prefix, batch_size).await?;
+        generate_content_root(&table_url, &engine, &store, &path_prefix, batch_size).await?;
         println!("   ✓ Content root generated");
         current_version = 2; // Commit 0, Commit 1 (enable features), Commit 2 (content root)
     }
@@ -859,12 +860,12 @@ async fn generate_incremental_commits(
 
 async fn generate_content_root(
     table_url: &url::Url,
+    engine: &std::sync::Arc<dyn delta_kernel::Engine>,
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
     path_prefix: &str,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use delta_kernel::committer::FileSystemCommitter;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::Snapshot;
 
     println!("   Step 6a: Enabling metadataTree-experimental feature...");
@@ -875,10 +876,7 @@ async fn generate_content_root(
 
     println!("   Step 6b: Creating transaction...");
 
-    // Create engine using the provided store
-    let engine = std::sync::Arc::new(DefaultEngineBuilder::new(store.clone()).build());
-
-    // Open the table
+    // Open the table using the provided engine (which has correct path handling)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
     println!("      ✓ Opened table at version {}", snapshot.version());

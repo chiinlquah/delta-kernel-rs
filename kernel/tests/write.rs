@@ -44,6 +44,65 @@ use test_utils::{
 
 mod common;
 
+/// Create a simple schema with column mapping enabled (required for batch_commit mode)
+fn create_column_mapping_schema(
+    field_name: &str,
+    data_type: DataType,
+) -> Result<Arc<StructType>, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StructType::try_new(vec![StructField::nullable(
+        field_name, data_type,
+    )
+    .with_metadata([
+        (
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::ColumnMappingId.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String("col-1".to_string()),
+        ),
+    ])])?))
+}
+
+/// Setup test tables with column mapping enabled (required for batch_commit mode)
+async fn setup_column_mapping_tables(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    table_base_name: &str,
+) -> Result<
+    Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<dyn ObjectStore>,
+        &'static str,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    let table_name_37 = format!("{table_base_name}_37_cm");
+    let (store_37, engine_37, table_location_37) = engine_store_setup(table_name_37.as_str(), None);
+    let table_name_37_static = Box::leak(table_name_37.into_boxed_str());
+
+    Ok(vec![(
+        create_table(
+            store_37.clone(),
+            table_location_37,
+            schema.clone(),
+            partition_columns,
+            true,
+            vec!["columnMapping"],
+            vec!["columnMapping"],
+        )
+        .await?,
+        engine_37,
+        store_37,
+        table_name_37_static,
+    )])
+}
+
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
         .as_str()
@@ -2050,18 +2109,11 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table: one int column named 'number' with parquet.field.id metadata
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )
-    .with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(1),
-    )])])?);
+    // create a simple table with column mapping (required for batch_commit mode)
+    let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, store, table_name) in
-        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
@@ -2782,19 +2834,27 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table: one int column named 'number' with parquet.field.id metadata
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )
-    .with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(1),
-    )])])?);
+    // batch_commit mode requires column mapping
+    let schema = if use_batch_commit {
+        create_column_mapping_schema("number", DataType::INTEGER)?
+    } else {
+        Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(1),
+        )])])?)
+    };
 
-    for (table_url, engine, _store, _table_name) in
+    let tables = if use_batch_commit {
+        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+    } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
-    {
+    };
+
+    for (table_url, engine, _store, _table_name) in tables {
         // First, add some files to the table
         let engine = Arc::new(engine);
         if use_batch_commit {
@@ -2884,18 +2944,27 @@ async fn remove_files_with_modified_selection_vector_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )
-    .with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(1),
-    )])])?);
+    // batch_commit mode requires column mapping
+    let schema = if use_batch_commit {
+        create_column_mapping_schema("number", DataType::INTEGER)?
+    } else {
+        Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(1),
+        )])])?)
+    };
 
-    for (table_url, engine, _store, _table_name) in
+    let tables = if use_batch_commit {
+        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+    } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
-    {
+    };
+
+    for (table_url, engine, _store, _table_name) in tables {
         let engine = Arc::new(engine);
 
         // Write data multiple times to create multiple files
@@ -3303,19 +3372,12 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
 {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Create a simple table schema with parquet.field.id metadata
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )
-    .with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(1),
-    )])])?);
+    // Create a simple table schema with column mapping (required for batch_commit mode)
+    let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
-    // Setup table - wrap engine in Arc for helper functions
+    // Setup table with column mapping - wrap engine in Arc for helper functions
     for (table_url, engine, store, _table_name) in
-        setup_test_tables(schema.clone(), &[], None, "batch_commit_test").await?
+        setup_column_mapping_tables(schema.clone(), &[], "batch_commit_test").await?
     {
         let engine = Arc::new(engine);
 
@@ -3396,17 +3458,10 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )
-    .with_metadata([(
-        ColumnMetadataKey::ParquetFieldId.as_ref(),
-        MetadataValue::Number(1),
-    )])])?);
+    let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, _store, _table_name) in
-        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
     {
         let engine = Arc::new(engine);
         // First, add some files to the table

@@ -300,10 +300,9 @@ struct DeletionVectorDetails {
 impl DeletionVectorDetails {
     /// Create DeletionVectorDetails from a DeletionVectorDescriptor
     /// This converts the descriptor to the format expected from scans
-    /// Note: PersistedRelative is converted to PersistedAbsolute in storage
     fn from_descriptor(descriptor: &DeletionVectorDescriptor) -> Self {
         Self {
-            storage_type: DeletionVectorStorageType::PersistedAbsolute.to_string(),
+            storage_type: descriptor.storage_type.to_string(),
             path_or_inline_dv: descriptor.path_or_inline_dv.clone(),
             cardinality: descriptor.cardinality,
         }
@@ -937,13 +936,12 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                     }
                 };
 
-                // Convert relative manifest path to absolute URL
-                let manifest_url = table_url.join(manifest_path)?;
+                // Use the relative manifest path directly (no conversion to absolute URL)
                 dv_updates.push(DvUpdate {
                     data_file_path: path.clone(),
                     dv_descriptor,
                     data_file_location: ManifestLocation {
-                        manifest_path: manifest_url,
+                        manifest_path: manifest_path.clone(),
                         index: *index,
                     },
                     previous_delete_file_location: None,
@@ -1017,9 +1015,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Update ONLY fileA's DV with new cardinality
-            // Convert relative manifest paths to absolute URLs
-            let data_manifest_url = table_url.join(&file_a_data_manifest)?;
-            let dv_manifest_url = table_url.join(&file_a_dv_loc.1)?;
+            // Use relative manifest paths directly (no conversion to absolute URL)
             let dv_updates = vec![DvUpdate {
                 data_file_path: "fileA.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1030,11 +1026,11 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                     cardinality: 10, // Changed from 5 to 10
                 },
                 data_file_location: ManifestLocation {
-                    manifest_path: data_manifest_url,
+                    manifest_path: file_a_data_manifest.clone(),
                     index: file_a_data_index,
                 },
                 previous_delete_file_location: Some(ManifestLocation {
-                    manifest_path: dv_manifest_url,
+                    manifest_path: file_a_dv_loc.1.clone(),
                     index: file_a_dv_loc.2,
                 }),
             }];
@@ -1166,13 +1162,12 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                     }
                 };
 
-                // Convert relative manifest path to absolute URL
-                let manifest_url = table_url.join(manifest_path)?;
+                // Use the relative manifest path directly (no conversion to absolute URL)
                 dv_updates.push(DvUpdate {
                     data_file_path: path.clone(),
                     dv_descriptor,
                     data_file_location: ManifestLocation {
-                        manifest_path: manifest_url,
+                        manifest_path: manifest_path.clone(),
                         index: *index,
                     },
                     previous_delete_file_location: None,
@@ -1239,9 +1234,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
 
             // Create AFFILIATED leaf for fileA (DV references file in SAME data manifest as fileA)
             let mut leaf_a = txn.new_leaf_node_writer(&engine)?;
-            // Convert relative manifest paths to absolute URLs
-            let file_a_data_url = table_url.join(&file_a_loc.1)?;
-            let file_a_dv_url = table_url.join(&file_a_loc.3)?;
+            // Use relative manifest paths directly (no conversion to absolute URL)
             let dv_updates_a = vec![DvUpdate {
                 data_file_path: "fileA.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1252,11 +1245,11 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                     cardinality: 15, // Updated
                 },
                 data_file_location: ManifestLocation {
-                    manifest_path: file_a_data_url,
+                    manifest_path: file_a_loc.1.clone(),
                     index: file_a_loc.2,
                 },
                 previous_delete_file_location: Some(ManifestLocation {
-                    manifest_path: file_a_dv_url,
+                    manifest_path: file_a_loc.3.clone(),
                     index: file_a_loc.4,
                 }),
             }];
@@ -1266,9 +1259,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
 
             // Create AFFILIATED leaf for fileB (DV references file in SAME data manifest as fileB)
             let mut leaf_b = txn.new_leaf_node_writer(&engine)?;
-            // Convert relative manifest paths to absolute URLs
-            let file_b_data_url = table_url.join(&file_b_loc.1)?;
-            let file_b_dv_url = table_url.join(&file_b_loc.3)?;
+            // Use relative manifest paths directly (no conversion to absolute URL)
             let dv_updates_b = vec![DvUpdate {
                 data_file_path: "fileB.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1279,11 +1270,11 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                     cardinality: 20, // Updated
                 },
                 data_file_location: ManifestLocation {
-                    manifest_path: file_b_data_url,
+                    manifest_path: file_b_loc.1.clone(),
                     index: file_b_loc.2,
                 },
                 previous_delete_file_location: Some(ManifestLocation {
-                    manifest_path: file_b_dv_url,
+                    manifest_path: file_b_loc.3.clone(),
                     index: file_b_loc.4,
                 }),
             }];
@@ -1437,8 +1428,12 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
 
         // Read the root manifest (path is now relative, so join with table root)
         let root_manifest_url = table_url.join(content_root.path())?;
-        let root_metadata =
-            delta_kernel::Metadata::read(&engine, &root_manifest_url, table_url.clone())?;
+        let root_metadata = delta_kernel::Metadata::read(
+            &engine,
+            &root_manifest_url,
+            content_root.path().to_string(),
+            table_url.clone(),
+        )?;
 
         // Check that root manifest entries don't include fileA.parquet or fileB.parquet
         use delta_kernel::{MetadataEntryVisitor, RowVisitor};
@@ -1479,16 +1474,21 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         );
 
         let leaf_manifest_entry = leaf_manifest_entries[0];
-        let leaf_manifest_url = url::Url::parse(
-            leaf_manifest_entry
-                .location
-                .as_ref()
-                .expect("Leaf manifest entry should have a location"),
-        )?;
+        let leaf_manifest_location = leaf_manifest_entry
+            .location
+            .as_ref()
+            .expect("Leaf manifest entry should have a location");
+        // Location might be relative or absolute, try parsing as URL first, then join with table_url
+        let leaf_manifest_url = url::Url::parse(leaf_manifest_location)
+            .or_else(|_| table_url.join(leaf_manifest_location))?;
 
         // Read the leaf manifest
-        let leaf_metadata =
-            delta_kernel::Metadata::read(&engine, &leaf_manifest_url, table_url.clone())?;
+        let leaf_metadata = delta_kernel::Metadata::read(
+            &engine,
+            &leaf_manifest_url,
+            leaf_manifest_location.to_string(),
+            table_url.clone(),
+        )?;
 
         // Parse leaf manifest entries
         let mut leaf_visitor = delta_kernel::MetadataEntryVisitor::default();
@@ -1580,8 +1580,12 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
 
             // Path is now relative, so join with table root
             let root_manifest_url = table_url.join(content_root.path())?;
-            let root_metadata =
-                delta_kernel::Metadata::read(&engine, &root_manifest_url, table_url.clone())?;
+            let root_metadata = delta_kernel::Metadata::read(
+                &engine,
+                &root_manifest_url,
+                content_root.path().to_string(),
+                table_url.clone(),
+            )?;
 
             use delta_kernel::{MetadataEntryVisitor, RowVisitor};
             let mut visitor = MetadataEntryVisitor::default();
@@ -1770,8 +1774,7 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Try to update DV for file in root - should error
-            // Convert relative manifest path to absolute URL
-            let manifest_url = table_url.join(&file_location.1)?;
+            // Use relative manifest path directly (no conversion to absolute URL)
             let dv_updates = vec![DvUpdate {
                 data_file_path: "fileA.parquet".to_string(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -1782,7 +1785,7 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
                     cardinality: 5,
                 },
                 data_file_location: ManifestLocation {
-                    manifest_path: manifest_url,
+                    manifest_path: file_location.1.clone(),
                     index: file_location.2,
                 },
                 previous_delete_file_location: None,
@@ -1905,13 +1908,12 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                     }
                 };
 
-                // Convert relative manifest path to absolute URL
-                let manifest_url = table_url.join(manifest_path)?;
+                // Use the relative manifest path directly (no conversion to absolute URL)
                 dv_updates.push(DvUpdate {
                     data_file_path: path.clone(),
                     dv_descriptor,
                     data_file_location: ManifestLocation {
-                        manifest_path: manifest_url,
+                        manifest_path: manifest_path.clone(),
                         index: *index,
                     },
                     previous_delete_file_location: None,
@@ -2058,8 +2060,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
 
             // Add DV for fileA
             let (file_path, manifest_path, index) = &file_locations[0];
-            // Convert relative manifest path to absolute URL
-            let manifest_url = table_url.join(manifest_path)?;
+            // Use relative manifest path directly (no conversion to absolute URL)
             let dv_updates = vec![DvUpdate {
                 data_file_path: file_path.clone(),
                 dv_descriptor: DeletionVectorDescriptor {
@@ -2070,7 +2071,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                     cardinality: DV_CARDINALITY,
                 },
                 data_file_location: ManifestLocation {
-                    manifest_path: manifest_url,
+                    manifest_path: manifest_path.clone(),
                     index: *index,
                 },
                 previous_delete_file_location: None,

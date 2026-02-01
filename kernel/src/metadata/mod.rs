@@ -6,7 +6,6 @@ pub(crate) mod writer;
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::deletion_vector::DeletionVectorStorageType;
 use crate::actions::Remove;
 use crate::actions::{Add, ContentRoot};
 use crate::engine_data::EngineData;
@@ -208,10 +207,10 @@ pub struct Metadata {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
-    /// The location (path/URL) of this manifest file.
-    /// None for newly built metadata that hasn't been written yet.
-    /// Some(path) after reading from disk or writing.
-    manifest_location: Option<Url>,
+    /// The exact path string as it appears in the Delta log (from contentRoot action or manifest location field).
+    /// This is NOT normalized or converted - it flows through exactly as stored in the log.
+    /// Empty string for newly built metadata that hasn't been written yet.
+    path_in_log: String,
     /// Optional UUID that identifies this metadata as a leaf manifest.
     /// When writing a root manifest, this is `None`.
     /// When writing a leaf manifest, this must be set to a unique UUID.
@@ -387,7 +386,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         }
     }
@@ -405,7 +404,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: Some(uuid::Uuid::new_v4()),
         }
     }
@@ -479,36 +478,36 @@ impl Metadata {
         let data_entries =
             filter_entries_by_predicate(data_entries, predicate, "root data entries");
 
-        // Process deletion vector entries
-        for (i, dv_entry) in dv_entries.into_iter().enumerate() {
-            // Only include deletion vectors that are not marked as deleted
-            let is_deleted = dv_entry
-                .tracking_info
-                .as_ref()
-                .map(|ti| ti.status == TrackingStatus::Deleted)
-                .unwrap_or(false);
-            if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
-                let referenced_file = dv_entry
-                    .referenced_file
-                    .clone()
-                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
-                // For DVs in root manifest, use the root manifest path if available, otherwise empty string
-                let manifest_path = self
-                    .manifest_location
+        // Process deletion vector entries (only if we have a path_in_log)
+        if !self.path_in_log.is_empty() {
+            for (i, dv_entry) in dv_entries.into_iter().enumerate() {
+                // Only include deletion vectors that are not marked as deleted
+                let is_deleted = dv_entry
+                    .tracking_info
                     .as_ref()
-                    .map(|u| u.as_str())
-                    .unwrap_or("");
-                let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
+                    .map(|ti| ti.status == TrackingStatus::Deleted)
+                    .unwrap_or(false);
+                if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
+                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
+                        Error::generic("Deletion vector must have a referenced file")
+                    })?;
+                    let dv_info = metadata_entry_to_deletion_vector_info(
+                        dv_entry,
+                        i,
+                        &self.path_in_log,
+                        &self.table_root,
+                    )?;
 
-                // Only insert if this DV has a higher sequence number than any existing one for this file
-                deletion_vector_map
-                    .entry(referenced_file)
-                    .and_modify(|existing| {
-                        if dv_info.sequence_number > existing.sequence_number {
-                            *existing = dv_info.clone();
-                        }
-                    })
-                    .or_insert(dv_info);
+                    // Only insert if this DV has a higher sequence number than any existing one for this file
+                    deletion_vector_map
+                        .entry(referenced_file)
+                        .and_modify(|existing| {
+                            if dv_info.sequence_number > existing.sequence_number {
+                                *existing = dv_info.clone();
+                            }
+                        })
+                        .or_insert(dv_info);
+                }
             }
         }
 
@@ -520,19 +519,12 @@ impl Metadata {
         let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
         let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
 
-        // Cache the table_root reference to avoid repeated parsing in the loop
-        let table_root_url = &self.table_root;
-
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                let manifest_path = self
-                    .manifest_location
-                    .as_ref()
-                    .map(|u| absolute_to_relative_path(u.as_str(), table_root_url))
-                    .unwrap_or_default();
-                entry_to_add_remove(entry, &dv_maps, i, table_root_url, manifest_path)
+                // Use the pre-computed path_in_log - no conversion needed!
+                entry_to_add_remove(entry, &dv_maps, i, self.path_in_log.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -642,38 +634,40 @@ impl Metadata {
         // Build a map of unmatched deletion vectors (DVs that reference files not in root)
         // These need to be passed through to child manifests
         let mut unmatched_dvs: HashMap<String, DeletionVectorInfo> = HashMap::new();
-        for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
-            let is_deleted = dv_entry
-                .tracking_info
-                .as_ref()
-                .map(|ti| ti.status == TrackingStatus::Deleted)
-                .unwrap_or(false);
 
-            if !is_deleted {
-                let referenced_file = dv_entry
-                    .referenced_file
-                    .clone()
-                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
+        // Process deletion vector entries (only if we have a path_in_log)
+        if !self.path_in_log.is_empty() {
+            for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
+                let is_deleted = dv_entry
+                    .tracking_info
+                    .as_ref()
+                    .map(|ti| ti.status == TrackingStatus::Deleted)
+                    .unwrap_or(false);
 
-                // Only add to unmatched_dvs if the referenced file is NOT in the root
-                if !root_data_files.contains(&referenced_file) {
-                    // For DVs in root manifest, use the root manifest path if available, otherwise empty string
-                    let manifest_path = self
-                        .manifest_location
-                        .as_ref()
-                        .map(|u| u.as_str())
-                        .unwrap_or("");
-                    let dv_info =
-                        metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
+                if !is_deleted {
+                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
+                        Error::generic("Deletion vector must have a referenced file")
+                    })?;
 
-                    unmatched_dvs
-                        .entry(referenced_file)
-                        .and_modify(|existing| {
-                            if dv_info.sequence_number > existing.sequence_number {
-                                *existing = dv_info.clone();
-                            }
-                        })
-                        .or_insert(dv_info);
+                    // Only add to unmatched_dvs if the referenced file is NOT in the root
+                    if !root_data_files.contains(&referenced_file) {
+                        // For DVs in root manifest, use the root manifest path
+                        let dv_info = metadata_entry_to_deletion_vector_info(
+                            dv_entry,
+                            i,
+                            &self.path_in_log,
+                            &self.table_root,
+                        )?;
+
+                        unmatched_dvs
+                            .entry(referenced_file)
+                            .and_modify(|existing| {
+                                if dv_info.sequence_number > existing.sequence_number {
+                                    *existing = dv_info.clone();
+                                }
+                            })
+                            .or_insert(dv_info);
+                    }
                 }
             }
         }
@@ -772,26 +766,26 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
-            let mut delete_entries =
-                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
+            let mut delete_entries = Metadata::read(
+                engine,
+                &delete_manifest_url,
+                delete_manifest_location.clone(),
+                table_root.clone(),
+            )?
+            .entries()?;
 
             // Apply manifest DV if present (stored inline on the manifest entry)
             if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
                 delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
-
             merge_deletion_vectors(
                 &mut deletion_vector_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
@@ -880,19 +874,22 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Read the data manifest file
         let data_manifest_location = manifest_refs
             .data_manifest
             .manifest
             .location
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-        let data_manifest_url = Url::parse(&data_manifest_location)
-            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
 
         // Read the data manifest entries using the existing Metadata::read method
-        let mut data_manifest_entries =
-            Metadata::read(engine, &data_manifest_url, table_root.clone())?.entries()?;
+        let mut data_manifest_entries = Metadata::read(
+            engine,
+            &data_manifest_url,
+            data_manifest_location.clone(),
+            table_root.clone(),
+        )?
+        .entries()?;
 
         // Apply manifest DV if present (stored inline on the manifest entry)
         if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
@@ -915,34 +912,31 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
-            let mut delete_entries =
-                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
+            let mut delete_entries = Metadata::read(
+                engine,
+                &delete_manifest_url,
+                delete_manifest_location.clone(),
+                table_root.clone(),
+            )?
+            .entries()?;
 
             // Apply manifest DV if present (stored inline on the manifest entry)
             if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
                 delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
-
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
         let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
-
-        // Convert absolute manifest location to relative path
-        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -960,13 +954,7 @@ impl Metadata {
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                entry_to_add_remove(
-                    entry,
-                    &dv_maps,
-                    i,
-                    table_root,
-                    relative_manifest_path.clone(),
-                )
+                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1013,20 +1001,19 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Read the data manifest file
         let data_manifest_location = manifest_refs
             .data_manifest
             .manifest
             .location
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-        let data_manifest_url = Url::parse(&data_manifest_location)
-            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
 
         // Read the data manifest entries using the handler
         let mut data_manifest_entries = Metadata::read_with_handler(
             parquet_handler.clone(),
             &data_manifest_url,
+            data_manifest_location.clone(),
             table_root.clone(),
         )?
         .entries()?;
@@ -1050,13 +1037,12 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
             let mut delete_entries = Metadata::read_with_handler(
                 parquet_handler.clone(),
                 &delete_manifest_url,
+                delete_manifest_location.clone(),
                 table_root.clone(),
             )?
             .entries()?;
@@ -1066,22 +1052,16 @@ impl Metadata {
                 delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
 
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
-
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
         let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
-
-        // Convert absolute manifest location to relative path
-        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -1097,13 +1077,7 @@ impl Metadata {
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                entry_to_add_remove(
-                    entry,
-                    &dv_maps,
-                    i,
-                    table_root,
-                    relative_manifest_path.clone(),
-                )
+                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1179,12 +1153,19 @@ impl Metadata {
     /// # Parameters
     /// - `engine`: The engine to use for reading the parquet file
     /// - `path`: The URL path to the metadata parquet file
+    /// - `path_in_log`: The original path string as it appears in the Delta log (not normalized)
+    /// - `table_root`: The table root URL
     ///
     /// # Returns
     /// A `Metadata` instance deserialized from the parquet file.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
-        Self::read_with_handler(engine.parquet_handler(), path, table_root)
+    pub fn read(
+        engine: &dyn Engine,
+        path: &Url,
+        path_in_log: String,
+        table_root: Url,
+    ) -> DeltaResult<Self> {
+        Self::read_with_handler(engine.parquet_handler(), path, path_in_log, table_root)
     }
 
     /// Read metadata using a parquet handler directly (for lazy streaming).
@@ -1194,6 +1175,7 @@ impl Metadata {
     fn read_with_handler(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
+        path_in_log: String,
         table_root: Url,
     ) -> DeltaResult<Self> {
         // Cached schema for reading MetadataEntry from parquet files.
@@ -1219,7 +1201,7 @@ impl Metadata {
             data,
             version: parsed.version,
             table_root,
-            manifest_location: Some(path.clone()),
+            path_in_log,
             // When reading existing metadata, we don't know if it's a root or leaf
             // This would need to be determined from the file path or stored in the metadata
             leaf: None,
@@ -1296,7 +1278,12 @@ impl Metadata {
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        Self::read(engine, &content_root_url, table_root)
+        Self::read(
+            engine,
+            &content_root_url,
+            content_root.path.clone(),
+            table_root,
+        )
     }
 }
 
@@ -1413,6 +1400,7 @@ fn merge_deletion_vectors(
     deletion_vector_map: &mut HashMap<String, DeletionVectorInfo>,
     entries: Vec<MetadataEntry>,
     delete_manifest_path: &str,
+    table_root: &Url,
 ) -> DeltaResult<()> {
     for (i, entry) in entries.into_iter().enumerate() {
         // Only process PositionDeletes entries that are not deleted
@@ -1428,7 +1416,8 @@ fn merge_deletion_vectors(
                 .clone()
                 .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
 
-            let dv_info = metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path)?;
+            let dv_info =
+                metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path, table_root)?;
 
             // Only insert if this DV has a higher sequence number than any existing one for this file
             deletion_vector_map
@@ -1456,6 +1445,7 @@ fn metadata_entry_to_deletion_vector_info(
     dv_entry: MetadataEntry,
     entry_index: usize,
     delete_manifest_path: &str,
+    table_root: &Url,
 ) -> DeltaResult<DeletionVectorInfo> {
     let sequence_number = dv_entry
         .tracking_info
@@ -1494,10 +1484,14 @@ fn metadata_entry_to_deletion_vector_info(
         .try_into()
         .map_err(|_| Error::generic("Entry index is too large to convert to i64"))?;
 
+    // Parse the location to determine storage type and encoded path
+    use crate::actions::deletion_vector::DeletionVectorPath;
+    let (storage_type, path_or_inline_dv) = DeletionVectorPath::parse_path(&location, table_root)?;
+
     Ok(DeletionVectorInfo {
         descriptor: DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedAbsolute,
-            path_or_inline_dv: location,
+            storage_type,
+            path_or_inline_dv,
             offset: offset_i32,
             size_in_bytes: size_in_bytes_i32,
             cardinality: dv_entry.record_count,
@@ -1536,43 +1530,29 @@ fn process_deletion_vector(
     }
 }
 
-/// Converts an absolute URL path to a relative path by stripping the table root prefix.
-///
-/// This function handles the conversion from absolute file URLs (stored in metadata entries)
-/// to relative paths (expected in Delta Add actions).
-///
-/// # Arguments
-/// * `absolute_path` - The full URL path (e.g., "memory:///part-file.parquet")
-/// * `table_root` - The table root URL (e.g., "memory:///")
-///
-/// # Returns
-/// A relative path string (e.g., "part-file.parquet"), or the original path if conversion fails.
-///
-/// # Examples
-/// ```ignore
-/// let relative = absolute_to_relative_path(
-///     "s3://bucket/table/data/file.parquet",
-///     "s3://bucket/table/"
-/// );
-/// assert_eq!(relative, "data/file.parquet");
-/// ```
-pub(crate) fn absolute_to_relative_path(absolute_path: &str, table_root_url: &Url) -> String {
-    // Try to parse the absolute path as a URL
-    if let Ok(full_url) = Url::parse(absolute_path) {
-        // Get the path components
-        let full_path_str = full_url.path();
-        let root_path_str = table_root_url.path();
+/// Helper that holds a URL and lazily computes/caches its relative path.
+/// Useful for avoiding repeated conversions of the same URL to relative path.
+/// Converts an absolute URL to a path relative to table_root.
+pub(crate) fn absolute_to_relative_path(
+    absolute_url: &Url,
+    table_root: &Url,
+) -> DeltaResult<String> {
+    let full_path = absolute_url.path();
+    let root_path = table_root.path();
 
-        // Remove the root prefix to get the relative path
-        full_path_str
-            .strip_prefix(root_path_str)
-            .unwrap_or(full_path_str)
-            .trim_start_matches('/')
-            .to_string()
-    } else {
-        // If URL parsing fails, return the original path
-        absolute_path.to_string()
-    }
+    Ok(full_path
+        .strip_prefix(root_path)
+        .unwrap_or(full_path)
+        .trim_start_matches('/')
+        .to_string())
+}
+
+/// Parses a string as an absolute URL, or if that fails, joins it with the table root.
+/// This handles both absolute and relative manifest/file paths.
+pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url> {
+    Url::parse(path)
+        .or_else(|_| table_root.join(path))
+        .map_err(|e| Error::generic(format!("Failed to parse URL '{}': {}", path, e)))
 }
 
 /// Converts a MetadataEntry to an AddRemove enum.
@@ -1588,26 +1568,23 @@ fn entry_to_add_remove(
     entry: MetadataEntry,
     dv_maps: &DeletionVectorMaps<'_>,
     entry_index: usize,
-    table_root_url: &Url,
     manifest_path: String,
 ) -> DeltaResult<AddRemove> {
     use std::collections::HashMap;
 
-    let full_path = entry.location.ok_or_else(|| {
+    let path = entry.location.ok_or_else(|| {
         Error::generic(format!(
             "Action requires location (content_type: {:?})",
             entry.content_type
         ))
     })?;
 
-    // Convert absolute path to relative path by removing the table root prefix
-    // The path in entry.location is an absolute URL, but Add actions expect relative paths
-    let path = absolute_to_relative_path(&full_path, table_root_url);
+    // The path in entry.location is already relative from the metadata builder
     let sequence_number = entry
         .tracking_info
         .as_ref()
         .and_then(|ti| ti.sequence_number);
-    let processed_dv = process_deletion_vector(dv_maps, &full_path, sequence_number)?;
+    let processed_dv = process_deletion_vector(dv_maps, &path, sequence_number)?;
 
     let status = entry
         .tracking_info
@@ -2489,39 +2466,32 @@ mod tests {
     fn test_absolute_to_relative_path() {
         // Test with memory:// URLs
         let table_root = Url::parse("memory:///").unwrap();
-        let result = absolute_to_relative_path("memory:///part-content-root.parquet", &table_root);
+        let absolute_url = Url::parse("memory:///part-content-root.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "part-content-root.parquet");
 
         // Test with s3:// URLs
         let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
-        let result = absolute_to_relative_path(
-            "s3://my-bucket/my-table/data/part-00000.parquet",
-            &table_root,
-        );
+        let absolute_url = Url::parse("s3://my-bucket/my-table/data/part-00000.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "data/part-00000.parquet");
 
         // Test with nested paths
         let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let result = absolute_to_relative_path(
-            "s3://bucket/table/year=2023/month=10/part.parquet",
-            &table_root,
-        );
+        let absolute_url = Url::parse("s3://bucket/table/year=2023/month=10/part.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "year=2023/month=10/part.parquet");
 
         // Test with file:// URLs
         let table_root = Url::parse("file:///path/to/table/").unwrap();
-        let result =
-            absolute_to_relative_path("file:///path/to/table/data/file.parquet", &table_root);
+        let absolute_url = Url::parse("file:///path/to/table/data/file.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "data/file.parquet");
-
-        // Test when path is already relative (URL parsing fails)
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let result = absolute_to_relative_path("part-00000.parquet", &table_root);
-        assert_eq!(result, "part-00000.parquet");
 
         // Test when root doesn't match (no common prefix)
         let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
-        let result = absolute_to_relative_path("s3://bucket-a/table-a/file.parquet", &table_root);
+        let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         // Since there's no common prefix in the path part, it returns the path without leading slash
         assert_eq!(result, "table-a/file.parquet");
     }
@@ -2990,7 +2960,7 @@ mod tests {
             data: vec![engine_data],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3317,7 +3287,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3326,7 +3296,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3350,7 +3322,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3359,7 +3331,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3383,7 +3357,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3392,7 +3366,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3416,7 +3392,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 3,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3425,7 +3401,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3483,7 +3461,7 @@ mod tests {
             ],
             version: 3,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3492,7 +3470,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3562,7 +3542,7 @@ mod tests {
             data,
             version: 4,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3571,7 +3551,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3638,7 +3620,7 @@ mod tests {
             data,
             version: 5,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3647,7 +3629,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3698,7 +3682,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3707,7 +3691,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3768,7 +3754,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3777,7 +3763,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3880,7 +3868,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -3931,7 +3919,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -3976,7 +3964,7 @@ mod tests {
                 .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4075,7 +4063,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4134,7 +4122,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4269,7 +4257,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4359,7 +4347,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4413,9 +4401,9 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create a child data manifest with actual data files
-        let data_entry_1 = create_data_entry("memory:///child-data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("memory:///child-data-2.parquet", 60);
+        // Create a child data manifest with actual data files (using relative paths)
+        let data_entry_1 = create_data_entry("child-data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("child-data-2.parquet", 60);
 
         let child_metadata = Metadata {
             data: vec![
@@ -4428,7 +4416,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4591,7 +4579,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4635,7 +4623,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4644,13 +4632,17 @@ mod tests {
         let delete_manifest_url = delete_manifest_writer.write(&engine)?;
 
         // Create unmatched DVs
+        let test_delete_manifest_url = Url::parse("memory:///test_delete_manifest.parquet")?;
+        let test_delete_manifest_path =
+            absolute_to_relative_path(&test_delete_manifest_url, &table_root_url)?;
         let mut unmatched_dvs = HashMap::new();
         unmatched_dvs.insert(
             "memory:///data3.parquet".to_string(),
             metadata_entry_to_deletion_vector_info(
                 create_dv_entry("memory:///dv3.parquet", "memory:///data3.parquet", 200),
                 0,
-                "memory:///test_delete_manifest.parquet",
+                &test_delete_manifest_path,
+                &table_root_url,
             )?,
         );
 
@@ -4684,10 +4676,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create two child data manifests with actual data files
+        // Create two child data manifests with actual data files (using relative paths)
         // Child manifest 1
-        let data_entry_1 = create_data_entry("memory:///partition1/data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("memory:///partition1/data-2.parquet", 60);
+        let data_entry_1 = create_data_entry("partition1/data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("partition1/data-2.parquet", 60);
 
         let child_metadata_1 = Metadata {
             data: vec![
@@ -4700,7 +4692,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4708,8 +4700,8 @@ mod tests {
         let child_manifest_url_1 = child_manifest_writer_1.write(&engine)?;
 
         // Child manifest 2 - use version 1 to avoid filename collision
-        let data_entry_3 = create_data_entry("memory:///partition2/data-3.parquet", 70);
-        let data_entry_4 = create_data_entry("memory:///partition2/data-4.parquet", 80);
+        let data_entry_3 = create_data_entry("partition2/data-3.parquet", 70);
+        let data_entry_4 = create_data_entry("partition2/data-4.parquet", 80);
 
         let child_metadata_2 = Metadata {
             data: vec![
@@ -4722,7 +4714,7 @@ mod tests {
             ],
             version: 1, // Use different version to avoid filename collision
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4744,7 +4736,7 @@ mod tests {
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -5493,13 +5485,12 @@ mod tests {
                     cardinality: 5,
                 };
 
-                // manifest_path is relative, so join with table_url
-                let manifest_url = table_url.join(manifest_path)?;
+                // Use the relative manifest path directly (no conversion to absolute URL)
                 dv_updates.push(DvUpdate {
                     data_file_path: path.clone(),
                     dv_descriptor,
                     data_file_location: ManifestLocation {
-                        manifest_path: manifest_url,
+                        manifest_path: manifest_path.clone(),
                         index: *index,
                     },
                     previous_delete_file_location: None,
@@ -5531,7 +5522,12 @@ mod tests {
         let content_root_info = content_root_result.unwrap().0;
         let root_manifest_url = table_url.join(content_root_info.path())?;
 
-        let root_metadata = Metadata::read(engine.as_ref(), &root_manifest_url, table_url.clone())?;
+        let root_metadata = Metadata::read(
+            engine.as_ref(),
+            &root_manifest_url,
+            content_root_info.path().to_string(),
+            table_url.clone(),
+        )?;
         let root_entries = root_metadata.entries()?;
 
         // The root might have DeleteManifest entries that contain the PositionDeletes
@@ -5564,9 +5560,13 @@ mod tests {
                         .location
                         .as_ref()
                         .expect("Manifest should have location");
-                    let manifest_url = Url::parse(manifest_path)?;
-                    let manifest_metadata =
-                        Metadata::read(engine.as_ref(), &manifest_url, table_url.clone())?;
+                    let manifest_url = table_url.join(manifest_path)?;
+                    let manifest_metadata = Metadata::read(
+                        engine.as_ref(),
+                        &manifest_url,
+                        manifest_path.clone(),
+                        table_url.clone(),
+                    )?;
                     let manifest_entries = manifest_metadata.entries()?;
 
                     for manifest_entry in manifest_entries {

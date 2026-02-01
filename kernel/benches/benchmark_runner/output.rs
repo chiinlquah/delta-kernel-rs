@@ -40,6 +40,7 @@ pub fn print_human(metrics: &BenchmarkMetrics) {
         println!("  Number of tasks: {}", scan.num_tasks);
         println!("  Number of files: {}", scan.num_files);
         println!("  Total bytes: {}", format_bytes(scan.total_bytes));
+        println!("  Deletion vector descriptors: {}", scan.num_dv_descriptors);
     }
 
     if let Some(ref write) = metrics.write_metrics {

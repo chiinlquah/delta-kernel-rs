@@ -5,8 +5,8 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::metadata::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::metadata::writer::MetadataWriter;
 use crate::metadata::{
-    ContentInfo, DataContentType, DataFileFormat, Metadata, MetadataEntry, TrackingInfo,
-    TrackingStatus,
+    absolute_to_relative_path, ContentInfo, DataContentType, DataFileFormat, Metadata,
+    MetadataEntry, TrackingInfo, TrackingStatus,
 };
 
 use crate::expressions::StructData;
@@ -80,16 +80,12 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// Therefore, when converting from Delta to Iceberg's [`ContentInfo`], we add 8 bytes
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
-/// # Arguments
-/// * `dv` - The deletion vector descriptor to extract content from
-/// * `table_root` - The table root URL (used for resolving relative paths)
-///
 /// # Returns
-/// A tuple of `(ContentInfo, String)` where the String is the absolute path to the DV file.
+/// A tuple of `(ContentInfo, String)` where the String is the DV file path.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-    table_root: &Url,
 ) -> DeltaResult<(ContentInfo, String)> {
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
     // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
     // - 4 bytes: size prefix
     // - 4 bytes: CRC checksum
@@ -98,13 +94,24 @@ pub(crate) fn extract_deletion_vector_content(
         size_in_bytes: dv.size_in_bytes as i64 + 8,
     };
 
-    match dv.absolute_path(table_root)? {
-        Some(url) => Ok((content_info, url.to_string())),
-        // Inline DVs are not currently supported - they would need to be persisted first
-        None => Err(Error::DeletionVector(
-            "Inline deletion vectors are not supported. They must be persisted first.".to_string(),
-        )),
-    }
+    let location = match dv.storage_type {
+        DeletionVectorStorageType::PersistedAbsolute => {
+            // Use absolute path as-is
+            dv.path_or_inline_dv.clone()
+        }
+        DeletionVectorStorageType::PersistedRelative => {
+            // Decode to relative path
+            dv.relative_path()?
+        }
+        DeletionVectorStorageType::Inline => {
+            return Err(Error::DeletionVector(
+                "Inline deletion vectors are not supported. They must be persisted first."
+                    .to_string(),
+            ));
+        }
+    };
+
+    Ok((content_info, location))
 }
 
 /// Extracts record_count from content_stats by finding the first column's value_count.
@@ -240,10 +247,8 @@ impl MetadataBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
-        let absolute_path = self.path_to_absolute(&path)?;
-
         // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(absolute_path.clone()) {
+        if !self.values_seen.insert(path.clone()) {
             // Already seen this file path - skip it
             return Ok(());
         }
@@ -259,7 +264,7 @@ impl MetadataBuilder {
 
         let data_file_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(absolute_path),
+            location: Some(path),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
@@ -325,10 +330,8 @@ impl MetadataBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
-        let absolute_path = self.path_to_absolute(&add.path)?;
-
         // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(absolute_path.clone()) {
+        if !self.values_seen.insert(add.path.clone()) {
             // Already seen this file path - skip it
             return Ok(());
         }
@@ -337,7 +340,7 @@ impl MetadataBuilder {
         let dv_content = add
             .deletion_vector
             .as_ref()
-            .map(|dv| extract_deletion_vector_content(dv, &self.table_root))
+            .map(extract_deletion_vector_content)
             .transpose()?;
 
         let status = if version == self.version {
@@ -367,7 +370,7 @@ impl MetadataBuilder {
 
         let data_file_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(absolute_path),
+            location: Some(add.path.clone()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
@@ -571,16 +574,14 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `file_path` - The file path to match against entry locations
     pub(crate) fn remove_data_file(&mut self, file_path: &str) -> DeltaResult<()> {
-        let absolute_path = self.path_to_absolute(file_path)?;
-
         self.pending_entries.retain(|entry| {
             // Only match data files (location matches, no referenced_file)
             let is_data_file =
-                entry.location.as_ref() == Some(&absolute_path) && entry.referenced_file.is_none();
+                entry.location.as_deref() == Some(file_path) && entry.referenced_file.is_none();
             !is_data_file
         });
 
-        self.values_seen.remove(&absolute_path);
+        self.values_seen.remove(file_path);
         Ok(())
     }
 
@@ -593,16 +594,14 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `dv_identifier` - The DV path to match (can be location or referenced file)
     pub(crate) fn remove_dv(&mut self, dv_identifier: &str) -> DeltaResult<()> {
-        let absolute_path = self.path_to_absolute(dv_identifier)?;
-
         self.pending_entries.retain(|entry| {
             // Match DVs by location OR referenced_file
-            let is_dv = entry.location.as_ref() == Some(&absolute_path)
-                || entry.referenced_file.as_ref() == Some(&absolute_path);
+            let is_dv = entry.location.as_deref() == Some(dv_identifier)
+                || entry.referenced_file.as_deref() == Some(dv_identifier);
             !is_dv
         });
 
-        self.values_seen.remove(&absolute_path);
+        self.values_seen.remove(dv_identifier);
         Ok(())
     }
 
@@ -659,22 +658,14 @@ impl MetadataBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
-        // Convert paths to absolute before the loop to avoid borrow checker issues
-        let absolute_file_path = file_path
-            .map(|path| self.path_to_absolute(path))
-            .transpose()?;
-        let absolute_dv_path = dv_path
-            .map(|path| self.path_to_absolute(path))
-            .transpose()?;
-
         // TODO: we should make pending entries a HashMap<String, MetadataEntry> to make this faster
         for entry in &mut self.pending_entries {
             // Check if this entry matches the file path or deletion vector path
-            let matches = if let Some(ref absolute_path) = absolute_file_path {
-                entry.location.as_ref() == Some(absolute_path)
-                    || entry.referenced_file.as_ref() == Some(absolute_path)
-            } else if let Some(ref absolute_dv) = absolute_dv_path {
-                entry.location.as_ref() == Some(absolute_dv)
+            let matches = if let Some(path) = file_path {
+                entry.location.as_deref() == Some(path)
+                    || entry.referenced_file.as_deref() == Some(path)
+            } else if let Some(dv) = dv_path {
+                entry.location.as_deref() == Some(dv)
             } else {
                 false
             };
@@ -807,9 +798,7 @@ impl MetadataBuilder {
         snapshot_id: Option<i64>,
         set_changes_dv: bool,
     ) -> DeltaResult<()> {
-        // Convert leaf path to absolute
-        let absolute_leaf_path = self.path_to_absolute(leaf_file_path)?;
-
+        // leaf_file_path is already relative (or should be)
         // Find the manifest entry
         let manifest_position = self
             .pending_entries
@@ -817,12 +806,12 @@ impl MetadataBuilder {
             .position(|entry| {
                 (entry.content_type == DataContentType::DataManifest
                     || entry.content_type == DataContentType::DeleteManifest)
-                    && entry.location.as_ref() == Some(&absolute_leaf_path)
+                    && entry.location.as_deref() == Some(leaf_file_path)
             })
             .ok_or_else(|| {
                 Error::generic(format!(
                     "Leaf manifest not found at path: {}",
-                    absolute_leaf_path
+                    leaf_file_path
                 ))
             })?;
 
@@ -833,7 +822,7 @@ impl MetadataBuilder {
             .ok_or_else(|| {
                 Error::generic(format!(
                     "Leaf manifest missing manifest_info: {}",
-                    absolute_leaf_path
+                    leaf_file_path
                 ))
             })?;
 
@@ -955,8 +944,8 @@ impl MetadataBuilder {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine)?;
 
-        // Write the leaf manifest to a parquet file
         let content_metadata_path = MetadataWriter::try_new(leaf_metadata)?.write(engine)?;
+        let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
         let record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
@@ -1036,7 +1025,7 @@ impl MetadataBuilder {
 
         Ok(MetadataEntry {
             content_type,
-            location: Some(content_metadata_path.to_string()),
+            location: Some(manifest_path),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -1105,7 +1094,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
-            manifest_location: None, // Will be set when written
+            path_in_log: String::new(), // Will be set when written
             leaf: None,
         })
     }
@@ -1147,7 +1136,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
-            manifest_location: None, // Will be set when written
+            path_in_log: String::new(), // Will be set when written
             leaf: Some(uuid::Uuid::new_v4()),
         })
     }
@@ -1176,7 +1165,7 @@ impl MetadataBuilder {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
-            manifest_location: None, // Will be set when written
+            path_in_log: String::new(), // Will be set when written
             leaf: Some(leaf_uuid),
         })
     }
@@ -1620,17 +1609,11 @@ mod tests {
         assert_eq!(entries.len(), 2);
 
         // Verify first entry
-        assert_eq!(
-            entries[0].location,
-            Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
-        );
+        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
         assert_eq!(entries[0].file_size_in_bytes, Some(1024));
 
         // Verify second entry
-        assert_eq!(
-            entries[1].location,
-            Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
-        );
+        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
         assert_eq!(entries[1].file_size_in_bytes, Some(2048));
 
         Ok(())
@@ -1670,23 +1653,14 @@ mod tests {
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
 
-        // Verify entries
-        assert_eq!(
-            entries[0].location,
-            Some("s3://my-bucket/my-table/part-00000.parquet".to_string())
-        );
+        // Verify entries (now relative paths)
+        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
         assert_eq!(entries[0].file_size_in_bytes, Some(1024));
 
-        assert_eq!(
-            entries[1].location,
-            Some("s3://my-bucket/my-table/part-00001.parquet".to_string())
-        );
+        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
         assert_eq!(entries[1].file_size_in_bytes, Some(2048));
 
-        assert_eq!(
-            entries[2].location,
-            Some("s3://my-bucket/my-table/part-00002.parquet".to_string())
-        );
+        assert_eq!(entries[2].location, Some("part-00002.parquet".to_string()));
         assert_eq!(entries[2].file_size_in_bytes, Some(3072));
 
         Ok(())
@@ -1946,7 +1920,7 @@ mod tests {
 
         let entry1 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -1976,7 +1950,7 @@ mod tests {
 
         let entry2 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-00001.parquet", table_root)),
+            location: Some("data/part-00001.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2088,7 +2062,7 @@ mod tests {
         // Create entries without content_stats
         let entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2130,8 +2104,6 @@ mod tests {
     fn test_extract_deletion_vector_persisted_relative() -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
 
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-
         // Test case from the existing deletion_vector tests
         // path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^"
         // prefix: "ab" (2 chars before the 20 char uuid)
@@ -2145,12 +2117,12 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+        let (content_info, location) = extract_deletion_vector_content(&dv)?;
 
-        // Should have location set to the absolute path
+        // Should have location set to the relative path
         assert_eq!(
             location,
-            "s3://my-bucket/my-table/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+            "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have content_info with offset and size (+8 for size field and CRC)
@@ -2165,8 +2137,6 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
 
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-
         // Test case with no prefix (uuid only, 20 chars)
         // This is the test case from dv_example() in deletion_vector.rs
         let dv = DeletionVectorDescriptor {
@@ -2177,12 +2147,12 @@ mod tests {
             cardinality: 2,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+        let (content_info, location) = extract_deletion_vector_content(&dv)?;
 
-        // Should have location set to the absolute path (no prefix directory)
+        // Should have location set to the relative path (no prefix directory)
         assert_eq!(
             location,
-            "s3://my-bucket/my-table/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+            "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
         // Should have content_info with offset and size (+8 for size field and CRC)
@@ -2196,8 +2166,6 @@ mod tests {
     fn test_extract_deletion_vector_persisted_absolute() -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
 
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-
         let dv = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedAbsolute,
             path_or_inline_dv:
@@ -2208,7 +2176,7 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv, &table_root)?;
+        let (content_info, location) = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
@@ -2227,8 +2195,6 @@ mod tests {
     fn test_extract_deletion_vector_inline_not_supported() {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
 
-        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
-
         // This is the inline DV from dv_inline() in deletion_vector.rs
         let dv = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::Inline,
@@ -2239,7 +2205,7 @@ mod tests {
             cardinality: 6,
         };
 
-        let result = extract_deletion_vector_content(&dv, &table_root);
+        let result = extract_deletion_vector_content(&dv);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Inline deletion vectors are not supported"));
@@ -2248,8 +2214,6 @@ mod tests {
     #[test]
     fn test_extract_deletion_vector_invalid_relative_path() {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
-
-        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
 
         // path_or_inline_dv is too short (less than 20 chars)
         let dv = DeletionVectorDescriptor {
@@ -2260,7 +2224,7 @@ mod tests {
             cardinality: 2,
         };
 
-        let result = extract_deletion_vector_content(&dv, &table_root);
+        let result = extract_deletion_vector_content(&dv);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid length"));
@@ -2282,7 +2246,7 @@ mod tests {
         // Add some data file entries to the leaf
         let data_entry_1 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-00000.parquet", table_root)),
+            location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2308,7 +2272,7 @@ mod tests {
 
         let data_entry_2 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-00001.parquet", table_root)),
+            location: Some("data/part-00001.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2380,15 +2344,22 @@ mod tests {
         );
 
         // Step 5: Read back the root and verify
-        let read_root = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let read_root = Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = read_root.entries()?;
         assert_eq!(root_entries.len(), 1);
         assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
         assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
 
         // Step 6: Read back the leaf and verify
-        let leaf_url = Url::parse(leaf_manifest_entry.location.as_ref().unwrap())?;
-        let read_leaf = Metadata::read(&engine, &leaf_url, table_root.clone())?;
+        let leaf_relative_path = leaf_manifest_entry.location.as_ref().unwrap();
+        let leaf_url = table_root.join(leaf_relative_path)?;
+        let read_leaf = Metadata::read(
+            &engine,
+            &leaf_url,
+            leaf_relative_path.clone(),
+            table_root.clone(),
+        )?;
         let leaf_entries = read_leaf.entries()?;
         assert_eq!(leaf_entries.len(), 2);
         assert_eq!(leaf_entries[0].content_type, DataContentType::Data);
@@ -2412,7 +2383,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -2452,7 +2423,9 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Step 4: Read back the root and verify manifest DV is stored inline
-        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata =
+            Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
 
         // Should have: 1 DataManifest (DV is now inline on this entry)
@@ -2479,8 +2452,9 @@ mod tests {
         assert_eq!(treemap.len(), 1);
 
         // Step 5: Read the leaf and apply manifest DV to verify filtering
-        let leaf_url = Url::parse(&leaf_path)?;
-        let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root.clone())?;
+        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_metadata =
+            Metadata::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
         let leaf_entries = leaf_metadata.entries()?;
         assert_eq!(leaf_entries.len(), 10); // Original 10 entries
 
@@ -2506,7 +2480,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -2546,7 +2520,9 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify
-        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata =
+            Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
         assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
 
@@ -2564,8 +2540,8 @@ mod tests {
         assert_eq!(treemap.len(), 3);
 
         // Apply manifest DV and verify filtering
-        let leaf_url = Url::parse(&leaf_path)?;
-        let leaf_metadata = Metadata::read(&engine, &leaf_url, table_root)?;
+        let leaf_url = table_root.join(&leaf_path)?;
+        let leaf_metadata = Metadata::read(&engine, &leaf_url, leaf_path.clone(), table_root)?;
         let leaf_entries = leaf_metadata.entries()?;
         let filtered_entries = crate::metadata::apply_manifest_dv(leaf_entries, manifest_dv_bytes)?;
         assert_eq!(filtered_entries.len(), 7); // 3 deleted, 7 remaining
@@ -2587,7 +2563,7 @@ mod tests {
         for i in 0..3 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -2628,7 +2604,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify the manifest is marked as deleted
-        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let leaf_manifest = root_entries
@@ -2661,7 +2638,7 @@ mod tests {
         for i in 0..10 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -2739,7 +2716,7 @@ mod tests {
         for i in 0..5 {
             let data_entry = MetadataEntry {
                 content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
+                location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
@@ -2767,11 +2744,8 @@ mod tests {
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
-        let leaf_url = Url::parse(&leaf_path)?;
-        let relative_path = leaf_url
-            .path()
-            .strip_prefix(table_root.path())
-            .unwrap_or(leaf_url.path());
+        // leaf_path is now already relative
+        let relative_path = &leaf_path;
 
         // Create root and delete using relative path
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
@@ -2780,8 +2754,9 @@ mod tests {
 
         let root_url = root_builder.write_root(&engine)?;
 
-        // Read back and verify manifest location is absolute
-        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        // Read back and verify manifest DV is stored inline
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let data_manifest = root_entries
@@ -2821,7 +2796,7 @@ mod tests {
         // Total: 5 entries, but only 3 are active (non-deleted)
         let manifest_entry = MetadataEntry {
             content_type: DataContentType::DataManifest,
-            location: Some(format!("{}leaf-manifest.parquet", table_root)),
+            location: Some("leaf-manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2866,7 +2841,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify the manifest is marked as deleted
-        let root_metadata = Metadata::read(&engine, &root_url, table_root)?;
+        let root_path_in_log = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let leaf_manifest = root_entries
@@ -2956,7 +2932,9 @@ mod tests {
         let root_url_v1 = root_builder.write_root(&engine)?;
 
         // Step 3: Read back and verify changes_dv from first commit
-        let root_metadata_v1 = Metadata::read(&engine, &root_url_v1, table_root.clone())?;
+        let root_path_v1 = crate::metadata::absolute_to_relative_path(&root_url_v1, &table_root)?;
+        let root_metadata_v1 =
+            Metadata::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
         let entries_v1 = root_metadata_v1.entries()?;
         let manifest_v1 = entries_v1
             .iter()
@@ -3001,7 +2979,9 @@ mod tests {
         let root_url_v2 = root_builder_v2.write_root(&engine)?;
 
         // Step 7: Read back and verify changes_dv only contains NEW deletions
-        let root_metadata_v2 = Metadata::read(&engine, &root_url_v2, table_root.clone())?;
+        let root_path_v2 = crate::metadata::absolute_to_relative_path(&root_url_v2, &table_root)?;
+        let root_metadata_v2 =
+            Metadata::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
         let entries_v2 = root_metadata_v2.entries()?;
         let manifest_v2 = entries_v2
             .iter()
@@ -3059,7 +3039,9 @@ mod tests {
         let root_url_v3 = root_builder_v3.write_root(&engine)?;
 
         // Step 10: Read back and verify changes_dv only contains NEW deletion
-        let root_metadata_v3 = Metadata::read(&engine, &root_url_v3, table_root.clone())?;
+        let root_path_v3 = crate::metadata::absolute_to_relative_path(&root_url_v3, &table_root)?;
+        let root_metadata_v3 =
+            Metadata::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
         let entries_v3 = root_metadata_v3.entries()?;
         let manifest_v3 = entries_v3
             .iter()
@@ -3150,7 +3132,9 @@ mod tests {
         let root_url_v4 = root_builder_v4.write_root(&engine)?;
 
         // Step 13: Read back and verify changes_dv is None (no deletions)
-        let root_metadata_v4 = Metadata::read(&engine, &root_url_v4, table_root.clone())?;
+        let root_path_v4 = crate::metadata::absolute_to_relative_path(&root_url_v4, &table_root)?;
+        let root_metadata_v4 =
+            Metadata::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
         let entries_v4 = root_metadata_v4.entries()?;
         let manifest_v4 = entries_v4
             .iter()
@@ -3243,7 +3227,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Step 3: Read back and verify changes_dv is NOT set for leaf reorganization
-        let root_metadata = Metadata::read(&engine, &root_url, table_root.clone())?;
+        let root_path = crate::metadata::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_metadata = Metadata::read(&engine, &root_url, root_path, table_root.clone())?;
         let entries = root_metadata.entries()?;
         let manifest = entries
             .iter()
@@ -3289,7 +3274,7 @@ mod tests {
         // Add three entries with different file paths
         let entry1 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}file1.parquet", table_root)),
+            location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3307,7 +3292,7 @@ mod tests {
         };
         let entry2 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}file2.parquet", table_root)),
+            location: Some("file2.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3325,7 +3310,7 @@ mod tests {
         };
         let entry3 = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}file3.parquet", table_root)),
+            location: Some("file3.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3387,7 +3372,7 @@ mod tests {
         // Add DV entry
         let dv_entry = MetadataEntry {
             content_type: DataContentType::PositionDeletes,
-            location: Some(format!("{}dv1.bin", table_root)),
+            location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3397,7 +3382,7 @@ mod tests {
             file_size_in_bytes: Some(128),
             content_stats: None,
             manifest_info: None,
-            referenced_file: Some(format!("{}data1.parquet", table_root)),
+            referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3405,7 +3390,7 @@ mod tests {
         };
         let data_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data1.parquet", table_root)),
+            location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3455,7 +3440,7 @@ mod tests {
         // Add DV entry that references a data file
         let dv_entry = MetadataEntry {
             content_type: DataContentType::PositionDeletes,
-            location: Some(format!("{}dv1.bin", table_root)),
+            location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3465,7 +3450,7 @@ mod tests {
             file_size_in_bytes: Some(128),
             content_stats: None,
             manifest_info: None,
-            referenced_file: Some(format!("{}data1.parquet", table_root)),
+            referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3473,7 +3458,7 @@ mod tests {
         };
         let data_entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}data1.parquet", table_root)),
+            location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
@@ -3517,7 +3502,7 @@ mod tests {
         // Add entry
         let entry = MetadataEntry {
             content_type: DataContentType::Data,
-            location: Some(format!("{}file1.parquet", table_root)),
+            location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
             content_info: None,
