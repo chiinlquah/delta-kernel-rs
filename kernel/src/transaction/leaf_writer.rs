@@ -777,13 +777,237 @@ mod tests {
         (engine, table_root, schema)
     }
 
-    /// Helper to create add files metadata for testing.
-    /// Note: stats are set to None (null) because proper content_stats requires matching
-    /// the table schema's stats format, which is complex to construct in tests.
+    /// Struct to hold file metadata including stats for testing
+    #[derive(Clone)]
+    struct FileMetadataWithStats {
+        path: &'static str,
+        size: i64,
+        modification_time: i64,
+        // Stats for the 'id' column (non-nullable INTEGER)
+        id_value_count: i64,
+        id_lower_bound: i32,
+        id_upper_bound: i32,
+        id_exact_bounds: bool,
+        // Stats for the 'value' column (nullable STRING)
+        value_value_count: i64,
+        value_null_value_count: i64,
+        value_lower_bound: Option<&'static str>,
+        value_upper_bound: Option<&'static str>,
+        value_exact_bounds: bool,
+    }
+
+    /// Helper to create add files metadata for testing with proper AMT-formatted stats.
+    /// The stats match the test schema: {id: INTEGER (non-nullable), value: STRING (nullable)}
+    fn create_test_add_metadata_with_stats(
+        files: Vec<FileMetadataWithStats>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        use crate::arrow::array::{
+            Array, ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, StringArray,
+            StructArray,
+        };
+        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let num_files = files.len();
+
+        // Build arrays for each file
+        let path_array = StringArray::from(
+            files
+                .iter()
+                .map(|f| f.path)
+                .collect::<Vec<_>>(),
+        );
+        let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
+        let mod_time_array =
+            Int64Array::from(files.iter().map(|f| f.modification_time).collect::<Vec<_>>());
+
+        // Create empty map for partitionValues
+        let entries_field = Arc::new(Field::new(
+            "key_value",
+            ArrowDataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ])),
+            false,
+        ));
+        let empty_keys = StringArray::from(Vec::<&str>::new());
+        let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+        let empty_entries = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(empty_keys) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                Arc::new(empty_values) as ArrayRef,
+            ),
+        ]);
+        let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+        let partition_values_array = Arc::new(MapArray::new(
+            entries_field,
+            offsets,
+            empty_entries,
+            None,
+            false,
+        ));
+
+        // Build stats struct in AMT format:
+        // {
+        //   id: { value_count, lower_bound, upper_bound, exact_bounds },
+        //   value: { value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds }
+        // }
+
+        // Build 'id' stats struct (non-nullable INTEGER: 4 fields)
+        let id_value_count =
+            Int64Array::from(files.iter().map(|f| f.id_value_count).collect::<Vec<_>>());
+        let id_lower_bound =
+            Int32Array::from(files.iter().map(|f| f.id_lower_bound).collect::<Vec<_>>());
+        let id_upper_bound =
+            Int32Array::from(files.iter().map(|f| f.id_upper_bound).collect::<Vec<_>>());
+        let id_exact_bounds =
+            BooleanArray::from(files.iter().map(|f| f.id_exact_bounds).collect::<Vec<_>>());
+
+        let id_stats_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("value_count", ArrowDataType::Int64, true)),
+                Arc::new(id_value_count) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("lower_bound", ArrowDataType::Int32, true)),
+                Arc::new(id_lower_bound) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("upper_bound", ArrowDataType::Int32, true)),
+                Arc::new(id_upper_bound) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("exact_bounds", ArrowDataType::Boolean, true)),
+                Arc::new(id_exact_bounds) as ArrayRef,
+            ),
+        ]);
+
+        // Build 'value' stats struct (nullable STRING: 7 fields)
+        let value_value_count =
+            Int64Array::from(files.iter().map(|f| f.value_value_count).collect::<Vec<_>>());
+        let value_null_value_count = Int64Array::from(
+            files
+                .iter()
+                .map(|f| f.value_null_value_count)
+                .collect::<Vec<_>>(),
+        );
+        // avg_value_size and max_value_size are not supported, so we set them to null
+        let value_avg_value_size = Int64Array::from(vec![None::<i64>; num_files]);
+        let value_max_value_size = Int64Array::from(vec![None::<i64>; num_files]);
+        let value_lower_bound = StringArray::from(
+            files
+                .iter()
+                .map(|f| f.value_lower_bound)
+                .collect::<Vec<_>>(),
+        );
+        let value_upper_bound = StringArray::from(
+            files
+                .iter()
+                .map(|f| f.value_upper_bound)
+                .collect::<Vec<_>>(),
+        );
+        let value_exact_bounds =
+            BooleanArray::from(files.iter().map(|f| f.value_exact_bounds).collect::<Vec<_>>());
+
+        let value_stats_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("value_count", ArrowDataType::Int64, true)),
+                Arc::new(value_value_count) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("null_value_count", ArrowDataType::Int64, true)),
+                Arc::new(value_null_value_count) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("avg_value_size", ArrowDataType::Int64, true)),
+                Arc::new(value_avg_value_size) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("max_value_size", ArrowDataType::Int64, true)),
+                Arc::new(value_max_value_size) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("lower_bound", ArrowDataType::Utf8, true)),
+                Arc::new(value_lower_bound) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("upper_bound", ArrowDataType::Utf8, true)),
+                Arc::new(value_upper_bound) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("exact_bounds", ArrowDataType::Boolean, true)),
+                Arc::new(value_exact_bounds) as ArrayRef,
+            ),
+        ]);
+
+        // Combine into top-level stats struct
+        let stats_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "id",
+                    id_stats_struct.data_type().clone(),
+                    true,
+                )),
+                Arc::new(id_stats_struct) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "value",
+                    value_stats_struct.data_type().clone(),
+                    true,
+                )),
+                Arc::new(value_stats_struct) as ArrayRef,
+            ),
+        ]);
+
+        // Build the Arrow schema
+        let arrow_schema = Arc::new(crate::arrow::datatypes::Schema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        ArrowDataType::Struct(Fields::from(vec![
+                            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+            Field::new("stats", stats_struct.data_type().clone(), true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                partition_values_array as ArrayRef,
+                Arc::new(size_array) as ArrayRef,
+                Arc::new(mod_time_array) as ArrayRef,
+                Arc::new(stats_struct) as ArrayRef,
+            ],
+        )?;
+
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    /// Helper to create add files metadata for testing without stats (null stats).
     fn create_test_add_metadata(files: Vec<(&str, i64, i64)>) -> DeltaResult<Box<dyn EngineData>> {
         use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
         use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
         use crate::arrow::record_batch::RecordBatch;
         use crate::engine::arrow_conversion::TryFromKernel;
         use crate::engine::arrow_data::ArrowEngineData;
@@ -816,13 +1040,10 @@ mod tests {
         // Create empty map for partitionValues
         let entries_field = Arc::new(Field::new(
             "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
-                    Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
-                ]
-                .into(),
-            ),
+            ArrowDataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ])),
             false,
         ));
         let empty_keys = StringArray::from(Vec::<&str>::new());
@@ -869,6 +1090,7 @@ mod tests {
 
     #[test]
     fn test_basic_leaf_writing() -> Result<(), Box<dyn std::error::Error>> {
+
         let (engine, table_root, schema) = test_setup();
         let version = 1;
         let snapshot_id = 12345;
@@ -876,8 +1098,24 @@ mod tests {
         let mut writer =
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
-        // Add files (path, size, modification_time)
-        let metadata = create_test_add_metadata(vec![("file1.parquet", 1024, 1000000)])?;
+        // Add files with proper AMT-formatted stats
+        let file_metadata = FileMetadataWithStats {
+            path: "file1.parquet",
+            size: 1024,
+            modification_time: 1000000,
+            // Stats for the 'id' column
+            id_value_count: 100,
+            id_lower_bound: 1,
+            id_upper_bound: 1000,
+            id_exact_bounds: true,
+            // Stats for the 'value' column
+            value_value_count: 100,
+            value_null_value_count: 5,
+            value_lower_bound: Some("alice"),
+            value_upper_bound: Some("zoe"),
+            value_exact_bounds: true,
+        };
+        let metadata = create_test_add_metadata_with_stats(vec![file_metadata])?;
         writer.add_files(metadata)?;
 
         // Finish and verify result
@@ -907,6 +1145,217 @@ mod tests {
             manifest_entry.location.is_some(),
             "Manifest entry should have a location"
         );
+
+        // Read back the manifest parquet file directly to verify content_stats columns
+        // The MetadataEntryVisitor doesn't read content_stats (it's table-schema-dependent),
+        // so we read the parquet file directly and check the columns are present.
+        let manifest_location = manifest_entry.location.as_ref().unwrap();
+        let manifest_url = table_root.join(manifest_location)?;
+
+        // Use the engine's parquet handler to read the file with a schema that includes content_stats
+        use crate::arrow::array::Array;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::FileMeta;
+
+        // Create FileMeta for reading (size and last_modified are not critical for reading)
+        let file_meta = FileMeta {
+            location: manifest_url.clone(),
+            last_modified: 0,
+            size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
+        };
+
+        let parquet_handler = engine.parquet_handler();
+
+        // Build a schema that includes the content_stats columns we want to read
+        let content_stats_schema = crate::metadata::stats::stats_schema(&StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::nullable("value", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+        ])?)?;
+
+        // Build the full read schema including content_stats
+        let read_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("location", DataType::STRING),
+            StructField::nullable(
+                "contentStats",
+                DataType::Struct(Box::new(content_stats_schema)),
+            ),
+        ]));
+
+        let read_result_iter = parquet_handler
+            .read_parquet_files(&[file_meta], read_schema, None)?;
+
+        let mut found_stats = false;
+        for batch_result in read_result_iter {
+            let batch = batch_result?;
+            let arrow_data = batch
+                .any_ref()
+                .downcast_ref::<ArrowEngineData>()
+                .expect("Expected ArrowEngineData");
+            let record_batch = arrow_data.record_batch();
+
+            // Check that contentStats column exists and has data
+            let content_stats_col = record_batch.column_by_name("contentStats");
+            assert!(
+                content_stats_col.is_some(),
+                "contentStats column should exist in manifest"
+            );
+
+            let stats_array = content_stats_col.unwrap();
+            assert_eq!(stats_array.len(), 1, "Should have 1 row");
+
+            // Verify the stats are not null
+            assert!(
+                stats_array.is_valid(0),
+                "contentStats should not be null for the entry"
+            );
+
+            // Access the struct array to verify nested values
+            let stats_struct = stats_array
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("contentStats should be a struct array");
+
+            // Verify 'id' column stats exist
+            let id_stats = stats_struct.column_by_name("id");
+            assert!(id_stats.is_some(), "id stats should exist in contentStats");
+            let id_struct = id_stats
+                .unwrap()
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("id stats should be a struct");
+
+            // Verify id.value_count
+            let id_value_count = id_struct
+                .column_by_name("value_count")
+                .expect("id.value_count should exist");
+            let id_vc_array = id_value_count
+                .as_any()
+                .downcast_ref::<crate::arrow::array::Int64Array>()
+                .expect("value_count should be Int64");
+            assert_eq!(
+                id_vc_array.value(0),
+                100,
+                "id.value_count should be 100"
+            );
+
+            // Verify id.lower_bound
+            let id_lower = id_struct
+                .column_by_name("lower_bound")
+                .expect("id.lower_bound should exist");
+            let id_lb_array = id_lower
+                .as_any()
+                .downcast_ref::<crate::arrow::array::Int32Array>()
+                .expect("lower_bound should be Int32");
+            assert_eq!(id_lb_array.value(0), 1, "id.lower_bound should be 1");
+
+            // Verify id.upper_bound
+            let id_upper = id_struct
+                .column_by_name("upper_bound")
+                .expect("id.upper_bound should exist");
+            let id_ub_array = id_upper
+                .as_any()
+                .downcast_ref::<crate::arrow::array::Int32Array>()
+                .expect("upper_bound should be Int32");
+            assert_eq!(id_ub_array.value(0), 1000, "id.upper_bound should be 1000");
+
+            // Verify id.exact_bounds
+            let id_exact = id_struct
+                .column_by_name("exact_bounds")
+                .expect("id.exact_bounds should exist");
+            let id_eb_array = id_exact
+                .as_any()
+                .downcast_ref::<crate::arrow::array::BooleanArray>()
+                .expect("exact_bounds should be Boolean");
+            assert!(id_eb_array.value(0), "id.exact_bounds should be true");
+
+            // Verify 'value' column stats exist
+            let value_stats = stats_struct.column_by_name("value");
+            assert!(
+                value_stats.is_some(),
+                "value stats should exist in contentStats"
+            );
+            let value_struct = value_stats
+                .unwrap()
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("value stats should be a struct");
+
+            // Verify value.value_count
+            let value_value_count = value_struct
+                .column_by_name("value_count")
+                .expect("value.value_count should exist");
+            let value_vc_array = value_value_count
+                .as_any()
+                .downcast_ref::<crate::arrow::array::Int64Array>()
+                .expect("value_count should be Int64");
+            assert_eq!(
+                value_vc_array.value(0),
+                100,
+                "value.value_count should be 100"
+            );
+
+            // Verify value.null_value_count
+            let value_null_count = value_struct
+                .column_by_name("null_value_count")
+                .expect("value.null_value_count should exist");
+            let value_nc_array = value_null_count
+                .as_any()
+                .downcast_ref::<crate::arrow::array::Int64Array>()
+                .expect("null_value_count should be Int64");
+            assert_eq!(
+                value_nc_array.value(0),
+                5,
+                "value.null_value_count should be 5"
+            );
+
+            // Verify value.lower_bound
+            let value_lower = value_struct
+                .column_by_name("lower_bound")
+                .expect("value.lower_bound should exist");
+            let value_lb_array = value_lower
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StringArray>()
+                .expect("lower_bound should be String");
+            assert_eq!(
+                value_lb_array.value(0),
+                "alice",
+                "value.lower_bound should be 'alice'"
+            );
+
+            // Verify value.upper_bound
+            let value_upper = value_struct
+                .column_by_name("upper_bound")
+                .expect("value.upper_bound should exist");
+            let value_ub_array = value_upper
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StringArray>()
+                .expect("upper_bound should be String");
+            assert_eq!(
+                value_ub_array.value(0),
+                "zoe",
+                "value.upper_bound should be 'zoe'"
+            );
+
+            // Verify value.exact_bounds
+            let value_exact = value_struct
+                .column_by_name("exact_bounds")
+                .expect("value.exact_bounds should exist");
+            let value_eb_array = value_exact
+                .as_any()
+                .downcast_ref::<crate::arrow::array::BooleanArray>()
+                .expect("exact_bounds should be Boolean");
+            assert!(value_eb_array.value(0), "value.exact_bounds should be true");
+
+            found_stats = true;
+        }
+
+        assert!(found_stats, "Should have read stats from manifest");
 
         Ok(())
     }

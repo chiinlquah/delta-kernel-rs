@@ -1455,10 +1455,11 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
                     getters[1].get(i, "partitionValues")?;
                 let size: i64 = getters[2].get(i, "size")?;
                 let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-                // TODO: Stats extraction is disabled because the input stats format (Delta JSON)
-                // differs from the expected output format (AMT). A proper conversion is needed.
-                // For now, content_stats is None and will be populated from JSON stats if available.
-                let stats: Option<StructData> = None;
+                // Extract stats as StructData using get_struct and materialize
+                let stats: Option<StructData> = getters[4]
+                    .get_struct(i, "stats")?
+                    .map(|struct_item| struct_item.materialize())
+                    .transpose()?;
 
                 self.entries
                     .push((path, partition_values, size, modification_time, stats));
