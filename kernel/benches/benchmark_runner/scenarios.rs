@@ -96,8 +96,8 @@ pub fn scan(
         time_to_enumerate_all,
         num_tasks,
         context.num_files,
-        0, // total_bytes not easily available from scan_metadata
         context.num_dv_descriptors,
+        0, // total_bytes not easily available from scan_metadata
     );
 
     Ok(BenchmarkMetrics::new(

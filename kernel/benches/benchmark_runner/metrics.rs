@@ -56,11 +56,11 @@ pub struct ScanMetrics {
     /// Number of files scanned
     pub num_files: usize,
 
+    /// Number of DV descriptors found
+    pub num_dv_descriptors: usize,
+
     /// Total bytes scanned
     pub total_bytes: u64,
-
-    /// Number of deletion vector descriptors present
-    pub num_dv_descriptors: usize,
 }
 
 /// Metrics for write operations
@@ -113,16 +113,16 @@ impl ScanMetrics {
         time_to_enumerate_all_tasks: Duration,
         num_tasks: usize,
         num_files: usize,
-        total_bytes: u64,
         num_dv_descriptors: usize,
+        total_bytes: u64,
     ) -> Self {
         Self {
             time_to_first_task_ms: time_to_first_task.as_millis() as u64,
             time_to_enumerate_all_tasks_ms: time_to_enumerate_all_tasks.as_millis() as u64,
             num_tasks,
             num_files,
-            total_bytes,
             num_dv_descriptors,
+            total_bytes,
         }
     }
 }

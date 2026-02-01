@@ -616,7 +616,7 @@ impl LeafNodeWriter {
     ///
     /// # Returns
     /// LeafNodeWriterResult with written manifests and tracking info
-    pub fn finish(self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
+    pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using MetadataBuilder's write_leaf()
         let data_manifest_entry = if self.data_builder.has_entries() {
             Some(

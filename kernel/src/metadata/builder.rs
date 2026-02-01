@@ -13,12 +13,12 @@ use crate::expressions::StructData;
 #[cfg(test)]
 use crate::metadata::ManifestStats;
 use crate::scan::state::Stats;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, EngineData, Error, Version};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 use url::Url;
 
 /// Helper function to serialize a RoaringTreemap with the portable magic number prefix.
@@ -149,8 +149,69 @@ fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
     0
 }
 
+/// Cache for DV bitmaps with lazy deserialization
+struct DvCache {
+    /// Original serialized manifest_dv bytes (from previous commits)
+    /// Kept as reference (Bytes is Rc-based, cheap to clone)
+    serialized_manifest_dv: Option<Bytes>,
+
+    /// Lazily deserialized manifest_dv (only populated when modified)
+    manifest_dv: Option<roaring::RoaringTreemap>,
+
+    /// Changes DV for current commit (always starts empty)
+    changes_dv: roaring::RoaringTreemap,
+
+    /// Track if this entry was modified (deserialized)
+    dirty: bool,
+
+    /// Total number of entries in the manifest (for bounds checking)
+    /// Cached from manifest_info to avoid O(n) scans
+    total_entry_count: i64,
+}
+
+impl DvCache {
+    fn new(serialized_manifest_dv: Option<Bytes>, total_entry_count: i64) -> Self {
+        Self {
+            serialized_manifest_dv,
+            manifest_dv: None,
+            changes_dv: roaring::RoaringTreemap::new(),
+            dirty: false,
+            total_entry_count,
+        }
+    }
+
+    /// Deserialize manifest_dv on first access
+    fn ensure_manifest_dv_loaded(&mut self) -> DeltaResult<()> {
+        if self.manifest_dv.is_some() {
+            return Ok(());
+        }
+
+        let dv = if let Some(ref bytes) = self.serialized_manifest_dv {
+            deserialize_roaring_treemap(bytes)?
+        } else {
+            roaring::RoaringTreemap::new()
+        };
+
+        self.manifest_dv = Some(dv);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Get mutable references to both bitmaps at once (avoids borrow checker issues)
+    /// Ensures manifest_dv is loaded first
+    fn get_both_dvs_mut(
+        &mut self,
+    ) -> DeltaResult<(&mut roaring::RoaringTreemap, &mut roaring::RoaringTreemap)> {
+        self.ensure_manifest_dv_loaded()?;
+        self.dirty = true;
+        let manifest_dv = self.manifest_dv.as_mut().ok_or_else(|| {
+            Error::generic("Internal bug: manifest_dv not loaded after ensure_manifest_dv_loaded")
+        })?;
+        Ok((manifest_dv, &mut self.changes_dv))
+    }
+}
+
 /// Builder for creating [`Metadata`] instances based on V4 Metadata
-#[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct MetadataBuilder {
     table_root: Url,
@@ -164,6 +225,25 @@ pub(crate) struct MetadataBuilder {
     /// Set of seen file paths to prevent duplicate entries.
     /// Only populated when processing existing actions, not new actions.
     values_seen: HashSet<String>,
+    /// Cached schema with content_stats. Computed lazily on first use.
+    cached_schema: OnceLock<SchemaRef>,
+    /// Combined cache for DV bitmaps (manifest_dv + changes_dv)
+    /// Keyed by manifest location. Provides O(1) access and lazy deserialization.
+    dv_cache: HashMap<String, DvCache>,
+}
+
+impl std::fmt::Debug for MetadataBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataBuilder")
+            .field("table_root", &self.table_root)
+            .field("pending_entries", &self.pending_entries.len())
+            .field("dv_cache_count", &self.dv_cache.len())
+            .field(
+                "dv_cache_dirty_count",
+                &self.dv_cache.values().filter(|c| c.dirty).count(),
+            )
+            .finish()
+    }
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
@@ -186,7 +266,122 @@ impl MetadataBuilder {
             version,
             table_schema,
             values_seen: HashSet::new(),
+            cached_schema: OnceLock::new(),
+            dv_cache: HashMap::new(),
         }
+    }
+
+    /// Ensures a cache entry exists for the given manifest location.
+    /// Cache should be populated in add_entry(), so this is mainly a safety check.
+    fn ensure_dv_cache_exists(&mut self, manifest_location: &str) -> DeltaResult<()> {
+        // Check if cache entry already exists
+        if self.dv_cache.contains_key(manifest_location) {
+            return Ok(());
+        }
+
+        // This shouldn't happen - cache should be populated in add_entry
+        Err(Error::generic(format!(
+            "Manifest cache not found at location: {}. This is a bug.",
+            manifest_location
+        )))
+    }
+
+    /// Serializes dirty DVs back into the pending entries.
+    /// Only serializes entries that were modified (dirty flag set).
+    /// Should be called before building to ensure DVs are properly persisted.
+    /// Also updates tracking_info with snapshot_id and sequence numbers based on status.
+    fn serialize_dvs_to_entries(&mut self, snapshot_id: Option<i64>) -> DeltaResult<()> {
+        let version = self.version as i64;
+
+        // Iterate over entries and look up in cache
+        for entry in &mut self.pending_entries {
+            // Only process manifest entries
+            if !matches!(
+                entry.content_type,
+                DataContentType::DataManifest | DataContentType::DeleteManifest
+            ) {
+                continue;
+            }
+
+            // Look up in cache by location
+            let Some(ref location) = entry.location else {
+                continue;
+            };
+
+            let Some(cache) = self.dv_cache.get(location) else {
+                continue;
+            };
+
+            // Only serialize if dirty
+            if !cache.dirty {
+                continue;
+            }
+
+            // Serialize manifest_dv if it was deserialized
+            if let Some(ref manifest_dv) = cache.manifest_dv {
+                entry.manifest_dv = Some(serialize_roaring_treemap(manifest_dv)?);
+
+                // Update tracking_info status based on DV cardinality
+                // If all active entries are deleted, mark manifest as Deleted
+                if let Some(ref manifest_info) = entry.manifest_info {
+                    let active_entry_count =
+                        manifest_info.added_files_count + manifest_info.existing_files_count;
+                    let cardinality = manifest_dv.len() as i64;
+
+                    if cardinality == active_entry_count {
+                        if let Some(ref mut tracking_info) = entry.tracking_info {
+                            tracking_info.status = TrackingStatus::Deleted;
+                        }
+                    }
+                }
+            }
+
+            // Serialize changes_dv if non-empty
+            if !cache.changes_dv.is_empty() {
+                if let Some(ref mut tracking_info) = entry.tracking_info {
+                    tracking_info.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
+                }
+            }
+
+            // Initialize or update tracking_info
+            if entry.tracking_info.is_none() {
+                // Initialize tracking_info if not present (new manifest being added)
+                entry.tracking_info = Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id,
+                    sequence_number: Some(version),
+                    file_sequence_number: Some(version),
+                    first_row_id: None,
+                    changes_dv: None,
+                });
+            } else if let Some(ref mut tracking_info) = entry.tracking_info {
+                // Update existing tracking_info based on status
+                // Only update snapshot_id when status is DELETED
+                if tracking_info.status == TrackingStatus::Deleted {
+                    tracking_info.snapshot_id = snapshot_id;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Gets or creates the cached schema with content_stats.
+    /// This is computed once and cached for the lifetime of the builder.
+    fn get_schema(&self) -> DeltaResult<SchemaRef> {
+        // Check if already cached
+        if let Some(schema) = self.cached_schema.get() {
+            return Ok(schema.clone());
+        }
+
+        // Compute the schema
+        let schema = MetadataEntry::to_schema_with_content_stats(&self.table_schema)?;
+        let schema_ref = Arc::new(schema);
+
+        // Try to cache it (ignore if another thread beat us to it)
+        let _ = self.cached_schema.set(schema_ref.clone());
+
+        Ok(schema_ref)
     }
 
     /// Converts a relative path to a data file from the root of the table
@@ -546,16 +741,34 @@ impl MetadataBuilder {
     /// This is useful when copying entries from existing metadata.
     #[allow(dead_code)]
     pub(crate) fn add_entry(&mut self, mut entry: MetadataEntry) {
-        // Clear changes_dv when adding manifest entries from a previous commit
-        // This ensures changes_dv only tracks changes from the current commit
+        // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
             DataContentType::DataManifest | DataContentType::DeleteManifest
         ) {
-            if let Some(ref mut tracking_info) = entry.tracking_info {
-                tracking_info.changes_dv = None;
+            if let Some(ref location) = entry.location {
+                // Get total entry count from manifest_info for bounds checking
+                let total_entry_count = if let Some(ref manifest_info) = entry.manifest_info {
+                    manifest_info.added_files_count
+                        + manifest_info.existing_files_count
+                        + manifest_info.deletes_files_count
+                } else {
+                    0
+                };
+
+                // Keep serialized manifest_dv bytes in entry, clone into cache
+                // Bytes is Rc-based, so clone is cheap (just increments refcount)
+                let cache = DvCache::new(entry.manifest_dv.clone(), total_entry_count);
+                self.dv_cache.insert(location.clone(), cache);
+
+                // Always clear changes_dv from entries (starts empty for new commit)
+                if let Some(ref mut tracking_info) = entry.tracking_info {
+                    tracking_info.changes_dv = None;
+                }
             }
         }
+
+        // Add entry to Vec (manifest_dv serialized bytes kept intact)
         self.pending_entries.push(entry);
     }
 
@@ -581,6 +794,8 @@ impl MetadataBuilder {
             !is_data_file
         });
 
+        // Remove from cache by location
+        self.dv_cache.remove(file_path);
         self.values_seen.remove(file_path);
         Ok(())
     }
@@ -601,6 +816,8 @@ impl MetadataBuilder {
             !is_dv
         });
 
+        // Remove from cache by location
+        self.dv_cache.remove(dv_identifier);
         self.values_seen.remove(dv_identifier);
         Ok(())
     }
@@ -624,6 +841,19 @@ impl MetadataBuilder {
     pub(crate) fn clear_root_data_and_dv_entries(&mut self) {
         use crate::metadata::DataContentType;
 
+        // Collect locations of entries being removed
+        let removed_locations: Vec<String> = self
+            .pending_entries
+            .iter()
+            .filter(|entry| {
+                !matches!(
+                    entry.content_type,
+                    DataContentType::DataManifest | DataContentType::DeleteManifest
+                )
+            })
+            .filter_map(|entry| entry.location.clone())
+            .collect();
+
         self.pending_entries.retain(|entry| {
             // Keep only manifest reference entries (these point to leaf manifests)
             // Remove actual data/DV entries from root
@@ -632,6 +862,11 @@ impl MetadataBuilder {
                 DataContentType::DataManifest | DataContentType::DeleteManifest
             )
         });
+
+        // Remove from cache
+        for location in removed_locations {
+            self.dv_cache.remove(&location);
+        }
 
         // Clear values_seen since we removed root entries
         // Note: We keep the HashSet structure but clear it because we want to track
@@ -723,24 +958,16 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `index` - Index of the entry to mark as deleted (0-based position in the manifest)
-    /// * `version` - Version for tracking info
-    /// * `snapshot_id` - Snapshot ID for tracking info
     ///
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
     #[allow(dead_code)]
-    pub(crate) fn delete_from_leaf(
-        &mut self,
-        leaf_file_path: &str,
-        index: u64,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> DeltaResult<()> {
+    pub(crate) fn delete_from_leaf(&mut self, leaf_file_path: &str, index: u64) -> DeltaResult<()> {
         use roaring::RoaringTreemap;
         let mut indices = RoaringTreemap::new();
         indices.insert(index);
-        self.delete_indices_from_leaf(leaf_file_path, &indices, version, snapshot_id, true)
+        self.delete_indices_from_leaf(leaf_file_path, &indices, true)
     }
 
     /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
@@ -751,8 +978,6 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `version` - Version for tracking info
-    /// * `snapshot_id` - Snapshot ID for tracking info
     /// * `set_changes_dv` - If true, sets tracking_info.changes_dv (for actual deletions).
     ///   If false, only updates manifest_dv (for leaf reorganization).
     ///
@@ -764,17 +989,9 @@ impl MetadataBuilder {
         &mut self,
         leaf_file_path: &str,
         indices: &roaring::RoaringTreemap,
-        version: Version,
-        snapshot_id: Option<i64>,
         set_changes_dv: bool,
     ) -> DeltaResult<()> {
-        self.delete_indices_from_leaf(
-            leaf_file_path,
-            indices,
-            version,
-            snapshot_id,
-            set_changes_dv,
-        )
+        self.delete_indices_from_leaf(leaf_file_path, indices, set_changes_dv)
     }
 
     /// Core implementation for marking entries in a leaf manifest as deleted.
@@ -785,8 +1002,6 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
-    /// * `version` - Version for tracking info
-    /// * `snapshot_id` - Snapshot ID for tracking info
     /// * `set_changes_dv` - If true, sets tracking_info.changes_dv to track this as an actual deletion.
     ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
     #[allow(dead_code)]
@@ -794,125 +1009,37 @@ impl MetadataBuilder {
         &mut self,
         leaf_file_path: &str,
         indices: &roaring::RoaringTreemap,
-        version: Version,
-        snapshot_id: Option<i64>,
         set_changes_dv: bool,
     ) -> DeltaResult<()> {
-        // leaf_file_path is already relative (or should be)
-        // Find the manifest entry
-        let manifest_position = self
-            .pending_entries
-            .iter()
-            .position(|entry| {
-                (entry.content_type == DataContentType::DataManifest
-                    || entry.content_type == DataContentType::DeleteManifest)
-                    && entry.location.as_deref() == Some(leaf_file_path)
-            })
-            .ok_or_else(|| {
-                Error::generic(format!(
-                    "Leaf manifest not found at path: {}",
-                    leaf_file_path
-                ))
-            })?;
+        // leaf_file_path is already relative
+        // O(1) cache lookup to get/modify bitmaps
+        self.ensure_dv_cache_exists(leaf_file_path)?;
+        let cache = self.dv_cache.get_mut(leaf_file_path).ok_or_else(|| {
+            Error::generic(format!(
+                "Internal bug: DV cache not found for manifest after ensure_dv_cache_exists: {}",
+                leaf_file_path
+            ))
+        })?;
 
-        // Get the entry counts from manifest_info for bounds checking
-        let manifest_info = self.pending_entries[manifest_position]
-            .manifest_info
-            .as_ref()
-            .ok_or_else(|| {
-                Error::generic(format!(
-                    "Leaf manifest missing manifest_info: {}",
-                    leaf_file_path
-                ))
-            })?;
-
-        // Total entry count includes all entries (added + existing + deleted) for bounds checking
-        let total_entry_count = manifest_info.added_files_count
-            + manifest_info.existing_files_count
-            + manifest_info.deletes_files_count;
-
-        // Calculate active entry count before getting mutable reference
-        let active_entry_count =
-            manifest_info.added_files_count + manifest_info.existing_files_count;
-
-        // Validate that all indices are within bounds
+        // Validate indices using cached entry count (O(1))
         if let Some(max_index) = indices.max() {
-            if max_index >= total_entry_count as u64 {
+            if max_index >= cache.total_entry_count as u64 {
                 return Err(Error::generic(format!(
-                    "Index {} is out of bounds for manifest with {} entries",
-                    max_index, total_entry_count
+                    "Index {} out of bounds (total entries: {})",
+                    max_index, cache.total_entry_count
                 )));
             }
         }
 
-        // Get mutable reference to the manifest entry
-        let manifest_entry = &mut self.pending_entries[manifest_position];
+        let (combined_bitmap, delta_bitmap) = cache.get_both_dvs_mut()?;
 
-        // Deserialize existing manifest_dv (cumulative DV)
-        let mut combined_bitmap = if let Some(ref existing_dv) = manifest_entry.manifest_dv {
-            deserialize_roaring_treemap(existing_dv)?
-        } else {
-            use roaring::RoaringTreemap;
-            RoaringTreemap::new()
-        };
-
-        // Deserialize existing changes_dv to accumulate deletions from current commit
-        let mut delta_bitmap = if let Some(ref tracking_info) = manifest_entry.tracking_info {
-            if let Some(ref existing_changes_dv) = tracking_info.changes_dv {
-                deserialize_roaring_treemap(existing_changes_dv)?
-            } else {
-                use roaring::RoaringTreemap;
-                RoaringTreemap::new()
-            }
-        } else {
-            use roaring::RoaringTreemap;
-            RoaringTreemap::new()
-        };
-
-        // Add new indices to both bitmaps
-        combined_bitmap |= indices;
-        delta_bitmap |= indices;
-
-        let cardinality = combined_bitmap.len() as i64;
-
-        // Serialize cumulative DV
-        manifest_entry.manifest_dv = Some(serialize_roaring_treemap(&combined_bitmap)?);
-
-        // Update tracking info to reflect the new version and optionally set changes_dv
-        // (active_entry_count was calculated earlier before getting mutable reference)
-        let serialized_delta = if set_changes_dv {
-            Some(serialize_roaring_treemap(&delta_bitmap)?)
-        } else {
-            None
-        };
-
-        if let Some(ref mut tracking_info) = manifest_entry.tracking_info {
-            tracking_info.sequence_number = Some(version as i64);
-            tracking_info.snapshot_id = snapshot_id;
-
-            // Only set changes_dv for actual deletions, not leaf reorganization
-            if set_changes_dv {
-                tracking_info.changes_dv = serialized_delta;
-            }
-
-            // If all active entries are deleted, mark the manifest as deleted
-            if cardinality == active_entry_count {
-                tracking_info.status = TrackingStatus::Deleted;
-            }
-        } else {
-            manifest_entry.tracking_info = Some(TrackingInfo {
-                status: if cardinality == active_entry_count {
-                    TrackingStatus::Deleted
-                } else {
-                    TrackingStatus::Added
-                },
-                snapshot_id,
-                sequence_number: Some(version as i64),
-                file_sequence_number: Some(version as i64),
-                first_row_id: None,
-                changes_dv: serialized_delta,
-            });
+        // Update bitmaps
+        *combined_bitmap |= indices;
+        if set_changes_dv {
+            *delta_bitmap |= indices;
         }
+
+        // tracking_info will be updated during write_leaf/build when we're already iterating
 
         Ok(())
     }
@@ -937,12 +1064,12 @@ impl MetadataBuilder {
     /// * `Err` if there was an error building or writing the metadata
     #[allow(dead_code)]
     pub(crate) fn write_leaf(
-        &self,
+        &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<MetadataEntry> {
         // Build the leaf metadata with a UUID
-        let leaf_metadata = self.build_leaf(engine)?;
+        let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
         let content_metadata_path = MetadataWriter::try_new(leaf_metadata)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
@@ -1076,19 +1203,51 @@ impl MetadataBuilder {
     }
 
     /// Builds a root Metadata instance (leaf is `None`).
-    pub(crate) fn build(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::SchemaRef;
-        use crate::IntoEngineData;
+    pub(crate) fn build(
+        &mut self,
+        engine: &dyn crate::Engine,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<Metadata> {
+        use crate::expressions::Scalar;
+        use crate::metadata::metadata_entry_to_scalars;
 
-        // Use dynamic schema with content_stats based on table schema
-        let schema: SchemaRef =
-            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
+        // Serialize all in-memory DVs back to entries
+        self.serialize_dvs_to_entries(snapshot_id)?;
 
-        let data: Vec<Box<dyn EngineData>> = self
-            .pending_entries
-            .iter()
-            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Use cached schema with content_stats based on table schema
+        let schema = self.get_schema()?;
+
+        // Handle empty case early
+        if self.pending_entries.is_empty() {
+            return Ok(Metadata {
+                table_root: self.table_root.clone(),
+                data: vec![],
+                version: self.version,
+                path_in_log: String::new(),
+                leaf: None,
+            });
+        }
+
+        // Calculate fields per row
+        let fields_per_row = schema.fields().len();
+
+        // Pre-allocate one big vector for all scalars
+        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+
+        // Push all scalars into the single vector
+        for entry in &self.pending_entries {
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
+            all_scalars.extend(scalars);
+        }
+
+        // Divide into row slices using chunks
+        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+
+        // Create multi-row EngineData in one call
+        let evaluation_handler = engine.evaluation_handler();
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        let data = vec![engine_data];
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1112,25 +1271,57 @@ impl MetadataBuilder {
     /// * `Ok(Url)` - The URL where the root manifest was written
     /// * `Err` if there was an error building or writing the metadata
     #[allow(dead_code)]
-    pub(crate) fn write_root(&self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
-        let root_metadata = self.build(engine)?;
+    pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
+        let root_metadata = self.build(engine, None)?;
         MetadataWriter::try_new(root_metadata)?.write(engine)
     }
 
     /// Builds a leaf Metadata instance with a generated UUID.
-    pub(crate) fn build_leaf(&self, engine: &dyn crate::Engine) -> DeltaResult<Metadata> {
-        use crate::schema::SchemaRef;
-        use crate::IntoEngineData;
+    pub(crate) fn build_leaf(
+        &mut self,
+        engine: &dyn crate::Engine,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<Metadata> {
+        use crate::expressions::Scalar;
+        use crate::metadata::metadata_entry_to_scalars;
 
-        // Use dynamic schema with content_stats based on table schema
-        let schema: SchemaRef =
-            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
+        // Serialize all in-memory DVs back to entries
+        self.serialize_dvs_to_entries(snapshot_id)?;
 
-        let data: Vec<Box<dyn EngineData>> = self
-            .pending_entries
-            .iter()
-            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Use cached schema with content_stats based on table schema
+        let schema = self.get_schema()?;
+
+        // Handle empty case early
+        if self.pending_entries.is_empty() {
+            return Ok(Metadata {
+                table_root: self.table_root.clone(),
+                data: vec![],
+                version: self.version,
+                path_in_log: String::new(),
+                leaf: Some(uuid::Uuid::new_v4()),
+            });
+        }
+
+        // Calculate fields per row
+        let fields_per_row = schema.fields().len();
+
+        // Pre-allocate one big vector for all scalars
+        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+
+        // Push all scalars into the single vector
+        for entry in &self.pending_entries {
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
+            all_scalars.extend(scalars);
+        }
+
+        // Divide into row slices using chunks
+        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+
+        // Create multi-row EngineData in one call
+        let evaluation_handler = engine.evaluation_handler();
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        let data = vec![engine_data];
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1144,22 +1335,51 @@ impl MetadataBuilder {
     /// Builds a leaf Metadata instance with a specific UUID.
     #[allow(dead_code)]
     pub(crate) fn build_leaf_with_uuid(
-        &self,
+        &mut self,
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
+        snapshot_id: Option<i64>,
     ) -> DeltaResult<Metadata> {
-        use crate::schema::SchemaRef;
-        use crate::IntoEngineData;
+        use crate::expressions::Scalar;
+        use crate::metadata::metadata_entry_to_scalars;
 
-        // Use dynamic schema with content_stats based on table schema
-        let schema: SchemaRef =
-            MetadataEntry::to_schema_with_content_stats(&self.table_schema)?.into();
+        // Serialize all in-memory DVs back to entries
+        self.serialize_dvs_to_entries(snapshot_id)?;
 
-        let data: Vec<Box<dyn EngineData>> = self
-            .pending_entries
-            .iter()
-            .map(|e| e.clone().into_engine_data(schema.clone(), engine))
-            .collect::<DeltaResult<Vec<_>>>()?;
+        // Use cached schema with content_stats based on table schema
+        let schema = self.get_schema()?;
+
+        // Handle empty case early
+        if self.pending_entries.is_empty() {
+            return Ok(Metadata {
+                table_root: self.table_root.clone(),
+                data: vec![],
+                version: self.version,
+                path_in_log: String::new(),
+                leaf: Some(leaf_uuid),
+            });
+        }
+
+        // Calculate fields per row
+        let fields_per_row = schema.fields().len();
+
+        // Pre-allocate one big vector for all scalars
+        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+
+        // Push all scalars into the single vector
+        for entry in &self.pending_entries {
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
+            all_scalars.extend(scalars);
+        }
+
+        // Divide into row slices using chunks
+        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+
+        // Create multi-row EngineData in one call
+        let evaluation_handler = engine.evaluation_handler();
+        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+
+        let data = vec![engine_data];
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1432,6 +1652,10 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     use serde_json::json;
 
+    // TODO: Add tests for all tracking_info columns (status, snapshot_id, sequence_number,
+    // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
+    // build operations for ADDED, DELETED, and EXISTED manifests.
+
     #[test]
     fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let _add_file_action = [json!({
@@ -1604,7 +1828,7 @@ mod tests {
 
         // Build metadata and verify
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine)?;
+        let metadata = builder.build(&engine, None)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 2);
 
@@ -1649,7 +1873,7 @@ mod tests {
 
         // Build metadata and verify
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine)?;
+        let metadata = builder.build(&engine, None)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
 
@@ -1687,7 +1911,7 @@ mod tests {
 
         // Build metadata and verify record counts
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine)?;
+        let metadata = builder.build(&engine, None)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
 
@@ -2417,7 +2641,7 @@ mod tests {
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 5)?;
 
         // Step 3: Write the root
         let root_url = root_builder.write_root(&engine)?;
@@ -2513,9 +2737,9 @@ mod tests {
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5, 2, Some(2))?;
-        root_builder.delete_from_leaf(&leaf_path, 7, 2, Some(2))?;
-        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 5)?;
+        root_builder.delete_from_leaf(&leaf_path, 7)?;
+        root_builder.delete_from_leaf(&leaf_path, 2)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2596,10 +2820,10 @@ mod tests {
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 0, 2, Some(2))?;
-        root_builder.delete_from_leaf(&leaf_path, 1, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 0)?;
+        root_builder.delete_from_leaf(&leaf_path, 1)?;
         // The third deletion should automatically mark the manifest as deleted
-        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 2)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2671,7 +2895,7 @@ mod tests {
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        let result = root_builder.delete_from_leaf(&leaf_path, 10, 2, Some(2));
+        let result = root_builder.delete_from_leaf(&leaf_path, 10);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of bounds"));
 
@@ -2688,12 +2912,12 @@ mod tests {
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Try to delete from a non-existent leaf
-        let result = root_builder.delete_from_leaf("nonexistent.parquet", 5, 2, Some(2));
+        let result = root_builder.delete_from_leaf("nonexistent.parquet", 5);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Leaf manifest not found"));
+            .contains("Manifest cache not found"));
 
         Ok(())
     }
@@ -2750,7 +2974,7 @@ mod tests {
         // Create root and delete using relative path
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        root_builder.delete_from_leaf(relative_path, 3, 2, Some(2))?;
+        root_builder.delete_from_leaf(relative_path, 3)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2834,9 +3058,9 @@ mod tests {
         // Delete all 3 active entries (indices 0, 1, 2)
         // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be marked deleted
         // With the NEW logic: cardinality (3) == active_entry_count (3), so manifest IS marked deleted
-        root_builder.delete_from_leaf(&leaf_path, 0, 2, Some(2))?;
-        root_builder.delete_from_leaf(&leaf_path, 1, 2, Some(2))?;
-        root_builder.delete_from_leaf(&leaf_path, 2, 2, Some(2))?;
+        root_builder.delete_from_leaf(&leaf_path, 0)?;
+        root_builder.delete_from_leaf(&leaf_path, 1)?;
+        root_builder.delete_from_leaf(&leaf_path, 2)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2926,8 +3150,8 @@ mod tests {
         // Step 2: Create root and delete entries 2 and 5 (first commit)
         let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
-        root_builder.delete_from_leaf(&leaf_path, 2, 1, Some(1))?;
-        root_builder.delete_from_leaf(&leaf_path, 5, 1, Some(1))?;
+        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        root_builder.delete_from_leaf(&leaf_path, 5)?;
 
         let root_url_v1 = root_builder.write_root(&engine)?;
 
@@ -2973,8 +3197,8 @@ mod tests {
         }
 
         // Step 5: Add new deletions (entries 3 and 7) in the second commit
-        root_builder_v2.delete_from_leaf(&leaf_path, 3, 2, Some(2))?;
-        root_builder_v2.delete_from_leaf(&leaf_path, 7, 2, Some(2))?;
+        root_builder_v2.delete_from_leaf(&leaf_path, 3)?;
+        root_builder_v2.delete_from_leaf(&leaf_path, 7)?;
 
         let root_url_v2 = root_builder_v2.write_root(&engine)?;
 
@@ -3034,7 +3258,7 @@ mod tests {
         }
 
         // Step 9: Delete one additional record (entry 8) in the third commit
-        root_builder_v3.delete_from_leaf(&leaf_path, 8, 3, Some(3))?;
+        root_builder_v3.delete_from_leaf(&leaf_path, 8)?;
 
         let root_url_v3 = root_builder_v3.write_root(&engine)?;
 
@@ -3222,7 +3446,7 @@ mod tests {
         indices.insert(3);
 
         // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
-        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, 1, Some(1), false)?;
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
         let root_url = root_builder.write_root(&engine)?;
 

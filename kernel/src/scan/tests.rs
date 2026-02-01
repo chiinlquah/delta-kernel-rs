@@ -582,7 +582,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         };
         builder.add(add, 3, None)?;
 
-        let metadata = builder.build(engine.as_ref()).unwrap();
+        let metadata = builder.build(engine.as_ref(), None).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap()
     };
@@ -788,7 +788,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         };
         builder.add(add, 10, None)?;
 
-        let metadata = builder.build(engine.as_ref()).unwrap();
+        let metadata = builder.build(engine.as_ref(), None).unwrap();
         let writer = MetadataWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap()
     };

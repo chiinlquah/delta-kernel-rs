@@ -698,8 +698,6 @@ impl Transaction {
                 metadata_builder.delete_multiple_from_leaf(
                     manifest_path,
                     entry_indices,
-                    commit_version,
-                    snapshot_id,
                     false, // Don't set changes_dv for leaf reorganization
                 )?;
             }
@@ -800,12 +798,8 @@ impl Transaction {
                                 remove.data_manifest_path.as_ref(),
                                 remove.data_manifest_position,
                             ) {
-                                metadata_builder.delete_from_leaf(
-                                    manifest_path,
-                                    position as u64,
-                                    commit_version,
-                                    snapshot_id,
-                                )?;
+                                metadata_builder
+                                    .delete_from_leaf(manifest_path, position as u64)?;
                             }
                         }
 
@@ -814,12 +808,8 @@ impl Transaction {
                                 remove.delete_manifest_path.as_ref(),
                                 remove.delete_manifest_position,
                             ) {
-                                metadata_builder.delete_from_leaf(
-                                    dv_manifest_path,
-                                    dv_position as u64,
-                                    commit_version,
-                                    snapshot_id,
-                                )?;
+                                metadata_builder
+                                    .delete_from_leaf(dv_manifest_path, dv_position as u64)?;
                             }
                         }
 
@@ -854,7 +844,7 @@ impl Transaction {
                 }
             }
 
-            let new_metadata = metadata_builder.build(engine)?;
+            let new_metadata = metadata_builder.build(engine, snapshot_id)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
             let path = crate::metadata::absolute_to_relative_path(
                 &content_metadata_path,

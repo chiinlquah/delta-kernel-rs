@@ -1143,7 +1143,7 @@ impl Metadata {
             metadata_builder.add_from_scan_row_data(engine_data, version, None)?;
         }
 
-        metadata_builder.build(engine)
+        metadata_builder.build(engine, None)
     }
 
     /// Reads Metadata from a parquet file at the specified path.
@@ -1913,33 +1913,101 @@ fn add_remove_to_scalars(
     Ok(scalars)
 }
 
-/// Flattens a scalar into leaf values, recursively handling nested structs.
-fn flatten_scalar(scalar: &Scalar, output: &mut Vec<Scalar>) {
-    match scalar {
-        Scalar::Struct(struct_data) => {
-            // Recursively flatten each field in the struct
-            for value in struct_data.values() {
-                flatten_scalar(value, output);
-            }
-        }
-        Scalar::Null(data_type) => {
-            // If this is a null struct, we need to expand it into null values for each leaf field
-            if let DataType::Struct(struct_type) = data_type {
-                let leaves = struct_type.as_ref().leaves(None::<&str>);
-                let (_, leaf_types) = leaves.as_ref();
-                for leaf_type in leaf_types {
-                    output.push(Scalar::Null(leaf_type.clone()));
+/// Converts a MetadataEntry to a vector of structured Scalar values matching the schema.
+/// This is used for bulk conversion with `create_many`.
+/// Unlike `into_engine_data` which uses flattened leaf values, this returns structured scalars.
+pub(crate) fn metadata_entry_to_scalars(
+    entry: &MetadataEntry,
+    schema: &crate::schema::SchemaRef,
+) -> DeltaResult<Vec<Scalar>> {
+    use crate::expressions::StructData;
+
+    // Build a vector of structured scalars for the schema (one per top-level field)
+    let mut scalars = Vec::with_capacity(schema.fields().len());
+
+    for field in schema.fields() {
+        let scalar = match field.name().as_str() {
+            "contentType" => Scalar::from(entry.content_type),
+            "location" => Scalar::from(entry.location.clone()),
+            "fileFormat" => Scalar::from(entry.file_format),
+            "trackingInfo" => match &entry.tracking_info {
+                Some(ti) => {
+                    // Get struct fields from schema
+                    let struct_fields =
+                        if let crate::schema::DataType::Struct(st) = field.data_type() {
+                            st.fields().cloned().collect::<Vec<_>>()
+                        } else {
+                            return Err(crate::Error::generic(
+                                "trackingInfo field should be a struct",
+                            ));
+                        };
+                    let values = vec![
+                        Scalar::from(ti.status),
+                        Scalar::from(ti.snapshot_id),
+                        Scalar::from(ti.sequence_number),
+                        Scalar::from(ti.file_sequence_number),
+                        Scalar::from(ti.first_row_id),
+                        Scalar::from(ti.changes_dv.clone()),
+                    ];
+                    Scalar::Struct(StructData::new_unchecked(struct_fields, values))
                 }
-            } else {
-                // Simple null leaf value
-                output.push(scalar.clone());
-            }
-        }
-        _ => {
-            // Leaf value - add it to the output
-            output.push(scalar.clone());
-        }
+                None => Scalar::Null(field.data_type().clone()),
+            },
+            "contentInfo" => match &entry.content_info {
+                Some(ci) => {
+                    let struct_fields =
+                        if let crate::schema::DataType::Struct(st) = field.data_type() {
+                            st.fields().cloned().collect::<Vec<_>>()
+                        } else {
+                            return Err(crate::Error::generic(
+                                "contentInfo field should be a struct",
+                            ));
+                        };
+                    let values = vec![Scalar::from(ci.offset), Scalar::from(ci.size_in_bytes)];
+                    Scalar::Struct(StructData::new_unchecked(struct_fields, values))
+                }
+                None => Scalar::Null(field.data_type().clone()),
+            },
+            "partitionSpecId" => Scalar::from(entry.partition_spec_id),
+            "sortOrderId" => Scalar::from(entry.sort_order_id),
+            "recordCount" => Scalar::from(entry.record_count),
+            "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
+            "contentStats" => match &entry.content_stats {
+                Some(struct_data) => Scalar::Struct(struct_data.clone()),
+                None => Scalar::Null(field.data_type().clone()),
+            },
+            "manifestStats" => match &entry.manifest_info {
+                Some(ms) => {
+                    let struct_fields =
+                        if let crate::schema::DataType::Struct(st) = field.data_type() {
+                            st.fields().cloned().collect::<Vec<_>>()
+                        } else {
+                            return Err(crate::Error::generic(
+                                "manifestStats field should be a struct",
+                            ));
+                        };
+                    let values = vec![
+                        Scalar::from(ms.added_files_count),
+                        Scalar::from(ms.existing_files_count),
+                        Scalar::from(ms.deletes_files_count),
+                        Scalar::from(ms.added_rows_count),
+                        Scalar::from(ms.existing_rows_count),
+                        Scalar::from(ms.delete_rows_count),
+                        Scalar::from(ms.min_sequence_number),
+                    ];
+                    Scalar::Struct(StructData::new_unchecked(struct_fields, values))
+                }
+                None => Scalar::Null(field.data_type().clone()),
+            },
+            "referencedFile" => Scalar::from(entry.referenced_file.clone()),
+            "manifestDv" => Scalar::from(entry.manifest_dv.clone()),
+            _ => Scalar::Null(field.data_type().clone()),
+        };
+
+        scalars.push(scalar);
     }
+
+    Ok(scalars)
 }
 
 /// Type of content stored by the manifest entry
@@ -2310,103 +2378,10 @@ impl crate::IntoEngineData for MetadataEntry {
         schema: crate::schema::SchemaRef,
         engine: &dyn crate::Engine,
     ) -> DeltaResult<Box<dyn crate::EngineData>> {
-        use crate::schema::DataType;
-        use crate::EvaluationHandlerExtension as _;
-
-        // Create scalar values matching the schema fields
-        // For nested structs, create_one expects FLATTENED leaf values, not Scalar::Struct
-        let mut flat_values = Vec::new();
-
-        // Fields 0-2: primitives
-        flat_values.extend([
-            Scalar::from(self.content_type), // content_type (INTEGER)
-            Scalar::from(self.location),     // location (STRING)
-            Scalar::from(self.file_format),  // file_format (STRING)
-        ]);
-
-        // Fields 3-8: tracking_info struct (6 fields)
-        flat_values.extend(match &self.tracking_info {
-            Some(ti) => [
-                Scalar::from(ti.status),
-                Scalar::from(ti.snapshot_id),
-                Scalar::from(ti.sequence_number),
-                Scalar::from(ti.file_sequence_number),
-                Scalar::from(ti.first_row_id),
-                Scalar::from(ti.changes_dv.clone()),
-            ],
-            None => [
-                Scalar::Null(DataType::INTEGER),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::BINARY),
-            ],
-        });
-
-        // Fields 9-10: content_info struct (2 fields)
-        flat_values.extend(match &self.content_info {
-            Some(ci) => [Scalar::from(ci.offset), Scalar::from(ci.size_in_bytes)],
-            None => [Scalar::Null(DataType::LONG), Scalar::Null(DataType::LONG)],
-        });
-
-        // Fields 11-14: primitives
-        flat_values.extend([
-            Scalar::from(self.partition_spec_id), // partition_spec_id (LONG)
-            Scalar::from(self.sort_order_id),     // sort_order_id (LONG)
-            Scalar::from(self.record_count),      // record_count (LONG)
-            Scalar::from(self.file_size_in_bytes), // file_size_in_bytes (LONG)
-        ]);
-
-        // content_stats (STRUCT) - only if schema includes it
-        if let Some(content_stats_field) = schema.field("contentStats") {
-            let content_stats_type = content_stats_field.data_type();
-
-            match &self.content_stats {
-                Some(struct_data) => {
-                    // Flatten the StructData values into leaf scalars
-                    let scalar = Scalar::Struct(struct_data.clone());
-                    flatten_scalar(&scalar, &mut flat_values);
-                }
-                None => {
-                    // Create null values for all leaf fields in content_stats
-                    flatten_scalar(&Scalar::Null(content_stats_type.clone()), &mut flat_values);
-                }
-            }
-        }
-
-        // Fields for manifest_info struct (7 fields)
-        flat_values.extend(match &self.manifest_info {
-            Some(ms) => [
-                Scalar::from(ms.added_files_count),
-                Scalar::from(ms.existing_files_count),
-                Scalar::from(ms.deletes_files_count),
-                Scalar::from(ms.added_rows_count),
-                Scalar::from(ms.existing_rows_count),
-                Scalar::from(ms.delete_rows_count),
-                Scalar::from(ms.min_sequence_number),
-            ],
-            None => [
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
-            ],
-        });
-
-        // Field: referenced_file
-        flat_values.push(Scalar::from(self.referenced_file)); // referenced_file (STRING)
-
-        // Field: manifest_dv
-        flat_values.push(Scalar::from(self.manifest_dv.clone()));
-
-        // key_metadata, split_offsets, equality_ids are intentionally excluded
-
+        // Use create_many with structured scalars (more efficient than create_one with flat values)
+        let scalars = metadata_entry_to_scalars(&self, &schema)?;
         let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &flat_values)
+        evaluator.create_many(schema, &[&scalars])
     }
 }
 
