@@ -1,5 +1,5 @@
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, Error};
 use bytes::Bytes;
 use std::str::FromStr;
@@ -20,7 +20,7 @@ pub struct MetadataEntryVisitor {
 impl RowVisitor for MetadataEntryVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| MetadataEntry::to_schema().leaves(None::<&str>));
+            LazyLock::new(|| MetadataEntry::base_schema().leaves(None::<&str>));
         NAMES_AND_TYPES.as_ref()
     }
 
@@ -41,12 +41,11 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<MetadataEntry> {
-    // The getters are in order of flattened leaf fields (22 total):
+    // The getters are in order of flattened leaf fields (24 total):
     // 0: content_type
     // 1: location
     // 2: file_format
-    // 3-7: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id)
-    // 8: inline_content
+    // 3-8: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
     // 9-10: content_info fields (offset, size_in_bytes)
     // 11: partition_spec_id
     // 12: sort_order_id
@@ -55,6 +54,7 @@ fn visit_metadata_entry_at<'a>(
     // (content_stats excluded from schema)
     // 15-21: manifest_info fields (7 fields)
     // 22: referenced_file
+    // 23: manifest_dv
     // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
 
     // Extract content_type
@@ -65,7 +65,6 @@ fn visit_metadata_entry_at<'a>(
         2 => DataContentType::EqualityDeletes,
         3 => DataContentType::DataManifest,
         4 => DataContentType::DeleteManifest,
-        5 => DataContentType::ManifestDV,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid content_type value: {}",
@@ -103,6 +102,9 @@ fn visit_metadata_entry_at<'a>(
         getters[6].get_opt(row_index, "tracking_info.file_sequence_number")?;
     let tracking_first_row_id: Option<i64> =
         getters[7].get_opt(row_index, "tracking_info.first_row_id")?;
+    let tracking_changes_dv: Option<&[u8]> =
+        getters[8].get_opt(row_index, "tracking_info.changes_dv")?;
+    let tracking_changes_dv_bytes = tracking_changes_dv.map(Bytes::copy_from_slice);
 
     let tracking_info = Some(TrackingInfo {
         status: tracking_status,
@@ -110,11 +112,8 @@ fn visit_metadata_entry_at<'a>(
         sequence_number: tracking_sequence_number,
         file_sequence_number: tracking_file_sequence_number,
         first_row_id: tracking_first_row_id,
+        changes_dv: tracking_changes_dv_bytes,
     });
-
-    // Extract inline_content
-    let inline_content_bytes: Option<&[u8]> = getters[8].get_opt(row_index, "inline_content")?;
-    let inline_content = inline_content_bytes.map(Bytes::copy_from_slice);
 
     // Extract content_info fields
     let ci_offset: Option<i64> = getters[9].get_opt(row_index, "content_info.offset")?;
@@ -163,6 +162,10 @@ fn visit_metadata_entry_at<'a>(
     // Extract referenced_file
     let referenced_file: Option<String> = getters[22].get_opt(row_index, "referenced_file")?;
 
+    // Extract manifest_dv
+    let manifest_dv: Option<&[u8]> = getters[23].get_opt(row_index, "manifest_dv")?;
+    let manifest_dv_bytes = manifest_dv.map(Bytes::copy_from_slice);
+
     // Note: The following fields are not currently used by Delta and are not extracted:
     // - key_metadata (binary data not supported in visitor pattern)
     // - split_offsets (array extraction not straightforward in visitor pattern)
@@ -173,7 +176,6 @@ fn visit_metadata_entry_at<'a>(
         location,
         file_format,
         tracking_info,
-        inline_content,
         content_info,
         partition_spec_id,
         sort_order_id,
@@ -182,6 +184,7 @@ fn visit_metadata_entry_at<'a>(
         content_stats: None, // Requires table schema to read - not included in base schema
         manifest_info,
         referenced_file,
+        manifest_dv: manifest_dv_bytes,
         key_metadata: None,  // Not currently used by Delta
         split_offsets: None, // Not currently used by Delta
         equality_ids: None,  // Not currently used by Delta

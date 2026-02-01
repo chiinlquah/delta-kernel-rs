@@ -238,7 +238,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
                 name: field.name.clone(),
                 data_type: data_type.into_owned(),
                 nullable: true,
-                metadata: Default::default(),
+                metadata: field.metadata.clone(),
             }),
         };
 

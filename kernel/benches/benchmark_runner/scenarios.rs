@@ -33,11 +33,15 @@ use url::Url;
 /// Context for counting scan files using the callback pattern
 struct ScanFileCounter {
     num_files: usize,
+    num_dv_descriptors: usize,
 }
 
 /// Callback function to count each scan file
-fn count_scan_file(context: &mut ScanFileCounter, _scan_file: delta_kernel::scan::state::ScanFile) {
+fn count_scan_file(context: &mut ScanFileCounter, scan_file: delta_kernel::scan::state::ScanFile) {
     context.num_files += 1;
+    if scan_file.dv_info.has_vector() {
+        context.num_dv_descriptors += 1;
+    }
 }
 
 /// Full table scan - list all scan tasks with no filters
@@ -67,7 +71,10 @@ pub fn scan(
 
     // Count first task if it exists using visit_scan_files callback
     let mut num_tasks = if first_task.is_some() { 1 } else { 0 };
-    let mut context = ScanFileCounter { num_files: 0 };
+    let mut context = ScanFileCounter {
+        num_files: 0,
+        num_dv_descriptors: 0,
+    };
 
     // Visit files in first task using callback pattern
     if let Some(Ok(metadata)) = first_task {
@@ -90,6 +97,7 @@ pub fn scan(
         num_tasks,
         context.num_files,
         0, // total_bytes not easily available from scan_metadata
+        context.num_dv_descriptors,
     );
 
     Ok(BenchmarkMetrics::new(

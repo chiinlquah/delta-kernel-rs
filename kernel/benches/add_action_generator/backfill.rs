@@ -7,9 +7,8 @@
 //! - Configurable deletion vector percentage
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+#[allow(unused_imports)] // Used in file:// URL path, may appear unused in some build configs
+use std::fs;
 use std::process;
 
 use clap::Parser;
@@ -26,6 +25,10 @@ mod stats;
 #[path = "writer.rs"]
 mod writer;
 
+// UC support module
+#[path = "../uc_support.rs"]
+mod uc_support;
+
 // Use the shared modules
 use generator::generate_add_actions;
 use writer::write_checkpoint_parquet;
@@ -35,9 +38,17 @@ use writer::write_checkpoint_parquet;
 #[command(about = "Backfill a Delta table with Snapshot V2 and sidecar files")]
 #[command(version)]
 struct Args {
-    /// Target table directory path
+    /// Target table directory path (or Unity Catalog table name if using UC options)
     #[arg(short = 't', long)]
     table_dir: String,
+
+    /// Unity Catalog endpoint URL (e.g., <https://uc.example.com>)
+    #[arg(long)]
+    uc_endpoint: Option<String>,
+
+    /// Unity Catalog authentication token
+    #[arg(long)]
+    uc_token: Option<String>,
 
     /// Percentage of deletion vectors (0-100)
     #[arg(short = 'd', long, default_value_t = 30.0, value_parser = validate_percentage)]
@@ -162,12 +173,32 @@ struct LastCheckpoint {
     checksum: Option<String>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     println!("Delta Table Backfill Tool");
     println!("=========================");
-    println!("Table directory: {}", args.table_dir);
+
+    // Use the common setup function to get table location and engine
+    let setup = match uc_support::setup_table_access(
+        &args.table_dir,
+        args.uc_endpoint.as_deref(),
+        args.uc_token.as_deref(),
+        uc_client::prelude::Operation::ReadWrite,
+    )
+    .await
+    {
+        Ok(setup) => setup,
+        Err(e) => {
+            eprintln!("Failed to set up table access: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let engine = setup.engine;
+
+    println!("Table URL: {}", setup.table_url);
     println!("DV percentage: {}%", args.dv_percentage);
     println!("Random seed: {}", args.seed);
     println!("Number of sidecar files: {}", args.num_sidecars);
@@ -184,7 +215,40 @@ fn main() {
     println!("Actions per commit: {}", args.actions_per_commit);
     println!();
 
-    if let Err(e) = run(&args) {
+    // Get the object store from the engine
+    let mut store = engine
+        .get_object_store_for_url(&setup.table_url)
+        .expect("Failed to get object store for URL");
+
+    // For file:// URLs, we need a prefixed store for writing
+    // The engine's store is rooted at /, but we need it rooted at the table directory
+    let path_prefix = if setup.table_url.scheme() == "file" {
+        let path = setup
+            .table_url
+            .to_file_path()
+            .expect("Failed to convert file:// URL to path");
+
+        // Create the directory if it doesn't exist
+        std::fs::create_dir_all(&path).expect("Failed to create table directory");
+
+        store = std::sync::Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(&path)
+                .expect("Failed to create prefixed file system"),
+        );
+        println!(
+            "Using prefixed local filesystem for writing to: {}",
+            path.display()
+        );
+        String::new() // No prefix needed since store is already prefixed
+    } else {
+        // For S3/UC, use the path prefix from the setup
+        if !setup.path_prefix.is_empty() {
+            println!("Using path prefix for S3 writes: {}", setup.path_prefix);
+        }
+        setup.path_prefix
+    };
+
+    if let Err(e) = run(&args, setup.table_url, engine.clone(), store, path_prefix).await {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
@@ -192,41 +256,44 @@ fn main() {
     println!("\n✓ Delta table backfill complete!");
 }
 
-fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // Create table directory structure
-    let table_path = PathBuf::from(&args.table_dir);
-    let delta_log_path = table_path.join("_delta_log");
-    let sidecars_path = delta_log_path.join("_sidecars");
-
-    println!("1. Creating directory structure...");
-    fs::create_dir_all(&sidecars_path)?;
-    println!("   ✓ Created: {}", delta_log_path.display());
-    println!("   ✓ Created: {}", sidecars_path.display());
+async fn run(
+    args: &Args,
+    table_url: url::Url,
+    engine: std::sync::Arc<dyn delta_kernel::Engine>,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("1. Setting up table structure...");
+    // Object stores are flat - no need to create directories
+    println!("   ✓ Ready to write to {}", table_url);
 
     // Generate commit 0
     println!("\n2. Generating commit 0 (metadata + protocol)...");
-    generate_commit_0(&delta_log_path)?;
+    generate_commit_0(&table_url, &store, &path_prefix).await?;
     println!("   ✓ Written: 00000000000000000000.json");
 
     // Generate sidecar files
     println!("\n3. Generating {} sidecar files...", args.num_sidecars);
     let sidecars = generate_sidecars(
-        &sidecars_path,
+        &table_url,
+        &store,
+        &path_prefix,
         args.num_sidecars,
         args.actions_per_sidecar,
         args.dv_percentage / 100.0,
         args.seed,
-    )?;
+    )
+    .await?;
     println!("   ✓ Generated {} sidecar files", sidecars.len());
 
     // Generate checkpoint
     println!("\n4. Generating checkpoint at version 0...");
-    generate_checkpoint(&delta_log_path, &sidecars)?;
+    generate_checkpoint(&table_url, &store, &path_prefix, &sidecars).await?;
 
     // Generate _last_checkpoint
     println!("\n5. Generating _last_checkpoint file...");
     let total_actions: i64 = (args.num_sidecars * args.actions_per_sidecar) as i64;
-    generate_last_checkpoint(&delta_log_path, &sidecars, total_actions)?;
+    generate_last_checkpoint(&table_url, &store, &path_prefix, &sidecars, total_actions).await?;
     println!("   ✓ Written: _last_checkpoint");
 
     // Generate content root if requested
@@ -235,7 +302,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         // Default batch_size to actions_per_sidecar for aligned partitioning
         let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
         println!("\n6. Generating content root representation...");
-        generate_content_root(&table_path, batch_size)?;
+        generate_content_root(&table_url, &engine, &store, &path_prefix, batch_size).await?;
         println!("   ✓ Content root generated");
         current_version = 2; // Commit 0, Commit 1 (enable features), Commit 2 (content root)
     }
@@ -249,14 +316,19 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             step_num, args.num_incremental_commits
         );
         generate_incremental_commits(
-            &delta_log_path,
-            args.num_incremental_commits,
-            args.actions_per_commit,
-            starting_id,
-            args.dv_percentage / 100.0,
-            args.seed,
-            current_version,
-        )?;
+            &table_url,
+            &store,
+            &path_prefix,
+            IncrementalCommitConfig {
+                num_commits: args.num_incremental_commits,
+                actions_per_commit: args.actions_per_commit,
+                starting_id,
+                dv_probability: args.dv_percentage / 100.0,
+                seed: args.seed,
+                starting_version: current_version,
+            },
+        )
+        .await?;
         println!(
             "   ✓ Generated {} incremental commits",
             args.num_incremental_commits
@@ -266,7 +338,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn generate_commit_0(delta_log_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn generate_commit_0(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     // Create table schema (matching the add_action_generator schema)
@@ -399,35 +475,27 @@ fn generate_commit_0(delta_log_path: &Path) -> Result<(), Box<dyn std::error::Er
     };
 
     // Write commit 0
-    let commit_path = delta_log_path.join("00000000000000000000.json");
-    let mut file = File::create(commit_path)?;
+    let mut content = String::new();
+    content.push_str(&serde_json::to_string(&json!({"metaData": metadata}))?);
+    content.push('\n');
+    content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
+    content.push('\n');
+    content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
+    content.push('\n');
 
-    // Write metadata action
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"metaData": metadata}))?
-    )?;
-
-    // Write protocol action
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"protocol": protocol}))?
-    )?;
-
-    // Write commit info
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"commitInfo": commit_info}))?
-    )?;
+    let commit_path = object_store::path::Path::from(format!(
+        "{}_delta_log/00000000000000000000.json",
+        path_prefix
+    ));
+    store.put(&commit_path, content.into()).await?;
 
     Ok(())
 }
 
-fn generate_sidecars(
-    sidecars_path: &Path,
+async fn generate_sidecars(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
     num_sidecars: usize,
     actions_per_sidecar: usize,
     dv_probability: f64,
@@ -439,7 +507,6 @@ fn generate_sidecars(
 
     for i in 0..num_sidecars {
         let sidecar_name = format!("sidecar-{:05}.parquet", i);
-        let sidecar_path = sidecars_path.join(&sidecar_name);
 
         // Calculate deterministic start for this sidecar to avoid ID overlap
         let deterministic_start = (i * actions_per_sidecar) as i64;
@@ -464,13 +531,25 @@ fn generate_sidecars(
             Some(file_seed),
         );
 
-        write_checkpoint_parquet(actions, sidecar_path.to_str().unwrap())
+        // Write to a temporary file first, then upload
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join(format!("sidecar-{}.parquet", uuid::Uuid::new_v4()));
+        write_checkpoint_parquet(actions, temp_path.to_str().unwrap())
             .map_err(|e| format!("Failed to generate sidecar {}: {}", sidecar_name, e))?;
 
-        // Get file size
-        let metadata = fs::metadata(&sidecar_path)?;
-        let size_in_bytes = metadata.len() as i64;
+        // Read the file and upload to object store
+        let file_bytes = tokio::fs::read(&temp_path).await?;
+        let size_in_bytes = file_bytes.len() as i64;
         let modification_time = chrono::Utc::now().timestamp_millis();
+
+        let sidecar_path = object_store::path::Path::from(format!(
+            "{}_delta_log/_sidecars/{}",
+            path_prefix, sidecar_name
+        ));
+        store.put(&sidecar_path, file_bytes.into()).await?;
+
+        // Clean up temp file
+        tokio::fs::remove_file(&temp_path).await.ok();
 
         sidecars.push(Sidecar {
             path: sidecar_name,
@@ -483,15 +562,16 @@ fn generate_sidecars(
     Ok(sidecars)
 }
 
-fn generate_checkpoint(
-    delta_log_path: &Path,
+async fn generate_checkpoint(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
     sidecars: &[Sidecar],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // V2 checkpoints can be JSON when using UUID naming format:
     // 00000000000000000000.checkpoint.{uuid}.json
     let uuid = uuid::Uuid::new_v4().to_string();
     let checkpoint_filename = format!("00000000000000000000.checkpoint.{}.json", uuid);
-    let checkpoint_path = delta_log_path.join(&checkpoint_filename);
 
     println!(
         "   Writing V2 checkpoint with {} sidecar references...",
@@ -499,8 +579,12 @@ fn generate_checkpoint(
     );
 
     // Read metadata and protocol from commit 0
-    let commit_0_path = delta_log_path.join("00000000000000000000.json");
-    let commit_0_content = fs::read_to_string(&commit_0_path)?;
+    let commit_0_path = object_store::path::Path::from(format!(
+        "{}_delta_log/00000000000000000000.json",
+        path_prefix
+    ));
+    let commit_0_bytes = store.get(&commit_0_path).await?.bytes().await?;
+    let commit_0_content = String::from_utf8(commit_0_bytes.to_vec())?;
 
     let mut metadata: Option<Metadata> = None;
     let mut protocol: Option<Protocol> = None;
@@ -521,42 +605,38 @@ fn generate_checkpoint(
     let metadata = metadata.ok_or("No metadata found in commit 0")?;
     let protocol = protocol.ok_or("No protocol found in commit 0")?;
 
-    // Create checkpoint file
-    let mut file = File::create(&checkpoint_path)?;
+    // Create checkpoint file content
+    let mut content = String::new();
 
     // 1. Write CheckpointMetadata action (this indicates it's a V2 checkpoint)
     let checkpoint_metadata = CheckpointMetadata {
         version: 0,
         tags: None,
     };
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"checkpointMetadata": checkpoint_metadata}))?
-    )?;
+    content.push_str(&serde_json::to_string(
+        &json!({"checkpointMetadata": checkpoint_metadata}),
+    )?);
+    content.push('\n');
 
     // 2. Write Metadata action
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"metaData": metadata}))?
-    )?;
+    content.push_str(&serde_json::to_string(&json!({"metaData": metadata}))?);
+    content.push('\n');
 
     // 3. Write Protocol action
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"protocol": protocol}))?
-    )?;
+    content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
+    content.push('\n');
 
     // 4. Write Sidecar actions
     for sidecar in sidecars {
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&json!({"sidecar": sidecar}))?
-        )?;
+        content.push_str(&serde_json::to_string(&json!({"sidecar": sidecar}))?);
+        content.push('\n');
     }
+
+    let checkpoint_path = object_store::path::Path::from(format!(
+        "{}_delta_log/{}",
+        path_prefix, checkpoint_filename
+    ));
+    store.put(&checkpoint_path, content.into()).await?;
 
     println!(
         "   ✓ Written V2 checkpoint with {} actions:",
@@ -572,13 +652,13 @@ fn generate_checkpoint(
     Ok(())
 }
 
-fn generate_last_checkpoint(
-    delta_log_path: &Path,
+async fn generate_last_checkpoint(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
     sidecars: &[Sidecar],
     total_actions: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let last_checkpoint_path = delta_log_path.join("_last_checkpoint");
-
     // Calculate total size of all sidecars
     let total_size_in_bytes: i64 = sidecars.iter().map(|s| s.size_in_bytes).sum();
 
@@ -593,7 +673,9 @@ fn generate_last_checkpoint(
     };
 
     let json_str = serde_json::to_string_pretty(&last_checkpoint)?;
-    fs::write(last_checkpoint_path, json_str)?;
+    let last_checkpoint_path =
+        object_store::path::Path::from(format!("{}_delta_log/_last_checkpoint", path_prefix));
+    store.put(&last_checkpoint_path, json_str.into()).await?;
 
     println!("   Total actions: {}", total_actions);
     println!("   Total size: {} bytes", total_size_in_bytes);
@@ -601,44 +683,48 @@ fn generate_last_checkpoint(
     Ok(())
 }
 
-fn generate_incremental_commits(
-    delta_log_path: &Path,
+struct IncrementalCommitConfig {
     num_commits: usize,
     actions_per_commit: usize,
     starting_id: i64,
     dv_probability: f64,
     seed: u64,
     starting_version: usize,
+}
+
+async fn generate_incremental_commits(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
+    config: IncrementalCommitConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for commit_idx in 0..num_commits {
-        let version = starting_version + commit_idx + 1;
-        let commit_filename = format!("{:020}.json", version);
-        let commit_path = delta_log_path.join(&commit_filename);
+    for commit_idx in 0..config.num_commits {
+        let version = config.starting_version + commit_idx + 1;
 
         // Calculate the starting ID for this commit
-        let commit_start_id = starting_id + (commit_idx * actions_per_commit) as i64;
+        let commit_start_id = config.starting_id + (commit_idx * config.actions_per_commit) as i64;
 
         // Use a different seed for each commit for variety
-        let commit_seed = seed + 1000 + (commit_idx as u64);
+        let commit_seed = config.seed + 1000 + (commit_idx as u64);
 
         println!(
             "   Generating commit {} (version {}) with {} actions (start_id={})...",
             commit_idx + 1,
             version,
-            actions_per_commit,
+            config.actions_per_commit,
             commit_start_id
         );
 
         // Generate add actions for this commit
         let actions = generate_add_actions(
-            actions_per_commit,
-            dv_probability,
+            config.actions_per_commit,
+            config.dv_probability,
             commit_start_id,
             Some(commit_seed),
         );
 
-        // Write commit file
-        let mut file = File::create(&commit_path)?;
+        // Build commit file content
+        let mut content = String::new();
 
         // Write commit info
         let timestamp = chrono::Utc::now().timestamp_millis();
@@ -647,16 +733,16 @@ fn generate_incremental_commits(
             operation: "WRITE".to_string(),
             operation_parameters: HashMap::from([
                 ("mode".to_string(), "Append".to_string()),
-                ("numFiles".to_string(), actions_per_commit.to_string()),
+                (
+                    "numFiles".to_string(),
+                    config.actions_per_commit.to_string(),
+                ),
             ]),
             is_blind_append: Some(true),
             engine_info: Some("delta-kernel-rust backfill tool".to_string()),
         };
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&json!({"commitInfo": commit_info}))?
-        )?;
+        content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
+        content.push('\n');
 
         // Write add actions
         for action in actions {
@@ -752,12 +838,17 @@ fn generate_incremental_commits(
                 "tags": null
             });
 
-            writeln!(
-                file,
-                "{}",
-                serde_json::to_string(&json!({"add": add_action}))?
-            )?;
+            content.push_str(&serde_json::to_string(&json!({"add": add_action}))?);
+            content.push('\n');
         }
+
+        // Write to object store
+        let commit_filename = format!("{:020}.json", version);
+        let commit_path = object_store::path::Path::from(format!(
+            "{}_delta_log/{}",
+            path_prefix, commit_filename
+        ));
+        store.put(&commit_path, content.into()).await?;
 
         if (commit_idx + 1) % 5 == 0 {
             println!("      ✓ Completed {} commits", commit_idx + 1);
@@ -767,31 +858,25 @@ fn generate_incremental_commits(
     Ok(())
 }
 
-fn generate_content_root(
-    table_path: &Path,
+async fn generate_content_root(
+    table_url: &url::Url,
+    engine: &std::sync::Arc<dyn delta_kernel::Engine>,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use delta_kernel::committer::FileSystemCommitter;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::Snapshot;
-    use std::sync::Arc;
 
     println!("   Step 6a: Enabling metadataTree-experimental feature...");
 
     // Generate commit 1 to enable the experimental feature
-    enable_metadata_tree_feature(table_path)?;
+    enable_metadata_tree_feature(table_url, store, path_prefix).await?;
     println!("      ✓ Feature enabled via commit 1");
 
     println!("   Step 6b: Creating transaction...");
 
-    // Create engine and open the table
-    let table_url =
-        url::Url::from_directory_path(table_path).map_err(|_| "Failed to create table URL")?;
-
-    let store = Arc::new(object_store::local::LocalFileSystem::new());
-    let engine = Arc::new(DefaultEngineBuilder::new(store).build());
-
-    // Open the table
+    // Open the table using the provided engine (which has correct path handling)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
     println!("      ✓ Opened table at version {}", snapshot.version());
@@ -846,16 +931,21 @@ fn generate_content_root(
     Ok(())
 }
 
-fn enable_metadata_tree_feature(table_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let delta_log_path = table_path.join("_delta_log");
-    let commit_path = delta_log_path.join("00000000000000000001.json");
-
+async fn enable_metadata_tree_feature(
+    _table_url: &url::Url,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path_prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     // Read the existing metadata from commit 0
     // Note: Column mapping is already enabled in commit 0, we just need to add metadataTree-experimental
-    let commit_0_path = delta_log_path.join("00000000000000000000.json");
-    let commit_0_content = fs::read_to_string(&commit_0_path)?;
+    let commit_0_path = object_store::path::Path::from(format!(
+        "{}_delta_log/00000000000000000000.json",
+        path_prefix
+    ));
+    let commit_0_bytes = store.get(&commit_0_path).await?.bytes().await?;
+    let commit_0_content = String::from_utf8(commit_0_bytes.to_vec())?;
 
     let mut metadata: Option<Metadata> = None;
     for line in commit_0_content.lines() {
@@ -899,28 +989,19 @@ fn enable_metadata_tree_feature(table_path: &Path) -> Result<(), Box<dyn std::er
     };
 
     // Write commit 1
-    let mut file = File::create(commit_path)?;
+    let mut content = String::new();
+    content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
+    content.push('\n');
+    content.push_str(&serde_json::to_string(&json!({"metaData": metadata}))?);
+    content.push('\n');
+    content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
+    content.push('\n');
 
-    // Write protocol action
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"protocol": protocol}))?
-    )?;
-
-    // Write metadata action (unchanged from commit 0, but required for protocol update)
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"metaData": metadata}))?
-    )?;
-
-    // Write commit info
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&json!({"commitInfo": commit_info}))?
-    )?;
+    let commit_path = object_store::path::Path::from(format!(
+        "{}_delta_log/00000000000000000001.json",
+        path_prefix
+    ));
+    store.put(&commit_path, content.into()).await?;
 
     Ok(())
 }

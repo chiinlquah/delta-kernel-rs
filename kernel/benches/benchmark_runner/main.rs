@@ -22,23 +22,32 @@ mod output;
 mod scenarios;
 
 use clap::{Parser, Subcommand};
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, BinaryPredicate, BinaryPredicateOp, Expression, Predicate, Scalar,
 };
-use delta_kernel::try_parse_uri;
 use std::process;
 use std::sync::Arc;
+use url::Url;
+
+#[path = "../uc_support.rs"]
+mod uc_support;
 
 #[derive(Parser)]
 #[command(name = "benchmark-runner")]
 #[command(about = "Run Delta table performance benchmarks")]
 #[command(version)]
 struct Args {
-    /// Path to the Delta table
+    /// Path to the Delta table (or Unity Catalog table name if using UC options)
     #[arg(short = 't', long)]
     table_path: String,
+
+    /// Unity Catalog endpoint URL (e.g., <https://uc.example.com>)
+    #[arg(long)]
+    uc_endpoint: Option<String>,
+
+    /// Unity Catalog authentication token
+    #[arg(long)]
+    uc_token: Option<String>,
 
     /// Benchmark scenario to run
     #[command(subcommand)]
@@ -117,55 +126,81 @@ enum Scenario {
     },
 }
 
-fn main() {
-    let args = Args::parse();
-
-    // Parse table URL and create engine
-    let table_url = match try_parse_uri(&args.table_path) {
-        Ok(url) => url,
-        Err(e) => {
-            eprintln!("Failed to parse table path: {}", e);
-            process::exit(1);
+/// Set up the table URL and engine, either from Unity Catalog or direct path
+async fn setup_table_and_engine(
+    args: &Args,
+) -> Result<(Url, Arc<dyn delta_kernel::Engine>), Box<dyn std::error::Error + Send + Sync>> {
+    // Determine operation type based on scenario
+    let operation = match args.scenario {
+        Scenario::FullTableScan | Scenario::NeedleInHaystack { .. } => {
+            uc_client::prelude::Operation::ReadWrite
         }
+        Scenario::BulkWrite { .. }
+        | Scenario::SmallWrite { .. }
+        | Scenario::VacuumDelete { .. } => uc_client::prelude::Operation::ReadWrite,
     };
 
-    let store = match store_from_url(&table_url) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("Failed to create object store: {}", e);
-            process::exit(1);
-        }
-    };
+    // Use the common setup function
+    let setup = uc_support::setup_table_access(
+        &args.table_path,
+        args.uc_endpoint.as_deref(),
+        args.uc_token.as_deref(),
+        operation,
+    )
+    .await?;
 
-    let engine = Arc::new(DefaultEngine::new(store));
+    Ok((setup.table_url, setup.engine))
+}
 
-    // Run the appropriate scenario
-    let result = match args.scenario {
-        Scenario::FullTableScan => {
-            scenarios::scan(table_url, engine.clone(), /*predicate= */ None)
-        }
+/// Run the specified benchmark scenario
+fn run_scenario(
+    scenario: &Scenario,
+    table_url: Url,
+    engine: Arc<dyn delta_kernel::Engine>,
+) -> delta_kernel::DeltaResult<crate::metrics::BenchmarkMetrics> {
+    match scenario {
+        Scenario::FullTableScan => scenarios::scan(table_url, engine, /*predicate=*/ None),
         Scenario::NeedleInHaystack { partition_id } => {
             let predicate = Some(Arc::new(Predicate::Binary(BinaryPredicate {
                 op: BinaryPredicateOp::Equal,
                 left: Box::new(column_expr!("id")),
-                right: Box::new(Expression::Literal(Scalar::Long(partition_id))),
+                right: Box::new(Expression::Literal(Scalar::Long(*partition_id))),
             })));
-            scenarios::scan(table_url, engine.clone(), predicate)
+            scenarios::scan(table_url, engine, predicate)
         }
         Scenario::BulkWrite {
             num_files,
             batch_size,
             bulk_mode,
-        } => scenarios::write(table_url, engine.clone(), num_files, batch_size, bulk_mode),
+        } => scenarios::write(table_url, engine, *num_files, *batch_size, *bulk_mode),
         Scenario::SmallWrite {
             num_files,
             bulk_mode,
-        } => scenarios::write(table_url, engine.clone(), num_files, num_files, bulk_mode),
+        } => scenarios::write(table_url, engine, *num_files, *num_files, *bulk_mode),
         Scenario::VacuumDelete {
             partition_threshold,
             bulk_mode,
-        } => scenarios::vacuum_delete(table_url, engine.clone(), partition_threshold, bulk_mode),
+        } => scenarios::vacuum_delete(table_url, engine, *partition_threshold, *bulk_mode),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    // Set up table and engine
+    let (table_url, engine) = match setup_table_and_engine(&args).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Failed to set up table and engine: {}", e);
+            process::exit(1);
+        }
     };
+
+    println!();
+
+    // Run the benchmark scenario
+    let result = run_scenario(&args.scenario, table_url, engine);
 
     match result {
         Ok(metrics) => {

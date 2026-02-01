@@ -629,8 +629,12 @@ impl LogSegment {
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        let metadata =
-            crate::metadata::Metadata::read(engine, &content_root_url, table_root.clone())?;
+        let metadata = crate::metadata::Metadata::read(
+            engine,
+            &content_root_url,
+            content_root.path.clone(),
+            table_root.clone(),
+        )?;
 
         // Get actions from root manifest
         // TODO: Provide partition keys

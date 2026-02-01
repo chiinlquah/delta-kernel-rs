@@ -328,7 +328,7 @@ pub struct Transaction {
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
     // Aggregated manifest deletion vectors from all leaf writers
-    aggregated_manifest_dvs: HashMap<Url, roaring::RoaringTreemap>,
+    aggregated_manifest_dvs: HashMap<String, roaring::RoaringTreemap>,
     // Aggregated unreconciled files from all leaf writers (detects conflicts)
     aggregated_unreconciled: HashSet<(String, crate::transaction::leaf_writer::DVUniqueId)>,
     // Aggregated root DV actions to remove from root DV manifest
@@ -585,6 +585,19 @@ impl Transaction {
                 || !self.remove_files_metadata.is_empty()
                 || !self.leaf_manifests.is_empty())
         {
+            // Content metadata trees require column mapping mode to be ID for stable field IDs
+            let column_mapping_mode = self
+                .read_snapshot
+                .table_configuration()
+                .column_mapping_mode();
+            require!(
+                column_mapping_mode == crate::table_features::ColumnMappingMode::Id,
+                Error::generic(format!(
+                    "Content metadata trees (batch_commit mode) require column mapping mode 'id', found '{:?}'",
+                    column_mapping_mode
+                ))
+            );
+
             // Find the latest content root in the log segment
             let latest_content_root = self
                 .read_snapshot
@@ -592,6 +605,8 @@ impl Transaction {
                 .content_root_with_version(engine)?;
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
+            // Convert to physical schema with parquet.field.id metadata for stats mapping
+            let physical_table_schema = table_schema.make_physical(column_mapping_mode);
             let table_root = self.read_snapshot.table_root().clone();
             let current_version = self.read_snapshot.version();
 
@@ -606,7 +621,8 @@ impl Transaction {
                         table_root.clone(),
                     )?;
                     // Use commit_version for the new metadata, not the old content root version
-                    let builder = metadata.to_builder(table_schema.clone(), commit_version);
+                    let builder =
+                        metadata.to_builder(physical_table_schema.clone(), commit_version);
                     // Replay delta log from the version after the content root
                     (builder, Some(root_path), content_root_version + 1)
                 } else {
@@ -615,7 +631,7 @@ impl Transaction {
                     let builder = crate::metadata::builder::MetadataBuilder::new_for(
                         table_root.clone(),
                         commit_version,
-                        table_schema.clone(),
+                        physical_table_schema.clone(),
                     );
                     // Replay all delta log commits from the beginning
                     (builder, None, 0)
@@ -677,14 +693,14 @@ impl Transaction {
 
             // Apply aggregated manifest DVs from leaf writers
             // These mark entries in leaf manifests as deleted (e.g., when files are moved between leaves)
-            for (manifest_url, entry_indices) in &self.aggregated_manifest_dvs {
-                // Convert URL to string path for delete_multiple_from_leaf
-                let manifest_path = manifest_url.as_str();
+            // set_changes_dv=false because this is leaf reorganization, not actual user-facing deletion
+            for (manifest_path, entry_indices) in &self.aggregated_manifest_dvs {
                 metadata_builder.delete_multiple_from_leaf(
                     manifest_path,
                     entry_indices,
                     commit_version,
                     snapshot_id,
+                    false, // Don't set changes_dv for leaf reorganization
                 )?;
             }
 
@@ -840,15 +856,13 @@ impl Transaction {
 
             let new_metadata = metadata_builder.build(engine)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
-
-            // Convert absolute path to relative path
-            let relative_path = crate::metadata::absolute_to_relative_path(
-                content_metadata_path.as_str(),
+            let path = crate::metadata::absolute_to_relative_path(
+                &content_metadata_path,
                 self.read_snapshot.table_root(),
-            );
+            )?;
 
             let content_root_action = ContentRoot {
-                path: relative_path,
+                path,
                 // TODO: set size_in_bytes
                 size_in_bytes: 0,
             };
@@ -999,6 +1013,14 @@ impl Transaction {
 
         let track_root_removals = !self.root_released;
 
+        // Compute root manifest path once here and pass it through
+        let root_manifest_path = root_manifest_url
+            .as_ref()
+            .map(|url| {
+                crate::metadata::absolute_to_relative_path(url, self.read_snapshot.table_root())
+            })
+            .transpose()?;
+
         // Get physical schema with parquet.field.id for adaptive metadata tree
         let column_mapping_mode = self
             .read_snapshot
@@ -1017,7 +1039,7 @@ impl Transaction {
             self.snapshot_id,
             physical_schema,
             track_root_removals,
-            root_manifest_url,
+            root_manifest_path,
         );
 
         Ok(writer)
@@ -2194,8 +2216,43 @@ pub struct RetryableTransaction {
 mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::Snapshot;
     use std::path::PathBuf;
+
+    /// Helper function to create a logical test table schema with column mapping metadata.
+    /// This returns the logical schema (with delta.columnMapping.* metadata).
+    /// Use test_table_physical_schema() when creating MetadataBuilder instances.
+    fn test_table_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, true).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-a7f4159c".to_string()),
+                ),
+            ]),
+            StructField::new("value", DataType::STRING, true).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-5f422f40".to_string()),
+                ),
+            ]),
+        ])
+    }
+
+    /// Returns the physical schema for test tables with column mapping enabled.
+    /// Use this when creating MetadataBuilder instances in tests.
+    fn test_table_physical_schema() -> StructType {
+        test_table_schema().make_physical(crate::table_features::ColumnMappingMode::Id)
+    }
 
     /// Sets up a snapshot for a table with deletion vector support at version 1
     fn setup_dv_enabled_table() -> (SyncEngine, Arc<Snapshot>) {
@@ -2573,28 +2630,67 @@ mod tests {
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     /// Helper to create an initial Delta table with Protocol and Metadata (version 0)
-    fn create_initial_table(table_root: &Url) -> DeltaResult<()> {
+    ///
+    /// # Arguments
+    /// * `table_root` - The table root URL
+    /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for batch_commit/content metadata trees)
+    fn create_initial_table(table_root: &Url, enable_column_mapping: bool) -> DeltaResult<()> {
         use serde_json::json;
         use std::fs::{create_dir_all, write};
         use uuid::Uuid;
 
         let table_id = Uuid::new_v4().to_string();
-        let schema = json!({
-            "type": "struct",
-            "fields": [
-                {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
-                {"name": "value", "type": "string", "nullable": true, "metadata": {}}
-            ]
-        });
 
-        let protocol = json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": [],
-                "writerFeatures": []
-            }
-        });
+        // Schema with or without column mapping metadata
+        let schema = if enable_column_mapping {
+            json!({
+                "type": "struct",
+                "fields": [
+                    {"name": "id", "type": "integer", "nullable": true, "metadata": {
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "col-a7f4159c"
+                    }},
+                    {"name": "value", "type": "string", "nullable": true, "metadata": {
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "col-5f422f40"
+                    }}
+                ]
+            })
+        } else {
+            json!({
+                "type": "struct",
+                "fields": [
+                    {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+                    {"name": "value", "type": "string", "nullable": true, "metadata": {}}
+                ]
+            })
+        };
+
+        let protocol = if enable_column_mapping {
+            json!({
+                "protocol": {
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": ["columnMapping"],
+                    "writerFeatures": ["columnMapping"]
+                }
+            })
+        } else {
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2,
+                    "readerFeatures": [],
+                    "writerFeatures": []
+                }
+            })
+        };
+
+        let configuration = if enable_column_mapping {
+            json!({"delta.columnMapping.mode": "id"})
+        } else {
+            json!({})
+        };
 
         let metadata = json!({
             "metaData": {
@@ -2605,7 +2701,7 @@ mod tests {
                 },
                 "schemaString": schema.to_string(),
                 "partitionColumns": [],
-                "configuration": {},
+                "configuration": configuration,
                 "createdTime": 1677811175819u64
             }
         });
@@ -2709,11 +2805,12 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        create_initial_table(&table_root)?;
+        // Enable column mapping for batch_commit mode (content metadata trees)
+        create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
         let mut leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
@@ -2722,7 +2819,7 @@ mod tests {
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
         let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_url = root_builder.write_root(&engine)?;
 
@@ -2840,7 +2937,8 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        create_initial_table(&table_root)?;
+        // Enable column mapping for batch_commit mode (content metadata trees)
+        create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with TWO leaf manifests:
         // - Data leaf manifest with data file entries (some reference DVs)
@@ -2848,7 +2946,7 @@ mod tests {
 
         // Create data leaf manifest with 5 data files
         let mut data_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
 
         // Files without DV
         data_leaf_builder.add(
@@ -2891,15 +2989,12 @@ mod tests {
 
         // Create delete leaf manifest with PositionDeletes entries for the DVs
         let mut delete_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
 
         // DV entry for file-2.parquet
         let dv_entry_2 = MetadataEntry {
             content_type: DataContentType::PositionDeletes,
-            location: Some(format!(
-                "{}deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin",
-                table_root
-            )),
+            location: Some("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2907,8 +3002,8 @@ mod tests {
                 sequence_number: Some(2),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 108, // 100 + 8
@@ -2919,7 +3014,8 @@ mod tests {
             file_size_in_bytes: Some(108),
             content_stats: None,
             manifest_info: None,
-            referenced_file: Some(format!("{}data/file-2.parquet", table_root)),
+            referenced_file: Some("data/file-2.parquet".to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2928,10 +3024,9 @@ mod tests {
         // DV entry for file-3.parquet
         let dv_entry_3 = MetadataEntry {
             content_type: DataContentType::PositionDeletes,
-            location: Some(format!(
-                "{}ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
-                table_root
-            )),
+            location: Some(
+                "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
+            ),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -2939,8 +3034,8 @@ mod tests {
                 sequence_number: Some(2),
                 file_sequence_number: Some(1),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 108,
@@ -2951,7 +3046,8 @@ mod tests {
             file_size_in_bytes: Some(108),
             content_stats: None,
             manifest_info: None,
-            referenced_file: Some(format!("{}data/file-3.parquet", table_root)),
+            referenced_file: Some("data/file-3.parquet".to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2964,7 +3060,7 @@ mod tests {
 
         // Create root manifest with both data and delete leaf manifests
         let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, StructType::new_unchecked([]));
+            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
         root_builder.add_entry(delete_leaf_entry);
         let root_url = root_builder.write_root(&engine)?;
@@ -3070,7 +3166,12 @@ mod tests {
         let root_manifest_url = table_root
             .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
-        let root_metadata = Metadata::read(&engine, &root_manifest_url, table_root.clone())?;
+        let root_metadata = Metadata::read(
+            &engine,
+            &root_manifest_url,
+            content_root_path.clone(),
+            table_root.clone(),
+        )?;
 
         // Extract all entries from the root manifest
         let mut root_visitor = MetadataEntryVisitor::default();
@@ -3091,43 +3192,22 @@ mod tests {
             .clone()
             .ok_or_else(|| Error::generic("Delete manifest has no location"))?;
 
-        // Verify that ManifestDVs were created for both manifests
-        let manifest_dvs: Vec<&MetadataEntry> = root_visitor
-            .entries
-            .iter()
-            .filter(|entry| entry.content_type == DataContentType::ManifestDV)
-            .collect();
+        // Verify that manifest DV is stored inline on the delete manifest
+        // (No separate ManifestDV entries anymore)
 
-        assert_eq!(
-            manifest_dvs.len(),
-            2,
-            "Expected 2 ManifestDVs (one for data manifest, one for delete manifest)"
-        );
+        // Check the delete manifest has a manifest_dv field
+        let manifest_dv_bytes = delete_manifest
+            .manifest_dv
+            .as_ref()
+            .ok_or_else(|| Error::generic("Delete manifest has no manifest_dv"))?;
 
-        // Find the ManifestDV for the delete manifest
-        let delete_manifest_dv = manifest_dvs
-            .iter()
-            .find(|dv| dv.referenced_file.as_ref() == Some(&delete_manifest_path))
-            .ok_or_else(|| Error::generic("No ManifestDV found for delete manifest"))?;
-
-        // Verify the ManifestDV has cardinality 1 (one deleted DV entry)
-        assert_eq!(
-            delete_manifest_dv.record_count, 1,
-            "Delete manifest ManifestDV should have cardinality 1"
-        );
+        if manifest_dv_bytes.len() < 4 {
+            return Err(Box::new(Error::generic("manifest_dv bytes too short")));
+        }
 
         // Decode the roaring bitmap to verify the deleted index
         use roaring::RoaringTreemap;
-        let inline_content = delete_manifest_dv
-            .inline_content
-            .as_ref()
-            .ok_or_else(|| Error::generic("ManifestDV has no inline content"))?;
-
-        if inline_content.len() < 4 {
-            return Err(Box::new(Error::generic(
-                "ManifestDV inline content too short",
-            )));
-        }
+        let inline_content = manifest_dv_bytes;
         let deleted_indices =
             RoaringTreemap::deserialize_from(&inline_content[4..]).map_err(|e| {
                 Box::new(Error::generic(format!(
@@ -3144,10 +3224,16 @@ mod tests {
         let deleted_index = deleted_indices.iter().next().unwrap();
 
         // Read the delete manifest and verify the entry at the deleted index
-        let delete_manifest_url = Url::parse(&delete_manifest_path)
+        // delete_manifest_path is now a relative path, join with table_root
+        let delete_manifest_url = table_root
+            .join(&delete_manifest_path)
             .map_err(|e| Error::generic(format!("Failed to parse delete manifest URL: {e}")))?;
-        let delete_manifest_metadata =
-            Metadata::read(&engine, &delete_manifest_url, table_root.clone())?;
+        let delete_manifest_metadata = Metadata::read(
+            &engine,
+            &delete_manifest_url,
+            delete_manifest_path.clone(),
+            table_root.clone(),
+        )?;
 
         let mut delete_visitor = MetadataEntryVisitor::default();
         for engine_data in delete_manifest_metadata.data() {
@@ -3206,6 +3292,7 @@ mod tests {
                     "type": "integer",
                     "nullable": true,
                     "metadata": {
+                        "parquet.field.id": 1,
                         "delta.columnMapping.id": 1,
                         "delta.columnMapping.physicalName": "id"
                     }
@@ -3215,6 +3302,7 @@ mod tests {
                     "type": "string",
                     "nullable": true,
                     "metadata": {
+                        "parquet.field.id": 2,
                         "delta.columnMapping.id": 2,
                         "delta.columnMapping.physicalName": "value"
                     }
@@ -3282,9 +3370,11 @@ mod tests {
         let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
 
         // Helper to create add metadata for testing
+        // Note: stats are set to null (empty struct) because proper content_stats requires
+        // matching the table schema's stats format
         fn create_test_add_metadata(paths: Vec<&str>) -> DeltaResult<Box<dyn crate::EngineData>> {
             use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
-            use crate::arrow::buffer::OffsetBuffer;
+            use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
             use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
             use crate::arrow::record_batch::RecordBatch;
             use crate::engine::arrow_data::ArrowEngineData;
@@ -3292,7 +3382,7 @@ mod tests {
 
             let num_files = paths.len();
 
-            // Create schema
+            // Create schema with empty stats struct
             let schema = Arc::new(StructType::new_unchecked(vec![
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
@@ -3305,13 +3395,7 @@ mod tests {
                 ),
                 StructField::not_null("size", DataType::LONG),
                 StructField::not_null("modificationTime", DataType::LONG),
-                StructField::nullable(
-                    "stats",
-                    DataType::struct_type_unchecked(vec![StructField::nullable(
-                        "numRecords",
-                        DataType::LONG,
-                    )]),
-                ),
+                StructField::nullable("stats", DataType::struct_type_unchecked(vec![])),
             ]));
 
             let arrow_schema = Arc::new(
@@ -3359,13 +3443,10 @@ mod tests {
                 false,
             ));
 
-            // Stats with numRecords
-            let num_records: ArrayRef =
-                Arc::new(Int64Array::from_iter_values(vec![100; num_files]));
-            let stats: ArrayRef = Arc::new(StructArray::new(
-                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
-                vec![num_records],
-                None,
+            // All-null stats (empty struct with null buffer)
+            let stats: ArrayRef = Arc::new(StructArray::new_empty_fields(
+                num_files,
+                Some(NullBuffer::from(vec![false; num_files])),
             ));
 
             let record_batch = RecordBatch::try_new(

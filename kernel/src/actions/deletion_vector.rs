@@ -104,12 +104,107 @@ impl DeletionVectorPath {
 
     /// Helper method to construct the relative path to a deletion vector file
     /// from the prefix and UUID suffix.
-    fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
+    pub(crate) fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
         if !prefix.is_empty() {
             format!("{prefix}/deletion_vector_{uuid}.bin")
         } else {
             format!("deletion_vector_{uuid}.bin")
         }
+    }
+
+    /// Detects if a path matches the relative DV format: {prefix}/deletion_vector_{uuid}.bin
+    /// Returns true if the path matches the pattern and the prefix doesn't contain "://"
+    /// (using a heuristic to rule out absolute URLs).
+    fn is_relative_format(path: &str) -> bool {
+        const DV_PREFIX: &str = "deletion_vector_";
+        const DV_SUFFIX: &str = ".bin";
+        const UUID_LEN: usize = 36;
+        const MIN_LEN: usize = DV_PREFIX.len() + UUID_LEN + DV_SUFFIX.len();
+
+        // Check minimum length
+        if path.len() < MIN_LEN {
+            return false;
+        }
+
+        // Check suffix matches deletion_vector_{uuid}.bin
+        let suffix_start = path.len() - MIN_LEN;
+        let suffix = &path[suffix_start..];
+
+        if !suffix.starts_with(DV_PREFIX) || !suffix.ends_with(DV_SUFFIX) {
+            return false;
+        }
+
+        // Validate UUID format: hyphens at positions 8, 13, 18, 23
+        let uuid_part = &suffix[DV_PREFIX.len()..suffix.len() - DV_SUFFIX.len()];
+        let uuid_bytes = uuid_part.as_bytes();
+        if uuid_bytes[8] != b'-'
+            || uuid_bytes[13] != b'-'
+            || uuid_bytes[18] != b'-'
+            || uuid_bytes[23] != b'-'
+        {
+            return false;
+        }
+
+        // If there's a prefix, ensure it doesn't look like an absolute URL
+        if path.len() > MIN_LEN {
+            let prefix_with_slash = &path[..suffix_start];
+            if !prefix_with_slash.ends_with('/') {
+                return false;
+            }
+            let prefix = &prefix_with_slash[..prefix_with_slash.len() - 1];
+            !prefix.contains("://")
+        } else {
+            true
+        }
+    }
+
+    /// Parses a deletion vector location path and returns the appropriate storage type
+    /// and encoded path for use in DeletionVectorDescriptor.
+    ///
+    /// If the location matches the relative DV format ({prefix}/deletion_vector_{uuid}.bin),
+    /// where the prefix doesn't contain "://" (heuristic to rule out absolute URLs),
+    /// it will be encoded as PersistedRelative with base85-encoded UUID.
+    /// Otherwise, it will be treated as PersistedAbsolute. For PersistedAbsolute,
+    /// paths containing "://" are treated as absolute URLs, while others are joined
+    /// with table_root.
+    pub(crate) fn parse_path(
+        location: &str,
+        table_root: &Url,
+    ) -> DeltaResult<(DeletionVectorStorageType, String)> {
+        // Try to detect and encode as PersistedRelative
+        if Self::is_relative_format(location) {
+            let (prefix, uuid_str) = if let Some(last_slash) = location.rfind('/') {
+                let prefix = &location[..last_slash];
+                let filename = &location[last_slash + 1..];
+                let uuid_str = &filename["deletion_vector_".len()..filename.len() - ".bin".len()];
+                (prefix, uuid_str)
+            } else {
+                let uuid_str = &location["deletion_vector_".len()..location.len() - ".bin".len()];
+                ("", uuid_str)
+            };
+
+            if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                let encoded = format!("{}{}", prefix, z85::encode(uuid.as_bytes()));
+                return Ok((DeletionVectorStorageType::PersistedRelative, encoded));
+            }
+        }
+
+        // Treat as absolute
+        let path_or_inline_dv = if location.contains("://") {
+            location.to_string()
+        } else {
+            table_root
+                .join(location)
+                .map_err(|e| {
+                    Error::generic(format!("Failed to resolve DV location {}: {}", location, e))
+                })?
+                .to_string()
+        };
+
+        Ok((
+            DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv,
+        ))
     }
 
     /// Returns the absolute path to the deletion vector file.
@@ -182,21 +277,29 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Decodes a PersistedRelative path to its full relative path format.
+    /// Returns the path as a string like "prefix/deletion_vector_{uuid}.bin".
+    pub(crate) fn relative_path(&self) -> DeltaResult<String> {
+        let path_len = self.path_or_inline_dv.len();
+        require!(
+            path_len >= 20,
+            Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
+        );
+        let prefix_len = path_len - 20;
+        let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
+            .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
+        let uuid = uuid::Uuid::from_slice(&decoded)
+            .map_err(|err| Error::DeletionVector(err.to_string()))?;
+        Ok(DeletionVectorPath::relative_path(
+            &self.path_or_inline_dv[..prefix_len],
+            &uuid,
+        ))
+    }
+
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
-                let path_len = self.path_or_inline_dv.len();
-                require!(
-                    path_len >= 20,
-                    Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
-                );
-                let prefix_len = path_len - 20;
-                let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
-                    .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
-                let uuid = uuid::Uuid::from_slice(&decoded)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let dv_suffix =
-                    DeletionVectorPath::relative_path(&self.path_or_inline_dv[..prefix_len], &uuid);
+                let dv_suffix = self.relative_path()?;
                 let dv_path = parent
                     .join(&dv_suffix)
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
@@ -813,5 +916,203 @@ mod tests {
         // Verify the encoded_relative_path is exactly as expected (z85 encoded UUID: 20 chars)
         let encoded = dv_path.encoded_relative_path();
         assert_eq!(encoded, "5<w-%>:JjlQ/G/]6C<1m");
+    }
+
+    #[test]
+    fn test_is_relative_format_valid_cases() {
+        let valid_paths = vec![
+            // No prefix
+            "deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+            // Simple prefix
+            "ab/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+            // Nested prefix
+            "prefix/nested/path/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+            // Numeric prefix
+            "prefix123/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+            // Mixed alphanumeric prefix
+            "abc123/def456/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+            // Different valid UUID
+            "deletion_vector_123e4567-e89b-12d3-a456-426614174000.bin",
+        ];
+
+        for path in valid_paths {
+            assert!(
+                DeletionVectorPath::is_relative_format(path),
+                "Expected '{}' to be valid",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_relative_format_invalid_cases() {
+        let invalid_paths = vec![
+            // Too short
+            ("deletion_vector_short.bin", "too short"),
+            // Wrong prefix
+            (
+                "dv_550e8400-e29b-41d4-a716-446655440000.bin",
+                "wrong prefix",
+            ),
+            // Wrong suffix
+            (
+                "deletion_vector_550e8400-e29b-41d4-a716-446655440000.parquet",
+                "wrong suffix",
+            ),
+            // UUID too short
+            ("deletion_vector_550e8400-e29b.bin", "UUID too short"),
+            // UUID too long
+            (
+                "deletion_vector_550e8400-e29b-41d4-a716-446655440000-extra.bin",
+                "UUID too long",
+            ),
+            // S3 URL
+            (
+                "s3://bucket/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+                "s3:// URL",
+            ),
+            // File URL
+            (
+                "file:///path/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+                "file:// URL",
+            ),
+            // HTTPS URL
+            (
+                "https://example.com/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+                "https:// URL",
+            ),
+            // Missing slash
+            (
+                "prefixdeletion_vector_550e8400-e29b-41d4-a716-446655440000.bin",
+                "missing slash",
+            ),
+            // UUID without hyphens
+            (
+                "deletion_vector_550e8400e29b41d4a716446655440000.bin",
+                "missing hyphens",
+            ),
+            // Wrong hyphen positions
+            (
+                "deletion_vector_550e840-0e29b-41d4-a716-446655440000.bin",
+                "wrong hyphen positions",
+            ),
+            // Extra hyphens
+            (
+                "deletion_vector_550e8400--e29b-41d4-a716-446655440000.bin",
+                "extra hyphens",
+            ),
+        ];
+
+        for (path, reason) in invalid_paths {
+            assert!(
+                !DeletionVectorPath::is_relative_format(path),
+                "Expected '{}' to be invalid (reason: {})",
+                path,
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_path_relative_format() {
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
+
+        // Test cases: (input_location, expected_storage_type, expected_encoded)
+        let test_cases = vec![
+            // Relative format with prefix
+            (
+                "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+                DeletionVectorStorageType::PersistedRelative,
+                "ab^-aqEH.-t@S}K{vb[*k^",
+            ),
+            // Relative format without prefix
+            (
+                "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin",
+                DeletionVectorStorageType::PersistedRelative,
+                "vBn[lx{q8@P<9BNH/isA",
+            ),
+            // Relative format with multi-level prefix
+            (
+                "a/b/c/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+                DeletionVectorStorageType::PersistedRelative,
+                "a/b/c^-aqEH.-t@S}K{vb[*k^",
+            ),
+        ];
+
+        for (location, expected_type, expected_encoded) in test_cases {
+            let (storage_type, path_or_inline_dv) =
+                DeletionVectorPath::parse_path(location, &table_root).unwrap();
+            assert_eq!(
+                storage_type, expected_type,
+                "Failed for location: {}",
+                location
+            );
+            assert_eq!(
+                path_or_inline_dv, expected_encoded,
+                "Failed for location: {}",
+                location
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_path_absolute_format() {
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
+
+        // Test cases: (input_location, expected_storage_type, expected_path_substring)
+        let test_cases = vec![
+            // Absolute URL with scheme
+            (
+                "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+                DeletionVectorStorageType::PersistedAbsolute,
+                "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+            ),
+            // HTTPS URL
+            (
+                "https://example.com/dv/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+                DeletionVectorStorageType::PersistedAbsolute,
+                "https://example.com/dv/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+            ),
+            // Relative path that doesn't match DV format (gets joined with table_root)
+            (
+                "some/other/path.bin",
+                DeletionVectorStorageType::PersistedAbsolute,
+                "s3://my-bucket/my-table/some/other/path.bin",
+            ),
+            // Path with invalid UUID (doesn't match relative format)
+            (
+                "deletion_vector_invalid-uuid.bin",
+                DeletionVectorStorageType::PersistedAbsolute,
+                "s3://my-bucket/my-table/deletion_vector_invalid-uuid.bin",
+            ),
+        ];
+
+        for (location, expected_type, expected_path) in test_cases {
+            let (storage_type, path_or_inline_dv) =
+                DeletionVectorPath::parse_path(location, &table_root).unwrap();
+            assert_eq!(
+                storage_type, expected_type,
+                "Failed for location: {}",
+                location
+            );
+            assert_eq!(
+                path_or_inline_dv, expected_path,
+                "Failed for location: {}",
+                location
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_path_with_absolute_prefix() {
+        let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
+
+        // Even if it looks like DV format, if prefix contains "://", treat as absolute
+        let location = "s3://bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
+        let (storage_type, path_or_inline_dv) =
+            DeletionVectorPath::parse_path(location, &table_root).unwrap();
+
+        assert_eq!(storage_type, DeletionVectorStorageType::PersistedAbsolute);
+        assert_eq!(path_or_inline_dv, location);
     }
 }

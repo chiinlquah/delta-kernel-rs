@@ -6,7 +6,6 @@ pub(crate) mod writer;
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::deletion_vector::DeletionVectorStorageType;
 use crate::actions::Remove;
 use crate::actions::{Add, ContentRoot};
 use crate::engine_data::EngineData;
@@ -17,7 +16,7 @@ use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{derive_macro_utils::ToDataType, DataType, MapType, StructField, StructType, ToSchema};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, MapType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
     SnapshotRef, Version,
@@ -26,7 +25,7 @@ use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use tracing::debug;
 use url::Url;
 
@@ -208,10 +207,10 @@ pub struct Metadata {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
-    /// The location (path/URL) of this manifest file.
-    /// None for newly built metadata that hasn't been written yet.
-    /// Some(path) after reading from disk or writing.
-    manifest_location: Option<Url>,
+    /// The exact path string as it appears in the Delta log (from contentRoot action or manifest location field).
+    /// This is NOT normalized or converted - it flows through exactly as stored in the log.
+    /// Empty string for newly built metadata that hasn't been written yet.
+    path_in_log: String,
     /// Optional UUID that identifies this metadata as a leaf manifest.
     /// When writing a root manifest, this is `None`.
     /// When writing a leaf manifest, this must be set to a unique UUID.
@@ -223,34 +222,20 @@ enum AddRemove {
     Remove(Remove),
 }
 
-/// A manifest entry paired with an optional manifest deletion vector that applies to it.
+/// A manifest entry wrapper.
 ///
-/// According to the Iceberg Single File Commits spec, manifest deletion vectors (ManifestDV)
+/// According to the Iceberg Single File Commits spec, manifest deletion vectors
 /// can filter out entries from a manifest by ordinal position without rewriting the manifest file.
 #[derive(Debug, Clone)]
 pub(crate) struct FilteredManifest {
     /// The manifest entry (can be DataManifest or DeleteManifest)
     pub(crate) manifest: MetadataEntry,
-    /// Optional manifest deletion vector that applies to entries in this manifest
-    /// If present, contains either inline deletion vector data or a reference to a puffin file
-    pub(crate) manifest_dv: Option<MetadataEntry>,
 }
 
 impl FilteredManifest {
-    /// Creates a new FilteredManifest with no deletion vector
+    /// Creates a new FilteredManifest
     pub(crate) fn new(manifest: MetadataEntry) -> Self {
-        Self {
-            manifest,
-            manifest_dv: None,
-        }
-    }
-
-    /// Creates a new FilteredManifest with a deletion vector
-    pub(crate) fn with_dv(manifest: MetadataEntry, manifest_dv: MetadataEntry) -> Self {
-        Self {
-            manifest,
-            manifest_dv: Some(manifest_dv),
-        }
+        Self { manifest }
     }
 }
 
@@ -387,11 +372,6 @@ pub(crate) struct ManifestReference {
     pub(crate) affiliated_dv_manifests: Vec<FilteredManifest>,
 }
 
-/// Cached schema for reading MetadataEntry from parquet files.
-/// Computed once and reused across all read operations.
-static METADATA_ENTRY_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(MetadataEntry::to_schema()));
-
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
     ///
@@ -406,7 +386,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         }
     }
@@ -424,7 +404,7 @@ impl Metadata {
             data: vec![],
             version,
             table_root,
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: Some(uuid::Uuid::new_v4()),
         }
     }
@@ -498,36 +478,36 @@ impl Metadata {
         let data_entries =
             filter_entries_by_predicate(data_entries, predicate, "root data entries");
 
-        // Process deletion vector entries
-        for (i, dv_entry) in dv_entries.into_iter().enumerate() {
-            // Only include deletion vectors that are not marked as deleted
-            let is_deleted = dv_entry
-                .tracking_info
-                .as_ref()
-                .map(|ti| ti.status == TrackingStatus::Deleted)
-                .unwrap_or(false);
-            if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
-                let referenced_file = dv_entry
-                    .referenced_file
-                    .clone()
-                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
-                // For DVs in root manifest, use the root manifest path if available, otherwise empty string
-                let manifest_path = self
-                    .manifest_location
+        // Process deletion vector entries (only if we have a path_in_log)
+        if !self.path_in_log.is_empty() {
+            for (i, dv_entry) in dv_entries.into_iter().enumerate() {
+                // Only include deletion vectors that are not marked as deleted
+                let is_deleted = dv_entry
+                    .tracking_info
                     .as_ref()
-                    .map(|u| u.as_str())
-                    .unwrap_or("");
-                let dv_info = metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
+                    .map(|ti| ti.status == TrackingStatus::Deleted)
+                    .unwrap_or(false);
+                if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
+                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
+                        Error::generic("Deletion vector must have a referenced file")
+                    })?;
+                    let dv_info = metadata_entry_to_deletion_vector_info(
+                        dv_entry,
+                        i,
+                        &self.path_in_log,
+                        &self.table_root,
+                    )?;
 
-                // Only insert if this DV has a higher sequence number than any existing one for this file
-                deletion_vector_map
-                    .entry(referenced_file)
-                    .and_modify(|existing| {
-                        if dv_info.sequence_number > existing.sequence_number {
-                            *existing = dv_info.clone();
-                        }
-                    })
-                    .or_insert(dv_info);
+                    // Only insert if this DV has a higher sequence number than any existing one for this file
+                    deletion_vector_map
+                        .entry(referenced_file)
+                        .and_modify(|existing| {
+                            if dv_info.sequence_number > existing.sequence_number {
+                                *existing = dv_info.clone();
+                            }
+                        })
+                        .or_insert(dv_info);
+                }
             }
         }
 
@@ -539,19 +519,12 @@ impl Metadata {
         let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
         let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
 
-        // Cache the table_root reference to avoid repeated parsing in the loop
-        let table_root_url = &self.table_root;
-
         let add_removes: Vec<AddRemove> = data_entries
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                let manifest_path = self
-                    .manifest_location
-                    .as_ref()
-                    .map(|u| absolute_to_relative_path(u.as_str(), table_root_url))
-                    .unwrap_or_default();
-                entry_to_add_remove(entry, &dv_maps, i, table_root_url, manifest_path)
+                // Use the pre-computed path_in_log - no conversion needed!
+                entry_to_add_remove(entry, &dv_maps, i, self.path_in_log.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -642,7 +615,6 @@ impl Metadata {
         // Separate entries by type
         let mut data_manifest_entries = Vec::new();
         let mut delete_manifest_entries = Vec::new();
-        let mut manifest_dv_entries = Vec::new();
         let mut position_delete_entries = Vec::new();
         let mut data_file_entries = Vec::new();
 
@@ -650,7 +622,6 @@ impl Metadata {
             match entry.content_type {
                 DataContentType::DataManifest => data_manifest_entries.push(entry),
                 DataContentType::DeleteManifest => delete_manifest_entries.push(entry),
-                DataContentType::ManifestDV => manifest_dv_entries.push(entry),
                 DataContentType::PositionDeletes => position_delete_entries.push(entry),
                 DataContentType::Data => data_file_entries.push(entry),
                 DataContentType::EqualityDeletes => {
@@ -665,70 +636,43 @@ impl Metadata {
             .filter_map(|entry| entry.location.clone())
             .collect();
 
-        // Build a map of manifest DVs by their referenced manifest file
-        // Key: referenced_file path (the manifest being filtered)
-        // Value: The ManifestDV entry
-        let mut manifest_dv_map: HashMap<String, MetadataEntry> = HashMap::new();
-        for manifest_dv_entry in manifest_dv_entries {
-            if let Some(ref referenced_file) = manifest_dv_entry.referenced_file {
-                // If multiple DVs reference the same manifest, keep the one with highest sequence number
-                let sequence_number = manifest_dv_entry
-                    .tracking_info
-                    .as_ref()
-                    .and_then(|ti| ti.sequence_number)
-                    .unwrap_or(0);
-
-                manifest_dv_map
-                    .entry(referenced_file.clone())
-                    .and_modify(|existing| {
-                        let existing_seq = existing
-                            .tracking_info
-                            .as_ref()
-                            .and_then(|ti| ti.sequence_number)
-                            .unwrap_or(0);
-                        if sequence_number > existing_seq {
-                            *existing = manifest_dv_entry.clone();
-                        }
-                    })
-                    .or_insert(manifest_dv_entry);
-            }
-        }
-
         // Build a map of unmatched deletion vectors (DVs that reference files not in root)
         // These need to be passed through to child manifests
         let mut unmatched_dvs: HashMap<String, DeletionVectorInfo> = HashMap::new();
-        for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
-            let is_deleted = dv_entry
-                .tracking_info
-                .as_ref()
-                .map(|ti| ti.status == TrackingStatus::Deleted)
-                .unwrap_or(false);
 
-            if !is_deleted {
-                let referenced_file = dv_entry
-                    .referenced_file
-                    .clone()
-                    .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
+        // Process deletion vector entries (only if we have a path_in_log)
+        if !self.path_in_log.is_empty() {
+            for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
+                let is_deleted = dv_entry
+                    .tracking_info
+                    .as_ref()
+                    .map(|ti| ti.status == TrackingStatus::Deleted)
+                    .unwrap_or(false);
 
-                // Only add to unmatched_dvs if the referenced file is NOT in the root
-                if !root_data_files.contains(&referenced_file) {
-                    // For DVs in root manifest, use the root manifest path if available, otherwise empty string
-                    let manifest_path = self
-                        .manifest_location
-                        .as_ref()
-                        .map(|u| u.as_str())
-                        .unwrap_or("");
-                    let dv_info =
-                        metadata_entry_to_deletion_vector_info(dv_entry, i, manifest_path)?;
+                if !is_deleted {
+                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
+                        Error::generic("Deletion vector must have a referenced file")
+                    })?;
 
-                    unmatched_dvs
-                        .entry(referenced_file)
-                        .and_modify(|existing| {
-                            if dv_info.sequence_number > existing.sequence_number {
-                                *existing = dv_info.clone();
-                            }
-                        })
-                        .or_insert(dv_info);
+                    // Only add to unmatched_dvs if the referenced file is NOT in the root
+                    if !root_data_files.contains(&referenced_file) {
+                        // For DVs in root manifest, use the root manifest path
+                        let dv_info = metadata_entry_to_deletion_vector_info(
+                            dv_entry,
+                            i,
+                            &self.path_in_log,
+                            &self.table_root,
+                        )?;
+
+                        unmatched_dvs
+                            .entry(referenced_file)
+                            .and_modify(|existing| {
+                                if dv_info.sequence_number > existing.sequence_number {
+                                    *existing = dv_info.clone();
+                                }
+                            })
+                            .or_insert(dv_info);
+                    }
                 }
             }
         }
@@ -748,21 +692,10 @@ impl Metadata {
             }
         }
 
-        // Convert unaffiliated deletes to FilteredManifest, pairing with DVs from the map
+        // Convert unaffiliated deletes to FilteredManifest
         let unaffiliated_dv_manifests: Vec<FilteredManifest> = unaffiliated_deletes
             .into_iter()
-            .map(|manifest_entry| {
-                let manifest_dv = manifest_entry
-                    .location
-                    .as_ref()
-                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
-
-                if let Some(dv) = manifest_dv {
-                    FilteredManifest::with_dv(manifest_entry, dv)
-                } else {
-                    FilteredManifest::new(manifest_entry)
-                }
-            })
+            .map(FilteredManifest::new)
             .collect();
 
         // Apply manifest-level data skipping if a predicate is provided
@@ -778,32 +711,17 @@ impl Metadata {
                     .clone()
                     .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
-                // Check if there's a manifest DV for this data manifest
-                let data_manifest_dv = manifest_dv_map.get(&location).cloned();
-                let data_manifest = if let Some(dv) = data_manifest_dv {
-                    FilteredManifest::with_dv(data_entry, dv)
-                } else {
-                    FilteredManifest::new(data_entry)
-                };
+                // DV is now stored inline on the manifest entry itself
+                let data_manifest = FilteredManifest::new(data_entry);
 
-                // Get affiliated delete manifests for this data manifest and wrap with DVs
+                // Get affiliated delete manifests for this data manifest
+                // DV is stored inline on each manifest entry
                 let affiliated_dv_manifests: Vec<FilteredManifest> = affiliated_deletes
                     .get(&location)
                     .map(|entries| {
                         entries
                             .iter()
-                            .map(|manifest_entry| {
-                                let manifest_dv = manifest_entry
-                                    .location
-                                    .as_ref()
-                                    .and_then(|loc| manifest_dv_map.get(loc).cloned());
-
-                                if let Some(dv) = manifest_dv {
-                                    FilteredManifest::with_dv(manifest_entry.clone(), dv)
-                                } else {
-                                    FilteredManifest::new(manifest_entry.clone())
-                                }
-                            })
+                            .map(|manifest_entry| FilteredManifest::new(manifest_entry.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -853,26 +771,26 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
-            let mut delete_entries =
-                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
+            let mut delete_entries = Metadata::read(
+                engine,
+                &delete_manifest_url,
+                delete_manifest_location.clone(),
+                table_root.clone(),
+            )?
+            .entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
-
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
 
             merge_deletion_vectors(
                 &mut deletion_vector_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
@@ -961,23 +879,26 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Read the data manifest file
         let data_manifest_location = manifest_refs
             .data_manifest
             .manifest
             .location
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-        let data_manifest_url = Url::parse(&data_manifest_location)
-            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
 
         // Read the data manifest entries using the existing Metadata::read method
-        let mut data_manifest_entries =
-            Metadata::read(engine, &data_manifest_url, table_root.clone())?.entries()?;
+        let mut data_manifest_entries = Metadata::read(
+            engine,
+            &data_manifest_url,
+            data_manifest_location.clone(),
+            table_root.clone(),
+        )?
+        .entries()?;
 
-        // Apply manifest DV if present
-        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
-            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        // Apply manifest DV if present (stored inline on the manifest entry)
+        if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, dv_bytes)?;
         }
 
         // Apply predicate-based data skipping to filter out entries that cannot match
@@ -996,34 +917,31 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
-            let mut delete_entries =
-                Metadata::read(engine, &delete_manifest_url, table_root.clone())?.entries()?;
+            let mut delete_entries = Metadata::read(
+                engine,
+                &delete_manifest_url,
+                delete_manifest_location.clone(),
+                table_root.clone(),
+            )?
+            .entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
-
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
 
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
         let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
-
-        // Convert absolute manifest location to relative path
-        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -1041,13 +959,7 @@ impl Metadata {
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                entry_to_add_remove(
-                    entry,
-                    &dv_maps,
-                    i,
-                    table_root,
-                    relative_manifest_path.clone(),
-                )
+                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1099,27 +1011,26 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Read the data manifest file
         let data_manifest_location = manifest_refs
             .data_manifest
             .manifest
             .location
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-        let data_manifest_url = Url::parse(&data_manifest_location)
-            .map_err(|e| Error::generic(format!("Failed to parse data manifest URL: {}", e)))?;
+        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
 
         // Read the data manifest entries using the handler
         let mut data_manifest_entries = Metadata::read_with_handler(
             parquet_handler.clone(),
             &data_manifest_url,
+            data_manifest_location.clone(),
             table_root.clone(),
         )?
         .entries()?;
 
-        // Apply manifest DV if present
-        if let Some(ref manifest_dv) = manifest_refs.data_manifest.manifest_dv {
-            data_manifest_entries = apply_manifest_dv(data_manifest_entries, manifest_dv)?;
+        // Apply manifest DV if present (stored inline on the manifest entry)
+        if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
+            data_manifest_entries = apply_manifest_dv(data_manifest_entries, dv_bytes)?;
         }
 
         // Apply predicate-based data skipping to filter out entries that cannot match
@@ -1136,38 +1047,31 @@ impl Metadata {
                 .location
                 .clone()
                 .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = Url::parse(&delete_manifest_location).map_err(|e| {
-                Error::generic(format!("Failed to parse delete manifest URL: {}", e))
-            })?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
 
             let mut delete_entries = Metadata::read_with_handler(
                 parquet_handler.clone(),
                 &delete_manifest_url,
+                delete_manifest_location.clone(),
                 table_root.clone(),
             )?
             .entries()?;
 
-            // Apply manifest DV if present
-            if let Some(ref manifest_dv) = filtered_manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, manifest_dv)?;
+            // Apply manifest DV if present (stored inline on the manifest entry)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
             }
-
-            // Convert absolute delete manifest path to relative
-            let relative_delete_manifest_path =
-                absolute_to_relative_path(&delete_manifest_location, table_root);
 
             merge_deletion_vectors(
                 &mut affiliated_dv_map,
                 delete_entries,
-                &relative_delete_manifest_path,
+                &delete_manifest_location,
+                table_root,
             )?;
         }
 
         // Combine shared and affiliated DV maps (using references, no cloning)
         let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
-
-        // Convert absolute manifest location to relative path
-        let relative_manifest_path = absolute_to_relative_path(&data_manifest_location, table_root);
 
         // Convert entries to AddRemove, filtering to only Data entries
         let add_removes: Vec<AddRemove> = data_manifest_entries
@@ -1183,13 +1087,7 @@ impl Metadata {
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                entry_to_add_remove(
-                    entry,
-                    &dv_maps,
-                    i,
-                    table_root,
-                    relative_manifest_path.clone(),
-                )
+                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1270,20 +1168,36 @@ impl Metadata {
     /// # Parameters
     /// - `engine`: The engine to use for reading the parquet file
     /// - `path`: The URL path to the metadata parquet file
+    /// - `path_in_log`: The original path string as it appears in the Delta log (not normalized)
+    /// - `table_root`: The table root URL
     ///
     /// # Returns
     /// A `Metadata` instance deserialized from the parquet file.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn read(engine: &dyn Engine, path: &Url, table_root: Url) -> DeltaResult<Self> {
-        Self::read_with_handler(engine.parquet_handler(), path, table_root)
+    pub fn read(
+        engine: &dyn Engine,
+        path: &Url,
+        path_in_log: String,
+        table_root: Url,
+    ) -> DeltaResult<Self> {
+        Self::read_with_handler(engine.parquet_handler(), path, path_in_log, table_root)
     }
 
     /// Read metadata using a parquet handler directly (for lazy streaming).
+    ///
+    /// Uses `MetadataEntry::base_schema()` for reading, which excludes content_stats.
+    /// The visitor extracts all fields except content_stats which requires table schema.
     fn read_with_handler(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
+        path_in_log: String,
         table_root: Url,
     ) -> DeltaResult<Self> {
+        // Cached schema for reading MetadataEntry from parquet files.
+        // Uses base_schema which excludes content_stats (requires table schema).
+        static READ_SCHEMA: LazyLock<SchemaRef> =
+            LazyLock::new(|| Arc::new(MetadataEntry::base_schema()));
+
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -1294,7 +1208,7 @@ impl Metadata {
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
         let read_result_iter =
-            parquet_handler.read_parquet_files(&[file], METADATA_ENTRY_SCHEMA.clone(), None)?;
+            parquet_handler.read_parquet_files(&[file], READ_SCHEMA.clone(), None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -1302,7 +1216,7 @@ impl Metadata {
             data,
             version: parsed.version,
             table_root,
-            manifest_location: Some(path.clone()),
+            path_in_log,
             // When reading existing metadata, we don't know if it's a root or leaf
             // This would need to be determined from the file path or stored in the metadata
             leaf: None,
@@ -1379,7 +1293,12 @@ impl Metadata {
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        Self::read(engine, &content_root_url, table_root)
+        Self::read(
+            engine,
+            &content_root_url,
+            content_root.path.clone(),
+            table_root,
+        )
     }
 }
 
@@ -1421,43 +1340,32 @@ struct ProcessedDeletionVector {
 /// A filtered list of entries with deleted positions removed.
 ///
 /// # Implementation Notes
-/// Currently only supports inline deletion vectors (stored in `inline_content`).
-/// External deletion vectors (referenced via `location`) are not yet supported.
+/// Applies a manifest deletion vector to filter entries by position.
+///
+/// Takes deletion vector bytes (stored inline on manifest entries in the `manifest_dv` field)
+/// and filters out entries at positions specified in the DV.
+///
+/// The DV format is: 4-byte magic number + RoaringTreemap portable serialization
 #[allow(dead_code)]
 pub(crate) fn apply_manifest_dv(
     entries: Vec<MetadataEntry>,
-    manifest_dv: &MetadataEntry,
+    dv_bytes: &Bytes,
 ) -> DeltaResult<Vec<MetadataEntry>> {
     use roaring::RoaringTreemap;
 
-    // Check if we have inline content
-    let inline_content = match &manifest_dv.inline_content {
-        Some(content) if !content.is_empty() => content,
-        _ => {
-            // No inline content, check if external is specified
-            if manifest_dv.location.is_some() {
-                return Err(Error::generic(
-                    "External (persisted) manifest deletion vectors are not yet supported",
-                ));
-            }
-            // No DV data at all, return entries unfiltered
-            return Ok(entries);
-        }
-    };
+    // Check if we have DV data
+    if dv_bytes.is_empty() {
+        return Ok(entries);
+    }
 
     // Parse the magic number from the first 4 bytes
-    if inline_content.len() < 4 {
+    if dv_bytes.len() < 4 {
         return Err(Error::generic(
-            "Inline deletion vector is too small (less than 4 bytes)",
+            "Manifest deletion vector is too small (less than 4 bytes)",
         ));
     }
 
-    let magic = u32::from_be_bytes([
-        inline_content[0],
-        inline_content[1],
-        inline_content[2],
-        inline_content[3],
-    ]);
+    let magic = u32::from_be_bytes([dv_bytes[0], dv_bytes[1], dv_bytes[2], dv_bytes[3]]);
 
     // Magic numbers from the deletion vector format
     const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
@@ -1465,7 +1373,7 @@ pub(crate) fn apply_manifest_dv(
 
     // Deserialize the RoaringTreemap
     let deleted_positions = match magic {
-        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&inline_content[4..])
+        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&dv_bytes[4..])
             .map_err(|err| Error::generic(format!("Failed to deserialize manifest DV: {}", err)))?,
         ROARING_BITMAP_NATIVE_MAGIC => {
             return Err(Error::generic(
@@ -1507,6 +1415,7 @@ fn merge_deletion_vectors(
     deletion_vector_map: &mut HashMap<String, DeletionVectorInfo>,
     entries: Vec<MetadataEntry>,
     delete_manifest_path: &str,
+    table_root: &Url,
 ) -> DeltaResult<()> {
     for (i, entry) in entries.into_iter().enumerate() {
         // Only process PositionDeletes entries that are not deleted
@@ -1522,7 +1431,8 @@ fn merge_deletion_vectors(
                 .clone()
                 .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
 
-            let dv_info = metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path)?;
+            let dv_info =
+                metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path, table_root)?;
 
             // Only insert if this DV has a higher sequence number than any existing one for this file
             deletion_vector_map
@@ -1550,6 +1460,7 @@ fn metadata_entry_to_deletion_vector_info(
     dv_entry: MetadataEntry,
     entry_index: usize,
     delete_manifest_path: &str,
+    table_root: &Url,
 ) -> DeltaResult<DeletionVectorInfo> {
     let sequence_number = dv_entry
         .tracking_info
@@ -1574,7 +1485,9 @@ fn metadata_entry_to_deletion_vector_info(
     })?);
 
     // Convert size_in_bytes from i64 to i32
-    let size_in_bytes_i32: i32 = content_info.size_in_bytes.try_into().map_err(|_| {
+    // Subtract 8 bytes to convert from Iceberg's size (full blob) back to Delta's size (bitmap only)
+    // Iceberg includes 4-byte size prefix + 4-byte CRC, Delta doesn't
+    let size_in_bytes_i32: i32 = (content_info.size_in_bytes - 8).try_into().map_err(|_| {
         Error::generic(format!(
             "Size in bytes for {} is too large to convert to i32",
             location
@@ -1586,10 +1499,14 @@ fn metadata_entry_to_deletion_vector_info(
         .try_into()
         .map_err(|_| Error::generic("Entry index is too large to convert to i64"))?;
 
+    // Parse the location to determine storage type and encoded path
+    use crate::actions::deletion_vector::DeletionVectorPath;
+    let (storage_type, path_or_inline_dv) = DeletionVectorPath::parse_path(&location, table_root)?;
+
     Ok(DeletionVectorInfo {
         descriptor: DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedAbsolute,
-            path_or_inline_dv: location,
+            storage_type,
+            path_or_inline_dv,
             offset: offset_i32,
             size_in_bytes: size_in_bytes_i32,
             cardinality: dv_entry.record_count,
@@ -1628,43 +1545,29 @@ fn process_deletion_vector(
     }
 }
 
-/// Converts an absolute URL path to a relative path by stripping the table root prefix.
-///
-/// This function handles the conversion from absolute file URLs (stored in metadata entries)
-/// to relative paths (expected in Delta Add actions).
-///
-/// # Arguments
-/// * `absolute_path` - The full URL path (e.g., "memory:///part-file.parquet")
-/// * `table_root` - The table root URL (e.g., "memory:///")
-///
-/// # Returns
-/// A relative path string (e.g., "part-file.parquet"), or the original path if conversion fails.
-///
-/// # Examples
-/// ```ignore
-/// let relative = absolute_to_relative_path(
-///     "s3://bucket/table/data/file.parquet",
-///     "s3://bucket/table/"
-/// );
-/// assert_eq!(relative, "data/file.parquet");
-/// ```
-pub(crate) fn absolute_to_relative_path(absolute_path: &str, table_root_url: &Url) -> String {
-    // Try to parse the absolute path as a URL
-    if let Ok(full_url) = Url::parse(absolute_path) {
-        // Get the path components
-        let full_path_str = full_url.path();
-        let root_path_str = table_root_url.path();
+/// Helper that holds a URL and lazily computes/caches its relative path.
+/// Useful for avoiding repeated conversions of the same URL to relative path.
+/// Converts an absolute URL to a path relative to table_root.
+pub(crate) fn absolute_to_relative_path(
+    absolute_url: &Url,
+    table_root: &Url,
+) -> DeltaResult<String> {
+    let full_path = absolute_url.path();
+    let root_path = table_root.path();
 
-        // Remove the root prefix to get the relative path
-        full_path_str
-            .strip_prefix(root_path_str)
-            .unwrap_or(full_path_str)
-            .trim_start_matches('/')
-            .to_string()
-    } else {
-        // If URL parsing fails, return the original path
-        absolute_path.to_string()
-    }
+    Ok(full_path
+        .strip_prefix(root_path)
+        .unwrap_or(full_path)
+        .trim_start_matches('/')
+        .to_string())
+}
+
+/// Parses a string as an absolute URL, or if that fails, joins it with the table root.
+/// This handles both absolute and relative manifest/file paths.
+pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url> {
+    Url::parse(path)
+        .or_else(|_| table_root.join(path))
+        .map_err(|e| Error::generic(format!("Failed to parse URL '{}': {}", path, e)))
 }
 
 /// Converts a MetadataEntry to an AddRemove enum.
@@ -1680,26 +1583,23 @@ fn entry_to_add_remove(
     entry: MetadataEntry,
     dv_maps: &DeletionVectorMaps<'_>,
     entry_index: usize,
-    table_root_url: &Url,
     manifest_path: String,
 ) -> DeltaResult<AddRemove> {
     use std::collections::HashMap;
 
-    let full_path = entry.location.ok_or_else(|| {
+    let path = entry.location.ok_or_else(|| {
         Error::generic(format!(
             "Action requires location (content_type: {:?})",
             entry.content_type
         ))
     })?;
 
-    // Convert absolute path to relative path by removing the table root prefix
-    // The path in entry.location is an absolute URL, but Add actions expect relative paths
-    let path = absolute_to_relative_path(&full_path, table_root_url);
+    // The path in entry.location is already relative from the metadata builder
     let sequence_number = entry
         .tracking_info
         .as_ref()
         .and_then(|ti| ti.sequence_number);
-    let processed_dv = process_deletion_vector(dv_maps, &full_path, sequence_number)?;
+    let processed_dv = process_deletion_vector(dv_maps, &path, sequence_number)?;
 
     let status = entry
         .tracking_info
@@ -2095,7 +1995,6 @@ pub enum DataContentType {
     // Types below are only allowed in the root
     DataManifest = 3,
     DeleteManifest = 4,
-    ManifestDV = 5,
 }
 
 // ToDataType implementations for enums
@@ -2209,6 +2108,11 @@ pub struct TrackingInfo {
     /// The _row_id for the first row in the data file if content_type is Data.
     /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
     pub(crate) first_row_id: Option<i64>,
+
+    /// Deletion vector tracking changes made in the current commit for manifest entries.
+    /// Only used when content_type is DataManifest or DeleteManifest.
+    /// This field tracks what was added/changed in the current commit and is cleared between commits.
+    pub(crate) changes_dv: Option<Bytes>,
 }
 
 impl TrackingInfo {
@@ -2281,15 +2185,13 @@ pub struct MetadataEntry {
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
     pub content_type: DataContentType,
 
-    /// Optional if content_type is 5 and inline_content is not null, required otherwise
+    /// Location of the file. Required for most content types.
     pub location: Option<String>,
 
     /// avro, orc, parquet or puffin
     pub(crate) file_format: DataFileFormat,
 
     pub tracking_info: Option<TrackingInfo>,
-
-    pub(crate) inline_content: Option<Bytes>,
 
     pub(crate) content_info: Option<ContentInfo>,
 
@@ -2331,37 +2233,9 @@ pub struct MetadataEntry {
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     pub(crate) equality_ids: Option<Vec<i32>>,
-}
 
-// Manual implementation of ToSchema to exclude fields that are not supported or not used by Delta:
-// - content_stats (requires table schema - use `to_schema_with_content_stats` instead)
-// - key_metadata (binary type not supported)
-// - split_offsets (not used by Delta today)
-// - equality_ids (not used by Delta today)
-impl crate::schema::ToSchema for MetadataEntry {
-    fn to_schema() -> crate::schema::StructType {
-        use crate::schema::{derive_macro_utils::GetStructField as _, StructType};
-
-        StructType::new_unchecked([
-            DataContentType::get_struct_field("contentType"),
-            Option::<String>::get_struct_field("location"),
-            DataFileFormat::get_struct_field("fileFormat"),
-            TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<Bytes>::get_struct_field("inlineContent"),
-            Option::<ContentInfo>::get_struct_field("contentInfo"),
-            i64::get_struct_field("partitionSpecId"),
-            Option::<i64>::get_struct_field("sortOrderId"),
-            i64::get_struct_field("recordCount"),
-            Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats intentionally excluded - requires table schema
-            // Use `to_schema_with_content_stats(table_schema)` to include it
-            Option::<ManifestStats>::get_struct_field("manifestStats"),
-            Option::<String>::get_struct_field("referencedFile"),
-            // key_metadata intentionally excluded - binary type not supported
-            // split_offsets intentionally excluded - not used by Delta today
-            // equality_ids intentionally excluded - not used by Delta today
-        ])
-    }
+    /// DV that applies to the manifest linked to from this entry.
+    pub(crate) manifest_dv: Option<Bytes>,
 }
 
 impl MetadataEntry {
@@ -2369,35 +2243,65 @@ impl MetadataEntry {
     /// Adds:
     /// - RowIndex: 0-based position of entry within source manifest file
     /// - FilePath: URL of the source manifest file
+    ///
+    /// # Arguments
+    /// * `table_schema` - The table's data schema to generate content_stats schema from
     #[allow(dead_code)]
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn to_schema_with_metadata_columns() -> SchemaRef {
-        use crate::schema::{MetadataColumnSpec, ToSchema};
+    pub(crate) fn to_schema_with_metadata_columns(
+        table_schema: &StructType,
+    ) -> DeltaResult<SchemaRef> {
+        use crate::schema::MetadataColumnSpec;
 
-        static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-        SCHEMA
-            .get_or_init(|| {
-                let base_schema = Self::to_schema();
-                let mut schema_with_tracking = base_schema;
+        let base_schema = Self::to_schema_with_content_stats(table_schema)?;
+        let mut schema_with_tracking = base_schema;
 
-                schema_with_tracking = schema_with_tracking
-                    .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)
-                    .unwrap();
+        schema_with_tracking = schema_with_tracking
+            .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)?;
 
-                schema_with_tracking = schema_with_tracking
-                    .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)
-                    .unwrap();
+        schema_with_tracking = schema_with_tracking
+            .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)?;
 
-                Arc::new(schema_with_tracking)
-            })
-            .clone()
+        Ok(Arc::new(schema_with_tracking))
+    }
+
+    /// Returns a base MetadataEntry schema that excludes content_stats.
+    ///
+    /// This is used for reading metadata entries back from parquet files where
+    /// we don't need the table-schema-dependent content_stats field. The visitor
+    /// pattern requires static schema references, so we use this fixed schema
+    /// for reading rather than the dynamic `to_schema_with_content_stats`.
+    ///
+    /// Note: When reading metadata entries using this schema, content_stats will
+    /// always be None since it's not included in this schema.
+    pub(crate) fn base_schema() -> StructType {
+        use crate::schema::derive_macro_utils::GetStructField as _;
+
+        StructType::new_unchecked([
+            DataContentType::get_struct_field("contentType"),
+            Option::<String>::get_struct_field("location"),
+            DataFileFormat::get_struct_field("fileFormat"),
+            TrackingInfo::get_struct_field("trackingInfo"),
+            Option::<ContentInfo>::get_struct_field("contentInfo"),
+            i64::get_struct_field("partitionSpecId"),
+            Option::<i64>::get_struct_field("sortOrderId"),
+            i64::get_struct_field("recordCount"),
+            Option::<i64>::get_struct_field("fileSizeInBytes"),
+            // content_stats intentionally excluded - requires table schema
+            // Use `to_schema_with_content_stats(table_schema)` when writing
+            Option::<ManifestStats>::get_struct_field("manifestStats"),
+            Option::<String>::get_struct_field("referencedFile"),
+            Option::<Bytes>::get_struct_field("manifestDv"),
+            // key_metadata intentionally excluded - binary type not supported
+            // split_offsets intentionally excluded - not used by Delta today
+            // equality_ids intentionally excluded - not used by Delta today
+        ])
     }
 
     /// Returns MetadataEntry schema with content_stats based on the given table schema.
     ///
-    /// The content_stats field schema is dynamically generated using [`stats::stats_schema`]
-    /// based on the table's data schema. This allows storing per-column statistics
-    /// (min/max bounds, null counts, etc.) that match the structure of the table.
+    /// The content_stats field schema is dynamically generated in Delta JSON stats format
+    /// (numRecords, nullCount, minValues, maxValues, tightBounds) matching the format
+    /// used by [`Transaction::add_files_schema`].
     ///
     /// # Arguments
     ///
@@ -2406,28 +2310,28 @@ impl MetadataEntry {
     /// # Returns
     ///
     /// Returns `Ok(StructType)` containing the full MetadataEntry schema with content_stats,
-    /// or an error if stats schema generation fails (e.g., missing field IDs).
+    /// or an error if stats schema generation fails.
     #[allow(dead_code)]
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
     ) -> DeltaResult<StructType> {
-        use crate::metadata::stats::stats_schema;
         use crate::schema::derive_macro_utils::GetStructField as _;
 
-        let stats_struct = stats_schema(table_schema)?;
+        // Generate AMT-style stats schema format:
+        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
+        let stats_struct = stats::stats_schema(table_schema)?;
 
         Ok(StructType::new_unchecked([
             DataContentType::get_struct_field("contentType"),
             Option::<String>::get_struct_field("location"),
             DataFileFormat::get_struct_field("fileFormat"),
             TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<Bytes>::get_struct_field("inlineContent"),
             Option::<ContentInfo>::get_struct_field("contentInfo"),
             i64::get_struct_field("partitionSpecId"),
             Option::<i64>::get_struct_field("sortOrderId"),
             i64::get_struct_field("recordCount"),
             Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats - dynamic based on table schema
+            // content_stats - dynamic based on table schema (AMT stats format)
             StructField::new(
                 "contentStats",
                 DataType::Struct(Box::new(stats_struct)),
@@ -2435,6 +2339,7 @@ impl MetadataEntry {
             ),
             Option::<ManifestStats>::get_struct_field("manifestStats"),
             Option::<String>::get_struct_field("referencedFile"),
+            Option::<Bytes>::get_struct_field("manifestDv"),
             // key_metadata intentionally excluded - binary type not supported
             // split_offsets intentionally excluded - not used by Delta today
             // equality_ids intentionally excluded - not used by Delta today
@@ -2462,7 +2367,7 @@ impl crate::IntoEngineData for MetadataEntry {
             Scalar::from(self.file_format),  // file_format (STRING)
         ]);
 
-        // Fields 3-7: tracking_info struct (5 fields)
+        // Fields 3-8: tracking_info struct (6 fields)
         flat_values.extend(match &self.tracking_info {
             Some(ti) => [
                 Scalar::from(ti.status),
@@ -2470,6 +2375,7 @@ impl crate::IntoEngineData for MetadataEntry {
                 Scalar::from(ti.sequence_number),
                 Scalar::from(ti.file_sequence_number),
                 Scalar::from(ti.first_row_id),
+                Scalar::from(ti.changes_dv.clone()),
             ],
             None => [
                 Scalar::null(DataType::INTEGER),
@@ -2477,11 +2383,9 @@ impl crate::IntoEngineData for MetadataEntry {
                 Scalar::null(DataType::LONG),
                 Scalar::null(DataType::LONG),
                 Scalar::null(DataType::LONG),
+                Scalar::null(DataType::BINARY),
             ],
         });
-
-        // Field 8: inline_content
-        flat_values.push(Scalar::from(self.inline_content.clone()));
 
         // Fields 9-10: content_info struct (2 fields)
         flat_values.extend(match &self.content_info {
@@ -2538,7 +2442,11 @@ impl crate::IntoEngineData for MetadataEntry {
 
         // Field: referenced_file
         flat_values.push(Scalar::from(self.referenced_file)); // referenced_file (STRING)
-                                                              // key_metadata, split_offsets, equality_ids are intentionally excluded
+
+        // Field: manifest_dv
+        flat_values.push(Scalar::from(self.manifest_dv.clone()));
+
+        // key_metadata, split_offsets, equality_ids are intentionally excluded
 
         let evaluator = engine.evaluation_handler();
         evaluator.create_one(schema, &flat_values)
@@ -2548,7 +2456,6 @@ impl crate::IntoEngineData for MetadataEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ToSchema;
     use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
 
@@ -2558,7 +2465,6 @@ mod tests {
 
     #[test]
     fn test_simple_into_engine_data() -> DeltaResult<()> {
-        use crate::schema::ToSchema;
         use crate::IntoEngineData;
         let engine = SyncEngine::new();
 
@@ -2573,8 +2479,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2583,12 +2489,13 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         };
 
-        let schema = MetadataEntry::to_schema().into();
+        let schema = test_metadata_entry_schema();
         let result = entry.into_engine_data(schema, &engine);
         if let Err(e) = &result {
             eprintln!("Error in test_simple_into_engine_data: {:?}", e);
@@ -2602,110 +2509,77 @@ mod tests {
     fn test_absolute_to_relative_path() {
         // Test with memory:// URLs
         let table_root = Url::parse("memory:///").unwrap();
-        let result = absolute_to_relative_path("memory:///part-content-root.parquet", &table_root);
+        let absolute_url = Url::parse("memory:///part-content-root.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "part-content-root.parquet");
 
         // Test with s3:// URLs
         let table_root = Url::parse("s3://my-bucket/my-table/").unwrap();
-        let result = absolute_to_relative_path(
-            "s3://my-bucket/my-table/data/part-00000.parquet",
-            &table_root,
-        );
+        let absolute_url = Url::parse("s3://my-bucket/my-table/data/part-00000.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "data/part-00000.parquet");
 
         // Test with nested paths
         let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let result = absolute_to_relative_path(
-            "s3://bucket/table/year=2023/month=10/part.parquet",
-            &table_root,
-        );
+        let absolute_url = Url::parse("s3://bucket/table/year=2023/month=10/part.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "year=2023/month=10/part.parquet");
 
         // Test with file:// URLs
         let table_root = Url::parse("file:///path/to/table/").unwrap();
-        let result =
-            absolute_to_relative_path("file:///path/to/table/data/file.parquet", &table_root);
+        let absolute_url = Url::parse("file:///path/to/table/data/file.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         assert_eq!(result, "data/file.parquet");
-
-        // Test when path is already relative (URL parsing fails)
-        let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let result = absolute_to_relative_path("part-00000.parquet", &table_root);
-        assert_eq!(result, "part-00000.parquet");
 
         // Test when root doesn't match (no common prefix)
         let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
-        let result = absolute_to_relative_path("s3://bucket-a/table-a/file.parquet", &table_root);
+        let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
+        let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
         // Since there's no common prefix in the path part, it returns the path without leading slash
         assert_eq!(result, "table-a/file.parquet");
     }
 
     #[test]
-    fn test_metadata_entry_schema_fields() {
-        use crate::schema::ToSchema;
-        // Verify the schema has the expected structure
-        let schema = MetadataEntry::to_schema();
+    fn test_metadata_entry_base_schema_fields() {
+        // Verify the base schema has the expected structure (excludes content_stats)
+        let schema = MetadataEntry::base_schema();
 
         // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
+        // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
+        // recordCount, fileSizeInBytes, manifestStats, referencedFile, manifestDv
         assert_eq!(schema.fields().len(), 12);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // Schema should have all the leaf fields (23 = flattened count, excluding key_metadata, split_offsets, equality_ids)
-        assert_eq!(leaf_names.len(), 23);
+        // Schema should have all the leaf fields (24 = flattened count, excluding key_metadata, split_offsets, equality_ids)
+        // Added 2 fields (manifestDv, manifestDeltaDv), removed 1 (inlineContent), so 23 + 1 = 24
+        assert_eq!(leaf_names.len(), 24);
     }
 
     #[test]
     fn test_to_schema_with_content_stats() -> DeltaResult<()> {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
 
-        // Create a simple table schema with a few fields
-        // We need to add parquet.field.id and column mapping metadata to each field
-        // (column mapping is required when metadata tree feature is enabled)
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
+        // Create a simple table schema with field IDs (required for AMT stats schema)
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-id".to_string()),
-                ),
-            ]),
-            StructField::new("name", DataType::STRING, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-name".to_string()),
-                ),
-            ]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-value".to_string()),
-                ),
-            ]),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+            field_with_id("value", DataType::DOUBLE, true, 3),
         ]);
 
         // Generate schema with content_stats
@@ -2720,52 +2594,69 @@ mod tests {
             .expect("contentStats field should exist");
         assert!(content_stats_field.nullable);
 
-        // Verify contentStats is a struct with stats for each table column
+        // Verify contentStats is a struct with AMT stats format:
+        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected contentStats to be a struct"),
         };
 
-        // Should have stats for each table column
+        // Should have 3 fields: id, name, value (one per column)
         assert_eq!(content_stats_struct.fields().count(), 3);
         assert!(content_stats_struct.field("id").is_some());
         assert!(content_stats_struct.field("name").is_some());
         assert!(content_stats_struct.field("value").is_some());
 
-        // Verify stats structure for 'id' (non-nullable int - 4 stats fields)
-        let id_stats = content_stats_struct.field("id").unwrap();
-        let id_stats_struct = match id_stats.data_type() {
+        // Verify each column has a stats struct
+        // id: non-nullable INTEGER -> {value_count, lower_bound, upper_bound, exact_bounds}
+        let id_stats = match content_stats_struct.field("id").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected id stats to be a struct"),
         };
-        assert_eq!(id_stats_struct.fields().count(), 4); // value_count, lower_bound, upper_bound, exact_bounds
-        assert!(id_stats_struct.field("value_count").is_some());
-        assert!(id_stats_struct.field("lower_bound").is_some());
-        assert!(id_stats_struct.field("upper_bound").is_some());
-        assert!(id_stats_struct.field("exact_bounds").is_some());
-        assert!(id_stats_struct.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("value_count").is_some());
+        assert!(id_stats.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(id_stats.field("lower_bound").is_some());
+        assert!(id_stats.field("upper_bound").is_some());
+        assert!(id_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            id_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::INTEGER
+        );
 
-        // Verify stats structure for 'name' (nullable string - 7 stats fields)
-        let name_stats = content_stats_struct.field("name").unwrap();
-        let name_stats_struct = match name_stats.data_type() {
+        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
         };
-        assert_eq!(name_stats_struct.fields().count(), 7); // includes null_value_count and size stats
-        assert!(name_stats_struct.field("null_value_count").is_some()); // nullable
-        assert!(name_stats_struct.field("avg_value_size").is_some()); // string type
-        assert!(name_stats_struct.field("max_value_size").is_some()); // string type
+        assert!(name_stats.field("value_count").is_some());
+        assert!(name_stats.field("null_value_count").is_some()); // nullable
+        assert!(name_stats.field("nan_value_count").is_none()); // not float/double
+        assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("max_value_size").is_some()); // string has size stats
+        assert!(name_stats.field("lower_bound").is_some());
+        assert!(name_stats.field("upper_bound").is_some());
+        assert!(name_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            name_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::STRING
+        );
 
-        // Verify stats structure for 'value' (nullable double - 6 stats fields)
-        let value_stats = content_stats_struct.field("value").unwrap();
-        let value_stats_struct = match value_stats.data_type() {
+        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
         };
-        assert_eq!(value_stats_struct.fields().count(), 6); // includes null_value_count and nan_value_count
-        assert!(value_stats_struct.field("null_value_count").is_some()); // nullable
-        assert!(value_stats_struct.field("nan_value_count").is_some()); // double type
-        assert!(value_stats_struct.field("avg_value_size").is_none()); // fixed-length
+        assert!(value_stats.field("value_count").is_some());
+        assert!(value_stats.field("null_value_count").is_some()); // nullable
+        assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
+        assert!(value_stats.field("lower_bound").is_some());
+        assert!(value_stats.field("upper_bound").is_some());
+        assert!(value_stats.field("exact_bounds").is_some());
+        assert_eq!(
+            value_stats.field("lower_bound").unwrap().data_type(),
+            &DataType::DOUBLE
+        );
 
         Ok(())
     }
@@ -2775,88 +2666,95 @@ mod tests {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
         use crate::IntoEngineData;
 
+        // Helper to create field with parquet field ID
+        fn field_with_id(
+            name: &str,
+            data_type: DataType,
+            nullable: bool,
+            field_id: i32,
+        ) -> StructField {
+            StructField::new(name, data_type, nullable).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(field_id as i64),
+            )])
+        }
+
         let engine = SyncEngine::new();
 
-        // Create a simple table schema with parquet field IDs and column mapping annotations
-        // (column mapping is required when metadata tree feature is enabled)
+        // Create a simple table schema with field IDs
         let table_schema = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-id".to_string()),
-                ),
-            ]),
-            StructField::new("value", DataType::DOUBLE, true).with_metadata([
-                (
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-value".to_string()),
-                ),
-            ]),
+            field_with_id("id", DataType::INTEGER, false, 1),
+            field_with_id("value", DataType::DOUBLE, true, 2),
         ]);
 
         // Generate the schema with content_stats
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats data
-        // For the 'id' field (non-nullable int): value_count, lower_bound, upper_bound, exact_bounds
-        // For the 'value' field (nullable double): value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds
-        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
-        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
+        // Create content_stats in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
 
-        // Build the 'id' stats struct (4 fields)
-        let id_stats_schema = match content_stats_fields[0].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
         let id_stats = StructData::try_new(
-            id_stats_fields,
             vec![
-                Scalar::Long(100),     // value_count
-                Scalar::Integer(1),    // lower_bound
-                Scalar::Integer(1000), // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::INTEGER),
+                StructField::nullable("upper_bound", DataType::INTEGER),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            ],
+            vec![
+                Scalar::Long(100),
+                Scalar::Integer(1),
+                Scalar::Integer(1000),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the 'value' stats struct (6 fields)
-        let value_stats_schema = match content_stats_fields[1].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let value_stats_fields: Vec<_> = value_stats_schema.into_fields().collect();
+        // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
         let value_stats = StructData::try_new(
-            value_stats_fields,
             vec![
-                Scalar::Long(100),      // value_count
-                Scalar::Long(5),        // null_value_count
-                Scalar::Long(0),        // nan_value_count
-                Scalar::Double(0.0),    // lower_bound
-                Scalar::Double(100.0),  // upper_bound
-                Scalar::Boolean(false), // exact_bounds
+                StructField::nullable("value_count", DataType::LONG),
+                StructField::nullable("null_value_count", DataType::LONG),
+                StructField::nullable("nan_value_count", DataType::LONG),
+                StructField::nullable("lower_bound", DataType::DOUBLE),
+                StructField::nullable("upper_bound", DataType::DOUBLE),
+                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            ],
+            vec![
+                Scalar::Long(100),
+                Scalar::Long(5),
+                Scalar::Long(0),
+                Scalar::Double(0.0),
+                Scalar::Double(100.0),
+                Scalar::Boolean(true),
             ],
         )?;
 
         // Build the content_stats struct
         let content_stats = StructData::try_new(
-            content_stats_fields,
+            vec![
+                StructField::nullable(
+                    "id",
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::INTEGER),
+                        StructField::nullable("upper_bound", DataType::INTEGER),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                    ]))),
+                ),
+                StructField::nullable(
+                    "value",
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("value_count", DataType::LONG),
+                        StructField::nullable("null_value_count", DataType::LONG),
+                        StructField::nullable("nan_value_count", DataType::LONG),
+                        StructField::nullable("lower_bound", DataType::DOUBLE),
+                        StructField::nullable("upper_bound", DataType::DOUBLE),
+                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                    ]))),
+                ),
+            ],
             vec![Scalar::Struct(id_stats), Scalar::Struct(value_stats)],
         )?;
 
@@ -2871,8 +2769,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2881,6 +2779,7 @@ mod tests {
             content_stats: Some(content_stats),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -2937,8 +2836,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -2947,6 +2846,7 @@ mod tests {
             content_stats: None, // Explicitly None
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3008,46 +2908,61 @@ mod tests {
         let schema_with_stats =
             Arc::new(MetadataEntry::to_schema_with_content_stats(&table_schema)?);
 
-        // Create content_stats data
-        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
-        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
+        // Create content_stats data in AMT format:
+        // {id: {value_count, lower_bound, upper_bound, exact_bounds},
+        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
 
-        // Build the 'id' stats struct (4 fields for non-nullable int)
-        let id_stats_schema = match content_stats_fields[0].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count)
+        let id_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::INTEGER),
+            StructField::nullable("upper_bound", DataType::INTEGER),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+        ];
         let id_stats = StructData::try_new(
-            id_stats_fields,
+            id_stats_fields.clone(),
             vec![
-                Scalar::Long(500),     // value_count
-                Scalar::Integer(1),    // lower_bound
-                Scalar::Integer(500),  // upper_bound
-                Scalar::Boolean(true), // exact_bounds
+                Scalar::Long(500),
+                Scalar::Integer(1),
+                Scalar::Integer(500),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the 'name' stats struct (7 fields for nullable string)
-        let name_stats_schema = match content_stats_fields[1].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let name_stats_fields: Vec<_> = name_stats_schema.into_fields().collect();
+        // Build name stats struct (nullable STRING, so has null_value_count and size stats)
+        let name_stats_fields = vec![
+            StructField::nullable("value_count", DataType::LONG),
+            StructField::nullable("null_value_count", DataType::LONG),
+            StructField::nullable("avg_value_size", DataType::LONG),
+            StructField::nullable("max_value_size", DataType::LONG),
+            StructField::nullable("lower_bound", DataType::STRING),
+            StructField::nullable("upper_bound", DataType::STRING),
+            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+        ];
         let name_stats = StructData::try_new(
-            name_stats_fields,
+            name_stats_fields.clone(),
             vec![
-                Scalar::Long(500),                      // value_count
-                Scalar::Long(10),                       // null_value_count
-                Scalar::Long(5),                        // avg_value_size
-                Scalar::Long(100),                      // max_value_size
-                Scalar::String("aardvark".to_string()), // lower_bound
-                Scalar::String("zebra".to_string()),    // upper_bound
-                Scalar::Boolean(false),                 // exact_bounds
+                Scalar::Long(500),
+                Scalar::Long(10),
+                Scalar::Null(DataType::LONG.into()),
+                Scalar::Null(DataType::LONG.into()),
+                Scalar::String("aardvark".to_string()),
+                Scalar::String("zebra".to_string()),
+                Scalar::Boolean(true),
             ],
         )?;
 
-        // Build the content_stats struct
+        // Build the content_stats struct in AMT format
+        let content_stats_fields = vec![
+            StructField::nullable(
+                "id",
+                DataType::Struct(Box::new(StructType::new_unchecked(id_stats_fields))),
+            ),
+            StructField::nullable(
+                "name",
+                DataType::Struct(Box::new(StructType::new_unchecked(name_stats_fields))),
+            ),
+        ];
         let content_stats = StructData::try_new(
             content_stats_fields,
             vec![Scalar::Struct(id_stats), Scalar::Struct(name_stats)],
@@ -3064,8 +2979,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3074,6 +2989,7 @@ mod tests {
             content_stats: Some(content_stats),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3087,7 +3003,7 @@ mod tests {
             data: vec![engine_data],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3130,6 +3046,38 @@ mod tests {
         assert!(matches!(scalar, Scalar::Binary(ref v) if v == &vec![1, 2, 3, 4]));
     }
 
+    /// Helper function to create a simple test table schema with parquet field IDs.
+    /// This is used for tests that need to generate content_stats schema.
+    fn test_table_schema() -> StructType {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+        StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, false).with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-id".to_string()),
+                ),
+            ]),
+        ])
+    }
+
+    /// Helper function to get the test schema for MetadataEntry with content_stats.
+    /// Uses `test_table_schema()` to generate the dynamic schema.
+    fn test_metadata_entry_schema() -> SchemaRef {
+        Arc::new(
+            MetadataEntry::to_schema_with_content_stats(&test_table_schema())
+                .expect("test schema should be valid"),
+        )
+    }
+
     // Helper function to create a simple MetadataEntry for testing
     fn create_simple_metadata_entry() -> MetadataEntry {
         MetadataEntry {
@@ -3142,8 +3090,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3152,6 +3100,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3170,8 +3119,8 @@ mod tests {
                 sequence_number: Some(500),
                 file_sequence_number: Some(600),
                 first_row_id: Some(5000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 1,
             sort_order_id: Some(1),
@@ -3180,20 +3129,21 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         }
     }
 
-    // Helper function to create a MetadataEntry with inline content
+    // Helper function to create a MetadataEntry with manifest DV
     fn create_metadata_entry_with_inline_dv() -> MetadataEntry {
-        // Create some sample inline content data
+        // Create some sample inline DV data
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
 
         MetadataEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/path/to/data.parquet".to_string()),
+            content_type: DataContentType::DataManifest,
+            location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
@@ -3201,8 +3151,8 @@ mod tests {
                 sequence_number: Some(300),
                 file_sequence_number: Some(400),
                 first_row_id: Some(3000),
+                changes_dv: None,
             }),
-            inline_content: Some(Bytes::from(inline_data)),
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3211,6 +3161,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: Some(Bytes::from(inline_data)),
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3229,8 +3180,8 @@ mod tests {
                 sequence_number: Some(1000),
                 file_sequence_number: Some(1000),
                 first_row_id: Some(10000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 2,
             sort_order_id: Some(2),
@@ -3247,6 +3198,7 @@ mod tests {
                 min_sequence_number: 100,
             }),
             referenced_file: Some("s3://bucket/path/to/referenced.parquet".to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3293,10 +3245,15 @@ mod tests {
             _ => panic!("tracking_info presence mismatch"),
         }
 
-        // Compare inline_content
+        // Compare manifest_dv and changes_dv
         assert_eq!(
-            expected.inline_content, actual.inline_content,
-            "inline_content mismatch"
+            expected.manifest_dv, actual.manifest_dv,
+            "manifest_dv mismatch"
+        );
+        assert_eq!(
+            expected.tracking_info.as_ref().map(|t| &t.changes_dv),
+            actual.tracking_info.as_ref().map(|t| &t.changes_dv),
+            "changes_dv mismatch"
         );
 
         assert_eq!(
@@ -3370,10 +3327,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3382,7 +3339,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3403,10 +3362,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 1,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3415,7 +3374,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3436,10 +3397,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 2,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3448,7 +3409,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3469,10 +3432,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![original_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 3,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3481,30 +3444,32 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
         assert_eq!(entries.len(), 1);
         assert_metadata_entry_eq(&original_entry, &entries[0]);
 
-        // Verify inline_content specifically
+        // Verify manifest_dv specifically
         let read_entry = &entries[0];
         assert!(
-            read_entry.inline_content.is_some(),
-            "inline_content should be present"
+            read_entry.manifest_dv.is_some(),
+            "manifest_dv should be present"
         );
-        let read_bytes = read_entry.inline_content.as_ref().unwrap();
-        let orig_bytes = original_entry.inline_content.as_ref().unwrap();
+        let read_bytes = read_entry.manifest_dv.as_ref().unwrap();
+        let orig_bytes = original_entry.manifest_dv.as_ref().unwrap();
         assert_eq!(
             read_bytes.len(),
             orig_bytes.len(),
-            "inline_content length must match"
+            "manifest_dv length must match"
         );
         assert_eq!(
             read_bytes.as_ref(),
             orig_bytes.as_ref(),
-            "inline_content bytes must match"
+            "manifest_dv bytes must match"
         );
 
         Ok(())
@@ -3526,20 +3491,20 @@ mod tests {
             data: vec![
                 entry1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 entry4
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 3,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3548,7 +3513,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3574,7 +3541,6 @@ mod tests {
             DataContentType::EqualityDeletes,
             DataContentType::DataManifest,
             DataContentType::DeleteManifest,
-            DataContentType::ManifestDV,
         ];
 
         let entries: Vec<MetadataEntry> = content_types
@@ -3590,8 +3556,8 @@ mod tests {
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: i as i64,
                 sort_order_id: Some(i as i64),
@@ -3600,6 +3566,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3610,7 +3577,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+                    .into_engine_data(test_metadata_entry_schema(), &engine)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -3618,7 +3585,7 @@ mod tests {
             data,
             version: 4,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3627,7 +3594,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3665,8 +3634,8 @@ mod tests {
                     sequence_number: Some((i * 100) as i64),
                     file_sequence_number: Some((i * 200) as i64),
                     first_row_id: Some((i * 1000) as i64),
+                    changes_dv: None,
                 }),
-                inline_content: None,
                 content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: Some(0),
@@ -3675,6 +3644,7 @@ mod tests {
                 content_stats: None,
                 manifest_info: None,
                 referenced_file: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3685,7 +3655,7 @@ mod tests {
             .iter()
             .map(|e| {
                 e.clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)
+                    .into_engine_data(test_metadata_entry_schema(), &engine)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -3693,7 +3663,7 @@ mod tests {
             data,
             version: 5,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3702,7 +3672,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3731,8 +3703,8 @@ mod tests {
                 sequence_number: None,      // None
                 file_sequence_number: None, // None
                 first_row_id: None,         // None
+                changes_dv: None,
             }),
-            inline_content: None, // None
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3741,6 +3713,7 @@ mod tests {
             content_stats: None,   // None
             manifest_info: None,   // None
             referenced_file: None, // None
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3749,10 +3722,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 6,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3761,7 +3734,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3775,7 +3750,8 @@ mod tests {
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
         assert!(ti.first_row_id.is_none());
-        assert!(actual.inline_content.is_none());
+        assert!(ti.changes_dv.is_none());
+        assert!(actual.manifest_dv.is_none());
         assert!(actual.manifest_info.is_none());
         assert!(actual.referenced_file.is_none());
 
@@ -3799,8 +3775,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3809,6 +3785,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3817,10 +3794,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 7,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -3829,7 +3806,9 @@ mod tests {
         let written_file = writer.write(&engine)?;
 
         // Read metadata back
-        let read_metadata = Metadata::read(&engine, &written_file, table_root_url.clone())?;
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3852,8 +3831,8 @@ mod tests {
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: Some(0),
@@ -3862,6 +3841,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3884,8 +3864,8 @@ mod tests {
                 sequence_number: Some(sequence_number),
                 file_sequence_number: Some(sequence_number),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: Some(ContentInfo {
                 offset: 0,
                 size_in_bytes: 100,
@@ -3897,6 +3877,7 @@ mod tests {
             content_stats: None,
             manifest_info: None,
             referenced_file: Some(referenced_file.to_string()),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -3923,14 +3904,14 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -3974,14 +3955,14 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4023,10 +4004,10 @@ mod tests {
         let metadata = Metadata {
             data: vec![data_entry
                 .clone()
-                .into_engine_data(MetadataEntry::to_schema().into(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4051,34 +4032,34 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_content_not_dropped_in_serialization() -> DeltaResult<()> {
-        // This test verifies that inline_content survives the into_engine_data conversion
+    fn test_manifest_dv_not_dropped_in_serialization() -> DeltaResult<()> {
+        // This test verifies that manifest_dv survives the into_engine_data conversion
         // even when not read back through the full reader path
         let engine = SyncEngine::new();
 
-        // Create a metadata entry with inline content
+        // Create a metadata entry with manifest DV
         let inline_dv_entry = create_metadata_entry_with_inline_dv();
-        let original_inline_bytes = inline_dv_entry.inline_content.as_ref().unwrap().clone();
+        let original_dv_bytes = inline_dv_entry.manifest_dv.as_ref().unwrap().clone();
 
         // Convert to engine data
         let engine_data = inline_dv_entry
             .clone()
-            .into_engine_data(MetadataEntry::to_schema().into(), &engine)?;
+            .into_engine_data(test_metadata_entry_schema(), &engine)?;
 
-        // The inline_content should be in the engine data
+        // The manifest_dv should be in the engine data
         // We can't easily extract it without the full visitor, but we can verify
         // that the conversion succeeded and the data was included
         assert!(!engine_data.is_empty(), "Engine data should not be empty");
 
         // Verify the original bytes are not empty
         assert!(
-            !original_inline_bytes.is_empty(),
-            "Original inline content should not be empty"
+            !original_dv_bytes.is_empty(),
+            "Original manifest DV should not be empty"
         );
         assert_eq!(
-            original_inline_bytes.len(),
+            original_dv_bytes.len(),
             8,
-            "Expected 8 bytes of inline content"
+            "Expected 8 bytes of manifest DV"
         );
 
         Ok(())
@@ -4112,20 +4093,20 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4177,14 +4158,14 @@ mod tests {
             data: vec![
                 data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4220,8 +4201,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4238,6 +4219,7 @@ mod tests {
                 min_sequence_number: 50,
             }),
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -4259,8 +4241,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4277,6 +4259,7 @@ mod tests {
                 min_sequence_number: 75,
             }),
             referenced_file: referenced_file.map(String::from),
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -4307,17 +4290,17 @@ mod tests {
             data: vec![
                 data_manifest
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 unaffiliated_delete
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4334,7 +4317,7 @@ mod tests {
             refs.data_manifest.manifest.location.as_ref().unwrap(),
             "memory:///data-manifest.parquet"
         );
-        assert!(refs.data_manifest.manifest_dv.is_none());
+        assert!(refs.data_manifest.manifest.manifest_dv.is_none());
 
         // Verify affiliated delete manifest
         assert_eq!(refs.affiliated_dv_manifests.len(), 1);
@@ -4346,7 +4329,10 @@ mod tests {
                 .unwrap(),
             "memory:///delete-manifest.parquet"
         );
-        assert!(refs.affiliated_dv_manifests[0].manifest_dv.is_none());
+        assert!(refs.affiliated_dv_manifests[0]
+            .manifest
+            .manifest_dv
+            .is_none());
 
         // Verify unaffiliated delete manifest (now in shared_state)
         assert_eq!(root_state.shared_state.unaffiliated_dv_manifests.len(), 1);
@@ -4359,6 +4345,7 @@ mod tests {
             "memory:///unaffiliated-delete.parquet"
         );
         assert!(root_state.shared_state.unaffiliated_dv_manifests[0]
+            .manifest
             .manifest_dv
             .is_none());
 
@@ -4390,20 +4377,20 @@ mod tests {
             data: vec![
                 data_manifest_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_manifest_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 delete_manifest_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4457,22 +4444,22 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create a child data manifest with actual data files
-        let data_entry_1 = create_data_entry("memory:///child-data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("memory:///child-data-2.parquet", 60);
+        // Create a child data manifest with actual data files (using relative paths)
+        let data_entry_1 = create_data_entry("child-data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("child-data-2.parquet", 60);
 
         let child_metadata = Metadata {
             data: vec![
                 data_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4551,34 +4538,11 @@ mod tests {
             .serialize_into(&mut serialized)
             .expect("Failed to serialize roaring bitmap");
 
-        // Create a ManifestDV entry with inline content
-        let manifest_dv = MetadataEntry {
-            content_type: DataContentType::ManifestDV,
-            location: None,
-            file_format: DataFileFormat::Puffin,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: None,
-            }),
-            inline_content: Some(Bytes::from(serialized)),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 2, // 2 deleted positions
-            file_size_in_bytes: None,
-            content_stats: None,
-            manifest_info: None,
-            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        // Create DV bytes
+        let dv_bytes = Bytes::from(serialized);
 
         // Apply the manifest DV
-        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
 
         // Verify we have 3 entries left (positions 0, 2, 4)
         assert_eq!(filtered_entries.len(), 3);
@@ -4608,28 +4572,11 @@ mod tests {
             create_data_entry("memory:///file1.parquet", 60),
         ];
 
-        // Create a ManifestDV entry with NO inline content (no deletions)
-        let manifest_dv = MetadataEntry {
-            content_type: DataContentType::ManifestDV,
-            location: None,
-            file_format: DataFileFormat::Puffin,
-            tracking_info: None,
-            inline_content: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 0,
-            file_size_in_bytes: None,
-            content_stats: None,
-            manifest_info: None,
-            referenced_file: Some("memory:///test-manifest.parquet".to_string()),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        // Empty DV bytes (no deletions)
+        let dv_bytes = Bytes::new();
 
         // Apply the manifest DV (should return all entries)
-        let filtered_entries = apply_manifest_dv(entries, &manifest_dv)?;
+        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
 
         // Verify all entries remain
         assert_eq!(filtered_entries.len(), 2);
@@ -4665,17 +4612,17 @@ mod tests {
             data: vec![
                 root_data_entry
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 unmatched_dv
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 matched_dv
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: "manifest.parquet".to_string(),
             leaf: None,
         };
 
@@ -4712,14 +4659,14 @@ mod tests {
             data: vec![
                 dv_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4728,13 +4675,17 @@ mod tests {
         let delete_manifest_url = delete_manifest_writer.write(&engine)?;
 
         // Create unmatched DVs
+        let test_delete_manifest_url = Url::parse("memory:///test_delete_manifest.parquet")?;
+        let test_delete_manifest_path =
+            absolute_to_relative_path(&test_delete_manifest_url, &table_root_url)?;
         let mut unmatched_dvs = HashMap::new();
         unmatched_dvs.insert(
             "memory:///data3.parquet".to_string(),
             metadata_entry_to_deletion_vector_info(
                 create_dv_entry("memory:///dv3.parquet", "memory:///data3.parquet", 200),
                 0,
-                "memory:///test_delete_manifest.parquet",
+                &test_delete_manifest_path,
+                &table_root_url,
             )?,
         );
 
@@ -4768,23 +4719,23 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // Create two child data manifests with actual data files
+        // Create two child data manifests with actual data files (using relative paths)
         // Child manifest 1
-        let data_entry_1 = create_data_entry("memory:///partition1/data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("memory:///partition1/data-2.parquet", 60);
+        let data_entry_1 = create_data_entry("partition1/data-1.parquet", 50);
+        let data_entry_2 = create_data_entry("partition1/data-2.parquet", 60);
 
         let child_metadata_1 = Metadata {
             data: vec![
                 data_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4792,21 +4743,21 @@ mod tests {
         let child_manifest_url_1 = child_manifest_writer_1.write(&engine)?;
 
         // Child manifest 2 - use version 1 to avoid filename collision
-        let data_entry_3 = create_data_entry("memory:///partition2/data-3.parquet", 70);
-        let data_entry_4 = create_data_entry("memory:///partition2/data-4.parquet", 80);
+        let data_entry_3 = create_data_entry("partition2/data-3.parquet", 70);
+        let data_entry_4 = create_data_entry("partition2/data-4.parquet", 80);
 
         let child_metadata_2 = Metadata {
             data: vec![
                 data_entry_3
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_entry_4
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 1, // Use different version to avoid filename collision
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4821,14 +4772,14 @@ mod tests {
             data: vec![
                 data_manifest_entry_1
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 data_manifest_entry_2
                     .clone()
-                    .into_engine_data(MetadataEntry::to_schema().into(), &engine)?,
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
             ],
             version: 0,
             table_root: table_root_url.clone(),
-            manifest_location: None,
+            path_in_log: String::new(),
             leaf: None,
         };
 
@@ -4927,8 +4878,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -4937,6 +4888,7 @@ mod tests {
             content_stats: Some(create_id_content_stats(min_id, max_id)?),
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5051,8 +5003,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -5061,6 +5013,7 @@ mod tests {
             content_stats: None, // No stats!
             manifest_info: None,
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5190,8 +5143,8 @@ mod tests {
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: None,
+                changes_dv: None,
             }),
-            inline_content: None,
             content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -5208,6 +5161,7 @@ mod tests {
                 min_sequence_number: 100,
             }),
             referenced_file: None,
+            manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
@@ -5312,6 +5266,392 @@ mod tests {
             "manifest1.parquet",
             "Only manifest1 should match id<100"
         );
+
+        Ok(())
+    }
+
+    /// End-to-end integration test for DV size conversion through the metadata tree.
+    ///
+    /// This test creates a table with deletion vectors using the Transaction API and bulk mode,
+    /// then verifies that:
+    /// 1. PositionDeletes entries in persisted manifests have Iceberg format sizes (Delta size + 8 bytes)
+    /// 2. The size conversion happens at write time in extract_deletion_vector_content
+    #[test]
+    fn test_dv_size_conversion_through_metadata_tree() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::actions::deletion_vector::{
+            DeletionVectorDescriptor, DeletionVectorStorageType,
+        };
+        use crate::arrow::array::{
+            new_null_array, ArrayRef, BooleanArray, Int64Array, MapArray, StringArray, StructArray,
+        };
+        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::arrow_conversion::TryFromKernel;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::engine::sync::SyncEngine;
+        use crate::snapshot::Snapshot;
+        use crate::transaction::{CommitResult, DvUpdate, ManifestLocation};
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use url::Url;
+        use uuid::Uuid;
+
+        let engine = Arc::new(SyncEngine::new());
+        let temp_dir = tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_url = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table with DV support (v0)
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 1,
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "id"
+                    }
+                },
+                {
+                    "name": "value",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {
+                        "parquet.field.id": 2,
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "value"
+                    }
+                }
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"],
+                "writerFeatures": ["deletionVectors", "columnMapping", "metadataTree-experimental"]
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableDeletionVectors": "true",
+                    "delta.columnMapping.mode": "id"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_url
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| crate::Error::generic("Cannot convert URL to file path"))?;
+
+        create_dir_all(&delta_log_path)?;
+        write(delta_log_path.join("00000000000000000000.json"), data)?;
+
+        // Step 2: Add files to a leaf WITHOUT DVs (v1)
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+            let mut txn = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()))?
+                .with_operation("WRITE".to_string())
+                .with_batch_commit();
+
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+            let add_files_schema = txn.add_files_schema();
+
+            // Create add files metadata inline using arrow
+            let files = [
+                ("file1.parquet", 1000, 1000000, 50),
+                ("file2.parquet", 2000, 1000001, 75),
+            ];
+            let num_files = files.len();
+
+            let path_array =
+                StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+            let size_array =
+                Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+            let mod_time_array =
+                Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+            let num_records_array =
+                Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+            // Create empty partition values
+            let entries_field = std::sync::Arc::new(Field::new(
+                "key_value",
+                ArrowDataType::Struct(
+                    vec![
+                        std::sync::Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                        std::sync::Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            let empty_entries = StructArray::from(vec![
+                (
+                    std::sync::Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                    std::sync::Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                    std::sync::Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as ArrayRef,
+                ),
+            ]);
+            let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+            let partition_values_array = std::sync::Arc::new(MapArray::new(
+                entries_field,
+                offsets,
+                empty_entries,
+                None,
+                false,
+            ));
+
+            // Build stats struct
+            let arrow_schema: ArrowSchema =
+                TryFromKernel::try_from_kernel(add_files_schema.as_ref())?;
+            let stats_field = arrow_schema
+                .field_with_name("stats")
+                .expect("stats field should exist");
+            let stats_arrow_schema = match stats_field.data_type() {
+                ArrowDataType::Struct(fields) => fields.clone(),
+                _ => panic!("stats field should be a struct"),
+            };
+
+            let mut stats_fields = Vec::new();
+            for field in stats_arrow_schema.iter() {
+                let array: ArrayRef = match field.name().as_str() {
+                    "numRecords" => std::sync::Arc::new(num_records_array.clone()),
+                    "tightBounds" => {
+                        std::sync::Arc::new(BooleanArray::from(vec![Some(true); num_files]))
+                    }
+                    _ => std::sync::Arc::new(new_null_array(field.data_type(), num_files)),
+                };
+                stats_fields.push((field.clone(), array));
+            }
+            let stats_struct = StructArray::from(stats_fields);
+
+            let batch = RecordBatch::try_new(
+                std::sync::Arc::new(arrow_schema),
+                vec![
+                    std::sync::Arc::new(path_array) as ArrayRef,
+                    partition_values_array as ArrayRef,
+                    std::sync::Arc::new(size_array) as ArrayRef,
+                    std::sync::Arc::new(mod_time_array) as ArrayRef,
+                    std::sync::Arc::new(stats_struct) as ArrayRef,
+                ],
+            )?;
+
+            let metadata_engine_data: Box<dyn crate::EngineData> =
+                Box::new(ArrowEngineData::new(batch));
+            leaf.add_files(metadata_engine_data)?;
+
+            let result = leaf.finish(engine.as_ref())?;
+            txn.add_leaf(result)?;
+
+            match txn.commit(engine.as_ref())? {
+                CommitResult::CommittedTransaction(_) => {}
+                other => panic!("Expected success, got {:?}", other),
+            };
+        }
+
+        // Step 3: Scan to find where files landed (manifest URL + indices)
+        let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot_v1.clone().scan_builder().build()?;
+
+        // Use scan callback to collect file locations - much simpler than RowVisitor!
+        fn collect_locations(
+            locations: &mut Vec<(String, String, i64)>,
+            scan_file: crate::scan::state::ScanFile,
+        ) {
+            if let (Some(manifest_path), Some(index)) = (
+                scan_file.data_manifest_path,
+                scan_file.data_manifest_position,
+            ) {
+                locations.push((scan_file.path, manifest_path, index));
+            }
+        }
+
+        let mut file_locations = Vec::new();
+        for scan_metadata_result in scan.scan_metadata(engine.as_ref())? {
+            let scan_metadata = scan_metadata_result?;
+            file_locations = scan_metadata.visit_scan_files(file_locations, collect_locations)?;
+        }
+
+        // Step 4: Add DVs for the files using a known size (v2)
+        let known_dv_size_in_bytes: i32 = 42; // The Delta format size (what we'll test for conversion)
+        {
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+            let mut txn = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()))?
+                .with_operation("UPDATE".to_string())
+                .with_batch_commit();
+
+            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+
+            let mut dv_updates = vec![];
+            for (i, (path, manifest_path, index)) in file_locations.iter().enumerate() {
+                // Use a different UUID for each file
+                let uuid_str = if i == 0 {
+                    "12345678-1234-1234-1234-123456789abc"
+                } else {
+                    "87654321-4321-4321-4321-cba987654321"
+                };
+
+                let dv_descriptor = DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: uuid_str.to_string(),
+                    offset: Some(0),
+                    size_in_bytes: known_dv_size_in_bytes,
+                    cardinality: 5,
+                };
+
+                // Use the relative manifest path directly (no conversion to absolute URL)
+                dv_updates.push(DvUpdate {
+                    data_file_path: path.clone(),
+                    dv_descriptor,
+                    data_file_location: ManifestLocation {
+                        manifest_path: manifest_path.clone(),
+                        index: *index,
+                    },
+                    previous_delete_file_location: None,
+                });
+            }
+
+            leaf.update_deletion_vectors(dv_updates)?;
+
+            let result = leaf.finish(engine.as_ref())?;
+            txn.add_leaf(result)?;
+
+            match txn.commit(engine.as_ref())? {
+                CommitResult::CommittedTransaction(_) => {}
+                other => panic!("Expected success, got {:?}", other),
+            };
+        }
+
+        // Step 5: Read the ContentRoot file directly to verify persisted sizes
+        let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let content_root_result = snapshot_v2
+            .log_segment()
+            .content_root_with_version(engine.as_ref())?;
+
+        assert!(
+            content_root_result.is_some(),
+            "Table should have ContentRoot after batch commit"
+        );
+
+        let content_root_info = content_root_result.unwrap().0;
+        let root_manifest_url = table_url.join(content_root_info.path())?;
+
+        let root_metadata = Metadata::read(
+            engine.as_ref(),
+            &root_manifest_url,
+            content_root_info.path().to_string(),
+            table_url.clone(),
+        )?;
+        let root_entries = root_metadata.entries()?;
+
+        // The root might have DeleteManifest entries that contain the PositionDeletes
+        // Let's find all manifests and read them to find PositionDeletes
+        let mut found_position_deletes_count = 0;
+
+        // First check if PositionDeletes are directly in the root
+        for entry in &root_entries {
+            if matches!(entry.content_type, DataContentType::PositionDeletes) {
+                let content_info = entry
+                    .content_info
+                    .as_ref()
+                    .expect("PositionDeletes should have content_info");
+
+                let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
+                assert_eq!(
+                    content_info.size_in_bytes, expected_iceberg_size,
+                    "Persisted size should be {} (Delta {} + 8 framing), but got {}",
+                    expected_iceberg_size, known_dv_size_in_bytes, content_info.size_in_bytes
+                );
+                found_position_deletes_count += 1;
+            }
+        }
+
+        // If not in root, check DeleteManifests
+        if found_position_deletes_count == 0 {
+            for entry in &root_entries {
+                if matches!(entry.content_type, DataContentType::DeleteManifest) {
+                    let manifest_path = entry
+                        .location
+                        .as_ref()
+                        .expect("Manifest should have location");
+                    let manifest_url = table_url.join(manifest_path)?;
+                    let manifest_metadata = Metadata::read(
+                        engine.as_ref(),
+                        &manifest_url,
+                        manifest_path.clone(),
+                        table_url.clone(),
+                    )?;
+                    let manifest_entries = manifest_metadata.entries()?;
+
+                    for manifest_entry in manifest_entries {
+                        if matches!(
+                            manifest_entry.content_type,
+                            DataContentType::PositionDeletes
+                        ) {
+                            // We found the PositionDeletes in a leaf manifest
+                            // Verify the size here
+                            let content_info = manifest_entry
+                                .content_info
+                                .as_ref()
+                                .expect("PositionDeletes should have content_info");
+
+                            let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
+                            assert_eq!(
+                                content_info.size_in_bytes,
+                                expected_iceberg_size,
+                                "Persisted size should be {} (Delta {} + 8 framing), but got {}",
+                                expected_iceberg_size,
+                                known_dv_size_in_bytes,
+                                content_info.size_in_bytes
+                            );
+                            found_position_deletes_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_position_deletes_count > 0,
+            "Should have PositionDeletes entries in root or leaf manifests"
+        );
+
+        // The test successfully proves:
+        // 1. Persisted manifests have PositionDeletes with Iceberg sizes (Delta + 8)
+        //    - We verified the content_info.size_in_bytes = 42 + 8 = 50
+        // 2. The size conversion happens at write time in:
+        //    - extract_deletion_vector_content (+8): builder.rs:98
+        // 3. On read, metadata_entry_to_deletion_vector_info would subtract 8 bytes (metadata/mod.rs:1488)
+        //    but we don't test that here since we'd need actual DV files
 
         Ok(())
     }
