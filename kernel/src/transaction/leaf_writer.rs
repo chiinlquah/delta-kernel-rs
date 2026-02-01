@@ -813,15 +813,14 @@ mod tests {
         let num_files = files.len();
 
         // Build arrays for each file
-        let path_array = StringArray::from(
+        let path_array = StringArray::from(files.iter().map(|f| f.path).collect::<Vec<_>>());
+        let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
+        let mod_time_array = Int64Array::from(
             files
                 .iter()
-                .map(|f| f.path)
+                .map(|f| f.modification_time)
                 .collect::<Vec<_>>(),
         );
-        let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
-        let mod_time_array =
-            Int64Array::from(files.iter().map(|f| f.modification_time).collect::<Vec<_>>());
 
         // Create empty map for partitionValues
         let entries_field = Arc::new(Field::new(
@@ -889,8 +888,12 @@ mod tests {
         ]);
 
         // Build 'value' stats struct (nullable STRING: 7 fields)
-        let value_value_count =
-            Int64Array::from(files.iter().map(|f| f.value_value_count).collect::<Vec<_>>());
+        let value_value_count = Int64Array::from(
+            files
+                .iter()
+                .map(|f| f.value_value_count)
+                .collect::<Vec<_>>(),
+        );
         let value_null_value_count = Int64Array::from(
             files
                 .iter()
@@ -912,8 +915,12 @@ mod tests {
                 .map(|f| f.value_upper_bound)
                 .collect::<Vec<_>>(),
         );
-        let value_exact_bounds =
-            BooleanArray::from(files.iter().map(|f| f.value_exact_bounds).collect::<Vec<_>>());
+        let value_exact_bounds = BooleanArray::from(
+            files
+                .iter()
+                .map(|f| f.value_exact_bounds)
+                .collect::<Vec<_>>(),
+        );
 
         let value_stats_struct = StructArray::from(vec![
             (
@@ -949,11 +956,7 @@ mod tests {
         // Combine into top-level stats struct
         let stats_struct = StructArray::from(vec![
             (
-                Arc::new(Field::new(
-                    "id",
-                    id_stats_struct.data_type().clone(),
-                    true,
-                )),
+                Arc::new(Field::new("id", id_stats_struct.data_type().clone(), true)),
                 Arc::new(id_stats_struct) as ArrayRef,
             ),
             (
@@ -1090,7 +1093,6 @@ mod tests {
 
     #[test]
     fn test_basic_leaf_writing() -> Result<(), Box<dyn std::error::Error>> {
-
         let (engine, table_root, schema) = test_setup();
         let version = 1;
         let snapshot_id = 12345;
@@ -1167,16 +1169,17 @@ mod tests {
         let parquet_handler = engine.parquet_handler();
 
         // Build a schema that includes the content_stats columns we want to read
-        let content_stats_schema = crate::metadata::stats::stats_schema(&StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            )]),
-            StructField::nullable("value", DataType::STRING).with_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(2),
-            )]),
-        ])?)?;
+        let content_stats_schema =
+            crate::metadata::stats::stats_schema(&StructType::try_new(vec![
+                StructField::not_null("id", DataType::INTEGER).with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(1),
+                )]),
+                StructField::nullable("value", DataType::STRING).with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(2),
+                )]),
+            ])?)?;
 
         // Build the full read schema including content_stats
         let read_schema = Arc::new(StructType::new_unchecked(vec![
@@ -1187,8 +1190,8 @@ mod tests {
             ),
         ]));
 
-        let read_result_iter = parquet_handler
-            .read_parquet_files(&[file_meta], read_schema, None)?;
+        let read_result_iter =
+            parquet_handler.read_parquet_files(&[file_meta], read_schema, None)?;
 
         let mut found_stats = false;
         for batch_result in read_result_iter {
@@ -1238,11 +1241,7 @@ mod tests {
                 .as_any()
                 .downcast_ref::<crate::arrow::array::Int64Array>()
                 .expect("value_count should be Int64");
-            assert_eq!(
-                id_vc_array.value(0),
-                100,
-                "id.value_count should be 100"
-            );
+            assert_eq!(id_vc_array.value(0), 100, "id.value_count should be 100");
 
             // Verify id.lower_bound
             let id_lower = id_struct
