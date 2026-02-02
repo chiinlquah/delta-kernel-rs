@@ -362,28 +362,43 @@ pub fn vacuum_delete(
     // Create scan without predicate to get all files
     let scan = snapshot.clone().scan_builder().build()?;
 
-    // Take the first 50000 files returned from the scan
+    // Delete 10% of files (max 10000 files) to avoid deleting entire table
     let mut batches_to_delete = Vec::new();
     let mut files_collected = 0;
-    const MAX_FILES_TO_DELETE: usize = 50000;
+    const MAX_FILES_TO_DELETE: usize = 10000;
 
+    // First, count total files to calculate 10%
+    let mut total_files = 0;
+    let mut all_batches = Vec::new();
     for result in scan.scan_metadata(engine.as_ref())? {
         let metadata = result?;
-        let num_files = metadata.scan_files.data().len();
+        total_files += metadata.scan_files.data().len();
+        all_batches.push(metadata.scan_files);
+    }
 
-        if files_collected + num_files <= MAX_FILES_TO_DELETE {
-            // Take the whole batch
-            batches_to_delete.push(metadata.scan_files);
+    // Calculate how many files to delete (10% of total, max 10000)
+    let files_to_delete = std::cmp::min(
+        (total_files as f64 * 0.1) as usize,
+        MAX_FILES_TO_DELETE
+    );
+
+    // Collect batches until we reach the target
+    for batch in all_batches {
+        let num_files = batch.data().len();
+
+        if files_collected + num_files <= files_to_delete {
+            batches_to_delete.push(batch);
             files_collected += num_files;
 
-            if files_collected >= MAX_FILES_TO_DELETE {
+            if files_collected >= files_to_delete {
                 break;
             }
         } else {
-            // Take only what we need to reach 50000
-            let remaining = MAX_FILES_TO_DELETE - files_collected;
+            // Take partial batch if needed
+            let remaining = files_to_delete - files_collected;
             if remaining > 0 {
-                batches_to_delete.push(metadata.scan_files);
+                batches_to_delete.push(batch);
+                files_collected += remaining; // Note: we're taking the whole batch but only counting 'remaining'
             }
             break;
         }
