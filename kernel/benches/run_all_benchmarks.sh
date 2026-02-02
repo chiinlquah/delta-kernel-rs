@@ -111,6 +111,12 @@ process_dataset() {
 
     mkdir -p "${dataset_dir}"
 
+    # Check if this dataset has content root (required for bulk mode)
+    local has_content_root=false
+    if [[ "${dataset}" == *"with_content_root"* ]]; then
+        has_content_root=true
+    fi
+
     # Phase 1: Initial Scans
     echo -e "${YELLOW}Phase 1: Initial Scans (Pre-DML)${NC}"
 
@@ -128,25 +134,37 @@ process_dataset() {
     run_benchmark "${dataset}" "small-write" "-n 5" "dml" \
         "${dataset_dir}/03_dml_small_write.json" || true
 
-    # Small write (5 files, bulk mode)
-    run_benchmark "${dataset}" "small-write" "-n 5 -m" "dml" \
-        "${dataset_dir}/04_dml_small_write_bulk.json" || true
+    if [ "${has_content_root}" = true ]; then
+        # Small write (5 files, bulk mode) - only for content_root datasets
+        run_benchmark "${dataset}" "small-write" "-n 5 -m" "dml" \
+            "${dataset_dir}/04_dml_small_write_bulk.json" || true
+    else
+        echo -e "  ${YELLOW}Skipping small-write bulk mode (requires content_root)${NC}"
+    fi
 
     # Bulk write (1000 files, 500 batch size, non-bulk)
     run_benchmark "${dataset}" "bulk-write" "-n 1000 -b 500" "dml" \
         "${dataset_dir}/05_dml_bulk_write.json" || true
 
-    # Bulk write (1000 files, 500 batch size, bulk mode)
-    run_benchmark "${dataset}" "bulk-write" "-n 1000 -b 500 -m" "dml" \
-        "${dataset_dir}/06_dml_bulk_write_bulk.json" || true
+    if [ "${has_content_root}" = true ]; then
+        # Bulk write (1000 files, 500 batch size, bulk mode) - only for content_root datasets
+        run_benchmark "${dataset}" "bulk-write" "-n 1000 -b 500 -m" "dml" \
+            "${dataset_dir}/06_dml_bulk_write_bulk.json" || true
+    else
+        echo -e "  ${YELLOW}Skipping bulk-write bulk mode (requires content_root)${NC}"
+    fi
 
     # Vacuum delete (threshold 5, non-bulk)
     run_benchmark "${dataset}" "vacuum-delete" "-p 5" "dml" \
         "${dataset_dir}/07_dml_vacuum_delete.json" || true
 
-    # Vacuum delete (threshold 5, bulk mode)
-    run_benchmark "${dataset}" "vacuum-delete" "-p 5 -m" "dml" \
-        "${dataset_dir}/08_dml_vacuum_delete_bulk.json" || true
+    if [ "${has_content_root}" = true ]; then
+        # Vacuum delete (threshold 5, bulk mode) - only for content_root datasets
+        run_benchmark "${dataset}" "vacuum-delete" "-p 5 -m" "dml" \
+            "${dataset_dir}/08_dml_vacuum_delete_bulk.json" || true
+    else
+        echo -e "  ${YELLOW}Skipping vacuum-delete bulk mode (requires content_root)${NC}"
+    fi
 
     # Phase 3: Post-DML Scans
     echo ""

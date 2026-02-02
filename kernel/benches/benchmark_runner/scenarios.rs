@@ -387,6 +387,7 @@ pub fn vacuum_delete(
         let num_files = batch.data().len();
 
         if files_collected + num_files <= files_to_delete {
+            // Take the entire batch
             batches_to_delete.push(batch);
             files_collected += num_files;
 
@@ -394,11 +395,48 @@ pub fn vacuum_delete(
                 break;
             }
         } else {
-            // Take partial batch if needed
+            // Take a partial batch using a selection vector
             let remaining = files_to_delete - files_collected;
             if remaining > 0 {
-                batches_to_delete.push(batch);
-                files_collected += remaining; // Note: we're taking the whole batch but only counting 'remaining'
+                // Get the existing selection vector from the batch
+                let (data, old_selection) = batch.into_parts();
+
+                // Build a new selection vector that respects the old one
+                // We need to select only the first 'remaining' SELECTED rows
+                let mut new_selection = Vec::new();
+                let mut selected_count = 0;
+
+                for i in 0..data.len() {
+                    // Check if this row was selected in the original batch
+                    let is_selected = if i < old_selection.len() {
+                        old_selection[i]
+                    } else {
+                        // Per FilteredEngineData contract: if selection vector is shorter than data,
+                        // remaining rows are assumed to be selected
+                        true
+                    };
+
+                    // If it was selected and we haven't reached our limit, keep it selected
+                    if is_selected && selected_count < remaining {
+                        new_selection.push(true);
+                        selected_count += 1;
+                    } else if is_selected {
+                        // It was selected but we've reached our limit, so deselect it
+                        new_selection.push(false);
+                    } else {
+                        // It wasn't selected in the original, keep it unselected
+                        new_selection.push(false);
+                    }
+                }
+
+                // Create a new FilteredEngineData with the combined selection vector
+                let filtered_batch = delta_kernel::engine_data::FilteredEngineData::try_new(
+                    data,
+                    new_selection,
+                )?;
+
+                batches_to_delete.push(filtered_batch);
+                files_collected += selected_count;
             }
             break;
         }
