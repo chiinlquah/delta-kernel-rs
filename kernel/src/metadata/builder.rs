@@ -2,7 +2,9 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::metadata::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
+use crate::metadata::stats::{
+    aggregate_content_stats, delta_json_stats_to_content_stats, struct_data_to_amt_stats,
+};
 use crate::metadata::writer::MetadataWriter;
 use crate::metadata::{
     absolute_to_relative_path, ContentInfo, DataContentType, DataFileFormat, Metadata,
@@ -1404,15 +1406,22 @@ pub(crate) type WriteMetadataEntry = (
 /// Visitor that extracts write metadata including stats as StructData.
 ///
 /// This visitor reads the write metadata format (path, partitionValues, size,
-/// modificationTime, stats) where stats is expected to be a StructData (content_stats format).
+/// modificationTime, stats) where stats can be either in AMT format (per-column stats)
+/// or Delta JSON format (numRecords, minValues, maxValues, nullCount). When Delta JSON
+/// format is detected, it is automatically converted to AMT format using the table schema.
 pub(crate) struct WriteMetadataWithStatsVisitor {
     /// Entries: (path, partition_values, size, modification_time, content_stats)
     pub entries: Vec<WriteMetadataEntry>,
+    /// The table schema, used to convert Delta JSON format stats to AMT format.
+    table_schema: crate::schema::SchemaRef,
 }
 
 impl WriteMetadataWithStatsVisitor {
-    pub(crate) fn new(_stats_schema: crate::schema::SchemaRef) -> WriteMetadataWithStatsVisitor {
-        WriteMetadataWithStatsVisitor { entries: vec![] }
+    pub(crate) fn new(table_schema: crate::schema::SchemaRef) -> WriteMetadataWithStatsVisitor {
+        WriteMetadataWithStatsVisitor {
+            entries: vec![],
+            table_schema,
+        }
     }
 }
 
@@ -1455,11 +1464,26 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
                     getters[1].get(i, "partitionValues")?;
                 let size: i64 = getters[2].get(i, "size")?;
                 let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-                // Extract stats as StructData using get_struct and materialize
+
+                // Extract stats as StructData using get_struct and materialize.
+                // Handle both AMT format (per-column stats) and Delta JSON format
+                // (numRecords, minValues, maxValues, nullCount).
                 let stats: Option<StructData> = getters[4]
                     .get_struct(i, "stats")?
                     .map(|struct_item| struct_item.materialize())
-                    .transpose()?;
+                    .transpose()?
+                    .and_then(|s| {
+                        // Check if this is Delta JSON format by looking for "numRecords" field.
+                        let is_delta_json_format =
+                            s.fields().iter().any(|f| f.name() == "numRecords");
+                        if is_delta_json_format {
+                            // Convert Delta JSON format to AMT format using the table schema
+                            struct_data_to_amt_stats(&s, self.table_schema.as_ref())
+                        } else {
+                            // Already in AMT format, use directly
+                            Some(s)
+                        }
+                    });
 
                 self.entries
                     .push((path, partition_values, size, modification_time, stats));

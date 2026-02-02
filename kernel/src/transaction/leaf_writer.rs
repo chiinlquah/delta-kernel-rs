@@ -12,7 +12,7 @@ use crate::{
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use url::Url;
 
 /// Composite identifier for deletion vectors.
@@ -488,14 +488,12 @@ impl LeafNodeWriter {
     ///
     /// # Arguments
     /// * `add_metadata` - EngineData with write metadata format (path, partitionValues, size,
-    ///   modificationTime, stats as StructData)
+    ///   modificationTime, stats as StructData). Stats can be in either AMT format (per-column
+    ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
+    ///   automatically converted to AMT format.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        // Generate the stats schema from the table schema
-        let stats_schema = crate::metadata::stats::stats_schema(self.table_schema.as_ref())?;
-        let stats_schema_ref: SchemaRef = Arc::new(stats_schema);
-
         let mut visitor =
-            crate::metadata::builder::WriteMetadataWithStatsVisitor::new(stats_schema_ref);
+            crate::metadata::builder::WriteMetadataWithStatsVisitor::new(self.table_schema.clone());
         visitor.visit_rows_of(add_metadata.as_ref())?;
 
         // Tuple: (path, partition_values, size, modification_time, content_stats)
@@ -777,29 +775,27 @@ mod tests {
         (engine, table_root, schema)
     }
 
-    /// Struct to hold file metadata including stats for testing
-    #[derive(Clone)]
-    struct FileMetadataWithStats {
-        path: &'static str,
-        size: i64,
-        modification_time: i64,
-        // Stats for the 'id' column (non-nullable INTEGER)
-        id_value_count: i64,
-        id_lower_bound: i32,
-        id_upper_bound: i32,
-        id_exact_bounds: bool,
-        // Stats for the 'value' column (nullable STRING)
-        value_value_count: i64,
-        value_null_value_count: i64,
-        value_lower_bound: Option<&'static str>,
-        value_upper_bound: Option<&'static str>,
-        value_exact_bounds: bool,
-    }
-
-    /// Helper to create add files metadata for testing with proper AMT-formatted stats.
-    /// The stats match the test schema: {id: INTEGER (non-nullable), value: STRING (nullable)}
-    fn create_test_add_metadata_with_stats(
-        files: Vec<FileMetadataWithStats>,
+    /// Helper to create add files metadata with Delta JSON format stats.
+    ///
+    /// This mimics what the engine produces when writing parquet files: stats in Delta JSON
+    /// format with numRecords, minValues, maxValues, nullCount, and tightBounds.
+    /// The WriteMetadataWithStatsVisitor will automatically convert these to AMT format.
+    ///
+    /// Parameters for each file: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
+    #[allow(clippy::type_complexity)]
+    fn create_test_add_metadata_with_delta_json_stats(
+        files: Vec<(
+            &str,
+            i64,
+            i64,
+            i64,
+            i32,
+            i32,
+            i64,
+            Option<&str>,
+            Option<&str>,
+            i64,
+        )>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         use crate::arrow::array::{
             Array, ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, StringArray,
@@ -813,12 +809,22 @@ mod tests {
         let num_files = files.len();
 
         // Build arrays for each file
-        let path_array = StringArray::from(files.iter().map(|f| f.path).collect::<Vec<_>>());
-        let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
+        let path_array = StringArray::from(
+            files
+                .iter()
+                .map(|(p, _, _, _, _, _, _, _, _, _)| *p)
+                .collect::<Vec<_>>(),
+        );
+        let size_array = Int64Array::from(
+            files
+                .iter()
+                .map(|(_, s, _, _, _, _, _, _, _, _)| *s)
+                .collect::<Vec<_>>(),
+        );
         let mod_time_array = Int64Array::from(
             files
                 .iter()
-                .map(|f| f.modification_time)
+                .map(|(_, _, m, _, _, _, _, _, _, _)| *m)
                 .collect::<Vec<_>>(),
         );
 
@@ -852,120 +858,123 @@ mod tests {
             false,
         ));
 
-        // Build stats struct in AMT format:
-        // {
-        //   id: { value_count, lower_bound, upper_bound, exact_bounds },
-        //   value: { value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds }
-        // }
+        // Build stats struct in Delta JSON format (like engine produces):
+        // { numRecords, nullCount: {id, value}, minValues: {id, value}, maxValues: {id, value}, tightBounds }
+        let num_records = Int64Array::from(
+            files
+                .iter()
+                .map(|(_, _, _, n, _, _, _, _, _, _)| *n)
+                .collect::<Vec<_>>(),
+        );
 
-        // Build 'id' stats struct (non-nullable INTEGER: 4 fields)
-        let id_value_count =
-            Int64Array::from(files.iter().map(|f| f.id_value_count).collect::<Vec<_>>());
-        let id_lower_bound =
-            Int32Array::from(files.iter().map(|f| f.id_lower_bound).collect::<Vec<_>>());
-        let id_upper_bound =
-            Int32Array::from(files.iter().map(|f| f.id_upper_bound).collect::<Vec<_>>());
-        let id_exact_bounds =
-            BooleanArray::from(files.iter().map(|f| f.id_exact_bounds).collect::<Vec<_>>());
-
-        let id_stats_struct = StructArray::from(vec![
+        // nullCount struct: { id: i64, value: i64 }
+        let null_count_id = Int64Array::from(
+            files
+                .iter()
+                .map(|(_, _, _, _, _, _, nc, _, _, _)| *nc)
+                .collect::<Vec<_>>(),
+        );
+        let null_count_value = Int64Array::from(
+            files
+                .iter()
+                .map(|(_, _, _, _, _, _, _, _, _, nc)| *nc)
+                .collect::<Vec<_>>(),
+        );
+        let null_count_struct = StructArray::from(vec![
             (
-                Arc::new(Field::new("value_count", ArrowDataType::Int64, true)),
-                Arc::new(id_value_count) as ArrayRef,
+                Arc::new(Field::new("id", ArrowDataType::Int64, true)),
+                Arc::new(null_count_id) as ArrayRef,
             ),
             (
-                Arc::new(Field::new("lower_bound", ArrowDataType::Int32, true)),
-                Arc::new(id_lower_bound) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("upper_bound", ArrowDataType::Int32, true)),
-                Arc::new(id_upper_bound) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("exact_bounds", ArrowDataType::Boolean, true)),
-                Arc::new(id_exact_bounds) as ArrayRef,
+                Arc::new(Field::new("value", ArrowDataType::Int64, true)),
+                Arc::new(null_count_value) as ArrayRef,
             ),
         ]);
 
-        // Build 'value' stats struct (nullable STRING: 7 fields)
-        let value_value_count = Int64Array::from(
+        // minValues struct: { id: i32, value: string }
+        let min_id = Int32Array::from(
             files
                 .iter()
-                .map(|f| f.value_value_count)
+                .map(|(_, _, _, _, min, _, _, _, _, _)| *min)
                 .collect::<Vec<_>>(),
         );
-        let value_null_value_count = Int64Array::from(
+        let min_value = StringArray::from(
             files
                 .iter()
-                .map(|f| f.value_null_value_count)
+                .map(|(_, _, _, _, _, _, _, min, _, _)| *min)
                 .collect::<Vec<_>>(),
         );
-        // avg_value_size and max_value_size are not supported, so we set them to null
-        let value_avg_value_size = Int64Array::from(vec![None::<i64>; num_files]);
-        let value_max_value_size = Int64Array::from(vec![None::<i64>; num_files]);
-        let value_lower_bound = StringArray::from(
-            files
-                .iter()
-                .map(|f| f.value_lower_bound)
-                .collect::<Vec<_>>(),
-        );
-        let value_upper_bound = StringArray::from(
-            files
-                .iter()
-                .map(|f| f.value_upper_bound)
-                .collect::<Vec<_>>(),
-        );
-        let value_exact_bounds = BooleanArray::from(
-            files
-                .iter()
-                .map(|f| f.value_exact_bounds)
-                .collect::<Vec<_>>(),
-        );
-
-        let value_stats_struct = StructArray::from(vec![
+        let min_values_struct = StructArray::from(vec![
             (
-                Arc::new(Field::new("value_count", ArrowDataType::Int64, true)),
-                Arc::new(value_value_count) as ArrayRef,
+                Arc::new(Field::new("id", ArrowDataType::Int32, true)),
+                Arc::new(min_id) as ArrayRef,
             ),
             (
-                Arc::new(Field::new("null_value_count", ArrowDataType::Int64, true)),
-                Arc::new(value_null_value_count) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("avg_value_size", ArrowDataType::Int64, true)),
-                Arc::new(value_avg_value_size) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("max_value_size", ArrowDataType::Int64, true)),
-                Arc::new(value_max_value_size) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("lower_bound", ArrowDataType::Utf8, true)),
-                Arc::new(value_lower_bound) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("upper_bound", ArrowDataType::Utf8, true)),
-                Arc::new(value_upper_bound) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("exact_bounds", ArrowDataType::Boolean, true)),
-                Arc::new(value_exact_bounds) as ArrayRef,
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                Arc::new(min_value) as ArrayRef,
             ),
         ]);
 
-        // Combine into top-level stats struct
+        // maxValues struct: { id: i32, value: string }
+        let max_id = Int32Array::from(
+            files
+                .iter()
+                .map(|(_, _, _, _, _, max, _, _, _, _)| *max)
+                .collect::<Vec<_>>(),
+        );
+        let max_value = StringArray::from(
+            files
+                .iter()
+                .map(|(_, _, _, _, _, _, _, _, max, _)| *max)
+                .collect::<Vec<_>>(),
+        );
+        let max_values_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("id", ArrowDataType::Int32, true)),
+                Arc::new(max_id) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                Arc::new(max_value) as ArrayRef,
+            ),
+        ]);
+
+        // tightBounds: boolean (all true)
+        let tight_bounds = BooleanArray::from(vec![true; num_files]);
+
+        // Combine into top-level stats struct (Delta JSON format)
         let stats_struct = StructArray::from(vec![
             (
-                Arc::new(Field::new("id", id_stats_struct.data_type().clone(), true)),
-                Arc::new(id_stats_struct) as ArrayRef,
+                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                Arc::new(num_records) as ArrayRef,
             ),
             (
                 Arc::new(Field::new(
-                    "value",
-                    value_stats_struct.data_type().clone(),
+                    "nullCount",
+                    null_count_struct.data_type().clone(),
                     true,
                 )),
-                Arc::new(value_stats_struct) as ArrayRef,
+                Arc::new(null_count_struct) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "minValues",
+                    min_values_struct.data_type().clone(),
+                    true,
+                )),
+                Arc::new(min_values_struct) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "maxValues",
+                    max_values_struct.data_type().clone(),
+                    true,
+                )),
+                Arc::new(max_values_struct) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+                Arc::new(tight_bounds) as ArrayRef,
             ),
         ]);
 
@@ -1100,24 +1109,21 @@ mod tests {
         let mut writer =
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
-        // Add files with proper AMT-formatted stats
-        let file_metadata = FileMetadataWithStats {
-            path: "file1.parquet",
-            size: 1024,
-            modification_time: 1000000,
-            // Stats for the 'id' column
-            id_value_count: 100,
-            id_lower_bound: 1,
-            id_upper_bound: 1000,
-            id_exact_bounds: true,
-            // Stats for the 'value' column
-            value_value_count: 100,
-            value_null_value_count: 5,
-            value_lower_bound: Some("alice"),
-            value_upper_bound: Some("zoe"),
-            value_exact_bounds: true,
-        };
-        let metadata = create_test_add_metadata_with_stats(vec![file_metadata])?;
+        // Add files with Delta JSON format stats (like the engine produces when writing parquet).
+        // The stats will be automatically converted to AMT format by WriteMetadataWithStatsVisitor.
+        // Parameters: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
+        let metadata = create_test_add_metadata_with_delta_json_stats(vec![(
+            "file1.parquet",
+            1024,          // size
+            1000000,       // modification_time
+            100,           // num_records
+            1,             // id min
+            1000,          // id max
+            0,             // id null count
+            Some("alice"), // value min
+            Some("zoe"),   // value max
+            5,             // value null count
+        )])?;
         writer.add_files(metadata)?;
 
         // Finish and verify result
