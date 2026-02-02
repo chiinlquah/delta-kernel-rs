@@ -1071,6 +1071,146 @@ pub(crate) fn delta_json_stats_to_content_stats(
     Ok(Some(content_stats))
 }
 
+/// Converts a StructData in Delta JSON format to AMT (Adaptive Metadata Tree) format.
+///
+/// This function takes a StructData that has the Delta Protocol JSON stats structure
+/// (numRecords, minValues, maxValues, nullCount, tightBounds) and converts it to the
+/// AMT per-column stats format used in manifests.
+///
+/// # Arguments
+///
+/// * `struct_data` - The StructData in Delta JSON format
+/// * `table_schema` - The table's data schema (used to determine column types)
+///
+/// # Returns
+///
+/// Returns `Some(StructData)` in AMT format if conversion succeeds, `None` if the
+/// input doesn't have the expected Delta JSON structure.
+#[allow(dead_code)]
+pub(crate) fn struct_data_to_amt_stats(
+    struct_data: &StructData,
+    table_schema: &StructType,
+) -> Option<StructData> {
+    // Check if this is Delta JSON format by looking for numRecords field
+    let has_num_records = struct_data
+        .fields()
+        .iter()
+        .any(|f| f.name() == "numRecords");
+    if !has_num_records {
+        return None;
+    }
+
+    // Extract values from the StructData
+    let num_records = extract_long_field(struct_data, "numRecords");
+    let tight_bounds = extract_bool_field(struct_data, "tightBounds").unwrap_or(true);
+    let min_values = extract_nested_struct(struct_data, "minValues");
+    let max_values = extract_nested_struct(struct_data, "maxValues");
+    let null_count = extract_nested_struct(struct_data, "nullCount");
+
+    // Build DeltaJsonStats from extracted values
+    let delta_stats = DeltaJsonStats {
+        num_records,
+        min_values: struct_to_json_map(&min_values),
+        max_values: struct_to_json_map(&max_values),
+        null_count: struct_to_null_count_map(&null_count),
+        tight_bounds,
+    };
+
+    // Generate the AMT-style stats schema and build content_stats
+    let stats_struct = stats_schema(table_schema).ok()?;
+    Some(build_struct_stats(
+        table_schema,
+        &stats_struct,
+        &delta_stats,
+        "",
+    ))
+}
+
+/// Extract a Long field from a StructData.
+fn extract_long_field(data: &StructData, field_name: &str) -> Option<i64> {
+    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
+    match data.values().get(idx)? {
+        Scalar::Long(v) => Some(*v),
+        Scalar::Integer(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
+/// Extract a Boolean field from a StructData.
+fn extract_bool_field(data: &StructData, field_name: &str) -> Option<bool> {
+    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
+    match data.values().get(idx)? {
+        Scalar::Boolean(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Extract a nested StructData field.
+fn extract_nested_struct(data: &StructData, field_name: &str) -> Option<StructData> {
+    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
+    match data.values().get(idx)? {
+        Scalar::Struct(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Convert a StructData to a HashMap<String, JsonValue> for minValues/maxValues.
+fn struct_to_json_map(data: &Option<StructData>) -> HashMap<String, JsonValue> {
+    let Some(data) = data else {
+        return HashMap::new();
+    };
+
+    let mut map = HashMap::new();
+    for (field, value) in data.fields().iter().zip(data.values().iter()) {
+        if let Some(json_val) = scalar_to_json_value(value) {
+            map.insert(field.name().to_string(), json_val);
+        }
+    }
+    map
+}
+
+/// Convert a StructData to a HashMap<String, i64> for nullCount.
+fn struct_to_null_count_map(data: &Option<StructData>) -> HashMap<String, i64> {
+    let Some(data) = data else {
+        return HashMap::new();
+    };
+
+    let mut map = HashMap::new();
+    for (field, value) in data.fields().iter().zip(data.values().iter()) {
+        let count = match value {
+            Scalar::Long(v) => *v,
+            Scalar::Integer(v) => *v as i64,
+            _ => continue,
+        };
+        map.insert(field.name().to_string(), count);
+    }
+    map
+}
+
+/// Convert a Scalar to a JsonValue.
+fn scalar_to_json_value(scalar: &Scalar) -> Option<JsonValue> {
+    match scalar {
+        Scalar::Integer(v) => Some(JsonValue::Number((*v).into())),
+        Scalar::Long(v) => Some(JsonValue::Number((*v).into())),
+        Scalar::Short(v) => Some(JsonValue::Number((*v as i64).into())),
+        Scalar::Byte(v) => Some(JsonValue::Number((*v as i64).into())),
+        Scalar::Float(v) => serde_json::Number::from_f64(*v as f64).map(JsonValue::Number),
+        Scalar::Double(v) => serde_json::Number::from_f64(*v).map(JsonValue::Number),
+        Scalar::String(s) => Some(JsonValue::String(s.clone())),
+        Scalar::Boolean(b) => Some(JsonValue::Bool(*b)),
+        Scalar::Null(_) => None,
+        // For other types, convert to string representation
+        Scalar::Timestamp(v) => Some(JsonValue::String(v.to_string())),
+        Scalar::TimestampNtz(v) => Some(JsonValue::String(v.to_string())),
+        Scalar::Date(v) => Some(JsonValue::String(v.to_string())),
+        Scalar::Binary(_) => None, // Binary not expected in stats min/max values
+        Scalar::Decimal(d) => Some(JsonValue::String(d.bits().to_string())),
+        Scalar::Struct(_) => None, // Nested structs not expected in min/max values
+        Scalar::Array(_) => None,  // Arrays not expected in min/max values
+        Scalar::Map(_) => None,    // Maps not expected in min/max values
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
