@@ -2033,7 +2033,7 @@ fn metadata_entry_to_deletion_vector_info(
 ///
 /// Returns a ProcessedDeletionVector struct containing the deletion vector descriptor,
 /// delete_manifest_path, and delete_manifest_position if a deletion vector is found with a
-/// sequence number greater than the entry's sequence number.
+/// sequence number greater than or equal to the entry's sequence number.
 fn process_deletion_vector(
     dv_maps: &DeletionVectorMaps<'_>,
     full_path: &str,
@@ -2042,7 +2042,7 @@ fn process_deletion_vector(
     let dv_info = dv_maps.get(full_path);
 
     match dv_info {
-        Some(info) if info.sequence_number > entry_sequence_number.unwrap_or(0) => {
+        Some(info) if info.sequence_number >= entry_sequence_number.unwrap_or(0) => {
             Ok(ProcessedDeletionVector {
                 descriptor: Some(info.descriptor.clone()),
                 delete_manifest_path: Some(info.delete_manifest_path.clone()),
@@ -4441,6 +4441,59 @@ mod tests {
         assert!(
             add.deletion_vector.is_some(),
             "DV with later sequence number should be included"
+        );
+        let dv = add.deletion_vector.as_ref().unwrap();
+        assert_eq!(dv.cardinality, 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dv_with_equal_sequence_number_included() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create a data file with sequence number 100
+        let data_entry = create_data_entry("memory:///data.parquet", 100);
+
+        // Create a DV for the data file with sequence number 100 (equal)
+        let dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 100);
+
+        // Create metadata with both entries
+        let metadata = Metadata {
+            data: vec![
+                data_entry
+                    .clone()
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
+                dv_entry
+                    .clone()
+                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
+            ],
+            version: 0,
+            table_root: table_root_url.clone(),
+            path_in_log: "manifest.parquet".to_string(),
+            leaf: None,
+        };
+
+        // Get action batches (no data skipping for this test)
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+
+        // Get the Add action using visitor
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        // Verify DV IS included (sequence number is equal)
+        assert!(
+            add.deletion_vector.is_some(),
+            "DV with equal sequence number should be included"
         );
         let dv = add.deletion_vector.as_ref().unwrap();
         assert_eq!(dv.cardinality, 10);

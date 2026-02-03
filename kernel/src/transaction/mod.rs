@@ -670,6 +670,9 @@ impl Transaction {
 
                     // Add incremental actions from delta log to the metadata builder
                     // Pass None for snapshot_id since we're replaying existing commits
+                    // TODO: When replaying, we should preserve original sequence_numbers from the
+                    // files' tracking_info instead of using current_version. This would require
+                    // extracting sequence_number from the scan data and passing it through.
                     metadata_builder.add_from_scan_row_data(engine_data, current_version, None)?;
                 }
             }

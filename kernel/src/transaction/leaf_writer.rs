@@ -705,6 +705,8 @@ impl LeafNodeWriter {
                 tracking_info: Some(TrackingInfo {
                     status: TrackingStatus::Added,
                     snapshot_id: Some(self.snapshot_id),
+                    // TODO: For newly added DVs, sequence_number and file_sequence_number should be None
+                    // to inherit from the manifest's tracking_info. Only needed for existing DVs.
                     sequence_number: Some(self.version as i64),
                     file_sequence_number: Some(self.version as i64),
                     first_row_id: None,
