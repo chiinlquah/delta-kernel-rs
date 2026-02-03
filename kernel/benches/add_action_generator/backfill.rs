@@ -269,7 +269,7 @@ async fn run(
 
     // Generate commit 0
     println!("\n2. Generating commit 0 (metadata + protocol)...");
-    generate_commit_0(&table_url, &store, &path_prefix).await?;
+    generate_commit_0(&table_url, &store, &path_prefix, args.generate_content_root).await?;
     println!("   ✓ Written: 00000000000000000000.json");
 
     // Generate sidecar files
@@ -302,9 +302,9 @@ async fn run(
         // Default batch_size to actions_per_sidecar for aligned partitioning
         let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
         println!("\n6. Generating content root representation...");
-        generate_content_root(&table_url, &engine, &store, &path_prefix, batch_size).await?;
+        generate_content_root(&table_url, &engine, batch_size).await?;
         println!("   ✓ Content root generated");
-        current_version = 2; // Commit 0, Commit 1 (enable features), Commit 2 (content root)
+        current_version = 1; // Commit 0 (with metadataTree-experimental), Commit 1 (content root)
     }
 
     // Generate incremental commits
@@ -342,6 +342,7 @@ async fn generate_commit_0(
     _table_url: &url::Url,
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
     path_prefix: &str,
+    enable_metadata_tree: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timestamp = chrono::Utc::now().timestamp_millis();
 
@@ -449,17 +450,18 @@ async fn generate_commit_0(
     };
 
     // Create protocol action for V2 checkpoint with column mapping (reader version 3, writer version 7)
+    // Optionally include metadataTree-experimental if content root will be generated
+    let mut reader_features = vec!["v2Checkpoint".to_string(), "columnMapping".to_string()];
+    let mut writer_features = vec!["v2Checkpoint".to_string(), "columnMapping".to_string()];
+    if enable_metadata_tree {
+        reader_features.push("metadataTree-experimental".to_string());
+        writer_features.push("metadataTree-experimental".to_string());
+    }
     let protocol = Protocol {
         min_reader_version: 3,
         min_writer_version: 7,
-        reader_features: Some(vec![
-            "v2Checkpoint".to_string(),
-            "columnMapping".to_string(),
-        ]),
-        writer_features: Some(vec![
-            "v2Checkpoint".to_string(),
-            "columnMapping".to_string(),
-        ]),
+        reader_features: Some(reader_features),
+        writer_features: Some(writer_features),
     };
 
     // Create commit info
@@ -861,20 +863,13 @@ async fn generate_incremental_commits(
 async fn generate_content_root(
     table_url: &url::Url,
     engine: &std::sync::Arc<dyn delta_kernel::Engine>,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
-    path_prefix: &str,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::Snapshot;
 
-    println!("   Step 6a: Enabling metadataTree-experimental feature...");
-
-    // Generate commit 1 to enable the experimental feature
-    enable_metadata_tree_feature(table_url, store, path_prefix).await?;
-    println!("      ✓ Feature enabled via commit 1");
-
-    println!("   Step 6b: Creating transaction...");
+    // Note: metadataTree-experimental feature is already enabled in commit 0
+    println!("   Step 6a: Creating transaction...");
 
     // Open the table using the provided engine (which has correct path handling)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -890,7 +885,7 @@ async fn generate_content_root(
 
     println!("      ✓ Transaction created in batch_commit mode");
 
-    println!("   Step 6c: Scanning existing actions...");
+    println!("   Step 6b: Scanning existing actions...");
 
     // Release root and delta actions (no predicate needed for counting approach)
     let scan = txn.release_root_and_delta_actions()?;
@@ -898,7 +893,7 @@ async fn generate_content_root(
     println!("      ✓ Released root and delta actions");
 
     println!(
-        "   Step 6d: Partitioning actions into leaves (every {} actions)...",
+        "   Step 6c: Partitioning actions into leaves (every {} actions)...",
         batch_size
     );
 
@@ -907,7 +902,7 @@ async fn generate_content_root(
 
     println!("      ✓ Created {} leaf manifests", leaf_count);
 
-    println!("   Step 6e: Committing transaction...");
+    println!("   Step 6d: Committing transaction...");
 
     // Commit the transaction
     use delta_kernel::transaction::CommitResult;
@@ -927,81 +922,6 @@ async fn generate_content_root(
             return Err("Transaction failed with retryable error".into());
         }
     }
-
-    Ok(())
-}
-
-async fn enable_metadata_tree_feature(
-    _table_url: &url::Url,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
-    path_prefix: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let timestamp = chrono::Utc::now().timestamp_millis();
-
-    // Read the existing metadata from commit 0
-    // Note: Column mapping is already enabled in commit 0, we just need to add metadataTree-experimental
-    let commit_0_path = object_store::path::Path::from(format!(
-        "{}_delta_log/00000000000000000000.json",
-        path_prefix
-    ));
-    let commit_0_bytes = store.get(&commit_0_path).await?.bytes().await?;
-    let commit_0_content = String::from_utf8(commit_0_bytes.to_vec())?;
-
-    let mut metadata: Option<Metadata> = None;
-    for line in commit_0_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let action: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(m) = action.get("metaData") {
-            metadata = Some(serde_json::from_value(m.clone())?);
-        }
-    }
-
-    let metadata = metadata.ok_or("No metadata found in commit 0")?;
-
-    // Create updated protocol with columnMapping and metadataTree-experimental features
-    let protocol = Protocol {
-        min_reader_version: 3,
-        min_writer_version: 7,
-        reader_features: Some(vec![
-            "v2Checkpoint".to_string(),
-            "columnMapping".to_string(),
-            "metadataTree-experimental".to_string(),
-        ]),
-        writer_features: Some(vec![
-            "v2Checkpoint".to_string(),
-            "columnMapping".to_string(),
-            "metadataTree-experimental".to_string(),
-        ]),
-    };
-
-    // Create commit info
-    let commit_info = CommitInfo {
-        timestamp,
-        operation: "ENABLE_FEATURES".to_string(),
-        operation_parameters: HashMap::from([(
-            "features".to_string(),
-            "metadataTree-experimental".to_string(),
-        )]),
-        is_blind_append: Some(false),
-        engine_info: Some("delta-kernel-rust backfill tool".to_string()),
-    };
-
-    // Write commit 1
-    let mut content = String::new();
-    content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
-    content.push('\n');
-    content.push_str(&serde_json::to_string(&json!({"metaData": metadata}))?);
-    content.push('\n');
-    content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
-    content.push('\n');
-
-    let commit_path = object_store::path::Path::from(format!(
-        "{}_delta_log/00000000000000000001.json",
-        path_prefix
-    ));
-    store.put(&commit_path, content.into()).await?;
 
     Ok(())
 }
