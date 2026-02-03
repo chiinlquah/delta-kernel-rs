@@ -274,7 +274,11 @@ pub fn write(
     let num_batches = num_files / batch_size;
     for batch_idx in 0..num_batches {
         let start_index = batch_idx * batch_size;
-        batches.push(create_add_files_metadata(&add_files_schema, batch_size, start_index)?);
+        batches.push(create_add_files_metadata(
+            &add_files_schema,
+            batch_size,
+            start_index,
+        )?);
     }
 
     add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
@@ -379,10 +383,7 @@ pub fn vacuum_delete(
     }
 
     // Calculate how many files to delete (10% of total, max 10000)
-    let files_to_delete = std::cmp::min(
-        (total_files as f64 * 0.1) as usize,
-        MAX_FILES_TO_DELETE
-    );
+    let files_to_delete = std::cmp::min((total_files as f64 * 0.1) as usize, MAX_FILES_TO_DELETE);
 
     // Collect batches until we reach the target
     for batch in all_batches {
@@ -432,10 +433,8 @@ pub fn vacuum_delete(
                 }
 
                 // Create a new FilteredEngineData with the combined selection vector
-                let filtered_batch = delta_kernel::engine_data::FilteredEngineData::try_new(
-                    data,
-                    new_selection,
-                )?;
+                let filtered_batch =
+                    delta_kernel::engine_data::FilteredEngineData::try_new(data, new_selection)?;
 
                 batches_to_delete.push(filtered_batch);
             }
