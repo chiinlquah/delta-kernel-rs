@@ -302,7 +302,7 @@ async fn run(
         // Default batch_size to actions_per_sidecar for aligned partitioning
         let batch_size = args.batch_size.unwrap_or(args.actions_per_sidecar);
         println!("\n6. Generating content root representation...");
-        generate_content_root(&table_url, &engine, &store, &path_prefix, batch_size).await?;
+        generate_content_root(&table_url, &engine, batch_size).await?;
         println!("   ✓ Content root generated");
         current_version = 1; // Commit 0 (with metadataTree-experimental), Commit 1 (content root)
     }
@@ -863,8 +863,6 @@ async fn generate_incremental_commits(
 async fn generate_content_root(
     table_url: &url::Url,
     engine: &std::sync::Arc<dyn delta_kernel::Engine>,
-    _store: &std::sync::Arc<dyn object_store::ObjectStore>,
-    _path_prefix: &str,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use delta_kernel::committer::FileSystemCommitter;
