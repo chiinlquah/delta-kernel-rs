@@ -99,6 +99,44 @@ run_benchmark() {
     fi
 }
 
+# Function to run a DML scenario on a clean copy of the dataset
+run_dml_scenario() {
+    local dataset=$1
+    local scenario=$2
+    local args=$3
+    local output_file=$4
+    local result_prefix=$5
+
+    # Create a temp directory for this scenario
+    local temp_dataset="/tmp/benchmark_temp_${dataset}_$$"
+
+    echo -e "${GREEN}  Running: ${scenario} ${args}${NC}"
+    echo -e "    ${BLUE}Creating clean copy...${NC}"
+
+    # Copy the original dataset to temp location
+    cp -r "${DATASETS_DIR}/${dataset}" "${temp_dataset}"
+
+    # Run the DML operation on the temp copy
+    local table_path="${temp_dataset}"
+    if ${BENCHMARK_RUNNER} -t "${table_path}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+        echo -e "    ${GREEN}✓ DML operation succeeded${NC}"
+
+        # Run a post-DML scan on the modified copy
+        local scan_output="${output_file%.json}_post_scan.json"
+        if ${BENCHMARK_RUNNER} -t "${table_path}" -o json full-table-scan > "${scan_output}" 2>&1; then
+            echo -e "    ${GREEN}✓ Post-DML scan succeeded${NC}"
+        else
+            echo -e "    ${RED}✗ Post-DML scan failed${NC}"
+        fi
+    else
+        echo -e "    ${RED}✗ DML operation failed${NC}"
+        echo "    Error output saved to: ${output_file}"
+    fi
+
+    # Clean up the temp directory
+    rm -rf "${temp_dataset}"
+}
+
 # Function to process a single dataset
 process_dataset() {
     local dataset=$1
@@ -117,7 +155,7 @@ process_dataset() {
         has_content_root=true
     fi
 
-    # Phase 1: Initial Scans
+    # Phase 1: Initial Scans (on original, unmodified dataset)
     echo -e "${YELLOW}Phase 1: Initial Scans (Pre-DML)${NC}"
 
     run_benchmark "${dataset}" "full-table-scan" "" "pre_dml" \
@@ -126,55 +164,45 @@ process_dataset() {
     run_benchmark "${dataset}" "needle-in-haystack" "-p 1" "pre_dml" \
         "${dataset_dir}/02_pre_scan_needle.json" || true
 
-    # Phase 2: DML Operations
+    # Phase 2: DML Operations (each on a clean copy)
     echo ""
-    echo -e "${YELLOW}Phase 2: DML Operations${NC}"
+    echo -e "${YELLOW}Phase 2: DML Operations (each on clean copy)${NC}"
 
     # Small write (5 files, non-bulk)
-    run_benchmark "${dataset}" "small-write" "-n 5" "dml" \
-        "${dataset_dir}/03_dml_small_write.json" || true
+    run_dml_scenario "${dataset}" "small-write" "-n 5" \
+        "${dataset_dir}/03_dml_small_write.json" "small_write"
 
     if [ "${has_content_root}" = true ]; then
         # Small write (5 files, bulk mode) - only for content_root datasets
-        run_benchmark "${dataset}" "small-write" "-n 5 -m" "dml" \
-            "${dataset_dir}/04_dml_small_write_bulk.json" || true
+        run_dml_scenario "${dataset}" "small-write" "-n 5 -m" \
+            "${dataset_dir}/04_dml_small_write_bulk.json" "small_write_bulk"
     else
         echo -e "  ${YELLOW}Skipping small-write bulk mode (requires content_root)${NC}"
     fi
 
     # Bulk write (1000 files, 500 batch size, non-bulk)
-    run_benchmark "${dataset}" "bulk-write" "-n 1000 -b 500" "dml" \
-        "${dataset_dir}/05_dml_bulk_write.json" || true
+    run_dml_scenario "${dataset}" "bulk-write" "-n 1000 -b 500" \
+        "${dataset_dir}/05_dml_bulk_write.json" "bulk_write"
 
     if [ "${has_content_root}" = true ]; then
         # Bulk write (1000 files, 500 batch size, bulk mode) - only for content_root datasets
-        run_benchmark "${dataset}" "bulk-write" "-n 1000 -b 500 -m" "dml" \
-            "${dataset_dir}/06_dml_bulk_write_bulk.json" || true
+        run_dml_scenario "${dataset}" "bulk-write" "-n 1000 -b 500 -m" \
+            "${dataset_dir}/06_dml_bulk_write_bulk.json" "bulk_write_bulk"
     else
         echo -e "  ${YELLOW}Skipping bulk-write bulk mode (requires content_root)${NC}"
     fi
 
     # Vacuum delete (threshold 5, non-bulk)
-    run_benchmark "${dataset}" "vacuum-delete" "-p 5" "dml" \
-        "${dataset_dir}/07_dml_vacuum_delete.json" || true
+    run_dml_scenario "${dataset}" "vacuum-delete" "-p 5" \
+        "${dataset_dir}/07_dml_vacuum_delete.json" "vacuum_delete"
 
     if [ "${has_content_root}" = true ]; then
         # Vacuum delete (threshold 5, bulk mode) - only for content_root datasets
-        run_benchmark "${dataset}" "vacuum-delete" "-p 5 -m" "dml" \
-            "${dataset_dir}/08_dml_vacuum_delete_bulk.json" || true
+        run_dml_scenario "${dataset}" "vacuum-delete" "-p 5 -m" \
+            "${dataset_dir}/08_dml_vacuum_delete_bulk.json" "vacuum_delete_bulk"
     else
         echo -e "  ${YELLOW}Skipping vacuum-delete bulk mode (requires content_root)${NC}"
     fi
-
-    # Phase 3: Post-DML Scans
-    echo ""
-    echo -e "${YELLOW}Phase 3: Post-DML Scans${NC}"
-
-    run_benchmark "${dataset}" "full-table-scan" "" "post_dml" \
-        "${dataset_dir}/09_post_scan_full_table.json" || true
-
-    run_benchmark "${dataset}" "needle-in-haystack" "-p 1" "post_dml" \
-        "${dataset_dir}/10_post_scan_needle.json" || true
 
     # Aggregate results for this dataset
     echo ""

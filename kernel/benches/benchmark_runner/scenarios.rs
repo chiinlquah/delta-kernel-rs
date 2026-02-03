@@ -119,9 +119,10 @@ fn new_null_array(data_type: &ArrowDataType, length: usize) -> ArrayRef {
 fn create_add_files_metadata(
     add_files_schema: &delta_kernel::schema::SchemaRef,
     num_files: usize,
+    start_index: usize,
 ) -> DeltaResult<Box<dyn delta_kernel::EngineData>> {
-    // Generate synthetic file metadata
-    let paths: Vec<String> = (0..num_files)
+    // Generate synthetic file metadata with unique file names
+    let paths: Vec<String> = (start_index..start_index + num_files)
         .map(|i| format!("part-{:05}.parquet", i))
         .collect();
     let sizes: Vec<i64> = (0..num_files)
@@ -271,8 +272,9 @@ pub fn write(
 
     let mut batches = Vec::new();
     let num_batches = num_files / batch_size;
-    for _ in 0..num_batches {
-        batches.push(create_add_files_metadata(&add_files_schema, batch_size)?);
+    for batch_idx in 0..num_batches {
+        let start_index = batch_idx * batch_size;
+        batches.push(create_add_files_metadata(&add_files_schema, batch_size, start_index)?);
     }
 
     add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
