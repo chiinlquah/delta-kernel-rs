@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, ContentRoot, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
+    CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -204,6 +204,10 @@ impl LogReplayScanner {
             let has_metadata_update = metadata_opt.is_some();
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let has_protocol_update = protocol_opt.is_some();
+            let content_root_opt = ContentRoot::try_new_from_data(actions.as_ref())?;
+            // TODO: disable content root if reader feature is disabled. We should look into validating
+            // that content root version is after the feature option was enabled but that may be too
+            // expensive here.
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
@@ -222,6 +226,7 @@ impl LogReplayScanner {
                     table_configuration,
                     metadata_opt,
                     protocol_opt,
+                    content_root_opt,
                     commit_file.version,
                 )?;
             }
@@ -330,6 +335,7 @@ impl PreparePhaseVisitor<'_> {
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
             StructField::nullable(METADATA_NAME, Metadata::to_schema()),
             StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+            StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()),
         ]))
     }
 }

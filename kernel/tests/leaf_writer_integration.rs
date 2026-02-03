@@ -53,8 +53,8 @@ async fn setup_test_tables_with_column_mapping(
             schema.clone(),
             partition_columns,
             true,
-            vec!["columnMapping"],
-            vec!["columnMapping"],
+            vec!["columnMapping", "metadataTree-experimental"],
+            vec!["columnMapping", "metadataTree-experimental"],
         )
         .await?,
         engine_37,
@@ -1421,10 +1421,8 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         // Verify that files were REMOVED from root, not just marked as deleted
         // Read the root manifest and check that it doesn't contain the moved files
         let content_root = final_snapshot
-            .log_segment()
-            .content_root_with_version(&engine)?
-            .expect("Should have content root after batch commit")
-            .0;
+            .content_root()
+            .expect("Should have content root after batch commit");
 
         // Read the root manifest (path is now relative, so join with table root)
         let root_manifest_url = table_url.join(content_root.path())?;
@@ -1572,11 +1570,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
 
             // Get the manifest URL from the committed snapshot
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let content_root = snapshot
-                .log_segment()
-                .content_root_with_version(&engine)?
-                .expect("Should have content root")
-                .0;
+            let content_root = snapshot.content_root().expect("Should have content root");
 
             // Path is now relative, so join with table root
             let root_manifest_url = table_url.join(content_root.path())?;

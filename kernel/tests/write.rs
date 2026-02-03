@@ -68,9 +68,18 @@ fn create_column_mapping_schema(
     ])])?))
 }
 
-/// Setup test tables with column mapping enabled (required for batch_commit mode)
-async fn setup_column_mapping_tables(
-    schema: SchemaRef,
+fn validate_txn_id(commit_info: &serde_json::Value) {
+    let txn_id = commit_info["txnId"]
+        .as_str()
+        .expect("txnId should be present in commitInfo");
+    Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
+}
+
+const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Creates tables with MetadataTreeExperimental feature for batch commit tests
+async fn setup_batch_commit_test_tables(
+    schema: Arc<StructType>,
     partition_columns: &[&str],
     table_base_name: &str,
 ) -> Result<
@@ -82,9 +91,10 @@ async fn setup_column_mapping_tables(
     )>,
     Box<dyn std::error::Error>,
 > {
-    let table_name_37 = format!("{table_base_name}_37_cm");
+    use test_utils::{create_table, engine_store_setup};
+
+    let table_name_37 = format!("{table_base_name}_37");
     let (store_37, engine_37, table_location_37) = engine_store_setup(table_name_37.as_str(), None);
-    let table_name_37_static = Box::leak(table_name_37.into_boxed_str());
 
     Ok(vec![(
         create_table(
@@ -92,25 +102,16 @@ async fn setup_column_mapping_tables(
             table_location_37,
             schema.clone(),
             partition_columns,
-            true,
-            vec!["columnMapping"],
-            vec!["columnMapping"],
+            true,                                               // use_37_protocol
+            vec!["columnMapping", "metadataTree-experimental"], // reader features
+            vec!["columnMapping", "metadataTree-experimental"], // writer features
         )
         .await?,
         engine_37,
         store_37,
-        table_name_37_static,
+        "test_table_37",
     )])
 }
-
-fn validate_txn_id(commit_info: &serde_json::Value) {
-    let txn_id = commit_info["txnId"]
-        .as_str()
-        .expect("txnId should be present in commitInfo");
-    Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
-}
-
-const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Creates a table with deletion vector support and writes the specified files
 async fn create_dv_table_with_files(
@@ -2068,14 +2069,11 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    // create a table with column mapping (required for batch_commit mode)
+    let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, store, table_name) in
-        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
@@ -2113,7 +2111,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, store, table_name) in
-        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
@@ -2849,7 +2847,7 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
     };
 
     let tables = if use_batch_commit {
-        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     };
@@ -2959,7 +2957,7 @@ async fn remove_files_with_modified_selection_vector_impl(
     };
 
     let tables = if use_batch_commit {
-        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     };
@@ -3377,7 +3375,7 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
 
     // Setup table with column mapping - wrap engine in Arc for helper functions
     for (table_url, engine, store, _table_name) in
-        setup_column_mapping_tables(schema.clone(), &[], "batch_commit_test").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "batch_commit_test").await?
     {
         let engine = Arc::new(engine);
 
@@ -3461,7 +3459,7 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, _store, _table_name) in
-        setup_column_mapping_tables(schema.clone(), &[], "test_table").await?
+        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let engine = Arc::new(engine);
         // First, add some files to the table

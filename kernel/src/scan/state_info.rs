@@ -272,6 +272,7 @@ pub(crate) mod tests {
         let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
+            None,
             Url::parse("s3://my-table").unwrap(),
             1,
         )?;

@@ -43,7 +43,7 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
     .unwrap();
     // CDF requires min_writer_version = 4
     let protocol = Protocol::try_new(1, 4, None::<Vec<String>>, None::<Vec<String>>).unwrap();
-    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+    TableConfiguration::try_new(metadata, protocol, None, table_root.clone(), 0).unwrap()
 }
 
 /// Helper to create a Metadata action with the given schema and configuration

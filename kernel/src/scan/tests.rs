@@ -545,8 +545,9 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let log_root = table_root.join("_delta_log/").unwrap();
 
     // Create initial commit with protocol and metadata
-    let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}
+    // Protocol includes MetadataTreeExperimental and ColumnMapping features
+    let commit0_content = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping","metadataTree-experimental"],"writerFeatures":["columnMapping","metadataTree-experimental"]}}
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-value\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"id"},"createdTime":1677811175819}}
 {"add":{"path":"part-v00000.parquet","partitionValues":{},"size":1024,"modificationTime":1677811178336,"dataChange":true}}"#;
     let path0 = Path::from("_delta_log/00000000000000000000.json");
     block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
@@ -594,8 +595,8 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             // Version 3 has the contentRoot action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}"#,
-                version, content_root_url
+{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
+                version, content_root_url, version
             )
         } else {
             format!(
@@ -751,8 +752,9 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let log_root = table_root.join("_delta_log/").unwrap();
 
     // Create initial commit with protocol and metadata
-    let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}
+    // Protocol includes MetadataTreeExperimental and ColumnMapping features
+    let commit0_content = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping","metadataTree-experimental"],"writerFeatures":["columnMapping","metadataTree-experimental"]}}
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-value\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"id"},"createdTime":1677811175819}}
 {"add":{"path":"part-v00000.parquet","partitionValues":{},"size":1024,"modificationTime":1677811178336,"dataChange":true}}"#;
     let path0 = Path::from("_delta_log/00000000000000000000.json");
     block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
@@ -803,8 +805,8 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             // Version 10 has the contentRoot action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}"#,
-                version, content_root_url
+{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
+                version, content_root_url, version
             )
         } else {
             format!(

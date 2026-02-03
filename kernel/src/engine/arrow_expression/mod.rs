@@ -60,7 +60,11 @@ impl Scalar {
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
     // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
     // fields.
-    fn append_to(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> DeltaResult<()> {
+    pub(crate) fn append_to(
+        &self,
+        builder: &mut dyn ArrayBuilder,
+        num_rows: usize,
+    ) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{

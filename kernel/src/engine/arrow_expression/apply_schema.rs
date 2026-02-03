@@ -99,6 +99,8 @@ fn transform_struct(
             .map(|(sa_col, target_field)| -> DeltaResult<_> {
                 let target_field = target_field.borrow();
                 let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
+
+                // Use schema's nullability - Arrow will validate any mismatch
                 let transformed_field = new_field_with_metadata(
                     &target_field.name,
                     transformed_col.data_type(),
@@ -115,6 +117,7 @@ fn transform_struct(
             transformed_cols.len()
         )));
     }
+
     Ok(StructArray::try_new(
         transformed_fields.into(),
         transformed_cols,

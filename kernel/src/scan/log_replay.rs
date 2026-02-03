@@ -493,24 +493,30 @@ pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
 fn get_add_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
-        Arc::new(Expression::Struct(vec![
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.size"),
-            column_expr_ref!("add.modificationTime"),
-            column_expr_ref!("add.stats"),
-            column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![
-                column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId"),
-                column_expr_ref!("add.defaultRowCommitVersion"),
-                column_expr_ref!("add.tags"),
-                column_expr_ref!("add.clusteringProvider"),
-                column_expr_ref!("add.dataManifestPath"),
-                column_expr_ref!("add.dataManifestPosition"),
-                column_expr_ref!("add.deleteManifestPath"),
-                column_expr_ref!("add.deleteManifestPosition"),
-            ])),
-        ]))
+        Arc::new(Expression::Struct(
+            vec![
+                column_expr_ref!("add.path"),
+                column_expr_ref!("add.size"),
+                column_expr_ref!("add.modificationTime"),
+                column_expr_ref!("add.stats"),
+                column_expr_ref!("add.deletionVector"),
+                Arc::new(Expression::Struct(
+                    vec![
+                        column_expr_ref!("add.partitionValues"),
+                        column_expr_ref!("add.baseRowId"),
+                        column_expr_ref!("add.defaultRowCommitVersion"),
+                        column_expr_ref!("add.tags"),
+                        column_expr_ref!("add.clusteringProvider"),
+                        column_expr_ref!("add.dataManifestPath"),
+                        column_expr_ref!("add.dataManifestPosition"),
+                        column_expr_ref!("add.deleteManifestPath"),
+                        column_expr_ref!("add.deleteManifestPosition"),
+                    ],
+                    None,
+                )),
+            ],
+            None,
+        ))
     });
     EXPR.clone()
 }
@@ -521,24 +527,28 @@ fn get_add_transform_expr() -> ExpressionRef {
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
-        Arc::new(Expression::Struct(vec![Arc::new(Expression::Struct(
-            vec![
-                column_expr_ref!("path"),
-                column_expr_ref!("fileConstantValues.partitionValues"),
-                column_expr_ref!("size"),
-                column_expr_ref!("modificationTime"),
-                column_expr_ref!("stats"),
-                column_expr_ref!("fileConstantValues.tags"),
-                column_expr_ref!("deletionVector"),
-                column_expr_ref!("fileConstantValues.baseRowId"),
-                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
-                column_expr_ref!("fileConstantValues.clusteringProvider"),
-                column_expr_ref!("fileConstantValues.dataManifestPath"),
-                column_expr_ref!("fileConstantValues.dataManifestPosition"),
-                column_expr_ref!("fileConstantValues.deleteManifestPath"),
-                column_expr_ref!("fileConstantValues.deleteManifestPosition"),
-            ],
-        ))]))
+        Arc::new(Expression::Struct(
+            vec![Arc::new(Expression::Struct(
+                vec![
+                    column_expr_ref!("path"),
+                    column_expr_ref!("fileConstantValues.partitionValues"),
+                    column_expr_ref!("size"),
+                    column_expr_ref!("modificationTime"),
+                    column_expr_ref!("stats"),
+                    column_expr_ref!("fileConstantValues.tags"),
+                    column_expr_ref!("deletionVector"),
+                    column_expr_ref!("fileConstantValues.baseRowId"),
+                    column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                    column_expr_ref!("fileConstantValues.clusteringProvider"),
+                    column_expr_ref!("fileConstantValues.dataManifestPath"),
+                    column_expr_ref!("fileConstantValues.dataManifestPosition"),
+                    column_expr_ref!("fileConstantValues.deleteManifestPath"),
+                    column_expr_ref!("fileConstantValues.deleteManifestPosition"),
+                ],
+                None,
+            ))],
+            None,
+        ))
     });
     EXPR.clone()
 }

@@ -466,6 +466,8 @@ impl MetadataBuilder {
             tracking_info: Some(TrackingInfo {
                 status,
                 snapshot_id,
+                // TODO: For newly added files (status = Added), sequence_number and file_sequence_number
+                // should be None to inherit from the manifest. Only existing files (status = Existed) need these set.
                 sequence_number: Some(version as i64),
                 file_sequence_number: Some(version as i64),
 
@@ -1159,9 +1161,9 @@ impl MetadataBuilder {
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id,
-                // Optional for leaf manifests
+                // TODO: Manifest entries in root should have sequence_number and file_sequence_number
+                // set to self.version so that leaf entries can inherit them when null.
                 sequence_number: None,
-                // Optional for leaf manifests
                 file_sequence_number: None,
                 // Maybe later
                 first_row_id: None,
