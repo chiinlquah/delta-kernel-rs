@@ -82,7 +82,7 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::{DataType, SchemaRef};
+use self::schema::{ColumnName, DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
@@ -486,6 +486,131 @@ pub trait EvaluationHandler: AsAny {
         schema: SchemaRef,
         rows: &[&[Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Create a new [`LookupJoiner`] for performing efficient key-based joins with cached lookup data.
+    ///
+    /// This method creates a joiner that maintains an in-memory hash map from join keys to data
+    /// locations, enabling O(1) lookup performance during joins. The joiner can be extended with
+    /// additional lookup data and used to join input data with the cached lookup table.
+    ///
+    /// # Parameters
+    ///
+    /// - `lookup_schema`: Schema of the complete lookup data table.
+    /// - `key_column`: Column path of the join key in the lookup data. **Must be String type**.
+    /// - `value_columns`: Column paths of the values to extract from lookup data and append during join.
+    /// - `lookup_version_column`: Column path for version in lookup data. **Must be Int64 type and must not contain null values**.
+    /// - `initial_data`: Initial lookup data to populate the joiner's cache.
+    ///
+    /// # Returns
+    ///
+    /// A [`LookupJoiner`] instance ready to perform joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The key column is not found in the lookup schema
+    /// - The key column is not of String type (only String keys are supported)
+    /// - Any value column is not found in the lookup schema
+    /// - The version column is not found in the lookup schema
+    /// - The version column is not of Int64 type
+    /// - Any version value in the lookup data is null
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let joiner = handler.new_lookup_join_handler(
+    ///     lookup_schema,
+    ///     &column_name!("id"),
+    ///     &[column_name!("name"), column_name!("age")],
+    ///     Some(&column_name!("version")),
+    ///     [&lookup_data].into_iter(),
+    /// )?;
+    /// ```
+    fn new_lookup_join_handler(
+        &self,
+        lookup_schema: SchemaRef,
+        key_column: &ColumnName,
+        value_columns: &[ColumnName],
+        lookup_version_column: &ColumnName,
+        initial_data: &[&FilteredEngineData],
+    ) -> DeltaResult<Box<dyn LookupJoiner>>;
+}
+
+/// A trait for performing efficient lookup joins with cached data.
+///
+/// A [`LookupJoiner`] maintains an in-memory hash map from join keys to data locations,
+/// enabling O(1) lookup performance during joins. The joiner supports:
+///
+/// - **Extending**: Adding more lookup data to the cache (first-wins for duplicate keys)
+/// - **Joining**: Joining input data with cached lookup data by appending value columns
+///
+/// # Key Type Support
+///
+/// Currently, only **String** keys are supported. The key column must be of String type
+/// in both the lookup data and input data.
+///
+/// # Null Key Handling
+///
+/// - **Null keys in lookup data**: Not added to the hash map, cannot be matched
+/// - **Null keys in input data**: Return null values for all value columns
+///
+/// # Performance
+///
+/// - Lookup time: O(1) average per key
+/// - Extend time: O(n) where n = new rows to index
+/// - Join time: O(m) where m = input rows
+/// - Space complexity: O(unique_keys + total_lookup_rows)
+pub trait LookupJoiner: AsAny {
+    /// Extend the joiner with additional lookup data.
+    ///
+    /// Adds more rows to the lookup cache. For duplicate keys, the first occurrence wins
+    /// (keys already in the cache are not updated).
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Additional lookup data to add to the cache.
+    ///
+    /// # Returns
+    ///
+    /// A new [`LookupJoiner`] instance with the extended cache.
+    fn extend(self: Box<Self>, data: &[&FilteredEngineData]) -> DeltaResult<Box<dyn LookupJoiner>>;
+
+    /// Join input data with cached lookup data.
+    ///
+    /// For each row in the input data, looks up the join key in the cached lookup table
+    /// and appends the corresponding value columns. If a key is not found or is null,
+    /// null values are appended for all value columns.
+    ///
+    /// The join filters based on versions: if the input version is strictly greater than
+    /// the lookup version for a matched key, null values are returned instead (treating
+    /// the lookup data as stale).
+    ///
+    /// # Parameters
+    ///
+    /// - `input_data`: Input data to join with the lookup table.
+    /// - `input_key_column`: Column path of the join key in the input data. **Must be String type**.
+    /// - `input_version_column`: Column path for version in input data. **Must be Int64 type and must not contain null values**.
+    ///
+    /// # Returns
+    ///
+    /// A [`FilteredEngineData`] with the original input columns plus the appended value columns
+    /// from the lookup table. The selection vector from the input is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The key column is not found in the input data
+    /// - The key column is not of String type
+    /// - The version column is not found in the input data
+    /// - The version column is not of Int64 type
+    /// - Any version value in the input data is null
+    /// - Arrow operations fail (e.g., schema mismatch, allocation failure)
+    fn join(
+        &self,
+        input_data: &FilteredEngineData,
+        input_key_column: &ColumnName,
+        input_version_column: &ColumnName,
+    ) -> DeltaResult<FilteredEngineData>;
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
