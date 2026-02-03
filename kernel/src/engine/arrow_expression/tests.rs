@@ -1125,3 +1125,44 @@ fn test_to_json_with_nested_struct() {
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
 }
+
+#[test]
+fn test_map_literal_evaluation() {
+    // This test verifies that Map literals work correctly in the optimized metadata path
+    // The optimized path creates an empty Map literal for partitionValues
+    let empty_map = MapData::try_new(
+        MapType::new(KernelDataType::STRING, KernelDataType::STRING, false),
+        Vec::<(Scalar, Scalar)>::new(),
+    )
+    .unwrap();
+
+    let map_expr = Expression::literal(Scalar::Map(empty_map));
+
+    // Create a simple schema and null row for evaluation context
+    let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+        "test",
+        KernelDataType::INTEGER,
+        true, // nullable
+    )]));
+
+    let handler = ArrowEvaluationHandler;
+    let null_row = handler.null_row(schema.clone()).unwrap();
+
+    // Create evaluator with non-nullable Map type (like in metadata path)
+    let map_type = KernelDataType::Map(Box::new(MapType::new(
+        KernelDataType::STRING,
+        KernelDataType::STRING,
+        false,
+    )));
+    let evaluator = handler
+        .new_expression_evaluator(schema, Arc::new(map_expr), map_type)
+        .unwrap();
+
+    // This should not panic - verifies Map literal evaluation works
+    let result = evaluator.evaluate(null_row.as_ref());
+    assert!(
+        result.is_ok(),
+        "Map literal evaluation should succeed: {:?}",
+        result.err()
+    );
+}

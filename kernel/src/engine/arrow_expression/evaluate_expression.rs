@@ -122,13 +122,15 @@ fn evaluate_struct_expression(
         .iter()
         .zip(output_schema.fields())
         .map(|(output_col, output_field)| {
+            // Use schema's nullability - Arrow will validate any mismatch
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();
+
     let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
     Ok(Arc::new(data))
 }
@@ -216,13 +218,15 @@ fn evaluate_transform_expression(
         .iter()
         .zip(output_schema.fields())
         .map(|(output_col, output_field)| {
+            // Use schema's nullability - Arrow will validate any mismatch
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();
+
     let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
     Ok(Arc::new(data))
 }
@@ -238,15 +242,21 @@ pub fn evaluate_expression(
     use UnaryExpressionOp::*;
     use VariadicExpressionOp::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => {
-            validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
+        (Literal(scalar), result_type_opt) => {
+            validate_array_type(scalar.to_array(batch.num_rows())?, result_type_opt)
         }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
-        (Struct(fields), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_expression(fields, batch, output_schema)
+        (Struct(fields, schema), Some(DataType::Struct(output_schema))) => {
+            // Use explicit schema if provided, otherwise use output_schema from context
+            let target_schema = schema.as_ref().map(|s| s.as_ref()).unwrap_or(output_schema);
+            evaluate_struct_expression(fields, batch, target_schema)
         }
-        (Struct(_), dt) => Err(Error::Generic(format!(
-            "Struct expression expects a DataType::Struct result, but got {dt:?}"
+        (Struct(fields, Some(schema)), None | Some(_)) => {
+            // Struct has explicit schema, use it regardless of result_type
+            evaluate_struct_expression(fields, batch, schema.as_ref())
+        }
+        (Struct(_, None), dt) => Err(Error::Generic(format!(
+            "Struct expression without schema expects a DataType::Struct result, but got {dt:?}"
         ))),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
             evaluate_transform_expression(transform, batch, output_schema)
@@ -1017,7 +1027,7 @@ mod tests {
         let test_cases = vec![
             (
                 "too many schema fields",
-                Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]),
+                Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")], None),
                 StructType::new_unchecked(vec![
                     StructField::not_null("a", DataType::INTEGER),
                     StructField::not_null("b", DataType::INTEGER),
@@ -1026,11 +1036,14 @@ mod tests {
             ),
             (
                 "too few schema fields",
-                Expr::Struct(vec![
-                    column_expr_ref!("a"),
-                    column_expr_ref!("b"),
-                    column_expr_ref!("c"),
-                ]),
+                Expr::Struct(
+                    vec![
+                        column_expr_ref!("a"),
+                        column_expr_ref!("b"),
+                        column_expr_ref!("c"),
+                    ],
+                    None,
+                ),
                 StructType::new_unchecked(vec![
                     StructField::not_null("a", DataType::INTEGER),
                     StructField::not_null("b", DataType::INTEGER),
