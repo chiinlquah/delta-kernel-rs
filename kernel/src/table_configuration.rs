@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{ContentRoot, Metadata, Protocol};
 use crate::scan::data_skipping::stats_schema::expected_stats_schema;
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, StructType};
@@ -55,6 +55,7 @@ pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
     schema: SchemaRef,
+    content_root: Option<ContentRoot>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -85,6 +86,7 @@ impl TableConfiguration {
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
+        content_root: Option<ContentRoot>,
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
@@ -103,6 +105,7 @@ impl TableConfiguration {
             schema,
             metadata,
             protocol,
+            content_root,
             table_properties,
             column_mapping_mode,
             table_root,
@@ -116,10 +119,11 @@ impl TableConfiguration {
         table_configuration: &Self,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
+        new_content_root: Option<ContentRoot>,
         new_version: Version,
     ) -> DeltaResult<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
-        if new_metadata.is_none() && new_protocol.is_none() {
+        if new_metadata.is_none() && new_protocol.is_none() && new_content_root.is_none() {
             return Ok(Self {
                 version: new_version,
                 ..table_configuration.clone()
@@ -132,6 +136,7 @@ impl TableConfiguration {
         Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
+            new_content_root.or(table_configuration.content_root.clone()),
             table_configuration.table_root.clone(),
             new_version,
         )
@@ -239,6 +244,15 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn version(&self) -> Version {
         self.version
+    }
+
+    /// The [`ContentRoot`] of this table at this version, if present.
+    ///
+    /// Returns `None` if this table has never written a ContentRoot action.
+    /// Once a ContentRoot is written, it is cached for the lifetime of this snapshot.
+    #[internal_api]
+    pub(crate) fn content_root(&self) -> Option<&ContentRoot> {
+        self.content_root.as_ref()
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
@@ -680,7 +694,7 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+        TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap()
     }
 
     #[test]
@@ -703,7 +717,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -734,7 +749,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -831,7 +847,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         // When ICT is enabled from table creation (version 0), it's perfectly normal
@@ -875,7 +892,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -916,7 +934,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
@@ -936,7 +955,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(!table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -948,7 +968,8 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         table_config
             .ensure_operation_supported(Operation::Scan)
             .expect_err("Unknown feature is not supported in kernel");
@@ -973,7 +994,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(!table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(!table_config.is_feature_enabled(&TableFeature::DeletionVectors));
     }
@@ -998,7 +1020,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
 
         let new_schema =
             StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
@@ -1036,6 +1059,7 @@ mod test {
             &table_config,
             Some(new_metadata.clone()),
             Some(new_protocol.clone()),
+            None,
             new_version,
         )
         .unwrap();
@@ -1087,6 +1111,7 @@ mod test {
         let result = TableConfiguration::try_new(
             metadata.clone(),
             protocol_without_timestamp_ntz_features,
+            None,
             table_root.clone(),
             0,
         );
@@ -1095,6 +1120,7 @@ mod test {
         let result = TableConfiguration::try_new(
             metadata,
             protocol_with_timestamp_ntz_features,
+            None,
             table_root,
             0,
         );
@@ -1132,13 +1158,19 @@ mod test {
         let result: Result<TableConfiguration, Error> = TableConfiguration::try_new(
             metadata.clone(),
             protocol_without_variant_features,
+            None,
             table_root.clone(),
             0,
         );
         assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
 
-        let result =
-            TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);
+        let result = TableConfiguration::try_new(
+            metadata,
+            protocol_with_variant_features,
+            None,
+            table_root,
+            0,
+        );
         assert!(
             result.is_ok(),
             "Should succeed when VARIANT is used with required features"
@@ -1374,7 +1406,7 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
             "rowTracking requires domainMetadata to be supported",
@@ -1396,7 +1428,7 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "RowTracking with DomainMetadata should be supported for writes"

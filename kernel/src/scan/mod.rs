@@ -621,7 +621,8 @@ impl Scan {
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
-                false,                     // Don't skip leaf manifests for incremental scans
+                self.snapshot.content_root(),
+                false, // Don't skip leaf manifests for incremental scans
             )?;
         let it = action_batch_iter.chain(existing_data.into_iter().map(apply_transform));
 
@@ -675,6 +676,7 @@ impl Scan {
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
+                self.snapshot.content_root(),
                 self.skip_leaf_manifests,
             )
     }

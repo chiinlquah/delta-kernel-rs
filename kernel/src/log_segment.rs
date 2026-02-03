@@ -13,6 +13,7 @@ use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
@@ -34,6 +35,8 @@ use url::Url;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_content_root_validation;
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
@@ -440,16 +443,15 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         data_predicate: Option<PredicateRef>,
+        content_root: Option<&ContentRoot>,
         skip_leaf_manifests: bool,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
         Option<bool>,
         SchemaRef,
     )> {
-        // Always get the content root from the log if it exists
-        let content_root_with_version = self.content_root_with_version(engine)?;
-        let content_root_version = content_root_with_version.as_ref().map(|(_, v)| *v);
-        let content_root = content_root_with_version.as_ref().map(|(cr, _)| cr);
+        // content_root is now passed in from caller (no I/O needed)
+        let content_root_version = content_root.map(|cr| cr.version);
 
         let commit_stream =
             CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
@@ -497,6 +499,7 @@ impl LogSegment {
                 meta_predicate,
                 None,
                 None,  // No data predicate for manifest-level skipping
+                None,  // No content root available in this context
                 false, // Don't skip leaf manifests by default
             )?;
         Ok(actions_iter)
@@ -980,73 +983,109 @@ impl LogSegment {
             .map(|sidecar| sidecar.to_filemeta(&self.log_root))
             .try_collect()
     }
+}
 
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
-    pub(crate) fn protocol_and_metadata(
+impl LogSegment {
+    /// Validate content root compatibility with protocol and update root enabled state.
+    ///
+    /// When a protocol is discovered, this checks that if the protocol lacks the
+    /// MetadataTreeExperimental feature, no content root should have been found.
+    /// Updates the root_enabled flag based on the protocol's features.
+    fn validate_content_root_with_protocol(
+        protocol: &Protocol,
+        content_root_opt: &Option<ContentRoot>,
+        root_enabled: &mut bool,
+    ) -> DeltaResult<()> {
+        *root_enabled = protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental);
+
+        // If protocol lacks the feature but we already found a content root, that's invalid
+        if !*root_enabled && content_root_opt.is_some() {
+            return Err(Error::invalid_protocol(
+                "Found ContentRoot action but protocol does not have MetadataTreeExperimental reader feature enabled"
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Read protocol, metadata, and content root from the log segment.
+    ///
+    /// If an existing_protocol is provided, it will be used to determine the initial
+    /// content root search state. If the protocol doesn't have the MetadataTreeExperimental
+    /// feature, content root search will be skipped entirely. If no existing_protocol is
+    /// provided, the search will start optimistically and adjust once protocol is discovered.
+    pub(crate) fn protocol_and_metadata_and_content_root(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        existing_protocol: Option<&Protocol>,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<ContentRoot>)> {
+        // Determine if content root is enabled based on existing protocol knowledge
+        let mut root_enabled = match existing_protocol {
+            Some(protocol) => protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental),
+            None => {
+                // No existing protocol - start optimistically
+                true
+            }
+        };
+
+        // Cache whether content root was enabled at start to determine early termination behavior
+        let root_enabled_at_start = root_enabled;
+
         let actions_batches = self.replay_for_metadata(engine)?;
-        let (mut metadata_opt, mut protocol_opt) = (None, None);
+        let (mut metadata_opt, mut protocol_opt, mut content_root_opt) = (None, None, None);
+
         for actions_batch in actions_batches {
             let actions = actions_batch?.actions;
+
+            // Always search for Protocol and Metadata
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
+
             if protocol_opt.is_none() {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+                if let Some(protocol) = protocol_opt.as_ref() {
+                    Self::validate_content_root_with_protocol(
+                        protocol,
+                        &content_root_opt,
+                        &mut root_enabled,
+                    )?;
+                }
             }
+
+            // Only search for content root if enabled
+            if root_enabled && content_root_opt.is_none() {
+                content_root_opt = ContentRoot::try_new_from_data(actions.as_ref())?;
+            }
+
+            // Early termination: stop when we have everything we need
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                // we've found both, we can stop
-                break;
-            }
-        }
-        Ok((metadata_opt, protocol_opt))
-    }
+                // If content root is disabled, we're done (no content root to search for)
+                if !root_enabled {
+                    break;
+                }
 
-    /// Find the content root action and its version from the log.
-    /// Returns the ContentRoot and the version of the commit where it was found.
-    /// This is used to optimize file action reading by skipping commits before the content root.
-    #[allow(dead_code, unreachable_pub)]
-    pub fn content_root_with_version(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<(ContentRoot, Version)>> {
-        let schema = get_commit_schema().project(&[CONTENT_ROOT_NAME])?;
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(
-                Expression::column([CONTENT_ROOT_NAME, "path"]).is_not_null(),
-            ))
-        });
-
-        // Read commits in descending order (most recent first)
-        for commit_file in self.ascending_commit_files.iter().rev() {
-            let batches = engine.json_handler().read_json_files(
-                std::slice::from_ref(&commit_file.location),
-                schema.clone(),
-                META_PREDICATE.clone(),
-            )?;
-
-            for batch_result in batches {
-                let batch = batch_result?;
-                if let Ok(Some(cr)) = ContentRoot::try_new_from_data(batch.as_ref()) {
-                    return Ok(Some((cr, commit_file.version)));
+                // If content root is enabled:
+                // - If we found content root, we're done
+                // - If content root was just enabled (wasn't enabled at start), we're done
+                //   (feature was just turned on, no content root written yet)
+                // - Otherwise keep searching (content root was enabled at start, should exist)
+                if content_root_opt.is_some() || !root_enabled_at_start {
+                    break;
                 }
             }
         }
 
-        Ok(None)
-    }
-
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+        // Final validation: if we found content root but protocol doesn't support it, error
+        if let (Some(protocol), Some(_)) = (protocol_opt.as_ref(), content_root_opt.as_ref()) {
+            if !protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental) {
+                return Err(Error::invalid_protocol(
+                    "Found ContentRoot action but protocol does not have MetadataTreeExperimental reader feature enabled"
+                ));
+            }
         }
+
+        Ok((metadata_opt, protocol_opt, content_root_opt))
     }
 
     // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
@@ -1054,12 +1093,16 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        let schema =
+            get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CONTENT_ROOT_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
             Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
+                Predicate::or(
+                    Expression::column([METADATA_NAME, "id"]).is_not_null(),
+                    Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
+                ),
+                Expression::column([CONTENT_ROOT_NAME, "path"]).is_not_null(),
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints

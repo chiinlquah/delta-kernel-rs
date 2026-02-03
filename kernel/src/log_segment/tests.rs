@@ -1,7 +1,6 @@
 use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 
-use futures::executor::block_on;
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_log::test;
@@ -15,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -108,14 +107,14 @@ fn test_replay_for_metadata() {
     // 5. txn (physically missing P&M columns)
     //
     // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
-    // always skips parts 4 and 5 because it terminates the iteration after finding both P&M.
+    // now also looks for ContentRoot in addition to P&M, so it doesn't terminate early.
     //
     // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
     //
     // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
-    // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
+    // read parts 1, 4, and 5 (5 in all instead of 2) because row group skipping is disabled for
     // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
-    assert_eq!(data.len(), 4);
+    assert_eq!(data.len(), 5);
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts
@@ -2537,294 +2536,6 @@ fn test_publish_validation() {
     } else {
         panic!("Expected Error::Generic");
     }
-}
-
-#[test]
-fn test_content_root_found_in_commit() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = Arc::new(DefaultEngine::new(store.clone()));
-
-    // Write commit files: version 0 without content root, version 1 with content root
-    let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[]}}
-"#;
-    let commit1_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"contentRoot":{"path":"memory:///test.content.parquet","sizeInBytes":1024}}
-"#;
-
-    let path0 = Path::from("_delta_log/00000000000000000000.json");
-    let path1 = Path::from("_delta_log/00000000000000000001.json");
-    block_on(async {
-        store.put(&path0, commit0_content.into()).await.unwrap();
-        store.put(&path1, commit1_content.into()).await.unwrap();
-    });
-
-    let table_root = {
-        let log_root_str = log_root.as_str();
-        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
-            Url::parse(stripped).unwrap()
-        } else {
-            log_root.clone()
-        }
-    };
-    let log_segment = LogSegment {
-        end_version: 1,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root,
-        ascending_commit_files: vec![
-            create_log_path("memory:///_delta_log/00000000000000000000.json"),
-            create_log_path("memory:///_delta_log/00000000000000000001.json"),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
-    assert!(
-        content_root_with_version.is_some(),
-        "Should find content root"
-    );
-    let (cr, version) = content_root_with_version.unwrap();
-    assert_eq!(cr.path, "memory:///test.content.parquet");
-    assert_eq!(cr.size_in_bytes, 1024);
-    assert_eq!(version, 1);
-
-    Ok(())
-}
-
-#[test]
-fn test_content_root_not_found() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = Arc::new(DefaultEngine::new(store.clone()));
-
-    // Write commit files without content root
-    let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[]}}
-"#;
-    let commit1_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"add":{"path":"file.parquet","partitionValues":{},"size":10,"modificationTime":0,"dataChange":true}}
-"#;
-
-    let path0 = Path::from("_delta_log/00000000000000000000.json");
-    let path1 = Path::from("_delta_log/00000000000000000001.json");
-    block_on(async {
-        store.put(&path0, commit0_content.into()).await.unwrap();
-        store.put(&path1, commit1_content.into()).await.unwrap();
-    });
-
-    let table_root = {
-        let log_root_str = log_root.as_str();
-        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
-            Url::parse(stripped).unwrap()
-        } else {
-            log_root.clone()
-        }
-    };
-    let log_segment = LogSegment {
-        end_version: 1,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root,
-        ascending_commit_files: vec![
-            create_log_path("memory:///_delta_log/00000000000000000000.json"),
-            create_log_path("memory:///_delta_log/00000000000000000001.json"),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
-    assert!(
-        content_root_with_version.is_none(),
-        "Should not find content root"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_content_root_found_in_checkpoint() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = Arc::new(DefaultEngine::new(store.clone()));
-
-    // Write a commit file with content root and protocol/metadata
-    // The content_root function uses read_actions with ContentRoot schema, so it should
-    // find ContentRoot in commits that have it
-    let commit1_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[]}}
-{"contentRoot":{"path":"memory:///commit.content.parquet","sizeInBytes":4096}}
-"#;
-    let path1 = Path::from("_delta_log/00000000000000000001.json");
-    block_on(async {
-        store.put(&path1, commit1_content.into()).await.unwrap();
-    });
-
-    let table_root = {
-        let log_root_str = log_root.as_str();
-        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
-            Url::parse(stripped).unwrap()
-        } else {
-            log_root.clone()
-        }
-    };
-    let log_segment = LogSegment {
-        end_version: 1,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root,
-        ascending_commit_files: vec![create_log_path(
-            "memory:///_delta_log/00000000000000000001.json",
-        )],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // Should find content root in commit
-    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
-    assert!(
-        content_root_with_version.is_some(),
-        "Should find content root"
-    );
-    let (cr, version) = content_root_with_version.unwrap();
-    assert_eq!(cr.path, "memory:///commit.content.parquet");
-    assert_eq!(cr.size_in_bytes, 4096);
-    assert_eq!(version, 1);
-
-    Ok(())
-}
-
-#[test]
-fn test_content_root_returns_first_found() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = Arc::new(DefaultEngine::new(store.clone()));
-
-    // Write commit files: version 0 with content root, version 1 with different content root
-    let commit0_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"contentRoot":{"path":"memory:///first.content.parquet","sizeInBytes":1024}}
-"#;
-    let commit1_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"contentRoot":{"path":"memory:///second.content.parquet","sizeInBytes":2048}}
-"#;
-
-    let path0 = Path::from("_delta_log/00000000000000000000.json");
-    let path1 = Path::from("_delta_log/00000000000000000001.json");
-    block_on(async {
-        store.put(&path0, commit0_content.into()).await.unwrap();
-        store.put(&path1, commit1_content.into()).await.unwrap();
-    });
-
-    let table_root = {
-        let log_root_str = log_root.as_str();
-        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
-            Url::parse(stripped).unwrap()
-        } else {
-            log_root.clone()
-        }
-    };
-    let log_segment = LogSegment {
-        end_version: 1,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root,
-        ascending_commit_files: vec![
-            create_log_path("memory:///_delta_log/00000000000000000000.json"),
-            create_log_path("memory:///_delta_log/00000000000000000001.json"),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // The function iterates from most recent to oldest, so it should find the first one
-    // it encounters. Since we read commits in descending order,
-    // it should find version 1's content root first.
-    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
-    assert!(
-        content_root_with_version.is_some(),
-        "Should find content root"
-    );
-    let (cr, version) = content_root_with_version.unwrap();
-    // Note: we read commits in descending order, so version 1 comes first
-    assert_eq!(cr.path, "memory:///second.content.parquet");
-    assert_eq!(cr.size_in_bytes, 2048);
-    assert_eq!(version, 1);
-
-    Ok(())
-}
-
-#[test]
-fn test_content_root_with_multiple_commits() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = Arc::new(DefaultEngine::new(store.clone()));
-
-    // Write commit files: version 1 without content root, version 2 with content root
-    let commit1_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"add":{"path":"file.parquet","partitionValues":{},"size":10,"modificationTime":0,"dataChange":true}}
-"#;
-    let commit2_content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}
-{"contentRoot":{"path":"memory:///commit.content.parquet","sizeInBytes":4096}}
-"#;
-
-    let path1 = Path::from("_delta_log/00000000000000000001.json");
-    let path2 = Path::from("_delta_log/00000000000000000002.json");
-    block_on(async {
-        store.put(&path1, commit1_content.into()).await.unwrap();
-        store.put(&path2, commit2_content.into()).await.unwrap();
-    });
-
-    let table_root = {
-        let log_root_str = log_root.as_str();
-        if let Some(stripped) = log_root_str.strip_suffix("_delta_log/") {
-            Url::parse(stripped).unwrap()
-        } else {
-            log_root.clone()
-        }
-    };
-    let log_segment = LogSegment {
-        end_version: 2,
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root,
-        ascending_commit_files: vec![
-            create_log_path("memory:///_delta_log/00000000000000000001.json"),
-            create_log_path("memory:///_delta_log/00000000000000000002.json"),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // Should find content root in commit file (version 2 comes first in descending order)
-    let content_root_with_version = log_segment.content_root_with_version(engine.as_ref())?;
-    assert!(
-        content_root_with_version.is_some(),
-        "Should find content root"
-    );
-    let (cr, version) = content_root_with_version.unwrap();
-    assert_eq!(cr.path, "memory:///commit.content.parquet");
-    assert_eq!(cr.size_in_bytes, 4096);
-    assert_eq!(version, 2);
-
-    Ok(())
 }
 
 /// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment

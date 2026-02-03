@@ -9,7 +9,7 @@ use crate::actions::domain_metadata::{
     all_domain_metadata_configuration, domain_metadata_configuration,
 };
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::INTERNAL_DOMAIN_PREFIX;
+use crate::actions::{ContentRoot, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
@@ -210,11 +210,15 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let (new_metadata, new_protocol) = new_log_segment.protocol_and_metadata(engine)?;
+        // Pass existing protocol to optimize content root search
+        let existing_protocol = existing_snapshot.table_configuration().protocol();
+        let (new_metadata, new_protocol, new_content_root) = new_log_segment
+            .protocol_and_metadata_and_content_root(engine, Some(existing_protocol))?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
             new_protocol,
+            new_content_root,
             new_log_segment.end_version,
         )?;
 
@@ -317,7 +321,9 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
 
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        // No existing protocol for initial snapshot - search will start optimistically
+        let (metadata_opt, protocol_opt, content_root) =
+            log_segment.protocol_and_metadata_and_content_root(engine, None)?;
         let read_metadata_duration = start.elapsed();
 
         reporter.as_ref().inspect(|r| {
@@ -327,8 +333,21 @@ impl Snapshot {
             });
         });
 
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+        // Unwrap metadata and protocol, returning errors if missing
+        let (metadata, protocol) = match (metadata_opt, protocol_opt) {
+            (Some(m), Some(p)) => (m, p),
+            (None, Some(_)) => return Err(Error::MissingMetadata),
+            (Some(_), None) => return Err(Error::MissingProtocol),
+            (None, None) => return Err(Error::MissingMetadataAndProtocol),
+        };
+
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            protocol,
+            content_root,
+            location,
+            log_segment.end_version,
+        )?;
 
         Ok(Self {
             log_segment,
@@ -434,6 +453,17 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
+    }
+
+    /// Get the [`ContentRoot`] for this snapshot, if present.
+    ///
+    /// Returns the cached ContentRoot action from the table's commit log.
+    /// This is populated during snapshot creation and does not require additional I/O.
+    ///
+    /// Returns `None` if this table has never written a ContentRoot action.
+    #[internal_api]
+    pub(crate) fn content_root(&self) -> Option<&ContentRoot> {
+        self.table_configuration().content_root()
     }
 
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.

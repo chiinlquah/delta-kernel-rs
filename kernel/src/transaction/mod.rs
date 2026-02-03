@@ -580,7 +580,15 @@ impl Transaction {
         );
 
         // Handle batch commit - either write to metadata tree or include in JSON log
-        if self.batch_commit
+        // Batch commit requires the MetadataTreeExperimental writer feature
+        let can_batch_commit = self.batch_commit
+            && self
+                .read_snapshot
+                .table_configuration()
+                .protocol()
+                .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
+
+        if can_batch_commit
             && (!self.add_files_metadata.is_empty()
                 || !self.remove_files_metadata.is_empty()
                 || !self.leaf_manifests.is_empty())
@@ -598,11 +606,11 @@ impl Transaction {
                 ))
             );
 
-            // Find the latest content root in the log segment
+            // Get the cached content root from the snapshot (no I/O needed)
             let latest_content_root = self
                 .read_snapshot
-                .log_segment()
-                .content_root_with_version(engine)?;
+                .content_root()
+                .map(|cr| (cr.clone(), cr.version));
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with parquet.field.id metadata for stats mapping
@@ -851,10 +859,13 @@ impl Transaction {
                 self.read_snapshot.table_root(),
             )?;
 
+            // The content root represents the state at the new commit version
+            let new_commit_version = self.read_snapshot.version() + 1;
             let content_root_action = ContentRoot {
                 path,
                 // TODO: set size_in_bytes
                 size_in_bytes: 0,
+                version: new_commit_version,
             };
 
             // Use the log schema to wrap ContentRoot in a "contentRoot" field
@@ -1044,13 +1055,10 @@ impl Transaction {
     /// * `Ok(Some(Url))` - The URL of the root manifest
     /// * `Ok(None)` - No content root exists yet
     /// * `Err` - Error reading the log segment
-    pub fn root_manifest_url(&self, engine: &dyn Engine) -> DeltaResult<Option<Url>> {
-        let content_root = self
-            .read_snapshot
-            .log_segment()
-            .content_root_with_version(engine)?;
+    pub fn root_manifest_url(&self, _engine: &dyn Engine) -> DeltaResult<Option<Url>> {
+        let content_root = self.read_snapshot.content_root();
         let table_root = self.read_snapshot.table_root();
-        Ok(content_root.and_then(|(cr, _)| table_root.join(&cr.path).ok()))
+        Ok(content_root.and_then(|cr| table_root.join(&cr.path).ok()))
     }
 
     /// Incorporate leaf writer results into this transaction.
@@ -2661,8 +2669,8 @@ mod tests {
                 "protocol": {
                     "minReaderVersion": 3,
                     "minWriterVersion": 7,
-                    "readerFeatures": ["columnMapping"],
-                    "writerFeatures": ["columnMapping"]
+                    "readerFeatures": ["columnMapping", "metadataTree-experimental"],
+                    "writerFeatures": ["columnMapping", "metadataTree-experimental"]
                 }
             })
         } else {
@@ -2730,7 +2738,8 @@ mod tests {
         let content_root = json!({
             "contentRoot": {
                 "path": content_root_path,
-                "sizeInBytes": 0
+                "sizeInBytes": 0,
+                "version": version
             }
         });
 

@@ -14,7 +14,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
-    IntoEngineData, RowVisitor as _,
+    IntoEngineData, RowVisitor as _, Version,
 };
 
 use url::Url;
@@ -488,6 +488,20 @@ impl Protocol {
             .is_some_and(|features| features.contains(feature))
     }
 
+    /// True if this protocol has the requested reader feature.
+    /// Use this to check if the table can be READ with a specific feature.
+    pub(crate) fn has_reader_feature(&self, feature: &TableFeature) -> bool {
+        self.reader_features()
+            .is_some_and(|features| features.contains(feature))
+    }
+
+    /// True if this protocol has the requested writer feature.
+    /// Use this to check if the table can be WRITTEN with a specific feature.
+    pub(crate) fn has_writer_feature(&self, feature: &TableFeature) -> bool {
+        self.writer_features()
+            .is_some_and(|features| features.contains(feature))
+    }
+
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
         // The protocol states that Reader features may be present if and only if the min_reader_version is 3
@@ -867,6 +881,8 @@ pub(crate) struct ContentRoot {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
     pub(crate) size_in_bytes: FileSize,
+    /// The table version that this content root represents.
+    pub(crate) version: Version,
 }
 
 impl ContentRoot {
@@ -890,7 +906,11 @@ impl IntoEngineData for ContentRoot {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [self.path.into(), self.size_in_bytes.into()];
+        let values = [
+            self.path.into(),
+            self.size_in_bytes.into(),
+            self.version.into(),
+        ];
 
         engine.evaluation_handler().create_one(schema, &values)
     }
@@ -2096,6 +2116,7 @@ mod tests {
             StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null("sizeInBytes", DataType::LONG),
+                StructField::not_null("version", DataType::LONG),
             ]),
         )]);
 
@@ -2112,6 +2133,7 @@ mod tests {
         let content_root = ContentRoot {
             path: "s3://bucket/table/data.parquet".to_string(),
             size_in_bytes: 1024,
+            version: 1,
         };
 
         // Test with full log schema that wraps ContentRoot in a "contentRoot" field
@@ -2132,7 +2154,7 @@ mod tests {
 
         // Verify the contentRoot field contains the expected data
         let content_root_array = record_batch.column(0).as_struct();
-        assert_eq!(content_root_array.num_columns(), 2); // path and sizeInBytes
+        assert_eq!(content_root_array.num_columns(), 3); // path, sizeInBytes, and version
 
         // Verify the path field
         let path_array = content_root_array.column(0).as_string::<i32>();
@@ -2143,6 +2165,12 @@ mod tests {
             .column(1)
             .as_primitive::<crate::arrow::datatypes::Int64Type>();
         assert_eq!(size_array.value(0), 1024);
+
+        // Verify the version field
+        let version_array = content_root_array
+            .column(2)
+            .as_primitive::<crate::arrow::datatypes::Int64Type>();
+        assert_eq!(version_array.value(0), 1);
     }
 
     #[test]
@@ -2154,6 +2182,7 @@ mod tests {
         let content_root = ContentRoot {
             path: "s3://bucket/table/data.parquet".to_string(),
             size_in_bytes: 1024,
+            version: 1,
         };
 
         // Test with the full log schema that wraps ContentRoot in a "contentRoot" field
@@ -2169,7 +2198,8 @@ mod tests {
         let expected_json = json!({
             "contentRoot": {
                 "path": "s3://bucket/table/data.parquet",
-                "sizeInBytes": 1024
+                "sizeInBytes": 1024,
+                "version": 1
             }
         })
         .to_string();
@@ -2262,6 +2292,108 @@ mod tests {
         assert_eq!(
             tags.get("MIN_INSERTION_TIME"),
             Some(&Some("1677811178336000".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_has_reader_feature() {
+        use crate::table_features::TableFeature;
+
+        // Protocol with reader feature
+        let protocol_with_feature = Protocol::try_new(
+            3,
+            7,
+            Some(vec!["metadataTree-experimental"]),
+            Some(vec!["metadataTree-experimental"]),
+        )
+        .unwrap();
+
+        assert!(
+            protocol_with_feature.has_reader_feature(&TableFeature::MetadataTreeExperimental),
+            "Should have reader feature"
+        );
+
+        // Protocol without the feature
+        let protocol_without_feature =
+            Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new()))
+                .unwrap();
+
+        assert!(
+            !protocol_without_feature.has_reader_feature(&TableFeature::MetadataTreeExperimental),
+            "Should not have reader feature"
+        );
+    }
+
+    #[test]
+    fn test_has_writer_feature() {
+        use crate::table_features::TableFeature;
+
+        // Protocol with writer feature (ReaderWriter features must be in both lists)
+        let protocol_with_feature = Protocol::try_new(
+            3,
+            7,
+            Some(vec!["metadataTree-experimental"]),
+            Some(vec!["metadataTree-experimental"]),
+        )
+        .unwrap();
+
+        assert!(
+            protocol_with_feature.has_writer_feature(&TableFeature::MetadataTreeExperimental),
+            "Should have writer feature"
+        );
+
+        // Protocol without the feature
+        let protocol_without_feature =
+            Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new()))
+                .unwrap();
+
+        assert!(
+            !protocol_without_feature.has_writer_feature(&TableFeature::MetadataTreeExperimental),
+            "Should not have writer feature"
+        );
+    }
+
+    #[test]
+    fn test_reader_writer_feature_independence() {
+        use crate::table_features::TableFeature;
+
+        // Test that reader and writer features are checked independently
+        // DeletionVectors is a ReaderWriter feature, so it must be in both lists
+        // metadataTree-experimental is also a ReaderWriter feature
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some(vec!["deletionVectors", "metadataTree-experimental"]),
+            Some(vec!["deletionVectors", "metadataTree-experimental"]),
+        )
+        .unwrap();
+
+        // Both features should be present in both lists
+        assert!(
+            protocol.has_reader_feature(&TableFeature::DeletionVectors),
+            "Should have DeletionVectors reader feature"
+        );
+        assert!(
+            protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental),
+            "Should have MetadataTreeExperimental reader feature"
+        );
+        assert!(
+            protocol.has_writer_feature(&TableFeature::MetadataTreeExperimental),
+            "Should have MetadataTreeExperimental writer feature"
+        );
+        assert!(
+            protocol.has_writer_feature(&TableFeature::DeletionVectors),
+            "Should have DeletionVectors writer feature"
+        );
+
+        // Test that a feature not in the protocol is not found
+        assert!(
+            !protocol.has_reader_feature(&TableFeature::ColumnMapping),
+            "Should not have ColumnMapping reader feature"
+        );
+        assert!(
+            !protocol.has_writer_feature(&TableFeature::ColumnMapping),
+            "Should not have ColumnMapping writer feature"
         );
     }
 }

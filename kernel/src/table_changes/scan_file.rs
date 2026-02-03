@@ -361,7 +361,7 @@ mod tests {
         .unwrap();
         let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
         let table_config =
-            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+            TableConfiguration::try_new(metadata, protocol, None, table_root.clone(), 0).unwrap();
 
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),

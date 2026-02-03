@@ -718,7 +718,7 @@ impl RowVisitor for ContentRootVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 2,
+            getters.len() == 3,
             Error::internal_error(format!(
                 "Wrong number of ContentRootVisitor getters: {}",
                 getters.len()
@@ -740,7 +740,7 @@ pub(crate) fn visit_content_root_at<'a>(
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<ContentRoot>> {
     require!(
-        getters.len() == 2,
+        getters.len() == 3,
         Error::InternalError(format!(
             "Wrong number of ContentRoot getters: {}",
             getters.len()
@@ -756,9 +756,11 @@ pub(crate) fn visit_content_root_at<'a>(
     else {
         return Ok(None);
     };
+    let version: i64 = getters[2].get(row_index, "contentRoot.version")?;
     Ok(Some(ContentRoot {
         path: path.into(),
         size_in_bytes: size_in_bytes as u64,
+        version: version as u64,
     }))
 }
 
@@ -1311,7 +1313,7 @@ mod tests {
     fn test_parse_content_root() {
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177}}"#,
-            r#"{"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345}}"#,
+            r#"{"contentRoot":{"path":"_delta_log/00000000000000000003.content.parquet","sizeInBytes":12345,"version":3}}"#,
             r#"{"add":{"path":"file1","partitionValues":{},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
         .into();
@@ -1328,6 +1330,7 @@ mod tests {
             "_delta_log/00000000000000000003.content.parquet"
         );
         assert_eq!(content_root.size_in_bytes, 12345);
+        assert_eq!(content_root.version, 3);
     }
 
     #[test]
@@ -1352,8 +1355,8 @@ mod tests {
     fn test_parse_content_root_multiple_takes_first() {
         // Although multiple content roots shouldn't happen in practice, test that we take the first one
         let json_strings: StringArray = vec![
-            r#"{"contentRoot":{"path":"first.parquet","sizeInBytes":100}}"#,
-            r#"{"contentRoot":{"path":"second.parquet","sizeInBytes":200}}"#,
+            r#"{"contentRoot":{"path":"first.parquet","sizeInBytes":100,"version":1}}"#,
+            r#"{"contentRoot":{"path":"second.parquet","sizeInBytes":200,"version":2}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -1366,5 +1369,6 @@ mod tests {
             .expect("Should have found content root");
         assert_eq!(content_root.path, "first.parquet");
         assert_eq!(content_root.size_in_bytes, 100);
+        assert_eq!(content_root.version, 1);
     }
 }
