@@ -736,7 +736,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     ) -> Option<bool> {
         match op.eval_expr_scalar(&|expr| self.eval_expr(expr), exprs) {
             Ok(Scalar::Boolean(val)) => Some(val != inverted),
-            Ok(Scalar::Null(dt)) if dt.as_ref() == &DataType::BOOLEAN => None,
+            Ok(Scalar::Null(DataType::BOOLEAN)) => None,
             Ok(other) => {
                 warn!(
                     "Expected {:?} to produce a boolean value, but got {:?}",

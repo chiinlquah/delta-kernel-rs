@@ -59,7 +59,7 @@ fn test_eval_binary_comparisons() {
     let five = &Scalar::from(5);
     let ten = &Scalar::from(10);
     let fifteen = &Scalar::from(15);
-    let null = &Scalar::null(DataType::INTEGER);
+    let null = &Scalar::Null(DataType::INTEGER);
 
     let predicates = [
         Pred::lt(col.clone(), ten.clone()),
@@ -194,7 +194,7 @@ fn test_eval_distinct() {
     let five = &Scalar::from(5);
     let ten = &Scalar::from(10);
     let fifteen = &Scalar::from(15);
-    let null = &Scalar::null(DataType::INTEGER);
+    let null = &Scalar::Null(DataType::INTEGER);
 
     let predicates = [
         Pred::distinct(col.clone(), ten.clone()),
@@ -253,7 +253,7 @@ fn test_eval_distinct() {
 fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
-    let null_pred = Pred::null_literal();
+    const NULL: Pred = Pred::null_literal();
     const FALSE: Pred = Pred::literal(false);
     const TRUE: Pred = Pred::literal(true);
 
@@ -268,8 +268,8 @@ fn test_sql_where() {
                 (Scalar::Integer(5), Scalar::Integer(15))
             } else {
                 (
-                    Scalar::null(DataType::INTEGER),
-                    Scalar::null(DataType::INTEGER),
+                    Scalar::Null(DataType::INTEGER),
+                    Scalar::Null(DataType::INTEGER),
                 )
             };
             let resolver = if missing {
@@ -320,7 +320,7 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // NULL inside AND allows static skipping under SQL semantics
-    let pred = &Pred::and(null_pred.clone(), Pred::lt(col.clone(), VAL));
+    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, Some(false));
 

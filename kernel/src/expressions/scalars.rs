@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
@@ -103,20 +102,13 @@ impl ArrayData {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MapData {
-    data_type: Arc<MapType>,
+    data_type: MapType,
     pairs: Vec<(Scalar, Scalar)>,
 }
 
 impl MapData {
     pub fn try_new(
         data_type: MapType,
-        values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
-    ) -> DeltaResult<Self> {
-        Self::try_new_arc(Arc::new(data_type), values)
-    }
-
-    pub fn try_new_arc(
-        data_type: Arc<MapType>,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
     ) -> DeltaResult<Self> {
         let key_type = data_type.key_type();
@@ -162,13 +154,13 @@ impl MapData {
     }
 
     pub fn map_type(&self) -> &MapType {
-        self.data_type.as_ref()
+        &self.data_type
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructData {
-    fields: Arc<Vec<StructField>>,
+    fields: Vec<StructField>,
     values: Vec<Scalar>,
 }
 
@@ -180,17 +172,6 @@ impl StructData {
     /// - if the data types of the values do not match the data types of the fields
     /// - if a null value is assigned to a non-nullable field
     pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> DeltaResult<Self> {
-        Self::try_new_arc(Arc::new(fields), values)
-    }
-
-    /// Try to create a new struct data with Arc-wrapped fields and values.
-    /// This version allows zero-cost sharing of fields when the Arc is already available.
-    ///
-    /// This will return an error:
-    /// - if the number of fields and values do not match
-    /// - if the data types of the values do not match the data types of the fields
-    /// - if a null value is assigned to a non-nullable field
-    pub fn try_new_arc(fields: Arc<Vec<StructField>>, values: Vec<Scalar>) -> DeltaResult<Self> {
         require!(
             fields.len() == values.len(),
             Error::invalid_struct_data(format!(
@@ -235,23 +216,7 @@ impl StructData {
     /// This is intended for use in code generation or other contexts where the invariants
     /// are guaranteed by construction (e.g., derive macros).
     #[allow(dead_code)]
-    pub(crate) fn new_unchecked(fields: Vec<StructField>, values: Vec<Scalar>) -> Self {
-        Self::new_arc_unchecked(Arc::new(fields), values)
-    }
-
-    /// Create a new struct data with Arc-wrapped fields without validation.
-    /// This version allows zero-cost sharing when the Arc is already available.
-    ///
-    /// # Safety
-    /// The caller must ensure that:
-    /// - The number of fields matches the number of values
-    /// - The data types of the values match the data types of the fields
-    /// - No null values are assigned to non-nullable fields
-    ///
-    /// This is intended for use in code generation or other contexts where the invariants
-    /// are guaranteed by construction (e.g., derive macros).
-    #[allow(dead_code)]
-    pub(crate) fn new_arc_unchecked(fields: Arc<Vec<StructField>>, values: Vec<Scalar>) -> Self {
+    pub(crate) const fn new_unchecked(fields: Vec<StructField>, values: Vec<Scalar>) -> Self {
         Self { fields, values }
     }
 
@@ -298,7 +263,7 @@ pub enum Scalar {
     /// Decimal value with a given precision and scale.
     Decimal(DecimalData),
     /// Null value with a given data type.
-    Null(Arc<DataType>),
+    Null(DataType),
     /// Struct value
     Struct(StructData),
     /// Array Value
@@ -323,26 +288,16 @@ impl Scalar {
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
-            Self::Null(data_type) => (**data_type).clone(),
-            Self::Struct(data) => DataType::struct_type_unchecked((*data.fields).clone()),
+            Self::Null(data_type) => data_type.clone(),
+            Self::Struct(data) => DataType::struct_type_unchecked(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
-            Self::Map(data) => (*data.data_type).clone().into(),
+            Self::Map(data) => data.data_type.clone().into(),
         }
     }
 
     /// Returns true if this scalar is null.
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null(_))
-    }
-
-    /// Construct a Null scalar with an owned DataType (wraps in Arc internally).
-    pub fn null(data_type: DataType) -> Self {
-        Self::Null(Arc::new(data_type))
-    }
-
-    /// Construct a Null scalar with an Arc-wrapped DataType (zero-copy for cached types).
-    pub fn null_arc(data_type: Arc<DataType>) -> Self {
-        Self::Null(data_type)
     }
 
     /// Constructs a Decimal value from raw parts
@@ -680,7 +635,7 @@ where
     fn try_from(opt: Option<Vec<T>>) -> Result<Self, Self::Error> {
         match opt {
             Some(vec) => vec.try_into(),
-            None => Ok(Self::null(ArrayType::new(T::to_data_type(), false).into())),
+            None => Ok(Self::Null(ArrayType::new(T::to_data_type(), false).into())),
         }
     }
 }
@@ -723,7 +678,7 @@ where
     fn try_from(opt: Option<HashMap<K, V>>) -> Result<Self, Self::Error> {
         match opt {
             Some(map) => map.try_into(),
-            None => Ok(Self::null(
+            None => Ok(Self::Null(
                 MapType::new(K::to_data_type(), V::to_data_type(), false).into(),
             )),
         }
@@ -735,7 +690,7 @@ impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
             Some(t) => t.into(),
-            None => Self::null(T::to_data_type()),
+            None => Self::Null(T::to_data_type()),
         }
     }
 }
@@ -763,7 +718,7 @@ impl PrimitiveType {
         use PrimitiveType::*;
 
         if raw.is_empty() {
-            return Ok(Scalar::null(self.data_type()));
+            return Ok(Scalar::Null(self.data_type()));
         }
 
         match self {
@@ -1100,7 +1055,7 @@ mod tests {
             MapData::try_new(
                 MapType::new(DataType::STRING, DataType::STRING, true),
                 [(
-                    Scalar::null(DataType::STRING),  // key
+                    Scalar::Null(DataType::STRING),  // key
                     Scalar::String("s".to_string()), // val
                 )],
             ),
@@ -1113,7 +1068,7 @@ mod tests {
                 MapType::new(DataType::STRING, DataType::STRING, false),
                 [(
                     Scalar::String("s".to_string()), // key
-                    Scalar::null(DataType::STRING),  // val
+                    Scalar::Null(DataType::STRING),  // val
                 )],
             ),
             "Schema error: Null map value disallowed if map value_contains_null is false",
@@ -1168,7 +1123,7 @@ mod tests {
     fn test_partial_cmp() {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
-        let c = Scalar::null(DataType::INTEGER);
+        let c = Scalar::Null(DataType::INTEGER);
 
         assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Less));
         assert_eq!(b.logical_partial_cmp(&a), Some(Ordering::Greater));
@@ -1178,7 +1133,7 @@ mod tests {
         assert_eq!(c.logical_partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
-        let null = Scalar::null(DataType::INTEGER);
+        let null = Scalar::Null(DataType::INTEGER);
         assert_eq!(null.logical_partial_cmp(&null), None);
     }
 
@@ -1186,14 +1141,14 @@ mod tests {
     fn test_partial_eq() {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
-        let c = Scalar::null(DataType::INTEGER);
+        let c = Scalar::Null(DataType::INTEGER);
         assert!(!a.logical_eq(&b));
         assert!(a.logical_eq(&a));
         assert!(!a.logical_eq(&c));
         assert!(!c.logical_eq(&a));
 
         // assert that NULL values are incomparable
-        let null = Scalar::null(DataType::INTEGER);
+        let null = Scalar::Null(DataType::INTEGER);
         assert!(!null.logical_eq(&null));
     }
 
@@ -1261,7 +1216,7 @@ mod tests {
         let entry1 = (Scalar::String("key1".to_string()), Scalar::Integer(42));
         let entry2 = (
             Scalar::String("key2".to_string()),
-            Scalar::null(DataType::INTEGER),
+            Scalar::Null(DataType::INTEGER),
         );
         let entry3 = (Scalar::String("key3".to_string()), Scalar::Integer(100));
         assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");

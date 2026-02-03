@@ -261,7 +261,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
         let fields = output_schema.fields();
         let arrays = fields
-            .map(|field| Scalar::null(field.data_type().clone()).to_array(1))
+            .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
             .try_collect()?;
         let record_batch =
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;

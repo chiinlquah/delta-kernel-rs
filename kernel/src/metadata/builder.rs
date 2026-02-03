@@ -1234,12 +1234,9 @@ impl MetadataBuilder {
         // Pre-allocate one big vector for all scalars
         let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
 
-        // Create schemas once to cache expensive Struct types
-        let schemas = crate::metadata::MetadataSchemas::new(&schema);
-
         // Push all scalars into the single vector
         for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema, &schemas)?;
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
             all_scalars.extend(scalars);
         }
 
@@ -1311,12 +1308,9 @@ impl MetadataBuilder {
         // Pre-allocate one big vector for all scalars
         let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
 
-        // Create schemas once to cache expensive Struct types
-        let schemas = crate::metadata::MetadataSchemas::new(&schema);
-
         // Push all scalars into the single vector
         for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema, &schemas)?;
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
             all_scalars.extend(scalars);
         }
 
@@ -1372,12 +1366,9 @@ impl MetadataBuilder {
         // Pre-allocate one big vector for all scalars
         let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
 
-        // Create schemas once to cache expensive Struct types
-        let schemas = crate::metadata::MetadataSchemas::new(&schema);
-
         // Push all scalars into the single vector
         for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema, &schemas)?;
+            let scalars = metadata_entry_to_scalars(entry, &schema)?;
             all_scalars.extend(scalars);
         }
 

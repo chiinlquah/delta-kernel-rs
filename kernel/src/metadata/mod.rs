@@ -16,7 +16,7 @@ use crate::log_replay::ActionsBatch;
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::{derive_macro_utils::ToDataType, DataType, MapType, StructField, StructType};
+use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
     SnapshotRef, Version,
@@ -539,20 +539,15 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars using a single buffer
-        // This eliminates per-row Vec allocations
-        let num_rows = add_removes.len();
-        let fields_per_row = schema.fields().len();
-        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
 
-        for add_remove in add_removes {
-            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
-        }
-
-        // Create slice references for each row from the flat buffer
-        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
-            .chunks(fields_per_row)
-            .collect();
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -974,20 +969,15 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars using a single buffer
-        // This eliminates per-row Vec allocations
-        let num_rows = add_removes.len();
-        let fields_per_row = schema.fields().len();
-        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
 
-        for add_remove in add_removes {
-            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
-        }
-
-        // Create slice references for each row from the flat buffer
-        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
-            .chunks(fields_per_row)
-            .collect();
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -1099,20 +1089,15 @@ impl Metadata {
         // Cache schemas to avoid repeated construction in the loop
         let schemas = ActionSchemas::new();
 
-        // Convert all AddRemove entries to rows of scalars using a single buffer
-        // This eliminates per-row Vec allocations
-        let num_rows = add_removes.len();
-        let fields_per_row = schema.fields().len();
-        let mut flat_buffer: Vec<Scalar> = Vec::with_capacity(num_rows * fields_per_row);
+        // Convert all AddRemove entries to rows of scalars
+        let scalar_rows: Vec<Vec<Scalar>> = add_removes
+            .into_iter()
+            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
+            .collect::<DeltaResult<Vec<_>>>()?;
 
-        for add_remove in add_removes {
-            add_remove_to_scalars(add_remove, schema, &schemas, &mut flat_buffer)?;
-        }
-
-        // Create slice references for each row from the flat buffer
-        let scalar_row_refs: Vec<&[Scalar]> = flat_buffer
-            .chunks(fields_per_row)
-            .collect();
+        // Convert to slices for the create_many API
+        let scalar_row_refs: Vec<&[Scalar]> =
+            scalar_rows.iter().map(|row| row.as_slice()).collect();
 
         // Create multi-row EngineData in one call
         let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
@@ -1666,8 +1651,8 @@ fn deletion_vector_descriptor_to_scalar(
 ) -> Scalar {
     use crate::expressions::StructData;
 
-    // Use cached fields to avoid repeated to_schema calls (Arc::clone is just a refcount increment)
-    let fields = Arc::clone(&schemas.dv_fields);
+    // Use cached fields to avoid repeated to_schema calls
+    let fields = schemas.dv_fields.clone();
 
     let values = vec![
         Scalar::from(dv.storage_type.to_string()), // Convert enum to string
@@ -1679,30 +1664,48 @@ fn deletion_vector_descriptor_to_scalar(
 
     // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
     // to match exactly in count, order, type, and nullability.
-    Scalar::Struct(StructData::new_arc_unchecked(fields, values))
+    Scalar::Struct(StructData::new_unchecked(fields, values))
 }
 
 /// Helper function to convert HashMap<String, String> to Scalar matching the schema's map type
 fn hashmap_to_scalar_matching_schema(
     map: HashMap<String, String>,
-    map_type: Arc<MapType>,
+    expected_type: &DataType,
 ) -> DeltaResult<Scalar> {
     use crate::expressions::MapData;
 
-    // Use the cached MapType directly with zero-cost Arc sharing
-    let map_data = MapData::try_new_arc(map_type, map)?;
+    // Extract the MapType from the expected type
+    let map_type = if let DataType::Map(map_type_box) = expected_type {
+        map_type_box.as_ref().clone()
+    } else {
+        return Err(Error::generic(format!(
+            "Expected Map type, got {:?}",
+            expected_type
+        )));
+    };
+
+    let map_data = MapData::try_new(map_type, map)?;
     Ok(map_data.into())
 }
 
 /// Helper function to convert HashMap<String, Option<String>> to Scalar matching the schema's map type
 fn hashmap_option_to_scalar_matching_schema(
     map: HashMap<String, Option<String>>,
-    map_type: Arc<MapType>,
+    expected_type: &DataType,
 ) -> DeltaResult<Scalar> {
     use crate::expressions::MapData;
 
-    // Use the cached MapType directly with zero-cost Arc sharing
-    let map_data = MapData::try_new_arc(map_type, map)?;
+    // Extract the MapType from the expected type
+    let map_type = if let DataType::Map(map_type_box) = expected_type {
+        map_type_box.as_ref().clone()
+    } else {
+        return Err(Error::generic(format!(
+            "Expected Map type, got {:?}",
+            expected_type
+        )));
+    };
+
+    let map_data = MapData::try_new(map_type, map)?;
     Ok(map_data.into())
 }
 
@@ -1710,45 +1713,39 @@ fn hashmap_option_to_scalar_matching_schema(
 /// Caching these avoids expensive repeated construction and cloning when processing batches.
 struct ActionSchemas {
     // Cached field vectors to avoid repeated cloning
-    add_fields: Arc<Vec<StructField>>,
-    remove_fields: Arc<Vec<StructField>>,
+    add_fields: Vec<StructField>,
+    remove_fields: Vec<StructField>,
 
     // Cached boxed data type for DeletionVectorDescriptor nulls
-    dv_null_type: Arc<DataType>,
-
-    // Cached struct types for Add, Remove, and Sidecar (used when creating null scalars)
-    add_struct_type: Arc<DataType>,
-    remove_struct_type: Arc<DataType>,
-    sidecar_struct_type: Arc<DataType>,
+    dv_null_type: DataType,
 
     // Cached field data types to avoid repeated field lookups
-    add_tags_type: Arc<DataType>,
-    remove_partition_values_type: Arc<DataType>,
-    remove_tags_type: Arc<DataType>,
-
-    // Cached MapTypes extracted from DataTypes to avoid cloning
-    add_partition_values_map_type: Arc<MapType>,
-    add_tags_map_type: Arc<MapType>,
-    remove_partition_values_map_type: Arc<MapType>,
-    remove_tags_map_type: Arc<MapType>,
+    add_partition_values_type: DataType,
+    add_tags_type: DataType,
+    remove_partition_values_type: DataType,
+    remove_tags_type: DataType,
 
     // Cached deletion vector fields to avoid repeated to_schema calls
-    dv_fields: Arc<Vec<StructField>>,
+    dv_fields: Vec<StructField>,
 }
 
 impl ActionSchemas {
     fn new() -> Self {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
-        use crate::actions::Sidecar;
         use crate::schema::ToSchema;
 
         let add_schema = Add::to_schema();
         let remove_schema = Remove::to_schema();
         let dv_schema = DeletionVectorDescriptor::to_schema();
-        let sidecar_schema = Sidecar::to_schema();
 
         // Cache frequently accessed field types to avoid repeated lookups
         // These fields are guaranteed to exist in the schemas generated by ToSchema derive macro
+        #[allow(clippy::unwrap_used)]
+        let add_partition_values_type = add_schema
+            .field("partitionValues")
+            .unwrap()
+            .data_type()
+            .clone();
         #[allow(clippy::unwrap_used)]
         let add_tags_type = add_schema.field("tags").unwrap().data_type().clone();
         #[allow(clippy::unwrap_used)]
@@ -1760,51 +1757,15 @@ impl ActionSchemas {
         #[allow(clippy::unwrap_used)]
         let remove_tags_type = remove_schema.field("tags").unwrap().data_type().clone();
 
-        // Extract MapTypes to avoid cloning them in the hot path
-        #[allow(clippy::unwrap_used)]
-        #[allow(clippy::panic)]
-        let add_partition_values_map_type = match add_schema
-            .field("partitionValues")
-            .unwrap()
-            .data_type()
-        {
-            DataType::Map(mt) => mt.as_ref().clone(),
-            _ => panic!("Expected Map type for partitionValues"),
-        };
-        #[allow(clippy::unwrap_used)]
-        #[allow(clippy::panic)]
-        let add_tags_map_type = match &add_tags_type {
-            DataType::Map(mt) => mt.as_ref().clone(),
-            _ => panic!("Expected Map type for tags"),
-        };
-        #[allow(clippy::unwrap_used)]
-        #[allow(clippy::panic)]
-        let remove_partition_values_map_type = match &remove_partition_values_type {
-            DataType::Map(mt) => mt.as_ref().clone(),
-            _ => panic!("Expected Map type for partitionValues"),
-        };
-        #[allow(clippy::unwrap_used)]
-        #[allow(clippy::panic)]
-        let remove_tags_map_type = match &remove_tags_type {
-            DataType::Map(mt) => mt.as_ref().clone(),
-            _ => panic!("Expected Map type for tags"),
-        };
-
         Self {
-            add_fields: Arc::new(add_schema.fields().cloned().collect()),
-            remove_fields: Arc::new(remove_schema.fields().cloned().collect()),
-            dv_fields: Arc::new(dv_schema.fields().cloned().collect()),
-            dv_null_type: Arc::new(DataType::Struct(Box::new(dv_schema))),
-            add_struct_type: Arc::new(DataType::Struct(Box::new(add_schema.clone()))),
-            remove_struct_type: Arc::new(DataType::Struct(Box::new(remove_schema.clone()))),
-            sidecar_struct_type: Arc::new(DataType::Struct(Box::new(sidecar_schema))),
-            add_tags_type: Arc::new(add_tags_type),
-            remove_partition_values_type: Arc::new(remove_partition_values_type),
-            remove_tags_type: Arc::new(remove_tags_type),
-            add_partition_values_map_type: Arc::new(add_partition_values_map_type),
-            add_tags_map_type: Arc::new(add_tags_map_type),
-            remove_partition_values_map_type: Arc::new(remove_partition_values_map_type),
-            remove_tags_map_type: Arc::new(remove_tags_map_type),
+            add_fields: add_schema.fields().cloned().collect(),
+            remove_fields: remove_schema.fields().cloned().collect(),
+            dv_fields: dv_schema.fields().cloned().collect(),
+            dv_null_type: DataType::Struct(Box::new(dv_schema)),
+            add_partition_values_type,
+            add_tags_type,
+            remove_partition_values_type,
+            remove_tags_type,
         }
     }
 }
@@ -1813,27 +1774,26 @@ impl ActionSchemas {
 fn add_to_scalar(add: &Add, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
     use crate::expressions::StructData;
 
-    // Use cached MapTypes to avoid expensive MapType extraction and cloning
-    let partition_values_map_type = &schemas.add_partition_values_map_type;
-    let tags_map_type = &schemas.add_tags_map_type;
-    let tags_null_type = &schemas.add_tags_type;
+    // Use cached field types to avoid expensive field lookups
+    let partition_values_type = &schemas.add_partition_values_type;
+    let tags_type = &schemas.add_tags_type;
 
-    // Convert HashMap fields using cached MapTypes
+    // Convert HashMap fields using schema types
     let partition_values_scalar: Scalar =
-        hashmap_to_scalar_matching_schema(add.partition_values.clone(), Arc::clone(partition_values_map_type))?;
+        hashmap_to_scalar_matching_schema(add.partition_values.clone(), partition_values_type)?;
     let tags_scalar = match &add.tags {
-        Some(tags) => hashmap_option_to_scalar_matching_schema(tags.clone(), Arc::clone(tags_map_type))?,
-        None => Scalar::null_arc(Arc::clone(tags_null_type)),
+        Some(tags) => hashmap_option_to_scalar_matching_schema(tags.clone(), tags_type)?,
+        None => Scalar::Null(tags_type.clone()),
     };
 
     // Convert DeletionVectorDescriptor, using cached boxed type for nulls
     let deletion_vector_scalar = match &add.deletion_vector {
         Some(dv) => deletion_vector_descriptor_to_scalar(dv, schemas),
-        None => Scalar::null_arc(Arc::clone(&schemas.dv_null_type)),
+        None => Scalar::Null(schemas.dv_null_type.clone()),
     };
 
-    // Use cached fields vector to avoid cloning from schema (Arc::clone is just a refcount increment)
-    let fields = Arc::clone(&schemas.add_fields);
+    // Use cached fields vector to avoid cloning from schema
+    let fields = schemas.add_fields.clone();
 
     let values = vec![
         Scalar::from(add.path.clone()),
@@ -1855,37 +1815,35 @@ fn add_to_scalar(add: &Add, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
 
     // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
     // to match exactly in count, order, type, and nullability.
-    Ok(Scalar::Struct(StructData::new_arc_unchecked(fields, values)))
+    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
 }
 
 /// Converts a Remove action to a Scalar representation
 fn remove_to_scalar(remove: &Remove, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
     use crate::expressions::StructData;
 
-    // Use cached MapTypes to avoid expensive MapType extraction and cloning
-    let partition_values_map_type = &schemas.remove_partition_values_map_type;
-    let partition_values_null_type = &schemas.remove_partition_values_type;
-    let tags_map_type = &schemas.remove_tags_map_type;
-    let tags_null_type = &schemas.remove_tags_type;
+    // Use cached field types to avoid expensive field lookups
+    let partition_values_type = &schemas.remove_partition_values_type;
+    let tags_type = &schemas.remove_tags_type;
 
-    // Convert HashMap fields using cached MapTypes
+    // Convert HashMap fields using schema types
     let partition_values_scalar = match &remove.partition_values {
-        Some(pv) => hashmap_to_scalar_matching_schema(pv.clone(), Arc::clone(partition_values_map_type))?,
-        None => Scalar::null_arc(Arc::clone(partition_values_null_type)),
+        Some(pv) => hashmap_to_scalar_matching_schema(pv.clone(), partition_values_type)?,
+        None => Scalar::Null(partition_values_type.clone()),
     };
     let tags_scalar = match &remove.tags {
-        Some(tags) => hashmap_to_scalar_matching_schema(tags.clone(), Arc::clone(tags_map_type))?,
-        None => Scalar::null_arc(Arc::clone(tags_null_type)),
+        Some(tags) => hashmap_to_scalar_matching_schema(tags.clone(), tags_type)?,
+        None => Scalar::Null(tags_type.clone()),
     };
 
     // Convert DeletionVectorDescriptor, using cached boxed type for nulls
     let deletion_vector_scalar = match &remove.deletion_vector {
         Some(dv) => deletion_vector_descriptor_to_scalar(dv, schemas),
-        None => Scalar::null_arc(Arc::clone(&schemas.dv_null_type)),
+        None => Scalar::Null(schemas.dv_null_type.clone()),
     };
 
-    // Use cached fields vector to avoid cloning from schema (Arc::clone is just a refcount increment)
-    let fields = Arc::clone(&schemas.remove_fields);
+    // Use cached fields vector to avoid cloning from schema
+    let fields = schemas.remove_fields.clone();
 
     let values = vec![
         Scalar::from(remove.path.clone()),
@@ -1906,83 +1864,61 @@ fn remove_to_scalar(remove: &Remove, schemas: &ActionSchemas) -> DeltaResult<Sca
 
     // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
     // to match exactly in count, order, type, and nullability.
-    Ok(Scalar::Struct(StructData::new_arc_unchecked(fields, values)))
+    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
 }
 
-/// Converts a single AddRemove to structured scalars, writing directly into the output buffer.
+/// Converts a single AddRemove to a vector of structured scalars.
 ///
 /// This function:
 /// - Checks which action fields (add/remove) are present in the schema
-/// - Appends structured scalar values (one per top-level field) to the output buffer
+/// - Creates a row of structured scalar values (one per top-level field)
 fn add_remove_to_scalars(
     add_remove: AddRemove,
     schema: &SchemaRef,
     schemas: &ActionSchemas,
-    output: &mut Vec<Scalar>,
-) -> DeltaResult<()> {
-    use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+) -> DeltaResult<Vec<Scalar>> {
+    use crate::actions::{ADD_NAME, REMOVE_NAME};
     use crate::expressions::Scalar;
+
+    // Build a vector of structured scalars for the schema (one per top-level field)
+    // Pre-allocate with exact capacity since we know the field count
+    let mut scalars = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
         let scalar = match field.name() {
             name if name == ADD_NAME => {
-                // Convert Add to Scalar if present, otherwise null (using cached type)
+                // Convert Add to Scalar if present, otherwise null
                 match &add_remove {
                     AddRemove::Add(add) => add_to_scalar(add, schemas)?,
-                    AddRemove::Remove(_) => Scalar::null_arc(Arc::clone(&schemas.add_struct_type)),
+                    AddRemove::Remove(_) => Scalar::Null(field.data_type().clone()),
                 }
             }
             name if name == REMOVE_NAME => {
-                // Convert Remove to Scalar if present, otherwise null (using cached type)
+                // Convert Remove to Scalar if present, otherwise null
                 match &add_remove {
                     AddRemove::Remove(remove) => remove_to_scalar(remove, schemas)?,
-                    AddRemove::Add(_) => Scalar::null_arc(Arc::clone(&schemas.remove_struct_type)),
+                    AddRemove::Add(_) => Scalar::Null(field.data_type().clone()),
                 }
             }
-            name if name == SIDECAR_NAME => {
-                // Sidecar is always null in add/remove processing (using cached type)
-                Scalar::null_arc(Arc::clone(&schemas.sidecar_struct_type))
-            }
             _ => {
-                // For any other unexpected field, use null (fallback for future action types)
-                Scalar::null(field.data_type().clone())
+                // For any other field not matching add/remove, use null
+                Scalar::Null(field.data_type().clone())
             }
         };
 
-        // Append the structured scalar directly to output (don't flatten)
-        output.push(scalar);
+        // Keep the structured scalar (don't flatten)
+        scalars.push(scalar);
     }
 
-    Ok(())
-}
-
-/// Cached complex DataTypes for MetadataEntry conversions to avoid expensive cloning
-pub(crate) struct MetadataSchemas {
-    // Cache Arc<DataType> for struct fields to avoid cloning expensive types
-    tracking_info_type: Option<Arc<DataType>>,
-    content_info_type: Option<Arc<DataType>>,
-    content_stats_type: Option<Arc<DataType>>,
-    manifest_stats_type: Option<Arc<DataType>>,
-}
-
-impl MetadataSchemas {
-    fn new(schema: &crate::schema::SchemaRef) -> Self {
-        Self {
-            tracking_info_type: schema.field("trackingInfo").map(|f| Arc::new(f.data_type().clone())),
-            content_info_type: schema.field("contentInfo").map(|f| Arc::new(f.data_type().clone())),
-            content_stats_type: schema.field("contentStats").map(|f| Arc::new(f.data_type().clone())),
-            manifest_stats_type: schema.field("manifestStats").map(|f| Arc::new(f.data_type().clone())),
-        }
-    }
+    Ok(scalars)
 }
 
 /// Converts a MetadataEntry to a vector of structured Scalar values matching the schema.
 /// This is used for bulk conversion with `create_many`.
-/// Unlike flattened approaches, this returns structured scalars that match the schema fields.
+/// Unlike `into_engine_data` which uses flattened leaf values, this returns structured scalars.
 pub(crate) fn metadata_entry_to_scalars(
     entry: &MetadataEntry,
     schema: &crate::schema::SchemaRef,
-    schemas: &MetadataSchemas,
 ) -> DeltaResult<Vec<Scalar>> {
     use crate::expressions::StructData;
 
@@ -2015,14 +1951,7 @@ pub(crate) fn metadata_entry_to_scalars(
                     ];
                     Scalar::Struct(StructData::new_unchecked(struct_fields, values))
                 }
-                None => {
-                    // Use cached Arc type to avoid cloning expensive Struct type
-                    if let Some(tracking_info_type) = &schemas.tracking_info_type {
-                        Scalar::Null(Arc::clone(tracking_info_type))
-                    } else {
-                        Scalar::Null(field.data_type().clone().into())
-                    }
-                }
+                None => Scalar::Null(field.data_type().clone()),
             },
             "contentInfo" => match &entry.content_info {
                 Some(ci) => {
@@ -2037,14 +1966,7 @@ pub(crate) fn metadata_entry_to_scalars(
                     let values = vec![Scalar::from(ci.offset), Scalar::from(ci.size_in_bytes)];
                     Scalar::Struct(StructData::new_unchecked(struct_fields, values))
                 }
-                None => {
-                    // Use cached Arc type to avoid cloning expensive Struct type
-                    if let Some(content_info_type) = &schemas.content_info_type {
-                        Scalar::Null(Arc::clone(content_info_type))
-                    } else {
-                        Scalar::Null(field.data_type().clone().into())
-                    }
-                }
+                None => Scalar::Null(field.data_type().clone()),
             },
             "partitionSpecId" => Scalar::from(entry.partition_spec_id),
             "sortOrderId" => Scalar::from(entry.sort_order_id),
@@ -2052,14 +1974,7 @@ pub(crate) fn metadata_entry_to_scalars(
             "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
             "contentStats" => match &entry.content_stats {
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
-                None => {
-                    // Use cached Arc type to avoid cloning expensive Struct type
-                    if let Some(content_stats_type) = &schemas.content_stats_type {
-                        Scalar::Null(Arc::clone(content_stats_type))
-                    } else {
-                        Scalar::Null(field.data_type().clone().into())
-                    }
-                }
+                None => Scalar::Null(field.data_type().clone()),
             },
             "manifestStats" => match &entry.manifest_info {
                 Some(ms) => {
@@ -2082,18 +1997,11 @@ pub(crate) fn metadata_entry_to_scalars(
                     ];
                     Scalar::Struct(StructData::new_unchecked(struct_fields, values))
                 }
-                None => {
-                    // Use cached Arc type to avoid cloning expensive Struct type
-                    if let Some(manifest_stats_type) = &schemas.manifest_stats_type {
-                        Scalar::Null(Arc::clone(manifest_stats_type))
-                    } else {
-                        Scalar::Null(field.data_type().clone().into())
-                    }
-                }
+                None => Scalar::Null(field.data_type().clone()),
             },
             "referencedFile" => Scalar::from(entry.referenced_file.clone()),
             "manifestDv" => Scalar::from(entry.manifest_dv.clone()),
-            _ => Scalar::Null(field.data_type().clone().into()),
+            _ => Scalar::Null(field.data_type().clone()),
         };
 
         scalars.push(scalar);
@@ -2471,9 +2379,7 @@ impl crate::IntoEngineData for MetadataEntry {
         engine: &dyn crate::Engine,
     ) -> DeltaResult<Box<dyn crate::EngineData>> {
         // Use create_many with structured scalars (more efficient than create_one with flat values)
-        // Cache expensive Struct types to avoid cloning
-        let schemas = MetadataSchemas::new(&schema);
-        let scalars = metadata_entry_to_scalars(&self, &schema, &schemas)?;
+        let scalars = metadata_entry_to_scalars(&self, &schema)?;
         let evaluator = engine.evaluation_handler();
         evaluator.create_many(schema, &[&scalars])
     }
@@ -2970,8 +2876,8 @@ mod tests {
             vec![
                 Scalar::Long(500),
                 Scalar::Long(10),
-                Scalar::Null(DataType::LONG.into()),
-                Scalar::Null(DataType::LONG.into()),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
                 Scalar::String("aardvark".to_string()),
                 Scalar::String("zebra".to_string()),
                 Scalar::Boolean(true),

@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_create_one_top_level_null() {
-        let values = &[Scalar::null(DeltaDataTypes::INTEGER)];
+        let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
         let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
             "col_1",
@@ -337,11 +337,11 @@ mod tests {
         let (a_val, b_val) = values;
         let a = match a_val {
             Some(v) => Scalar::Integer(v),
-            None => Scalar::null(DeltaDataTypes::INTEGER),
+            None => Scalar::Null(DeltaDataTypes::INTEGER),
         };
         let b = match b_val {
             Some(v) => Scalar::Integer(v),
-            None => Scalar::null(DeltaDataTypes::INTEGER),
+            None => Scalar::Null(DeltaDataTypes::INTEGER),
         };
         let values: &[Scalar] = &[a, b];
 

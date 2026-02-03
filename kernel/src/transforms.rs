@@ -210,7 +210,7 @@ pub(crate) fn parse_partition_value_raw(
         (Some(_), None) => Err(Error::generic(format!(
             "Unexpected partition column type: {data_type:?}"
         ))),
-        _ => Ok(Scalar::null(data_type.clone())),
+        _ => Ok(Scalar::Null(data_type.clone())),
     }
 }
 
