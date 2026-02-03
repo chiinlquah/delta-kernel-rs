@@ -438,7 +438,6 @@ pub fn vacuum_delete(
                 )?;
 
                 batches_to_delete.push(filtered_batch);
-                files_collected += selected_count;
             }
             break;
         }
