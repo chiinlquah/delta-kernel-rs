@@ -119,9 +119,10 @@ fn new_null_array(data_type: &ArrowDataType, length: usize) -> ArrayRef {
 fn create_add_files_metadata(
     add_files_schema: &delta_kernel::schema::SchemaRef,
     num_files: usize,
+    start_index: usize,
 ) -> DeltaResult<Box<dyn delta_kernel::EngineData>> {
-    // Generate synthetic file metadata
-    let paths: Vec<String> = (0..num_files)
+    // Generate synthetic file metadata with unique file names
+    let paths: Vec<String> = (start_index..start_index + num_files)
         .map(|i| format!("part-{:05}.parquet", i))
         .collect();
     let sizes: Vec<i64> = (0..num_files)
@@ -271,8 +272,13 @@ pub fn write(
 
     let mut batches = Vec::new();
     let num_batches = num_files / batch_size;
-    for _ in 0..num_batches {
-        batches.push(create_add_files_metadata(&add_files_schema, batch_size)?);
+    for batch_idx in 0..num_batches {
+        let start_index = batch_idx * batch_size;
+        batches.push(create_add_files_metadata(
+            &add_files_schema,
+            batch_size,
+            start_index,
+        )?);
     }
 
     add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
@@ -362,28 +368,75 @@ pub fn vacuum_delete(
     // Create scan without predicate to get all files
     let scan = snapshot.clone().scan_builder().build()?;
 
-    // Take the first 50000 files returned from the scan
+    // Delete 10% of files (max 10000 files) to avoid deleting entire table
     let mut batches_to_delete = Vec::new();
     let mut files_collected = 0;
     const MAX_FILES_TO_DELETE: usize = 50000;
 
+    // First, count total files to calculate 10%
+    let mut total_files = 0;
+    let mut all_batches = Vec::new();
     for result in scan.scan_metadata(engine.as_ref())? {
         let metadata = result?;
-        let num_files = metadata.scan_files.data().len();
+        total_files += metadata.scan_files.data().len();
+        all_batches.push(metadata.scan_files);
+    }
 
-        if files_collected + num_files <= MAX_FILES_TO_DELETE {
-            // Take the whole batch
-            batches_to_delete.push(metadata.scan_files);
+    // Calculate how many files to delete (10% of total, max 10000)
+    let files_to_delete = std::cmp::min((total_files as f64 * 0.1) as usize, MAX_FILES_TO_DELETE);
+
+    // Collect batches until we reach the target
+    for batch in all_batches {
+        let num_files = batch.data().len();
+
+        if files_collected + num_files <= files_to_delete {
+            // Take the entire batch
+            batches_to_delete.push(batch);
             files_collected += num_files;
 
-            if files_collected >= MAX_FILES_TO_DELETE {
+            if files_collected >= files_to_delete {
                 break;
             }
         } else {
-            // Take only what we need to reach 50000
-            let remaining = MAX_FILES_TO_DELETE - files_collected;
+            // Take a partial batch using a selection vector
+            let remaining = files_to_delete - files_collected;
             if remaining > 0 {
-                batches_to_delete.push(metadata.scan_files);
+                // Get the existing selection vector from the batch
+                let (data, old_selection) = batch.into_parts();
+
+                // Build a new selection vector that respects the old one
+                // We need to select only the first 'remaining' SELECTED rows
+                let mut new_selection = Vec::new();
+                let mut selected_count = 0;
+
+                for i in 0..data.len() {
+                    // Check if this row was selected in the original batch
+                    let is_selected = if i < old_selection.len() {
+                        old_selection[i]
+                    } else {
+                        // Per FilteredEngineData contract: if selection vector is shorter than data,
+                        // remaining rows are assumed to be selected
+                        true
+                    };
+
+                    // If it was selected and we haven't reached our limit, keep it selected
+                    if is_selected && selected_count < remaining {
+                        new_selection.push(true);
+                        selected_count += 1;
+                    } else if is_selected {
+                        // It was selected but we've reached our limit, so deselect it
+                        new_selection.push(false);
+                    } else {
+                        // It wasn't selected in the original, keep it unselected
+                        new_selection.push(false);
+                    }
+                }
+
+                // Create a new FilteredEngineData with the combined selection vector
+                let filtered_batch =
+                    delta_kernel::engine_data::FilteredEngineData::try_new(data, new_selection)?;
+
+                batches_to_delete.push(filtered_batch);
             }
             break;
         }
