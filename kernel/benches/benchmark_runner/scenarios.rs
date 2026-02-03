@@ -367,7 +367,7 @@ pub fn vacuum_delete(
     // Delete 10% of files (max 10000 files) to avoid deleting entire table
     let mut batches_to_delete = Vec::new();
     let mut files_collected = 0;
-    const MAX_FILES_TO_DELETE: usize = 10000;
+    const MAX_FILES_TO_DELETE: usize = 50000;
 
     // First, count total files to calculate 10%
     let mut total_files = 0;

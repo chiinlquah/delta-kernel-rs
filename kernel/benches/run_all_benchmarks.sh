@@ -186,7 +186,7 @@ process_dataset() {
 
     if [ "${has_content_root}" = true ]; then
         # Bulk write (1000 files, 500 batch size, bulk mode) - only for content_root datasets
-        run_dml_scenario "${dataset}" "bulk-write" "-n 1000 -b 500 -m" \
+        run_dml_scenario "${dataset}" "bulk-write" "-n 10000 -b 20 -m" \
             "${dataset_dir}/06_dml_bulk_write_bulk.json" "bulk_write_bulk"
     else
         echo -e "  ${YELLOW}Skipping bulk-write bulk mode (requires content_root)${NC}"
