@@ -20,7 +20,6 @@ use common::{LocationArgs, ParseWithExamples};
 use url::Url;
 
 use delta_kernel::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
-use delta_kernel::checkpoint::CheckpointDataIterator;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};

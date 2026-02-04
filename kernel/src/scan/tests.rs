@@ -420,6 +420,7 @@ fn test_replay_for_scan_metadata() {
         scan.replay_for_scan_metadata(&engine).unwrap();
 
     let data: Vec<_> = data_iter.try_collect().unwrap();
+
     // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
     // could be skipped when looking for adds/removes.
     //

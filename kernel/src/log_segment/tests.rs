@@ -1179,6 +1179,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1252,6 +1253,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1320,6 +1322,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -2826,9 +2829,9 @@ fn test_schema_has_compatible_stats_parsed_basic() {
 }
 
 #[test]
-fn test_schema_has_compatible_stats_parsed_missing_column_fails() {
+fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
     // Checkpoint has "id" column, stats schema needs "other" column
-    // Now that we properly check, missing column should FAIL because coalesce won't work
+    // Missing column is acceptable - it will return null when accessed
     let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
@@ -2837,8 +2840,9 @@ fn test_schema_has_compatible_stats_parsed_missing_column_fails() {
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("other", DataType::INTEGER)]);
 
-    // Missing column in checkpoint should fail - we need the column for data skipping
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+    // Missing column in checkpoint is OK - it will return null when accessed,
+    // which is acceptable for data skipping (just means we can't skip based on that column)
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema
     ));
@@ -2961,6 +2965,157 @@ fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     ));
 }
 
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct() {
+    // Create a nested struct: user: { name: string, age: integer }
+    let user_struct = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            user_struct.clone(),
+        )]);
+
+    // Exact match should work
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", user_struct)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_with_extra_fields() {
+    // Checkpoint has extra nested fields not needed by stats schema
+    let checkpoint_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING), // extra field
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    // Stats schema only needs a subset of fields
+    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Extra fields in checkpoint nested struct should be OK
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_missing_field_ok() {
+    // Checkpoint is missing a nested field that stats schema needs
+    let checkpoint_user =
+        StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    // Stats schema needs more fields than checkpoint has
+    let stats_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER), // missing in checkpoint
+    ]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Missing nested field is OK - it will return null when accessed
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_type_mismatch() {
+    // Checkpoint has incompatible type in nested field
+    let checkpoint_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::INTEGER), // wrong type!
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Type mismatch in nested field should fail
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_deeply_nested() {
+    // Deeply nested: company: { department: { team: { name: string } } }
+    let team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+    let department = StructType::new_unchecked([StructField::nullable("team", team.clone())]);
+    let company = StructType::new_unchecked([StructField::nullable("department", department)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "company",
+            company.clone(),
+        )]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("company", company)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
+    // Type mismatch deep in nested structure
+    let checkpoint_team =
+        StructType::new_unchecked([StructField::nullable("name", DataType::INTEGER)]); // wrong!
+    let checkpoint_dept =
+        StructType::new_unchecked([StructField::nullable("team", checkpoint_team)]);
+    let checkpoint_company =
+        StructType::new_unchecked([StructField::nullable("department", checkpoint_dept)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "company",
+            checkpoint_company,
+        )]);
+
+    let stats_team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+    let stats_dept = StructType::new_unchecked([StructField::nullable("team", stats_team)]);
+    let stats_company =
+        StructType::new_unchecked([StructField::nullable("department", stats_dept)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("company", stats_company)]);
+
+    // Type mismatch deep in hierarchy should be detected
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
 // ============================================================================
 // new_with_commit tests
 // ============================================================================
@@ -3063,4 +3218,23 @@ async fn test_new_with_commit_not_end_version_plus_one() {
         result,
         "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
     );
+}
+
+// ============================================================================
+// get_unpublished_catalog_commits tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_unpublished_catalog_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_published_version, Some(2));
+    let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    assert_eq!(versions, vec![3, 4]);
 }

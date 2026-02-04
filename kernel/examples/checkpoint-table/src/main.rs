@@ -7,10 +7,9 @@ use futures::future::{BoxFuture, FutureExt};
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
 
-use delta_kernel::checkpoint::CheckpointDataIterator;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::{DeltaResult, Error, FileMeta, Snapshot};
+use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, FileMeta, Snapshot};
 
 /// An example program that checkpoints a table.
 /// !!!WARNING!!!: This doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.
@@ -45,7 +44,7 @@ async fn main() -> ExitCode {
 
 async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
-    batch_iter: &mut impl CheckpointDataIterator,
+    batch_iter: &mut ActionReconciliationIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
 ) -> DeltaResult<()> {
     parquet_writer.write(first_batch).await?;
@@ -75,6 +74,7 @@ async fn try_main() -> DeltaResult<()> {
     let checkpoint_path = writer.checkpoint_path()?;
     // this gives us a iterator of `FilteredEngineData` that needs to be written to the file
     let mut data_iter = writer.checkpoint_data(&engine)?;
+    let state = data_iter.state();
 
     let batch_iter = data_iter.by_ref();
     // we'll use the first batch to determine the schema
@@ -108,7 +108,7 @@ async fn try_main() -> DeltaResult<()> {
         };
         // It's important to call `finalize` on the writer, which will create a `_last_checkpoint`
         // file
-        writer.finalize(&engine, &file_meta, data_iter)?;
+        writer.finalize(&engine, &file_meta, &state)?;
         println!("Table checkpointed");
     } else {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");

@@ -13,14 +13,16 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{
     Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
 };
 
-pub(crate) mod stats_schema;
+
 #[cfg(test)]
 mod tests;
+
+use delta_kernel_derive::internal_api;
 
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
@@ -49,6 +51,7 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
+#[internal_api]
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
@@ -90,6 +93,20 @@ impl DataSkippingFilter {
         let predicate = predicate?;
         let stats_schema = stats_schema?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
+
+        let stats_schema = NullableStatsTransform
+            .transform_struct(&referenced_schema)?
+            .into_owned();
+
+        let nullcount_schema = NullCountStatsTransform
+            .transform_struct(&stats_schema)?
+            .into_owned();
+        let stats_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", nullcount_schema),
+            StructField::nullable("minValues", stats_schema.clone()),
+            StructField::nullable("maxValues", stats_schema),
+        ]));
 
         // Skipping happens in several steps:
         //

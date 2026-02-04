@@ -12,7 +12,7 @@ use crate::arrow::array::{
     StructArray, TimestampMicrosecondArray,
 };
 use crate::arrow::compute::{max, min};
-use crate::arrow::datatypes::{DataType, Field, Fields};
+use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -27,6 +27,7 @@ use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::stats::collect_stats;
 use super::UrlExt;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
@@ -36,6 +37,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
@@ -795,30 +797,18 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     readahead: usize,
 }
 
+
 /// Metadata of a data file (typically a parquet file).
-///
-/// Includes full file statistics collected during write.
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
-    // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
-    num_records: usize,
-    // Optional full statistics
-    stats: Option<StructArray>,
+    /// Collected statistics for this file (includes numRecords, tightBounds, etc.).
+    stats: StructArray,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, num_records: usize) -> Self {
-        Self {
-            file_meta,
-            num_records,
-            stats: None,
-        }
-    }
-
-    pub fn with_stats(mut self, stats: StructArray) -> Self {
-        self.stats = Some(stats);
-        self
+    pub fn new(file_meta: FileMeta, stats: StructArray) -> Self {
+        Self { file_meta, stats }
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
@@ -832,15 +822,14 @@ impl DataFileMetadata {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
-                FileMeta {
-                    location,
-                    last_modified,
-                    size,
-                },
-            num_records,
+            FileMeta {
+                location,
+                last_modified,
+                size,
+            },
             stats,
+            ..
         } = self;
-
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
         let key_builder = StringBuilder::new();
@@ -864,42 +853,33 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
 
-        // Use full stats if available, otherwise minimal stats
-        let stats_array: Arc<StructArray> = if let Some(full_stats) = stats {
-            Arc::new(full_stats.clone())
-        } else {
-            Arc::new(StructArray::try_new_with_length(
-                vec![Field::new("numRecords", DataType::Int64, true)].into(),
-                vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
-                None,
-                1,
-            )?)
-        };
+        let stats_array = Arc::new(stats.clone());
 
-        // Build schema dynamically based on the stats array's actual schema
-        use crate::arrow::datatypes::Schema as ArrowSchema;
-        let base_schema: ArrowSchema = crate::transaction::MINIMAL_ADD_FILES_SCHEMA
-            .as_ref()
-            .try_into_arrow()?;
-
-        // Replace the stats field with the actual stats schema
-        let mut fields: Vec<Field> = base_schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
-        // The last field is stats - replace it with the actual stats schema
-        if let Some(last) = fields.last_mut() {
-            *last = Field::new(
-                "stats",
-                DataType::Struct(stats_array.fields().clone()),
-                true,
-            );
-        }
-        let schema = Arc::new(ArrowSchema::new(fields));
+        // Build schema dynamically based on stats (stats schema varies based on collected statistics)
+        let key_value_struct = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ]
+                .into(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                DataType::Map(
+                    Arc::new(Field::new("key_value", key_value_struct, false)),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", DataType::Int64, false),
+            Field::new("modificationTime", DataType::Int64, false),
+            Field::new("stats", stats_array.data_type().clone(), true),
+        ]);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            schema,
+            Arc::new(schema),
             vec![path, partitions, size, modification_time, stats_array],
         )?)))
     }
@@ -931,10 +911,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
+        stats_columns: &[ColumnName],
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
-        let num_records = record_batch.num_rows();
+
+        // Collect statistics before writing (includes numRecords)
+        let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
@@ -972,7 +955,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta, num_records))
+        Ok(DataFileMetadata::new(file_meta, stats))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -990,23 +973,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
-        stats_columns: &[String],
+        stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Collect statistics from the data during write
-        use crate::engine::arrow_data::extract_record_batch;
-        let record_batch = extract_record_batch(data.as_ref())?;
-
-        // Initialize stats collector and update with this batch
-        let mut stats_collector = StatisticsCollector::new(record_batch.schema(), stats_columns);
-        stats_collector.update(record_batch)?;
-        let stats = stats_collector.finalize()?;
-
-        // Write the parquet file
-        let mut parquet_metadata = self.write_parquet(path, data).await?;
-
-        // Attach the collected statistics
-        parquet_metadata = parquet_metadata.with_stats(stats);
-
+        let parquet_metadata = self
+            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+            .await?;
         parquet_metadata.as_record_batch(&partition_values)
     }
 }
@@ -1453,7 +1424,20 @@ mod tests {
         let last_modified = 10000000000;
         let num_records = 10;
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
+        let stats = StructArray::try_new(
+            vec![
+                Field::new("numRecords", ArrowDataType::Int64, true),
+                Field::new("tightBounds", ArrowDataType::Boolean, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int64Array::from(vec![num_records as i64])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+            None,
+        )
+        .unwrap();
+        let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
@@ -1466,6 +1450,7 @@ mod tests {
                 .try_into_arrow()
                 .unwrap(),
         );
+
         let mut partition_values_builder = MapBuilder::new(
             Some(MapFieldNames {
                 entry: "key_value".to_string(),
@@ -1479,13 +1464,33 @@ mod tests {
         partition_values_builder.values().append_value("a");
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
-        let stats_struct = StructArray::try_new_with_length(
-            vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
-            None,
-            1,
-        )
-        .unwrap();
+
+        // Build expected schema dynamically based on stats
+        let stats_field = Field::new("stats", stats.data_type().clone(), true);
+        let schema = Arc::new(crate::arrow::datatypes::Schema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        ArrowDataType::Struct(
+                            vec![
+                                Field::new("key", ArrowDataType::Utf8, false),
+                                Field::new("value", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+            stats_field,
+        ]));
 
         let expected = RecordBatch::try_new(
             schema,
@@ -1494,7 +1499,7 @@ mod tests {
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
-                Arc::new(stats_struct),
+                Arc::new(stats),
             ],
         )
         .unwrap();
@@ -1517,7 +1522,7 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data)
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
             .await
             .unwrap();
 
@@ -1528,8 +1533,7 @@ mod tests {
                     last_modified,
                     size: _,
                 },
-            num_records,
-            ..
+            ref stats,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
@@ -1539,6 +1543,15 @@ mod tests {
         let filename = location.path().split('/').next_back().unwrap();
         assert_eq!(&expected_location.join(filename).unwrap(), location);
         assert!(now - last_modified < 10_000);
+
+        // Check numRecords from stats
+        let num_records = stats
+            .column_by_name("numRecords")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(num_records, 3);
 
         // check we can read back
@@ -1581,7 +1594,7 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );

@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::checkpoint::CheckpointDataIterator;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
