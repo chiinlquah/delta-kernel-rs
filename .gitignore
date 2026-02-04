@@ -19,3 +19,6 @@ ffi/examples/read-table/build
 /build
 /kernel/target
 /target
+
+# Benchmark data
+kernel/benches/add_action_generator/datasets/
