@@ -857,7 +857,7 @@ fn test_create_one_top_level_null() {
         KernelDataType::INTEGER,
     )]));
 
-    match handler.create_one(schema, values) {
+    match handler.create_one(schema.clone(), values) {
         Ok(result) => {
             // Arrow didn't validate - verify we got a null row
             let record_batch = result.try_into_record_batch().unwrap();

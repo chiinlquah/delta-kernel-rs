@@ -6,9 +6,8 @@ use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_log::test;
 use url::Url;
 
-use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
+    get_all_actions_schema, get_commit_schema, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
@@ -1170,7 +1169,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1244,7 +1243,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
     )?;
 
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1313,7 +1312,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
     )?;
 
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1336,67 +1335,6 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     Ok(())
 }
 
-#[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
-
-    write_json_to_store(
-        &store,
-        vec![Action::Add(Add {
-            path: "fake_path_1".into(),
-            data_change: true,
-            ..Default::default()
-        })],
-        filename,
-    )
-    .await?;
-
-    let checkpoint_one_file = log_root.join(filename)?.to_string();
-
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
-
-    let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
-            ..Default::default()
-        }
-        .build()?,
-        log_root,
-        None,
-        None,
-    )?;
-
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema,
-        None,
-        None,
-        None,
-        None,  // No data predicate for manifest-level skipping
-        false, // Don't skip leaf manifests for tests
-    )?;
-
-    // Assert that the first batch returned is from reading checkpoint file 1
-    let ActionsBatch {
-        actions: first_batch,
-        is_log_batch,
-    } = iter.next().unwrap()?;
-    assert!(!is_log_batch);
-    let mut visitor = AddVisitor::default();
-    visitor.visit_rows_of(&*first_batch)?;
-    assert!(visitor.adds.len() == 1);
-    assert!(visitor.adds[0].path == "fake_path_1");
-
-    assert!(iter.next().is_none());
-
-    Ok(())
-}
-
 // Tests the end-to-end process of creating a checkpoint stream.
 // Verifies that:
 // - The checkpoint file is read and produces batches containing references to sidecar files.
@@ -1407,7 +1345,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
@@ -1466,16 +1403,17 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
     )?;
-
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
         None,
         None,
-        None,  // No data predicate for manifest-level skipping
-        false, // Don't skip leaf manifests for tests
+        None,
+        false,
     )?;
+
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -2479,66 +2417,6 @@ fn test_log_segment_contiguous_commit_files() {
         0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
         file_type: Commit }]",
     );
-}
-
-#[test]
-fn test_publish_validation() {
-    use crate::Error;
-
-    // Test with only regular committed files - should pass validation
-    let regular_commits = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000002.json"),
-    ];
-
-    let log_root = Url::parse("file:///path/").unwrap();
-    let log_segment = LogSegment {
-        ascending_commit_files: regular_commits,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root: log_root.clone(), // Test uses dummy path
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    assert!(log_segment.validate_no_staged_commits().is_ok());
-
-    // Test with a staged commit - should fail validation
-    let with_staged = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
-    ];
-
-    let log_root = Url::parse("file:///path/").unwrap();
-    let log_segment_with_staged = LogSegment {
-        ascending_commit_files: with_staged,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root: log_root.clone(), // Test uses dummy path
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // Should fail with staged commits
-    let result = log_segment_with_staged.validate_no_staged_commits();
-    assert!(result.is_err());
-    if let Err(Error::Generic(msg)) = result {
-        assert_eq!(msg, "Found staged commit file in log segment");
-    } else {
-        panic!("Expected Error::Generic");
-    }
 }
 
 /// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment

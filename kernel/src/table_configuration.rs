@@ -13,8 +13,6 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::{ContentRoot, Metadata, Protocol};
-use crate::scan::data_skipping::stats_schema::expected_stats_schema;
-use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
@@ -1601,7 +1599,7 @@ mod test {
         // Use reader version 2 which supports column mapping
         let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+        TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap()
     }
 
     #[test]
@@ -1614,7 +1612,7 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 

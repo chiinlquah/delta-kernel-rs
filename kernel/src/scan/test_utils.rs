@@ -5,7 +5,6 @@ use crate::utils::test_utils::string_array_to_engine_data;
 use itertools::Itertools;
 use std::sync::Arc;
 
-use crate::actions::get_log_add_schema;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
 use crate::{

@@ -9,11 +9,10 @@ use crate::actions::visitors::visit_deletion_vector_at;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
     get_log_add_schema, Add, Cdc, ContentRoot, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
-    CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, COMMIT_INFO_NAME,
+    COMMIT_INFO_NAME, CONTENT_ROOT_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
-use crate::scan::data_skipping::stats_schema::build_stats_schema;
 
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -60,20 +59,7 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    // For table_changes, we read commit files directly (not checkpoints), so there's no
-    // stats_parsed available. Build stats_schema from the predicate's referenced schema.
-    let (predicate, stats_schema) = match physical_predicate {
-        Some((pred, schema)) => (Some(pred), build_stats_schema(&schema)),
-        None => (None, None),
-    };
-    let filter = DataSkippingFilter::new(
-        engine.as_ref(),
-        predicate,
-        stats_schema,
-        get_log_add_schema().clone(),
-        false, // has_compatible_stats_parsed
-    )
-    .map(Arc::new);
+    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
@@ -358,7 +344,7 @@ impl LogReplayScanner {
             // below if a file has been removed. Note: None implies all files passed data skipping.
             // Table changes always reads from commit files (is_log_batch = true), not checkpoints.
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref(), true /* is_log_batch */)?,
+                Some(filter) => filter.apply(actions.as_ref())?,
                 None => vec![true; actions.len()],
             };
 

@@ -129,12 +129,13 @@ impl LogSegment {
     /// This is used to construct a pre-commit snapshot that provides table configuration
     /// (protocol, metadata, schema) for operations like CTAS.
     #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
+    pub(crate) fn for_pre_commit(table_root: Url, log_root: Url) -> Self {
         use crate::PRE_COMMIT_VERSION;
         Self {
             end_version: PRE_COMMIT_VERSION,
             checkpoint_version: None,
             log_root,
+            table_root,
             ascending_commit_files: vec![],
             ascending_compaction_files: vec![],
             checkpoint_parts: vec![],
@@ -512,33 +513,29 @@ impl LogSegment {
         data_predicate: Option<PredicateRef>,
         content_root: Option<&ContentRoot>,
         skip_leaf_manifests: bool,
-    ) -> DeltaResult<(
-        impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
-        Option<bool>,
-        SchemaRef,
-    )> {
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         // content_root is now passed in from caller (no I/O needed)
         let content_root_version = content_root.map(|cr| cr.version);
 
         let commit_stream =
             CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
 
-        let (checkpoint_stream, has_stats_parsed, checkpoint_schema) = self
-            .create_checkpoint_stream(
-                engine,
-                checkpoint_read_schema,
-                meta_predicate,
-                stats_schema,
-                content_root,
-                data_predicate,
-                skip_leaf_manifests,
-            )?;
+        let actions_with_checkpoint_info = self.create_checkpoint_stream(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            content_root,
+            data_predicate,
+            skip_leaf_manifests,
+        )?;
 
-        Ok((
-            commit_stream.chain(checkpoint_stream),
-            has_stats_parsed,
-            checkpoint_schema,
-        ))
+        Ok(ActionsWithCheckpointInfo {
+            actions: actions_with_checkpoint_info.actions.chain(commit_stream),
+            checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
+        })
     }
 
     fn remove_file_actions_from_schema(schema: SchemaRef) -> DeltaResult<SchemaRef> {
@@ -558,18 +555,17 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let (actions_iter, _has_stats_parsed, _checkpoint_schema) = self
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
-                action_schema.clone(),
-                action_schema,
-                meta_predicate,
-                None,
-                None,  // No data predicate for manifest-level skipping
-                None,  // No content root available in this context
-                false, // Don't skip leaf manifests by default
-            )?;
-        Ok(actions_iter)
+        let action_with_checkpoint_info = self.read_actions_with_projected_checkpoint_actions(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            meta_predicate,
+            None,
+            None,  // No data predicate for manifest-level skipping
+            None,  // No content root available in this context
+            false, // Don't skip leaf manifests by default
+        )?;
+        Ok(action_with_checkpoint_info.actions)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -858,11 +854,9 @@ impl LogSegment {
         content_root: Option<&ContentRoot>,
         data_predicate: Option<PredicateRef>,
         skip_leaf_manifests: bool,
-    ) -> DeltaResult<(
+    ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-        Option<bool>,
-        SchemaRef,
-    )>{
+    > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         // Read the content root file if it exists and file actions are necessary.
@@ -888,14 +882,6 @@ impl LogSegment {
         } else {
             (Box::new(std::iter::empty()), action_schema.clone())
         };
-
-        if read_schema.fields().len() == 0 {
-            return Ok((
-                          ActionsWithCheckpointInfo {
-                              actions: content_root_stream,
-                              checkpoint_info,
-                          }, None, action_schema.clone()));
-        }
 
         // Extract file actions schema and sidecar files
         // Only process sidecars when:
@@ -966,6 +952,18 @@ impl LogSegment {
             action_schema.clone()
         };
 
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed,
+            checkpoint_read_schema: augmented_checkpoint_read_schema.clone(),
+        };
+
+        if read_schema.fields().len() == 0 {
+            return Ok(ActionsWithCheckpointInfo {
+                actions: content_root_stream,
+                checkpoint_info,
+            });
+        }
+
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
             .iter()
@@ -1017,20 +1015,10 @@ impl LogSegment {
             .map_ok(|batch| ActionsBatch::new(batch, false))
             .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
 
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed,
-            checkpoint_read_schema: augmented_checkpoint_read_schema,
-        };
-        
-        // TODO(fokko): Check conflict
-        Ok((
-           ActionsWithCheckpointInfo {
-               actions: actions_iter,
-               checkpoint_info,
-           },
-            has_stats_parsed,
-           augmented_checkpoint_read_schema,
-        ))
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(actions_iter),
+            checkpoint_info,
+        })
     }
 
     /// Extracts sidecar file references from a checkpoint file.

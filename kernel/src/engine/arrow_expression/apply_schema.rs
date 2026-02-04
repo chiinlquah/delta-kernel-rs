@@ -5,9 +5,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::arrow::array::{
-    make_array, Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
@@ -37,17 +36,6 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
-}
-
-/// Propagate a parent null buffer to a column, combining it with the column's existing nulls.
-fn propagate_nulls_to_column(column: &ArrayRef, parent_nulls: &NullBuffer) -> ArrayRef {
-    let data = column.to_data();
-    let combined_nulls = NullBuffer::union(Some(parent_nulls), data.nulls());
-    let builder = data.into_builder().nulls(combined_nulls);
-    // SAFETY: We're only adding more nulls to an existing valid array.
-    // The union can only grow the set of NULL rows, preserving data validity.
-    let data = unsafe { builder.build_unchecked() };
-    make_array(data)
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified

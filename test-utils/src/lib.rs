@@ -681,7 +681,7 @@ pub fn create_add_files_with_dvs(
                 Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
                 Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
             ]
-                .into(),
+            .into(),
         ),
         false,
     ));

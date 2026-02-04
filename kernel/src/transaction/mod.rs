@@ -11,7 +11,6 @@ use crate::actions::{
     get_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
-     get_commit_schema, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -64,6 +63,18 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
     ]))
+});
+
+/// The static instance referenced by [`add_files_schema`].
+pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let stats = StructField::nullable(
+        "stats",
+        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
+    );
+
+    StructTypeBuilder::from_schema(mandatory_add_file_schema())
+        .add_field(stats)
+        .build_arc_unchecked()
 });
 
 /// Returns a reference to the mandatory fields in an add action.
@@ -239,54 +250,6 @@ fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
-/// Extracts leaf column paths from a stats schema structure.
-///
-/// Walks through minValues/maxValues schemas (they have same structure) and returns
-/// all leaf columns as ColumnName instances representing their full paths.
-fn extract_leaf_columns_from_stats(
-    stats_schema: &StructType,
-) -> Vec<crate::expressions::ColumnName> {
-    // Look for minValues field (could also use maxValues, they're identical)
-    let Some(min_values_field) = stats_schema.fields().find(|f| f.name() == "minValues") else {
-        return vec![]; // No min/max fields means no eligible columns
-    };
-
-    let DataType::Struct(min_values_struct) = min_values_field.data_type() else {
-        return vec![];
-    };
-
-    let mut columns = Vec::new();
-    let mut path = Vec::new();
-    extract_leaf_columns_recursive(min_values_struct, &mut path, &mut columns);
-    columns
-}
-
-/// Recursively extracts leaf column paths from a schema.
-fn extract_leaf_columns_recursive(
-    schema: &StructType,
-    current_path: &mut Vec<String>,
-    result: &mut Vec<crate::expressions::ColumnName>,
-) {
-    use crate::expressions::ColumnName;
-
-    for field in schema.fields() {
-        current_path.push(field.name().to_string());
-
-        match field.data_type() {
-            DataType::Struct(nested) => {
-                // Recurse into nested struct
-                extract_leaf_columns_recursive(nested, current_path, result);
-            }
-            _ => {
-                // Leaf column - add to result
-                result.push(ColumnName::new(current_path.iter().map(|s| s.as_str())));
-            }
-        }
-
-        current_path.pop();
-    }
-}
-
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -447,7 +410,15 @@ impl Transaction {
             domain_metadata_additions: system_domain_metadata,
             domain_removals: vec![],
             data_change: true,
+            batch_commit: false,
             dv_matched_files: vec![],
+            aggregated_manifest_dvs: HashMap::new(),
+            aggregated_unreconciled: HashSet::new(),
+            aggregated_root_dv_actions: HashSet::new(),
+            leaf_manifests: vec![],
+            snapshot_id: generate_snapshot_id(),
+            root_released: false,
+            cached_root_manifest_url: std::cell::OnceCell::new(),
             // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
             // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
             // return the correct columns for the new table.
@@ -538,62 +509,58 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        let commit_version = self.read_snapshot.version() + 1;
-
-
+        // TODO(fokko) Check what's going on here
         // Step 3: Generate Protocol and Metadata actions for create-table
-        let (protocol_action, metadata_action) = if self.is_create_table() {
-            let table_config = self.read_snapshot.table_configuration();
-            let protocol = table_config.protocol().clone();
-            let metadata = table_config.metadata().clone();
-
-            let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
-            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
-
-            let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
-            let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
-
-            (Some(protocol_data), Some(metadata_data))
-        } else {
-            (None, None)
-        };
-
-        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+        // let (protocol_action, metadata_action) = if self.is_create_table() {
+        //     let table_config = self.read_snapshot.table_configuration();
+        //     let protocol = table_config.protocol().clone();
+        //     let metadata = table_config.metadata().clone();
+        //
+        //     let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+        //     let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+        //
+        //     let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
+        //     let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
+        //
+        //     (Some(protocol_data), Some(metadata_data))
+        // } else {
+        //     (None, None)
+        // };
+        // // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.get_commit_version();
-        let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
-
-        // Step 4b: Generate all domain metadata actions (user and system domains)
-        let domain_metadata_actions =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        // let (add_actions, row_tracking_domain_metadata) =
+        //     self.generate_adds(engine, commit_version)?;
+        //
+        // // Step 4b: Generate all domain metadata actions (user and system domains)
+        // let domain_metadata_actions =
+        //     self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 6: Generate remove actions (collect to avoid borrowing self)
+        // Step 6a: Generate remove actions (collect to avoid borrowing self)
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
+        // TODO(fokko) Check what's going on here
         // Build the action chain
         // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata -> removes
         // For existing table: CommitInfo -> adds -> txns -> domain_metadata -> removes
-        let actions = iter::once(commit_info_action)
-            .chain(protocol_action.map(Ok))
-            .chain(metadata_action.map(Ok))
-            .chain(add_actions)
-            .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
+        // let actions = iter::once(commit_info_action)
+        //     .chain(protocol_action.map(Ok))
+        //     .chain(metadata_action.map(Ok))
+        //     .chain(add_actions)
+        //     .chain(set_transaction_actions)
+        //     .chain(domain_metadata_actions);
 
-
-        // TODO(fokko) Check for conflicts
-        // // Step 4: Generate all domain metadata actions (user and system domains)
-        // let actions = self.generate_log_actions(
-        //     engine,
-        //     commit_version,
-        //     snapshot_id,
-        //     commit_info_action,
-        //     set_transaction_actions,
-        // )?;
+        // Step 6b: Generate all domain metadata actions (user and system domains)
+        let actions = self.generate_log_actions(
+            engine,
+            commit_version,
+            snapshot_id,
+            commit_info_action,
+            set_transaction_actions,
+        )?;
 
         let filtered_actions = actions
             .into_iter()
@@ -1569,20 +1536,16 @@ impl Transaction {
     /// file to be added to the table. Kernel takes this information and extends it to the full add_file
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
-    /// The stats field structure is determined by table configuration. See [`stats_schema`] for details.
+    /// For now, Kernel only supports the number of records as a file statistic.
+    /// This will change in a future release.
+    ///
+    /// Note: While currently static, in the future the schema might change depending on
+    /// options set on the transaction or features enabled on the table.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`stats_schema`]: crate::transaction::Transaction::stats_schema
-    pub fn add_files_schema(&self) -> SchemaRef {
-        let stats_schema = self.stats_schema();
-
-        StructTypeBuilder::from_schema(mandatory_add_file_schema())
-            .add_field(StructField::nullable(
-                "stats",
-                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
-            ))
-            .build_arc_unchecked()
+    pub fn add_files_schema(&self) -> &'static SchemaRef {
+        &BASE_ADD_FILES_SCHEMA
     }
 
     /// Returns the expected schema for file statistics.
@@ -1830,7 +1793,7 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                self.add_files_schema(),
+                self.add_files_schema().clone(),
                 with_stats_col(&with_data_change_col(&self.add_files_schema())),
                 self.data_change,
             );
@@ -2540,7 +2503,7 @@ mod tests {
 
         // Test that with_batch_commit returns self correctly
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_batch_commit()
             .with_engine_info("test engine");
 
@@ -2561,7 +2524,7 @@ mod tests {
             .unwrap();
 
         // Test that batch_commit defaults to false
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         assert!(!txn.batch_commit);
         Ok(())
     }
@@ -3029,7 +2992,7 @@ mod tests {
 
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
-            .transaction(committer)?
+            .transaction(committer, &engine)?
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
@@ -3271,7 +3234,7 @@ mod tests {
 
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
-            .transaction(committer)?
+            .transaction(committer, &engine)?
             .with_batch_commit()
             .with_operation("DELETE".to_string());
 
@@ -3548,7 +3511,7 @@ mod tests {
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
-            .transaction(committer)?
+            .transaction(committer, &engine)?
             .with_batch_commit()
             .with_operation("CREATE_CONTENT_ROOT".to_string());
 
