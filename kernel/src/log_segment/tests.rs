@@ -26,7 +26,7 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{DataType, StructType};
-use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
+use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
@@ -210,27 +210,6 @@ async fn add_sidecar_to_store(
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path, data).await
-}
-
-/// Writes all actions to a _delta_log json checkpoint file in the store.
-/// This function formats the provided filename into the _delta_log directory.
-async fn write_json_to_store(
-    store: &Arc<InMemory>,
-    actions: Vec<Action>,
-    filename: &str,
-) -> DeltaResult<()> {
-    let json_lines: Vec<String> = actions
-        .into_iter()
-        .map(|action| serde_json::to_string(&action).expect("action to string"))
-        .collect();
-    let content = json_lines.join("\n");
-    let checkpoint_path = format!("_delta_log/{filename}");
-
-    store
-        .put(&Path::from(checkpoint_path), content.into())
-        .await?;
-
-    Ok(())
 }
 
 fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {

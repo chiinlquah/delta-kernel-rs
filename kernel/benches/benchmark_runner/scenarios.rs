@@ -259,7 +259,7 @@ pub fn write(
     // Create transaction
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("benchmark-runner")
         .with_operation("WRITE".to_string())
         .with_data_change(true);
@@ -275,7 +275,7 @@ pub fn write(
     for batch_idx in 0..num_batches {
         let start_index = batch_idx * batch_size;
         batches.push(create_add_files_metadata(
-            &add_files_schema,
+            add_files_schema,
             batch_size,
             start_index,
         )?);
@@ -447,7 +447,7 @@ pub fn vacuum_delete(
     // Create transaction
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("benchmark-runner")
         .with_operation("DELETE".to_string())
         .with_data_change(true);

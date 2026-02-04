@@ -1776,9 +1776,9 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(&self.add_files_schema()),
+                with_row_tracking_cols(self.add_files_schema()),
                 with_row_tracking_cols(&with_stats_col(&with_data_change_col(
-                    &self.add_files_schema(),
+                    self.add_files_schema(),
                 ))),
                 self.data_change,
             );
@@ -1794,7 +1794,7 @@ impl Transaction {
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
                 self.add_files_schema().clone(),
-                with_stats_col(&with_data_change_col(&self.add_files_schema())),
+                with_stats_col(&with_data_change_col(self.add_files_schema())),
                 self.data_change,
             );
 

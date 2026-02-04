@@ -575,29 +575,6 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Create a Metadata action with writeStatsAsStruct enabled
-fn create_metadata_action_with_stats_struct() -> Action {
-    let mut config = HashMap::new();
-    config.insert(
-        "delta.checkpoint.writeStatsAsStruct".to_string(),
-        "true".to_string(),
-    );
-    Action::Metadata(
-        Metadata::try_new(
-            Some("test-table".into()),
-            None,
-            StructType::new_unchecked([
-                StructField::nullable("id", KernelDataType::LONG),
-                StructField::nullable("name", KernelDataType::STRING),
-            ]),
-            vec![],
-            0,
-            config,
-        )
-        .unwrap(),
-    )
-}
-
 /// Create an Add action with JSON stats
 fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
     let stats = format!(

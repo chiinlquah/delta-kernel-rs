@@ -167,7 +167,7 @@ async fn create_dv_table_with_files(
             )
         })
         .collect();
-    let metadata = create_add_files_metadata(&add_files_schema, files)?;
+    let metadata = create_add_files_metadata(add_files_schema, files)?;
     txn.add_files(metadata);
 
     let _ = txn.commit(engine.as_ref())?;
@@ -350,7 +350,7 @@ async fn batch_write_data_and_check_result_and_stats(
     let committer = Box::new(FileSystemCommitter::new());
     let txn = snapshot
         .clone()
-        .transaction(committer)?
+        .transaction(committer, engine.as_ref())?
         .with_data_change(true)
         .with_batch_commit();
     append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
@@ -2084,7 +2084,7 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("batch commit test")
             .with_batch_commit();
 
@@ -2122,7 +2122,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("batch commit test")
             .with_batch_commit()
             .with_data_change(true);
@@ -3386,7 +3386,7 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut batch_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_batch_commit()
             .with_engine_info("batch commit test")
             .with_operation("BATCH_COMMIT".to_string());
@@ -3473,7 +3473,7 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
         // Now create a transaction with batch_commit enabled
         let mut txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_batch_commit() // Enable batch commit mode
             .with_engine_info("test engine")
             .with_operation("DELETE".to_string())
@@ -3509,6 +3509,7 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
             _ => panic!("Transaction did not succeed."),
         }
     }
+    Ok(())
 }
 
 #[tokio::test]

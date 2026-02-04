@@ -880,7 +880,7 @@ async fn generate_content_root(
     println!("      Creating transaction...");
 
     let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot.transaction(committer)?;
+    let mut txn = snapshot.transaction(committer, engine.as_ref())?;
     txn = txn.with_batch_commit();
 
     println!("      ✓ Transaction created in batch_commit mode");
