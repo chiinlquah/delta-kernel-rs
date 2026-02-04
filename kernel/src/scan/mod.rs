@@ -957,10 +957,14 @@ impl Scan {
 ///    },
 ///    fileConstantValues: {
 ///      partitionValues: map<string, string>,
-///      tags: map<string, string>,
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
+///      tags: map<string, string>,
 ///      clusteringProvider: string,
+///      dataManifestPath: string,
+///      dataManifestPosition: long,
+///      deleteManifestPath: string,
+///      deleteManifestPosition: long,
 ///    }
 /// }
 /// ```

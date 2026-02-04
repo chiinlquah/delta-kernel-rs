@@ -533,7 +533,7 @@ impl LogSegment {
         )?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: actions_with_checkpoint_info.actions.chain(commit_stream),
+            actions: commit_stream.chain(actions_with_checkpoint_info.actions),
             checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
         })
     }

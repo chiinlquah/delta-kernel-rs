@@ -161,8 +161,10 @@ pub use metadata::{DataContentType, Metadata, MetadataEntry, TrackingInfo, Track
 // Export metadata reader for testing
 pub use metadata::reader::MetadataEntryVisitor;
 
-#[cfg(not(feature = "internal-api"))]
+#[cfg(feature = "internal-api")]
 pub mod parallel;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod parallel;
 
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;

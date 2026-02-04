@@ -4,6 +4,7 @@ use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
+use crate::arrow::array::{ArrayRef, StructArray};
 use crate::arrow::datatypes::{DataType, Schema};
 use crate::arrow::{
     array::{create_array, RecordBatch},
@@ -65,7 +66,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit (version 0) - metadata and protocol actions
-    // Protocol action includes the v2Checkpoint reader/writer feature.
+    // Protocol action does not include the v2Checkpoint reader/writer feature.
     write_commit_to_store(
         &store,
         vec![
@@ -80,34 +81,32 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer()?;
 
-    // Use V2 schema for the checkpoint metadata batch
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
-    // Verify the underlying EngineData contains the expected fields
+    // Verify the underlying EngineData contains the expected CheckpointMetadata action
     let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
     let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
 
-    // Verify the schema has the expected fields
-    let schema = record_batch.schema();
-    assert!(
-        schema.field_with_name("checkpointMetadata").is_ok(),
-        "Schema should have checkpointMetadata field"
-    );
-    assert!(
-        schema.field_with_name("add").is_ok(),
-        "Schema should have add field"
-    );
-    assert!(
-        schema.field_with_name("remove").is_ok(),
-        "Schema should have remove field"
-    );
+    // Build the expected RecordBatch
+    // Note: The schema is a struct with a single field "checkpointMetadata" of type struct
+    // containing a single field "version" of type long
+    let expected_schema = Arc::new(Schema::new(vec![Field::new(
+        "checkpointMetadata",
+        DataType::Struct(vec![Field::new("version", DataType::Int64, false)].into()),
+        true,
+    )]));
+    let expected = RecordBatch::try_new(
+        expected_schema,
+        vec![Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("version", DataType::Int64, false)),
+            create_array!(Int64, [0]) as ArrayRef,
+        )]))],
+    )
+    .unwrap();
 
-    // Verify we have one row
-    assert_eq!(record_batch.num_rows(), 1);
-
-    // Verify action counts
+    assert_eq!(*record_batch, expected);
     assert_eq!(checkpoint_batch.actions_count, 1);
     assert_eq!(checkpoint_batch.add_actions_count, 0);
 
