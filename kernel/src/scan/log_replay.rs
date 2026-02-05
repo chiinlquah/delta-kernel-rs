@@ -102,7 +102,10 @@ pub struct SerializableScanState {
 pub struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
+    /// Transform for checkpoint batches - may include stats_parsed if available
     add_transform: Arc<dyn ExpressionEvaluator>,
+    /// Transform for commit batches - never includes stats_parsed (commits don't have it)
+    add_transform_for_commits: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -142,7 +145,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
-        _checkpoint_info: CheckpointReadInfo,
+        checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
     ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
@@ -163,13 +166,62 @@ impl ScanLogReplayProcessor {
                 None
             }
         };
+
+        // Determine if we should include stats_parsed in the output schema.
+        // This requires BOTH:
+        // 1. The scan explicitly requested stats columns via include_stats_columns()
+        //    (logical_stats_schema is set only for write operations, not for data skipping predicates)
+        // 2. The checkpoint actually has compatible stats_parsed (has_stats_parsed is true)
+        // Note: We use logical_stats_schema (not physical_stats_schema) because physical_stats_schema
+        // is also set for data skipping predicates, but those scans don't need stats_parsed output.
+        let include_stats_parsed =
+            state_info.logical_stats_schema.is_some() && checkpoint_info.has_stats_parsed;
+
+        // Build the scan row schema, optionally including stats_parsed
+        let stats_schema_for_output = if include_stats_parsed {
+            state_info.physical_stats_schema.clone()
+        } else {
+            None
+        };
+        let scan_row_schema = scan_row_schema_with_stats_parsed(stats_schema_for_output.clone());
+        let scan_row_datatype: DataType = scan_row_schema.as_ref().clone().into();
+
+        // Build input schema for the checkpoint transform evaluator
+        // When include_stats_parsed is true, we need to add stats_parsed to the Add schema
+        // so the expression evaluator can resolve the add.stats_parsed column reference
+        let checkpoint_input_schema =
+            log_add_schema_with_stats_parsed(stats_schema_for_output.clone());
+
+        // Build expressions for stats_parsed:
+        // - For checkpoints: extract the column from the input
+        // - For commits: produce null values (commits don't have stats_parsed)
+        // Both must produce the same output schema for consistent downstream processing.
+        use crate::expressions::column_expr_ref;
+        let (checkpoint_stats_expr, commit_stats_expr) = match &stats_schema_for_output {
+            Some(schema) => {
+                let stats_type = DataType::Struct(Box::new(schema.as_ref().clone()));
+                (
+                    Some(column_expr_ref!("add.stats_parsed")),
+                    Some(Arc::new(Expression::Literal(Scalar::Null(stats_type)))),
+                )
+            }
+            None => (None, None),
+        };
+
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_input_schema,
+                get_add_transform_expr(checkpoint_stats_expr),
+                scan_row_datatype.clone(),
+            )?,
+            // For commits, we use the same output schema but produce null for stats_parsed
+            // This ensures all batches have consistent schema for downstream consumers
+            add_transform_for_commits: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
-                get_add_transform_expr(),
-                SCAN_ROW_DATATYPE.clone(),
+                get_add_transform_expr(commit_stats_expr),
+                scan_row_datatype,
             )?,
             seen_file_keys,
             state_info,
@@ -498,12 +550,62 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
-    LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
+/// Creates a scan row schema that includes stats_parsed when a stats schema is provided.
+///
+/// This is used when `include_stats_columns()` is called on a scan, allowing the parsed
+/// statistics from checkpoints to flow through to the output.
+pub(crate) fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
+    let Some(stats_schema) = stats_schema else {
+        return SCAN_ROW_SCHEMA.clone();
+    };
 
-fn get_add_transform_expr() -> ExpressionRef {
+    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+    fields.push(StructField::nullable(
+        "stats_parsed",
+        DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+    ));
+    Arc::new(StructType::new_unchecked(fields))
+}
+
+/// Creates a log add schema that includes stats_parsed when a stats schema is provided.
+///
+/// This is needed for the expression evaluator input schema when we want to extract
+/// stats_parsed from checkpoint data. The standard get_log_add_schema() doesn't include
+/// stats_parsed, so we need to build a dynamic schema that includes it.
+fn log_add_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
+    use crate::actions::{Add, ADD_NAME};
+
+    let Some(stats_schema) = stats_schema else {
+        return get_log_add_schema().clone();
+    };
+
+    // Get the base Add schema (which is a StructType) and add stats_parsed to it
+    let add_struct = Add::to_schema();
+    let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+    add_fields.push(StructField::nullable(
+        "stats_parsed",
+        DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+    ));
+
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        StructType::new_unchecked(add_fields),
+    )]))
+}
+
+/// Creates the expression for transforming add actions into scan rows.
+///
+/// The `stats_parsed_expr` parameter controls how stats_parsed is handled:
+/// - `None`: Base expression without stats_parsed field
+/// - `Some(expr)`: Expression with stats_parsed field using the provided expression
+///
+/// For checkpoints, use `column_expr_ref!("add.stats_parsed")` to extract stats_parsed.
+/// For commits, use `Expression::Literal(Scalar::Null(stats_type))` to produce null values.
+fn get_add_transform_expr(stats_parsed_expr: Option<ExpressionRef>) -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+
+    // Base expression without stats_parsed
+    static BASE_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
         Arc::new(Expression::Struct(
             vec![
                 column_expr_ref!("add.path"),
@@ -529,7 +631,37 @@ fn get_add_transform_expr() -> ExpressionRef {
             None,
         ))
     });
-    EXPR.clone()
+
+    let Some(stats_parsed_expr) = stats_parsed_expr else {
+        return BASE_EXPR.clone();
+    };
+
+    // Build expression with stats_parsed dynamically (can't be static since stats_parsed_expr varies)
+    Arc::new(Expression::Struct(
+        vec![
+            column_expr_ref!("add.path"),
+            column_expr_ref!("add.size"),
+            column_expr_ref!("add.modificationTime"),
+            column_expr_ref!("add.stats"),
+            column_expr_ref!("add.deletionVector"),
+            Arc::new(Expression::Struct(
+                vec![
+                    column_expr_ref!("add.partitionValues"),
+                    column_expr_ref!("add.baseRowId"),
+                    column_expr_ref!("add.defaultRowCommitVersion"),
+                    column_expr_ref!("add.tags"),
+                    column_expr_ref!("add.clusteringProvider"),
+                    column_expr_ref!("add.dataManifestPath"),
+                    column_expr_ref!("add.dataManifestPosition"),
+                    column_expr_ref!("add.deleteManifestPath"),
+                    column_expr_ref!("add.deleteManifestPosition"),
+                ],
+                None,
+            )),
+            stats_parsed_expr,
+        ],
+        None,
+    ))
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -649,7 +781,15 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         visitor.visit_rows_of(actions.as_ref())?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions.as_ref())?;
+        // Use appropriate transform based on batch type:
+        // - Commit batches (is_log_batch=true) don't have stats_parsed, use base transform
+        // - Checkpoint batches (is_log_batch=false) may have stats_parsed
+        let transform = if is_log_batch {
+            &self.add_transform_for_commits
+        } else {
+            &self.add_transform
+        };
+        let result = transform.evaluate(actions.as_ref())?;
         ScanMetadata::try_new(
             result,
             visitor.selection_vector,
