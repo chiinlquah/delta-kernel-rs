@@ -2464,29 +2464,23 @@ mod tests {
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
-
-        // The schema should include the mandatory fields
-        assert!(schema.fields().any(|f| f.name() == "path"));
-        assert!(schema.fields().any(|f| f.name() == "partitionValues"));
-        assert!(schema.fields().any(|f| f.name() == "size"));
-        assert!(schema.fields().any(|f| f.name() == "modificationTime"));
-
-        // The stats field should be present and should be a struct
-        let stats_field = schema
-            .fields()
-            .find(|f| f.name() == "stats")
-            .expect("stats field should exist");
-        assert!(matches!(stats_field.data_type(), DataType::Struct(_)));
-
-        // Verify that stats schema contains the expected fields based on table config
-        if let DataType::Struct(stats_schema) = stats_field.data_type() {
-            // Should always have numRecords
-            assert!(stats_schema.fields().any(|f| f.name() == "numRecords"));
-            // Should have tightBounds
-            assert!(stats_schema.fields().any(|f| f.name() == "tightBounds"));
-            // May have nullCount, minValues, maxValues depending on table config
-        }
-
+        let expected = StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable(
+                "stats",
+                DataType::struct_type_unchecked(vec![StructField::nullable(
+                    "numRecords",
+                    DataType::LONG,
+                )]),
+            ),
+        ]);
+        assert_eq!(*schema, expected.into());
         Ok(())
     }
 
