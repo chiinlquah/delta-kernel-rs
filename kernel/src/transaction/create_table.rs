@@ -317,15 +317,10 @@ impl CreateTableTransactionBuilder {
         )?;
 
         // Create pre-commit snapshot from protocol/metadata
-        let log_segment = LogSegment::for_pre_commit(table_url, delta_log_url.clone());
+        let log_segment = LogSegment::for_pre_commit(table_url.clone(), delta_log_url);
         // TODO(fokko): Check content root
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            protocol,
-            None,
-            delta_log_url,
-            PRE_COMMIT_VERSION,
-        )?;
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, None, table_url, PRE_COMMIT_VERSION)?;
 
         // Create Transaction with pre-commit snapshot
         Transaction::try_new_create_table(

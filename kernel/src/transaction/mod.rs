@@ -8,9 +8,10 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, generate_snapshot_id,
-    get_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
+    get_commit_schema, get_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
+    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME,
+    PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -509,51 +510,18 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // TODO(fokko) Check what's going on here
-        // Step 3: Generate Protocol and Metadata actions for create-table
-        // let (protocol_action, metadata_action) = if self.is_create_table() {
-        //     let table_config = self.read_snapshot.table_configuration();
-        //     let protocol = table_config.protocol().clone();
-        //     let metadata = table_config.metadata().clone();
-        //
-        //     let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
-        //     let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
-        //
-        //     let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
-        //     let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
-        //
-        //     (Some(protocol_data), Some(metadata_data))
-        // } else {
-        //     (None, None)
-        // };
-        // // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+        // Step 3: Get commit version for actions
         let commit_version = self.get_commit_version();
-        // let (add_actions, row_tracking_domain_metadata) =
-        //     self.generate_adds(engine, commit_version)?;
-        //
-        // // Step 4b: Generate all domain metadata actions (user and system domains)
-        // let domain_metadata_actions =
-        //     self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
+        // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 6a: Generate remove actions (collect to avoid borrowing self)
+        // Step 5: Generate remove actions (collect to avoid borrowing self)
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
-        // TODO(fokko) Check what's going on here
-        // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata -> removes
-        // For existing table: CommitInfo -> adds -> txns -> domain_metadata -> removes
-        // let actions = iter::once(commit_info_action)
-        //     .chain(protocol_action.map(Ok))
-        //     .chain(metadata_action.map(Ok))
-        //     .chain(add_actions)
-        //     .chain(set_transaction_actions)
-        //     .chain(domain_metadata_actions);
-
-        // Step 6b: Generate all domain metadata actions (user and system domains)
+        // Step 6: Generate all log actions (commit info, protocol, metadata for create-table,
+        // set transactions, domain metadata, add actions)
         let actions = self.generate_log_actions(
             engine,
             commit_version,
@@ -625,8 +593,30 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
+        // Start with commit info action
         let mut actions_vec =
             vec![commit_info_action.map(FilteredEngineData::with_all_rows_selected)];
+
+        // For create-table: add Protocol and Metadata actions after commit info
+        if self.is_create_table() {
+            let table_config = self.read_snapshot.table_configuration();
+            let protocol = table_config.protocol().clone();
+            let metadata = table_config.metadata().clone();
+
+            let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+
+            let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
+            let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
+
+            actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(
+                protocol_data,
+            )));
+            actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(
+                metadata_data,
+            )));
+        }
+
         actions_vec.extend(
             set_transaction_actions
                 .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
