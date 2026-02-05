@@ -849,12 +849,6 @@ fn test_create_one_not_null_struct() {
 
 #[test]
 fn test_create_one_top_level_null() {
-    // When creating a struct with a single null value for a not-null field,
-    // the LiteralExpressionTransform creates a null_literal for the entire struct.
-    // Arrow's RecordBatch validation behavior may vary by version/configuration:
-    // - Some versions validate and return an error for null values in non-nullable columns
-    // - Some versions skip validation and allow the null row
-    // Both behaviors are acceptable - the key is that we don't panic.
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
@@ -863,7 +857,7 @@ fn test_create_one_top_level_null() {
         KernelDataType::INTEGER,
     )]));
 
-    match handler.create_one(schema, values) {
+    match handler.create_one(schema.clone(), values) {
         Ok(result) => {
             // Arrow didn't validate - verify we got a null row
             let record_batch = result.try_into_record_batch().unwrap();
@@ -881,6 +875,10 @@ fn test_create_one_top_level_null() {
             );
         }
     }
+    assert_result_error_with_message(
+        handler.create_one(schema, values),
+        "Column 'col_1' is declared as non-nullable but contains null values",
+    );
 }
 
 #[test]

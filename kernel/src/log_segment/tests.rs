@@ -6,9 +6,8 @@ use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_log::test;
 use url::Url;
 
-use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
+    get_all_actions_schema, get_commit_schema, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
@@ -27,7 +26,7 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{DataType, StructType};
-use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
+use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
@@ -211,27 +210,6 @@ async fn add_sidecar_to_store(
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path, data).await
-}
-
-/// Writes all actions to a _delta_log json checkpoint file in the store.
-/// This function formats the provided filename into the _delta_log directory.
-async fn write_json_to_store(
-    store: &Arc<InMemory>,
-    actions: Vec<Action>,
-    filename: &str,
-) -> DeltaResult<()> {
-    let json_lines: Vec<String> = actions
-        .into_iter()
-        .map(|action| serde_json::to_string(&action).expect("action to string"))
-        .collect();
-    let content = json_lines.join("\n");
-    let checkpoint_path = format!("_delta_log/{filename}");
-
-    store
-        .put(&Path::from(checkpoint_path), content.into())
-        .await?;
-
-    Ok(())
 }
 
 fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
@@ -1170,7 +1148,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1179,6 +1157,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1243,7 +1222,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
     )?;
 
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1252,6 +1231,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1311,7 +1291,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
     )?;
 
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1320,6 +1300,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
     )?;
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1328,67 +1309,6 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
-    assert!(iter.next().is_none());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
-
-    write_json_to_store(
-        &store,
-        vec![Action::Add(Add {
-            path: "fake_path_1".into(),
-            data_change: true,
-            ..Default::default()
-        })],
-        filename,
-    )
-    .await?;
-
-    let checkpoint_one_file = log_root.join(filename)?.to_string();
-
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
-
-    let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
-            ..Default::default()
-        }
-        .build()?,
-        log_root,
-        None,
-        None,
-    )?;
-
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema,
-        None,
-        None,
-        None,
-        None,  // No data predicate for manifest-level skipping
-        false, // Don't skip leaf manifests for tests
-    )?;
-
-    // Assert that the first batch returned is from reading checkpoint file 1
-    let ActionsBatch {
-        actions: first_batch,
-        is_log_batch,
-    } = iter.next().unwrap()?;
-    assert!(!is_log_batch);
-    let mut visitor = AddVisitor::default();
-    visitor.visit_rows_of(&*first_batch)?;
-    assert!(visitor.adds.len() == 1);
-    assert!(visitor.adds[0].path == "fake_path_1");
-
     assert!(iter.next().is_none());
 
     Ok(())
@@ -1404,7 +1324,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
@@ -1463,16 +1382,17 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
     )?;
-
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
         None,
         None,
-        None,  // No data predicate for manifest-level skipping
-        false, // Don't skip leaf manifests for tests
+        None,
+        false,
     )?;
+
+    let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -2478,66 +2398,6 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-#[test]
-fn test_publish_validation() {
-    use crate::Error;
-
-    // Test with only regular committed files - should pass validation
-    let regular_commits = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000002.json"),
-    ];
-
-    let log_root = Url::parse("file:///path/").unwrap();
-    let log_segment = LogSegment {
-        ascending_commit_files: regular_commits,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root: log_root.clone(), // Test uses dummy path
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    assert!(log_segment.validate_no_staged_commits().is_ok());
-
-    // Test with a staged commit - should fail validation
-    let with_staged = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
-    ];
-
-    let log_root = Url::parse("file:///path/").unwrap();
-    let log_segment_with_staged = LogSegment {
-        ascending_commit_files: with_staged,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: log_root.clone(),
-        table_root: log_root.clone(), // Test uses dummy path
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // Should fail with staged commits
-    let result = log_segment_with_staged.validate_no_staged_commits();
-    assert!(result.is_err());
-    if let Err(Error::Generic(msg)) = result {
-        assert_eq!(msg, "Found staged commit file in log segment");
-    } else {
-        panic!("Expected Error::Generic");
-    }
-}
-
 /// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
@@ -2826,9 +2686,9 @@ fn test_schema_has_compatible_stats_parsed_basic() {
 }
 
 #[test]
-fn test_schema_has_compatible_stats_parsed_missing_column_fails() {
+fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
     // Checkpoint has "id" column, stats schema needs "other" column
-    // Now that we properly check, missing column should FAIL because coalesce won't work
+    // Missing column is acceptable - it will return null when accessed
     let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
@@ -2837,8 +2697,9 @@ fn test_schema_has_compatible_stats_parsed_missing_column_fails() {
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("other", DataType::INTEGER)]);
 
-    // Missing column in checkpoint should fail - we need the column for data skipping
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+    // Missing column in checkpoint is OK - it will return null when accessed,
+    // which is acceptable for data skipping (just means we can't skip based on that column)
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema
     ));
@@ -2961,6 +2822,157 @@ fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     ));
 }
 
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct() {
+    // Create a nested struct: user: { name: string, age: integer }
+    let user_struct = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            user_struct.clone(),
+        )]);
+
+    // Exact match should work
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", user_struct)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_with_extra_fields() {
+    // Checkpoint has extra nested fields not needed by stats schema
+    let checkpoint_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING), // extra field
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    // Stats schema only needs a subset of fields
+    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Extra fields in checkpoint nested struct should be OK
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_missing_field_ok() {
+    // Checkpoint is missing a nested field that stats schema needs
+    let checkpoint_user =
+        StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    // Stats schema needs more fields than checkpoint has
+    let stats_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER), // missing in checkpoint
+    ]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Missing nested field is OK - it will return null when accessed
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_nested_struct_type_mismatch() {
+    // Checkpoint has incompatible type in nested field
+    let checkpoint_user = StructType::new_unchecked([
+        StructField::nullable("name", DataType::INTEGER), // wrong type!
+    ]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "user",
+            checkpoint_user,
+        )]);
+
+    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
+
+    // Type mismatch in nested field should fail
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_deeply_nested() {
+    // Deeply nested: company: { department: { team: { name: string } } }
+    let team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+    let department = StructType::new_unchecked([StructField::nullable("team", team.clone())]);
+    let company = StructType::new_unchecked([StructField::nullable("department", department)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "company",
+            company.clone(),
+        )]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("company", company)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
+    // Type mismatch deep in nested structure
+    let checkpoint_team =
+        StructType::new_unchecked([StructField::nullable("name", DataType::INTEGER)]); // wrong!
+    let checkpoint_dept =
+        StructType::new_unchecked([StructField::nullable("team", checkpoint_team)]);
+    let checkpoint_company =
+        StructType::new_unchecked([StructField::nullable("department", checkpoint_dept)]);
+
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "company",
+            checkpoint_company,
+        )]);
+
+    let stats_team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+    let stats_dept = StructType::new_unchecked([StructField::nullable("team", stats_team)]);
+    let stats_company =
+        StructType::new_unchecked([StructField::nullable("department", stats_dept)]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable("company", stats_company)]);
+
+    // Type mismatch deep in hierarchy should be detected
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
 // ============================================================================
 // new_with_commit tests
 // ============================================================================
@@ -3063,4 +3075,23 @@ async fn test_new_with_commit_not_end_version_plus_one() {
         result,
         "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
     );
+}
+
+// ============================================================================
+// get_unpublished_catalog_commits tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_unpublished_catalog_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_published_version, Some(2));
+    let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    assert_eq!(versions, vec![3, 4]);
 }

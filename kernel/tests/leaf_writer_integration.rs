@@ -644,7 +644,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
         // Step 1: Create transaction with batch commit enabled
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("WRITE".to_string())
             .with_batch_commit();
 
@@ -652,7 +652,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
         let mut leaf = txn.new_leaf_node_writer(&engine)?;
         let add_files_schema = txn.add_files_schema();
         let metadata = create_add_files_metadata(
-            &add_files_schema,
+            add_files_schema,
             vec![
                 ("part-001.parquet", 2048, 1000000, 50),
                 ("part-002.parquet", 3072, 1000001, 75),
@@ -697,7 +697,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
         // Create transaction with batch commit enabled
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("WRITE".to_string())
             .with_batch_commit();
 
@@ -720,7 +720,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
                     20 + i,
                 ),
             ];
-            let metadata = create_add_files_metadata(&add_files_schema, files)?;
+            let metadata = create_add_files_metadata(add_files_schema, files)?;
             leaf.add_files(metadata)?;
 
             // Finish leaf and add to transaction
@@ -762,12 +762,12 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
-                &txn.add_files_schema(),
+                txn.add_files_schema(),
                 vec![
                     ("fileA.parquet", 1024, 1000000, 10),
                     ("fileB.parquet", 2048, 1000001, 20),
@@ -788,12 +788,12 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
-                &txn.add_files_schema(),
+                txn.add_files_schema(),
                 vec![
                     ("fileC.parquet", 3072, 1000002, 30),
                     ("fileD.parquet", 4096, 1000003, 40),
@@ -814,12 +814,12 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
-                &txn.add_files_schema(),
+                txn.add_files_schema(),
                 vec![
                     ("fileE.parquet", 5120, 1000004, 50),
                     ("fileF.parquet", 6144, 1000005, 60),
@@ -872,14 +872,14 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![
                     ("fileA.parquet", 2048, 1000000, 50),
                     ("fileB.parquet", 3072, 1000001, 75),
@@ -909,7 +909,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1008,7 +1008,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1087,7 +1087,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
@@ -1095,7 +1095,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
             let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata1 = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
             leaf1.add_files(metadata1)?;
@@ -1105,7 +1105,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
             // Create leaf2 with fileB
             let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
             let metadata2 = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![("fileB.parquet", 3072, 1000001, 75)],
             )?;
             leaf2.add_files(metadata2)?;
@@ -1133,7 +1133,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1228,7 +1228,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1328,13 +1328,13 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string());
             // NOTE: NOT using .with_batch_commit() so files go to root
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![
                     ("fileA.parquet", 2048, 1000000, 50),
                     ("fileB.parquet", 3072, 1000001, 75),
@@ -1358,7 +1358,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         {
             let txn = snapshot_v1
                 .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit(); // Enable batch commit to create root manifest
 
@@ -1381,7 +1381,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
 
             let mut txn = snapshot_v2
                 .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit(); // Enable batch commit to use leaf writer
 
@@ -1544,14 +1544,14 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
         let _data_manifest_url = {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![
                     ("fileA.parquet", 2048, 1000000, 50),
                     ("fileB.parquet", 3072, 1000001, 75),
@@ -1609,7 +1609,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
 
             let mut txn = snapshot_v1
                 .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit(); // Enable batch commit to use leaf writer
 
@@ -1663,13 +1663,13 @@ async fn test_dv_update_marks_root_dv_deleted() -> Result<(), Box<dyn std::error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string());
             // NOTE: NOT using .with_batch_commit() so files go to root
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
             txn.add_files(metadata);
@@ -1690,7 +1690,7 @@ async fn test_dv_update_marks_root_dv_deleted() -> Result<(), Box<dyn std::error
             let scan = snapshot.clone().scan_builder().build()?;
 
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit();
 
@@ -1731,14 +1731,14 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             // Even with batch commit, if we don't use leaf writer, files go to root
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
             txn.add_files(metadata);
@@ -1755,7 +1755,7 @@ async fn test_dv_update_errors_for_root_files() -> Result<(), Box<dyn std::error
             let scan = snapshot.clone().scan_builder().build()?;
 
             let txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1822,13 +1822,13 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
-                &txn.add_files_schema(),
+                txn.add_files_schema(),
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
             leaf1.add_files(metadata)?;
@@ -1845,13 +1845,13 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
             let metadata = create_add_files_metadata(
-                &txn.add_files_schema(),
+                txn.add_files_schema(),
                 vec![("fileB.parquet", 3072, 1000001, 75)],
             )?;
             leaf2.add_files(metadata)?;
@@ -1876,7 +1876,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
             let file_locations = collect_data_file_locations(&scan, &engine)?;
 
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -1960,7 +1960,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
 
             let mut txn = snapshot_v3
                 .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("OPTIMIZE".to_string())
                 .with_batch_commit();
 
@@ -2013,14 +2013,14 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
             let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
-                &add_files_schema,
+                add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
             leaf1.add_files(metadata)?;
@@ -2046,7 +2046,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
@@ -2107,7 +2107,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
             let scan = snapshot.clone().scan_builder().build()?;
 
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 

@@ -3,6 +3,7 @@ use std::sync::{Arc, LazyLock};
 
 use tracing::{debug, error};
 
+use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
@@ -13,14 +14,18 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{
     Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
 };
 
 pub(crate) mod stats_schema;
+
+use stats_schema::{NullCountStatsTransform, NullableStatsTransform};
 #[cfg(test)]
 mod tests;
+
+use delta_kernel_derive::internal_api;
 
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
@@ -49,53 +54,50 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
+#[internal_api]
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
-    /// Evaluator for extracting stats_parsed from checkpoints.
-    /// Only present when the checkpoint has compatible pre-parsed stats.
-    select_stats_parsed_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
 }
 
 impl DataSkippingFilter {
-    /// Creates a new data skipping filter. Returns None if there is no predicate/stats_schema,
-    /// or the predicate is ineligible for data skipping.
+    /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
+    /// is ineligible for data skipping.
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
-    ///
-    /// `checkpoint_read_schema` is the schema used to read checkpoint files, which includes
-    /// `stats_parsed` for data skipping optimization. This schema is needed to create the
-    /// evaluator that extracts stats_parsed from the actions.
-    ///
-    /// `has_compatible_stats_parsed` indicates whether the checkpoint has compatible pre-parsed
-    /// stats. When true, checkpoint batches use stats_parsed directly instead of parsing JSON.
     pub(crate) fn new(
         engine: &dyn Engine,
-        predicate: Option<PredicateRef>,
-        stats_schema: Option<SchemaRef>,
-        checkpoint_read_schema: SchemaRef,
-        has_compatible_stats_parsed: bool,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
         static STATS_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
-        static STATS_PARSED_EXPR: LazyLock<ExpressionRef> =
-            LazyLock::new(|| Arc::new(column_expr!("add.stats_parsed")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
-        let predicate = predicate?;
-        let stats_schema = stats_schema?;
+        let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
+
+        let stats_schema = NullableStatsTransform
+            .transform_struct(&referenced_schema)?
+            .into_owned();
+
+        let nullcount_schema = NullCountStatsTransform
+            .transform_struct(&stats_schema)?
+            .into_owned();
+        let stats_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", nullcount_schema),
+            StructField::nullable("minValues", stats_schema.clone()),
+            StructField::nullable("maxValues", stats_schema),
+        ]));
 
         // Skipping happens in several steps:
         //
-        // 1. The stats selector fetches add.stats or add.stats_parsed from the metadata.
-        //    For checkpoint batches with compatible stats_parsed, we use stats_parsed directly.
-        //    Otherwise, we parse add.stats (JSON string) to a stats struct.
+        // 1. The stats selector fetches add.stats from the metadata
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
@@ -107,7 +109,7 @@ impl DataSkippingFilter {
         let select_stats_evaluator = engine
             .evaluation_handler()
             .new_expression_evaluator(
-                checkpoint_read_schema.clone(),
+                get_log_add_schema().clone(),
                 STATS_EXPR.clone(),
                 DataType::STRING,
             )
@@ -115,23 +117,6 @@ impl DataSkippingFilter {
             // as its a performance optimization so we log the error and continue.
             .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
             .ok()?;
-
-        // Only create stats_parsed evaluator when checkpoint has compatible pre-parsed stats
-        let select_stats_parsed_evaluator = if has_compatible_stats_parsed {
-            engine
-                .evaluation_handler()
-                .new_expression_evaluator(
-                    checkpoint_read_schema.clone(),
-                    STATS_PARSED_EXPR.clone(),
-                    DataType::Struct(Box::new(stats_schema.as_ref().clone())),
-                )
-                .inspect_err(|e| {
-                    debug!("stats_parsed evaluator not available (falling back to JSON): {e}")
-                })
-                .ok()
-        } else {
-            None
-        };
 
         let skipping_evaluator = engine
             .evaluation_handler()
@@ -155,7 +140,6 @@ impl DataSkippingFilter {
         Some(Self {
             stats_schema,
             select_stats_evaluator,
-            select_stats_parsed_evaluator,
             skipping_evaluator,
             filter_evaluator,
             json_handler: engine.json_handler(),
@@ -164,51 +148,34 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
     /// which can be applied to the actions to find those that passed data skipping.
-    ///
-    /// `is_log_batch` indicates whether this batch is from a commit log (`true`) or checkpoint (`false`).
-    /// Checkpoint batches may have pre-parsed stats (`stats_parsed`) that can be used directly
-    /// instead of parsing JSON. Commit batches only have JSON stats.
-    pub(crate) fn apply(
-        &self,
-        actions: &dyn EngineData,
-        is_log_batch: bool,
-    ) -> DeltaResult<Vec<bool>> {
-        // Get the final stats by either:
-        // 1. Using stats_parsed directly (for checkpoint batches with compatible stats)
-        // 2. Parsing JSON (for commit batches or when stats_parsed unavailable)
-        let final_stats = if let Some(stats_parsed_evaluator) = (!is_log_batch)
-            .then_some(())
-            .and(self.select_stats_parsed_evaluator.as_ref())
-        {
-            // Checkpoint batch with compatible stats_parsed - use it directly
-            let stats_parsed = stats_parsed_evaluator.evaluate(actions)?;
-            debug!(
-                "Using stats_parsed from checkpoint ({} rows)",
-                stats_parsed.len()
-            );
-            stats_parsed
-        } else {
-            // Commit batch or no stats_parsed evaluator - parse JSON
-            let stats_json = self.select_stats_evaluator.evaluate(actions)?;
-            assert_eq!(stats_json.len(), actions.len());
-            self.json_handler
-                .parse_json(stats_json, self.stats_schema.clone())?
-        };
+    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        // retrieve and parse stats from actions data
+        let stats = self.select_stats_evaluator.evaluate(actions)?;
+        assert_eq!(stats.len(), actions.len());
+        let parsed_stats = self
+            .json_handler
+            .parse_json(stats, self.stats_schema.clone())?;
+        assert_eq!(parsed_stats.len(), actions.len());
 
-        assert_eq!(final_stats.len(), actions.len());
-
-        // Evaluate predicate on the stats
-        let skipping_predicate = self.skipping_evaluator.evaluate(&*final_stats)?;
+        // evaluate the predicate on the parsed stats, then convert to selection vector
+        let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
         assert_eq!(skipping_predicate.len(), actions.len());
         let selection_vector = self
             .filter_evaluator
             .evaluate(skipping_predicate.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
-        // Visit the engine's selection vector to produce a Vec<bool>
+        // visit the engine's selection vector to produce a Vec<bool>
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
         Ok(visitor.selection_vector)
+
+        // TODO(zach): add some debug info about data skipping that occurred
+        // let before_count = actions.length();
+        // debug!(
+        //     "number of actions before/after data skipping: {before_count} / {}",
+        //     filtered_actions.num_rows()
+        // );
     }
 }
 

@@ -5888,7 +5888,7 @@ mod tests {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
                 .with_operation("WRITE".to_string())
                 .with_batch_commit();
 
@@ -6018,7 +6018,7 @@ mod tests {
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
             let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 

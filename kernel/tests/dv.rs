@@ -102,7 +102,7 @@ fn get_write_context(
     engine: &dyn delta_kernel::Engine,
 ) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
     Ok(txn.get_write_context())
 }
 
@@ -139,7 +139,7 @@ fn create_dv_update_transaction(
 ) -> Result<delta_kernel::transaction::Transaction, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
     Ok(snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("test engine")
         .with_operation("DELETE".to_string()))
 }
@@ -261,14 +261,14 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string());
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();
     let add_metadata = create_add_files_metadata(
-        &add_files_schema,
+        add_files_schema,
         vec![
             (&data_file_path_1, parquet_data_len_1 as i64, 1000000, 10),
             (&data_file_path_2, parquet_data_len_2 as i64, 1000000, 10),

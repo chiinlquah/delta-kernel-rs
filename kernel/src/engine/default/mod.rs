@@ -35,6 +35,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod stats;
 pub mod storage;
 
 /// Converts a Stream-producing future to a synchronous iterator.
@@ -259,7 +260,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 write_context.target_dir(),
                 physical_data,
                 partition_values,
-                write_context.stats_columns(),
+                Some(write_context.stats_columns()),
             )
             .await
     }
