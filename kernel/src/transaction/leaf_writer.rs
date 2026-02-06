@@ -209,17 +209,18 @@ struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
     add_type: AddType,
     selection_vector: Vec<bool>,
+    /// Whether to request the stats_parsed column from the scan data.
+    /// This should be true when the scan data includes stats_parsed (i.e., when
+    /// include_stats_columns() was called and the checkpoint has compatible stats).
+    include_stats_parsed: bool,
 }
 
 impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType};
+        use crate::schema::{column_name, MapType, StructType};
         type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
 
-        // Request all columns for all AddTypes - we'll just choose which to use during extraction
-        // Note: stats_parsed is NOT included here because it's optional (only present when
-        // include_stats_columns was called AND the checkpoint has stats_parsed). The visitor
-        // checks dynamically if stats_parsed is present by checking the getters length.
+        // Base columns requested for all AddTypes
         static ALL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let names = vec![
                 column_name!("path"),
@@ -264,7 +265,26 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
             (names, types)
         });
 
-        (&ALL_COLUMNS.0, &ALL_COLUMNS.1)
+        // Extended columns that also include stats_parsed (when the scan data has it)
+        static ALL_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let mut names = ALL_COLUMNS.0.clone();
+            names.push(column_name!("stats_parsed"));
+            let mut types = ALL_COLUMNS.1.clone();
+            // Use an empty struct type: extract_columns only checks
+            // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
+            // as a single getter, so the exact fields don't matter here.
+            types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
+            (names, types)
+        });
+
+        if self.include_stats_parsed {
+            (
+                &ALL_COLUMNS_WITH_STATS_PARSED.0,
+                &ALL_COLUMNS_WITH_STATS_PARSED.1,
+            )
+        } else {
+            (&ALL_COLUMNS.0, &ALL_COLUMNS.1)
+        }
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
@@ -553,11 +573,31 @@ impl LeafNodeWriter {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
+        // Check if the scan data includes stats_parsed by examining the Arrow schema.
+        // stats_parsed is present when include_stats_columns() was called and the checkpoint
+        // has compatible stats. We need to request it explicitly so that visit_rows creates
+        // a getter for it.
+        let include_stats_parsed = {
+            use crate::engine::arrow_data::ArrowEngineData;
+            scan_metadata
+                .data()
+                .any_ref()
+                .downcast_ref::<ArrowEngineData>()
+                .is_some_and(|arrow_data| {
+                    arrow_data
+                        .record_batch()
+                        .schema()
+                        .field_with_name("stats_parsed")
+                        .is_ok()
+                })
+        };
+
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
             add_type,
             selection_vector,
+            include_stats_parsed,
         };
 
         visitor.visit_rows_of(scan_metadata.data())?;
