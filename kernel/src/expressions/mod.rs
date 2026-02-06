@@ -457,7 +457,12 @@ pub enum Expression {
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions with optional schema.
     /// When schema is provided, field names come from the schema; otherwise they're inferred from context.
-    Struct(Vec<ExpressionRef>, Option<Box<StructType>>),
+    /// The optional nullability predicate, if provided and evaluates to false/null, makes the entire struct null.
+    Struct(
+        Vec<ExpressionRef>,
+        Option<Box<StructType>>,
+        Option<ExpressionRef>,
+    ),
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     Transform(Transform),
@@ -668,7 +673,7 @@ impl Expression {
 
     /// Create a new struct expression without explicit schema (field names inferred from context)
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
-        Self::Struct(exprs.into_iter().map(Into::into).collect(), None)
+        Self::Struct(exprs.into_iter().map(Into::into).collect(), None, None)
     }
 
     /// Create a new struct expression with explicit schema (field names from schema)
@@ -679,6 +684,21 @@ impl Expression {
         Self::Struct(
             exprs.into_iter().map(Into::into).collect(),
             Some(Box::new(schema)),
+            None,
+        )
+    }
+
+    /// Create a new struct expression with explicit schema and nullability predicate.
+    /// If the nullability predicate evaluates to false or null, the entire struct becomes null.
+    pub fn struct_from_with_nullability(
+        exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
+        schema: StructType,
+        nullability_predicate: impl Into<Arc<Self>>,
+    ) -> Self {
+        Self::Struct(
+            exprs.into_iter().map(Into::into).collect(),
+            Some(Box::new(schema)),
+            Some(nullability_predicate.into()),
         )
     }
 
@@ -1011,7 +1031,7 @@ impl Display for Expression {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
-            Struct(exprs, _) => write!(f, "Struct({})", format_child_list(exprs)),
+            Struct(exprs, _, _) => write!(f, "Struct({})", format_child_list(exprs)),
             Transform(transform) => {
                 write!(f, "Transform(")?;
                 let mut sep = "";

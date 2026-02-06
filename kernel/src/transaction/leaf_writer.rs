@@ -617,17 +617,18 @@ impl LeafNodeWriter {
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using MetadataBuilder's write_leaf()
         let data_manifest_entry = if self.data_builder.has_entries() {
-            Some(
-                self.data_builder
-                    .write_leaf(engine, Some(self.snapshot_id))?,
-            )
+            let entry = self
+                .data_builder
+                .write_leaf(engine, Some(self.snapshot_id))?;
+            Some(entry)
         } else {
             None
         };
 
         // Write DV manifest if we have deletion vectors
         let dv_manifest_entry = if !self.deletion_vectors.is_empty() {
-            Some(self.write_dv_manifest(engine, data_manifest_entry.as_ref())?)
+            let entry = self.write_dv_manifest(engine, data_manifest_entry.as_ref())?;
+            Some(entry)
         } else {
             None
         };

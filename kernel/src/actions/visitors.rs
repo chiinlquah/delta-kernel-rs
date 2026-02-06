@@ -1269,7 +1269,9 @@ mod tests {
             vec![Arc::new(Expression::Struct(
                 vec![column_expr_ref!("commitInfo.inCommitTimestamp")],
                 None,
+                None,
             ))],
+            None,
             None,
         );
         engine

@@ -22,7 +22,7 @@ use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_colum
 
 mod apply_schema;
 pub mod evaluate_expression;
-mod lookup_join;
+pub(crate) mod lookup_join;
 pub mod opaque;
 
 use lookup_join::ArrowLookupJoiner;
@@ -343,15 +343,15 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         lookup_version_column: &crate::schema::ColumnName,
         initial_data: &[&crate::engine_data::FilteredEngineData],
     ) -> DeltaResult<Box<dyn crate::LookupJoiner>> {
-        let joiner = ArrowLookupJoiner::new(
+        ArrowLookupJoiner::new(
             self,
             lookup_schema,
             key_column,
             value_columns,
             lookup_version_column,
-        )?;
-        let joiner: Box<dyn crate::LookupJoiner> = Box::new(joiner);
-        joiner.extend(initial_data)
+            initial_data,
+        )
+        .map(|joiner| Box::new(joiner) as Box<dyn crate::LookupJoiner>)
     }
 }
 
