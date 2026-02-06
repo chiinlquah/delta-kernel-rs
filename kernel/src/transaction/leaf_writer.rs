@@ -209,81 +209,94 @@ struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
     add_type: AddType,
     selection_vector: Vec<bool>,
-    /// Whether to request the stats_parsed column from the scan data.
-    /// This should be true when the scan data includes stats_parsed (i.e., when
-    /// include_stats_columns() was called and the checkpoint has compatible stats).
-    include_stats_parsed: bool,
+    /// Whether to request the stats_parsed column. Starts as true and is set to false
+    /// by visit_rows_of if the data doesn't have the column.
+    request_stats_parsed: bool,
 }
+
+type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
+
+/// Base scan columns without stats_parsed.
+static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    use crate::schema::{column_name, MapType};
+    let names = vec![
+        column_name!("path"),
+        column_name!("size"),
+        column_name!("modificationTime"),
+        column_name!("stats"),
+        column_name!("deletionVector.storageType"),
+        column_name!("deletionVector.pathOrInlineDv"),
+        column_name!("deletionVector.offset"),
+        column_name!("deletionVector.sizeInBytes"),
+        column_name!("deletionVector.cardinality"),
+        column_name!("fileConstantValues.partitionValues"),
+        column_name!("fileConstantValues.baseRowId"),
+        column_name!("fileConstantValues.defaultRowCommitVersion"),
+        column_name!("fileConstantValues.dataManifestPath"),
+        column_name!("fileConstantValues.dataManifestPosition"),
+        column_name!("fileConstantValues.deleteManifestPath"),
+        column_name!("fileConstantValues.deleteManifestPosition"),
+    ];
+    let types = vec![
+        DataType::STRING,
+        DataType::LONG,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::STRING,
+        DataType::STRING,
+        DataType::INTEGER,
+        DataType::INTEGER,
+        DataType::LONG,
+        DataType::Map(Box::new(MapType::new(
+            DataType::STRING,
+            DataType::STRING,
+            true,
+        ))),
+        DataType::LONG,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::LONG,
+    ];
+    (names, types)
+});
+
+/// Extended scan columns including stats_parsed.
+static SCAN_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    use crate::schema::{column_name, StructType};
+    let mut names = BASE_SCAN_COLUMNS.0.clone();
+    names.push(column_name!("stats_parsed"));
+    let mut types = BASE_SCAN_COLUMNS.1.clone();
+    // Use an empty struct type: extract_columns only checks
+    // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
+    // as a single getter, so the exact fields don't matter here.
+    types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
+    (names, types)
+});
 
 impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType, StructType};
-        type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
-
-        // Base columns requested for all AddTypes
-        static ALL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("path"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats"),
-                column_name!("deletionVector.storageType"),
-                column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("deletionVector.offset"),
-                column_name!("deletionVector.sizeInBytes"),
-                column_name!("deletionVector.cardinality"),
-                column_name!("fileConstantValues.partitionValues"),
-                column_name!("fileConstantValues.baseRowId"),
-                column_name!("fileConstantValues.defaultRowCommitVersion"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
-                column_name!("fileConstantValues.deleteManifestPath"),
-                column_name!("fileConstantValues.deleteManifestPosition"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::STRING,
-                DataType::STRING,
-                DataType::INTEGER,
-                DataType::INTEGER,
-                DataType::LONG,
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::LONG,
-            ];
-            (names, types)
-        });
-
-        // Extended columns that also include stats_parsed (when the scan data has it)
-        static ALL_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let mut names = ALL_COLUMNS.0.clone();
-            names.push(column_name!("stats_parsed"));
-            let mut types = ALL_COLUMNS.1.clone();
-            // Use an empty struct type: extract_columns only checks
-            // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
-            // as a single getter, so the exact fields don't matter here.
-            types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
-            (names, types)
-        });
-
-        if self.include_stats_parsed {
+        if self.request_stats_parsed {
             (
-                &ALL_COLUMNS_WITH_STATS_PARSED.0,
-                &ALL_COLUMNS_WITH_STATS_PARSED.1,
+                &SCAN_COLUMNS_WITH_STATS_PARSED.0,
+                &SCAN_COLUMNS_WITH_STATS_PARSED.1,
             )
         } else {
-            (&ALL_COLUMNS.0, &ALL_COLUMNS.1)
+            (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
+        }
+    }
+
+    fn visit_rows_of(&mut self, data: &dyn EngineData) -> DeltaResult<()> {
+        // Try with stats_parsed first. If the data doesn't have the column,
+        // fall back to requesting without it.
+        match data.visit_rows(self.selected_column_names_and_types().0, self) {
+            Ok(()) => Ok(()),
+            Err(crate::Error::MissingColumn(_)) => {
+                self.request_stats_parsed = false;
+                data.visit_rows(self.selected_column_names_and_types().0, self)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -573,31 +586,12 @@ impl LeafNodeWriter {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
-        // Check if the scan data includes stats_parsed by examining the Arrow schema.
-        // stats_parsed is present when include_stats_columns() was called and the checkpoint
-        // has compatible stats. We need to request it explicitly so that visit_rows creates
-        // a getter for it.
-        let include_stats_parsed = {
-            use crate::engine::arrow_data::ArrowEngineData;
-            scan_metadata
-                .data()
-                .any_ref()
-                .downcast_ref::<ArrowEngineData>()
-                .is_some_and(|arrow_data| {
-                    arrow_data
-                        .record_batch()
-                        .schema()
-                        .field_with_name("stats_parsed")
-                        .is_ok()
-                })
-        };
-
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
             add_type,
             selection_vector,
-            include_stats_parsed,
+            request_stats_parsed: true,
         };
 
         visitor.visit_rows_of(scan_metadata.data())?;
@@ -1620,6 +1614,7 @@ mod tests {
                     StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             ),
+            StructField::nullable("stats_parsed", DataType::struct_type_unchecked(vec![])),
         ]));
 
         // Create arrays
@@ -1754,6 +1749,9 @@ mod tests {
             ),
         ]);
 
+        // Create an empty stats_parsed struct array (no fields, all null)
+        let stats_parsed_struct = StructArray::new_empty_fields(num_files, None);
+
         let batch = RecordBatch::try_new(
             Arc::new(TryFromKernel::try_from_kernel(scan_schema.as_ref())?),
             vec![
@@ -1763,6 +1761,7 @@ mod tests {
                 Arc::new(stats_array) as ArrayRef,
                 Arc::new(deletion_vector_struct) as ArrayRef,
                 Arc::new(file_constant_values_struct) as ArrayRef,
+                Arc::new(stats_parsed_struct) as ArrayRef,
             ],
         )?;
 
