@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -395,19 +395,32 @@ impl EngineData for ArrowEngineData {
             .with_backtrace());
         }
 
-        // Collect the names of all leaf columns we want to extract, along with their parents, to
-        // guide our depth-first extraction. If the list contains any non-leaf, duplicate, or
-        // missing column references, the extracted column list will be too short (error out below).
-        let mut mask = HashSet::new();
+        // Build a map of column paths to their expected types.
+        // - For parent paths (non-leaf), the value is None (used for traversal into nested structs)
+        // - For leaf columns, the value is Some(&DataType) (used for type validation)
+        // This allows extract_columns to look up the expected type by column name instead of
+        // using positional indexing, which fixes bugs when columns are found in different order
+        // than they were requested.
+        let mut column_map = HashMap::new();
+
+        // Add all parent paths with None (for traversal)
         for column in leaf_columns {
-            for i in 0..column.len() {
-                mask.insert(&column[..i + 1]);
+            for i in 0..(column.len()) {
+                column_map.entry(&column[..i + 1]).or_insert(None);
             }
         }
-        debug!("Column mask for selected columns {leaf_columns:?} is {mask:#?}");
+
+        // Set leaf columns to Some(data_type)
+        for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
+            column_map.insert(column.as_ref(), Some(data_type));
+        }
+        debug!(
+            "Column map for selected columns {leaf_columns:?} has {} entries",
+            column_map.len()
+        );
 
         let mut getters = vec![];
-        Self::extract_columns(&mut vec![], &mut getters, leaf_types, &mask, &self.data)?;
+        Self::extract_columns(&mut vec![], &mut getters, &column_map, &self.data)?;
         if getters.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
                 "Visitor expected {} leaf columns, but only {} were found in the data",
@@ -475,18 +488,16 @@ impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
         getters: &mut Vec<&'a dyn GetData<'a>>,
-        leaf_types: &[DataType],
-        column_mask: &HashSet<&[String]>,
+        column_map: &HashMap<&[String], Option<&DataType>>,
         data: &'a dyn ProvidesColumnsAndFields,
     ) -> DeltaResult<()> {
         for (column, field) in data.columns().iter().zip(data.fields()) {
             path.push(field.name().to_string());
-            if column_mask.contains(&path[..]) {
+            if let Some(type_option) = column_map.get(&path[..]) {
                 if let Some(struct_array) = column.as_struct_opt() {
                     // Check if the expected type is Struct - if so, extract the struct as a whole
                     // Otherwise, recurse into the struct to extract nested fields
-                    let expected_type = leaf_types.get(getters.len());
-                    if matches!(expected_type, Some(DataType::Struct(_))) {
+                    if matches!(type_option, Some(DataType::Struct(_))) {
                         debug!("Pushing struct array for {}", ColumnName::new(path.iter()));
                         getters.push(struct_array);
                     } else {
@@ -494,22 +505,17 @@ impl ArrowEngineData {
                             "Recurse into a struct array for {}",
                             ColumnName::new(path.iter())
                         );
-                        Self::extract_columns(
-                            path,
-                            getters,
-                            leaf_types,
-                            column_mask,
-                            struct_array,
-                        )?;
+                        Self::extract_columns(path, getters, column_map, struct_array)?;
                     }
                 } else if column.data_type() == &ArrowDataType::Null {
                     debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                     getters.push(&());
-                } else {
-                    let data_type = &leaf_types[getters.len()];
+                } else if let Some(data_type) = type_option {
+                    // Leaf column with expected type - look up type by name instead of position
                     let getter = Self::extract_leaf_column(path, data_type, column)?;
                     getters.push(getter);
                 }
+                // If type_option is None, it's a parent path with no leaf to extract - skip
             } else {
                 debug!("Skipping unmasked path {}", ColumnName::new(path.iter()));
             }

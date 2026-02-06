@@ -478,11 +478,11 @@ async fn generate_commit_0(
 
     // Write commit 0
     let mut content = String::new();
+    content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
+    content.push('\n');
     content.push_str(&serde_json::to_string(&json!({"metaData": metadata}))?);
     content.push('\n');
     content.push_str(&serde_json::to_string(&json!({"protocol": protocol}))?);
-    content.push('\n');
-    content.push_str(&serde_json::to_string(&json!({"commitInfo": commit_info}))?);
     content.push('\n');
 
     let commit_path = object_store::path::Path::from(format!(

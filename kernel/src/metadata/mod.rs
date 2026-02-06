@@ -5,9 +5,7 @@ pub(crate) mod writer;
 
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::Remove;
-use crate::actions::{Add, ContentRoot};
+use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::EngineData;
 use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
@@ -18,8 +16,8 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, ParquetHandler, SchemaRef,
-    SnapshotRef, Version,
+    DeltaResult, Engine, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, LookupJoiner,
+    ParquetHandler, SchemaRef, SnapshotRef, Version,
 };
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
@@ -28,6 +26,64 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tracing::debug;
 use url::Url;
+
+/// Cached schema for the projection of metadata columns used when building DV batches.
+/// Includes: contentType, referencedFile, trackingInfo, dv_cardinality, deleteManifestPath, deleteManifestPosition
+static DV_PROJECTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("contentType", DataType::INTEGER, false),
+        StructField::new("referencedFile", DataType::STRING, true),
+        StructField::new(
+            "trackingInfo",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructField::new("status", DataType::INTEGER, false),
+                StructField::new("snapshotId", DataType::LONG, true),
+                StructField::new("sequenceNumber", DataType::LONG, true),
+                StructField::new("fileSequenceNumber", DataType::LONG, true),
+                StructField::new("firstRowId", DataType::LONG, true),
+                StructField::new("changesDv", DataType::BINARY, true),
+            ]))),
+            true,
+        ),
+        StructField::new("dv_cardinality", DataType::LONG, true),
+        StructField::new("deleteManifestPath", DataType::STRING, true),
+        StructField::new("deleteManifestPosition", DataType::LONG, true),
+    ]))
+});
+
+/// Cached schema for parsed deletion vector columns (flat representation).
+/// This schema is used when appending DV fields to batches in `append_parsed_dv_columns()`.
+/// These columns can be transformed using an expression.
+static DV_COLUMNS_SCHEMA_TRANSFORMABLE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("dv_cardinality", DataType::LONG, true),
+        StructField::new("deleteManifestPath", DataType::STRING, true),
+        StructField::new("deleteManifestPosition", DataType::LONG, true),
+    ]))
+});
+
+// Flat schema for DV columns that need to be transformed via a visitor
+// (this has non-trivial cost)
+static DV_COLUMNS_SCHEMA_VISITOR_NEEDED: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("dv_storageType", DataType::STRING, true),
+        StructField::new("dv_pathOrInlineDv", DataType::STRING, true),
+        StructField::new("dv_offset", DataType::INTEGER, true),
+        StructField::new("dv_sizeInBytes", DataType::INTEGER, true),
+    ]))
+});
+
+static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields: Vec<_> = DV_COLUMNS_SCHEMA_TRANSFORMABLE.fields().cloned().collect();
+    fields.extend(DV_COLUMNS_SCHEMA_VISITOR_NEEDED.fields().cloned());
+    Arc::new(StructType::new_unchecked(fields))
+});
+
+/// Cached schema for stats with just numRecords field.
+/// Used when building Add action stats from metadata entries.
+static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new_unchecked(vec![StructField::new("numRecords", DataType::LONG, false)])
+});
 
 /// A stats provider that extracts min/max statistics from AMT manifest `content_stats`.
 ///
@@ -217,11 +273,6 @@ pub struct Metadata {
     leaf: Option<uuid::Uuid>,
 }
 
-enum AddRemove {
-    Add(Add),
-    Remove(Remove),
-}
-
 /// A manifest entry wrapper.
 ///
 /// According to the Iceberg Single File Commits spec, manifest deletion vectors
@@ -239,37 +290,6 @@ impl FilteredManifest {
     }
 }
 
-/// Combined deletion vector maps for looking up DVs during manifest processing.
-///
-/// This structure separates deletion vectors into two categories:
-/// - Shared: DVs that apply to all data files (from unaffiliated manifests and unmatched root DVs)
-/// - Affiliated: DVs specific to a particular data manifest
-///
-/// When looking up a DV, the shared map is probed first, then the affiliated map.
-#[derive(Debug)]
-pub(crate) struct DeletionVectorMaps<'a> {
-    /// Shared DV map (unaffiliated delete manifests + unmatched DVs from root)
-    pub(crate) shared: &'a HashMap<String, DeletionVectorInfo>,
-    /// Affiliated DV map (specific to a particular data manifest)
-    pub(crate) affiliated: &'a HashMap<String, DeletionVectorInfo>,
-}
-
-impl<'a> DeletionVectorMaps<'a> {
-    /// Creates a new DeletionVectorMaps with both shared and affiliated maps.
-    pub(crate) fn new(
-        shared: &'a HashMap<String, DeletionVectorInfo>,
-        affiliated: &'a HashMap<String, DeletionVectorInfo>,
-    ) -> Self {
-        Self { shared, affiliated }
-    }
-
-    /// Looks up a deletion vector by file path.
-    /// Probes the shared map first, then the affiliated map.
-    pub(crate) fn get(&self, path: &str) -> Option<&DeletionVectorInfo> {
-        self.shared.get(path).or_else(|| self.affiliated.get(path))
-    }
-}
-
 /// Lazy iterator that processes manifests one at a time for true streaming.
 ///
 /// This enables manifest-level streaming by deferring all I/O and processing
@@ -278,8 +298,8 @@ impl<'a> DeletionVectorMaps<'a> {
 struct LazyManifestBatchIterator {
     /// Remaining manifests to process
     manifests: std::vec::IntoIter<ManifestReference>,
-    /// Shared DV map (via Arc)
-    shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+    /// Shared leaf state (for optimized path to access unaffiliated DV manifests)
+    shared_state: SharedLeafState,
     /// Parquet handler for reading manifest files
     parquet_handler: Arc<dyn ParquetHandler>,
     /// Evaluation handler for creating batches
@@ -314,7 +334,7 @@ impl Iterator for LazyManifestBatchIterator {
             // Process this manifest NOW (lazy - only happens when we reach this point)
             let result = Metadata::manifest_to_action_batches_with_handlers(
                 manifest_ref,
-                self.shared_dv_map.clone(),
+                &self.shared_state,
                 self.parquet_handler.clone(),
                 self.evaluation_handler.clone(),
                 &self.schema,
@@ -342,17 +362,13 @@ impl Iterator for LazyManifestBatchIterator {
 pub(crate) struct SharedLeafState {
     /// Delete manifests with no specific affiliation (apply to all data files)
     pub(crate) unaffiliated_dv_manifests: Vec<FilteredManifest>,
-    /// Position deletion vectors from the root that didn't match any files in the root.
-    /// Key: referenced_file path, Value: DeletionVectorInfo
-    /// These need to be checked against files in child manifests.
-    pub(crate) unmatched_dvs: HashMap<String, DeletionVectorInfo>,
 }
 
 /// Complete state of the root manifest, including manifest references and deletion vectors.
 ///
 /// This structure separates concerns:
 /// - Manifest references (data and affiliated delete manifests) are per-child-manifest
-/// - Shared state (unaffiliated manifests and unmatched DVs) apply to all children
+/// - Shared state (unaffiliated manifests) apply to all children
 #[derive(Debug, Clone)]
 pub(crate) struct LeafReferences {
     /// References to child data manifests and their affiliated delete manifests
@@ -370,6 +386,12 @@ pub(crate) struct ManifestReference {
     pub(crate) data_manifest: FilteredManifest,
     /// Delete manifest entries affiliated with this specific data manifest (via referenced_file)
     pub(crate) affiliated_dv_manifests: Vec<FilteredManifest>,
+}
+
+/// A pair of optional Add and Remove evaluators
+struct EvaluatorPair {
+    add_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
+    remove_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
 }
 
 impl Metadata {
@@ -438,34 +460,29 @@ impl Metadata {
     /// - Schema contains only Add actions (no Remove field)
     /// - No PositionDeletes or EqualityDeletes (Data and Manifest entries are allowed)
     /// - No deletion vectors present (manifest_dv field is null)
-    /// - No DV manifests for leaves (delete_manifest_path and delete_manifest_position are null)
-    fn can_use_optimized_path(&self, schema: &SchemaRef) -> DeltaResult<bool> {
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
+    ///
+    /// Validates that metadata contains no unsupported row types.
+    ///
+    /// Currently only checks for active EqualityDeletes, which are not supported.
+    fn validate_no_unsupported_rows(&self) -> DeltaResult<()> {
         use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
         use crate::schema::{ColumnName, DataType};
         use std::sync::LazyLock;
 
-        // Check if schema is Add-only (contains Add but not Remove)
-        if !schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME) {
-            return Ok(false);
-        }
+        // Specialized visitor to check for unsupported row types
+        struct UnsupportedRowValidator;
 
-        // Specialized visitor to check for blocking conditions
-        struct OptimizedPathCheckVisitor {
-            can_use_optimized: bool,
-        }
-
-        impl RowVisitor for OptimizedPathCheckVisitor {
+        impl RowVisitor for UnsupportedRowValidator {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["manifestDv"]),
+                        ColumnName::new(["trackingInfo", "status"]),
                     ]
                 });
-                static TYPES: &[DataType] = &[DataType::INTEGER, DataType::BINARY];
+                static TYPES: &[DataType] = &[DataType::INTEGER, DataType::INTEGER];
                 (NAMES.as_slice(), TYPES)
             }
 
@@ -476,21 +493,25 @@ impl Metadata {
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
                     let content_type_int: i32 = getters[0].get(i, "contentType")?;
+                    let status: i32 = getters[1].get(i, "trackingInfo.status")?;
 
-                    // Reject PositionDeletes (1) and EqualityDeletes (2)
-                    // Allow: Data (0), DataManifest (3), DeleteManifest (4)
+                    // Check for EqualityDeletes (contentType=2)
+                    // EqualityDeletes are not supported by the kernel
+                    if content_type_int == 2 {
+                        // Allow if marked as DELETED (status=3) - will be filtered out anyway
+                        if status != 3 {
+                            return Err(Error::unsupported(
+                                "EqualityDeletes are not supported. \
+                                 This table uses equality delete files which require full row matching. \
+                                 Please use a reader that supports EqualityDeletes or rewrite the table \
+                                 to use PositionDeletes instead."
+                            ));
+                        }
+                    }
+
+                    // Allow: Data (0), PositionDeletes (1), DataManifest (3), DeleteManifest (4)
+                    // PositionDeletes (1) will be handled via lookup join
                     // Manifests are filtered out by build_metadata_selection_vector
-                    if content_type_int == 1 || content_type_int == 2 {
-                        self.can_use_optimized = false;
-                        return Ok(());
-                    }
-
-                    // Check for manifest DVs
-                    let manifest_dv: Option<&[u8]> = getters[1].get_opt(i, "manifestDv")?;
-                    if manifest_dv.is_some() {
-                        self.can_use_optimized = false;
-                        return Ok(());
-                    }
                 }
                 Ok(())
             }
@@ -502,41 +523,181 @@ impl Metadata {
                 continue;
             }
 
-            let mut visitor = OptimizedPathCheckVisitor {
-                can_use_optimized: true,
-            };
+            let mut visitor = UnsupportedRowValidator;
             visitor.visit_rows_of(batch.as_ref())?;
-
-            if !visitor.can_use_optimized {
-                return Ok(false);
-            }
         }
 
-        Ok(true)
+        Ok(())
+    }
+
+    /// Helper to build expression for a field based on action type.
+    fn build_action_field_expression(
+        field_name: &str,
+        field_type: &DataType,
+        action_name: &str,
+        path_in_log: &str,
+    ) -> DeltaResult<crate::expressions::Expression> {
+        use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
+        use crate::schema::{DataType, MapType};
+
+        Ok(match field_name {
+            // Common fields for both Add and Remove
+            "path" => Expression::column(["location"]),
+            "size" => Expression::variadic(
+                VariadicExpressionOp::Coalesce,
+                [
+                    Expression::column(["fileSizeInBytes"]),
+                    Expression::literal(0i64),
+                ],
+            ),
+            "stats" => {
+                // Use cached stats schema
+                let num_records_struct = Expression::struct_from_with_schema(
+                    [Expression::column(["recordCount"])],
+                    (*STATS_NUM_RECORDS_SCHEMA).clone(),
+                );
+                Expression::unary(UnaryExpressionOp::ToJson, num_records_struct)
+            }
+            "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
+            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "snapshotId"]),
+            "partitionValues" => {
+                let empty_map = MapData::try_new(
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    Vec::<(Scalar, Scalar)>::new(),
+                )?;
+                Expression::literal(Scalar::Map(empty_map))
+            }
+            "dataChange" => Expression::literal(true),
+            "tags" => Expression::null_literal(DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            )))),
+            "deletionVector" => Expression::null_literal(field_type.clone()),
+
+            // Add-specific fields
+            "modificationTime" if action_name == "add" => Expression::literal(i64::MIN),
+            "dataManifestPath" if action_name == "add" => {
+                Expression::literal(path_in_log.to_string())
+            }
+            "dataManifestPosition" if action_name == "add" => Expression::column(["_pos"]),
+            "clusteringProvider" if action_name == "add" => {
+                Expression::null_literal(DataType::STRING)
+            }
+            "deleteManifestPath" if action_name == "add" => {
+                Expression::null_literal(DataType::STRING)
+            }
+            "deleteManifestPosition" if action_name == "add" => {
+                Expression::null_literal(DataType::LONG)
+            }
+
+            // Remove-specific fields
+            "deletionTimestamp" if action_name == "remove" => Expression::literal(i64::MIN),
+            "extendedFileMetadata" if action_name == "remove" => Expression::literal(true),
+
+            // Default: null with field's type
+            _ => Expression::null_literal(field_type.clone()),
+        })
+    }
+
+    /// Builds a Transform expression to convert MetadataEntry → Add or Remove action.
+    fn build_metadata_to_action_transform(
+        action_schema: &SchemaRef,
+        action_name: &str,
+        path_in_log: &str,
+    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
+        use crate::expressions::Expression;
+        use crate::schema::DataType;
+
+        let action_field = action_schema
+            .field(action_name)
+            .ok_or_else(|| Error::generic(format!("Schema missing '{action_name}' field")))?;
+        let action_struct_type = match action_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => {
+                return Err(Error::generic(format!(
+                    "'{action_name}' field is not a struct"
+                )))
+            }
+        };
+
+        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+        for field in action_struct_type.fields() {
+            let expr = Self::build_action_field_expression(
+                field.name(),
+                field.data_type(),
+                action_name,
+                path_in_log,
+            )?;
+            field_exprs.push(Arc::new(expr));
+        }
+
+        let action_struct_expr =
+            Expression::struct_from_with_schema(field_exprs, (**action_struct_type).clone());
+
+        // Wrap action struct in top-level schema
+        let top_level_expr =
+            Self::wrap_action_in_top_level(action_name, action_struct_expr, action_struct_type);
+
+        Ok(Arc::new(top_level_expr))
+    }
+
+    /// Helper to wrap an action struct expression in a top-level schema with the action name.
+    /// Returns the wrapped expression.
+    fn wrap_action_in_top_level(
+        action_name: &str,
+        action_expr: crate::expressions::Expression,
+        action_struct_type: &StructType,
+    ) -> crate::expressions::Expression {
+        use crate::expressions::Expression;
+
+        let top_level_schema = StructType::new_unchecked(vec![StructField::new(
+            action_name,
+            DataType::Struct(Box::new(action_struct_type.clone())),
+            true,
+        )]);
+
+        Expression::struct_from_with_schema([action_expr], top_level_schema)
     }
 
     /// Builds a Transform expression to convert MetadataEntry → Add fields.
-    ///
-    /// This creates an expression that transforms EngineData from metadata parquet files
-    /// directly into Add action format, bypassing the expensive field-by-field extraction
-    /// and reconstruction through MetadataEntry structs.
-    ///
-    /// # Field Mappings
-    /// - `location` → `path`
-    /// - `file_size_in_bytes` → `size` (unwrap or 0)
-    /// - `record_count` → `stats` (JSON: {"numRecords": <count>})
-    /// - `tracking_info.first_row_id` → `base_row_id`
-    /// - `tracking_info.snapshot_id` → `default_row_commit_version` (TODO: check if should be sequence_number)
-    /// - (constant) → `data_manifest_path` (from path_in_log)
-    /// - `_pos` metadata col → `data_manifest_position`
-    /// - Constants for: `modification_time`, `partition_values`, `data_change`
-    /// - Nulls for: `tags`, `deletion_vector`, `clustering_provider`, `delete_manifest_path`, `delete_manifest_position`
     fn build_metadata_to_add_transform(
         add_schema: &SchemaRef,
         path_in_log: &str,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
-        use crate::schema::{DataType, MapType};
+        Self::build_metadata_to_action_transform(add_schema, "add", path_in_log)
+    }
+
+    /// Builds a Transform expression to convert MetadataEntry → Remove fields.
+    fn build_metadata_to_remove_transform(
+        remove_schema: &SchemaRef,
+        path_in_log: &str,
+    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
+        Self::build_metadata_to_action_transform(remove_schema, "remove", path_in_log)
+    }
+
+    /// Builds a Transform expression to convert joined MetadataEntry + DV fields → Add fields.
+    ///
+    /// This is similar to build_metadata_to_add_transform, but it also constructs the
+    /// deletionVector, deleteManifestPath, and deleteManifestPosition fields from the
+    /// columns that were joined from the DV joiner.
+    ///
+    /// The joined schema has these additional top-level fields (raw metadata fields):
+    /// - location: String (from DV joiner - needs parsing into storageType + pathOrInlineDv)
+    /// - contentInfo.offset: i64 (from DV joiner)
+    /// - contentInfo.sizeInBytes: i64 (from DV joiner)
+    /// - recordCount: i64 (from DV joiner)
+    /// - _pos: i64 (from DV joiner - deleteManifestPosition)
+    ///
+    /// TODO: Parse location string to extract storageType and pathOrInlineDv
+    /// TODO: Handle type conversions and null checks for building DeletionVectorDescriptor
+    /// For now, DV fields are set to null as a placeholder until parsing is implemented.
+    fn build_metadata_to_add_transform_with_dv(
+        add_schema: &SchemaRef,
+        path_in_log: &str,
+    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
+        use crate::expressions::Expression;
+        use crate::schema::DataType;
 
         // Get the Add struct type from the schema
         let add_field = add_schema
@@ -547,149 +708,418 @@ impl Metadata {
             _ => return Err(Error::generic("'add' field is not a struct")),
         };
 
+        // Get the deletionVector field type for building the DV struct
+        let _dv_field = add_struct_type
+            .field("deletionVector")
+            .ok_or_else(|| Error::generic("Add schema missing 'deletionVector' field"))?;
+
         // Build expressions for each Add field
         let mut add_field_exprs: Vec<Arc<Expression>> = Vec::new();
 
         for field in add_struct_type.fields() {
             let expr: Expression = match field.name().as_str() {
-                "path" => {
-                    // Map location → path
-                    Expression::column(["location"])
-                }
-                "size" => {
-                    // Map file_size_in_bytes → size, use coalesce to default to 0
-                    Expression::variadic(
-                        VariadicExpressionOp::Coalesce,
-                        [
-                            Expression::column(["fileSizeInBytes"]),
-                            Expression::literal(0i64),
+                // DV-specific fields that differ from base transform
+                "deletionVector" => {
+                    // Combine flat DV columns into a struct
+                    // Use nullability predicate: struct is null when storageType is null (no DV match)
+                    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+                    use crate::schema::ToSchema;
+                    let dv_schema = <DeletionVectorDescriptor as ToSchema>::to_schema();
+
+                    // Create struct with nullability predicate
+                    // When dv_storageType IS NOT NULL, the struct is non-null
+                    // When dv_storageType IS NULL (no join match), the entire struct becomes null
+                    Expression::Struct(
+                        vec![
+                            Arc::new(Expression::column(["dv_storageType"])),
+                            Arc::new(Expression::column(["dv_pathOrInlineDv"])),
+                            Arc::new(Expression::column(["dv_offset"])),
+                            Arc::new(Expression::column(["dv_sizeInBytes"])),
+                            Arc::new(Expression::column(["dv_cardinality"])),
                         ],
+                        Some(Box::new(dv_schema)),
+                        Some(Arc::new(Expression::Predicate(Box::new(
+                            Expression::column(["dv_storageType"]).is_not_null(),
+                        )))),
                     )
                 }
-                "stats" => {
-                    // Convert record_count to JSON: {"numRecords": <count>}
-                    // Create a struct with explicit schema specifying the "numRecords" field name
-                    let stats_schema =
-                        StructType::new_unchecked(vec![crate::schema::StructField::new(
-                            "numRecords",
-                            DataType::LONG,
-                            false,
-                        )]);
-                    let num_records_struct = Expression::struct_from_with_schema(
-                        [Expression::column(["recordCount"])],
-                        stats_schema,
-                    );
-                    Expression::unary(UnaryExpressionOp::ToJson, num_records_struct)
-                }
-                "baseRowId" => {
-                    // Map tracking_info.first_row_id → baseRowId
-                    Expression::column(["trackingInfo", "firstRowId"])
-                }
-                "defaultRowCommitVersion" => {
-                    // TODO: Check if this should be sequence_number instead of snapshot_id
-                    // Map tracking_info.snapshot_id → defaultRowCommitVersion
-                    Expression::column(["trackingInfo", "snapshotId"])
-                }
-                "dataManifestPath" => {
-                    // Constant: path_in_log
-                    Expression::literal(path_in_log.to_string())
-                }
-                "dataManifestPosition" => {
-                    // Use the _pos metadata column which contains 0-based row indices
-                    // This is automatically added by parquet readers
-                    // If _pos is not available, can_use_optimized_path() will return false
-                    Expression::column(["_pos"])
-                }
-                "modificationTime" => {
-                    // Constant: i64::MIN
-                    Expression::literal(i64::MIN)
-                }
-                "partitionValues" => {
-                    // Constant: empty HashMap
-                    // Create an empty map using a literal
-                    let empty_map = MapData::try_new(
-                        MapType::new(DataType::STRING, DataType::STRING, false),
-                        Vec::<(Scalar, Scalar)>::new(),
-                    )?;
-                    Expression::literal(Scalar::Map(empty_map))
-                }
-                "dataChange" => {
-                    // TODO: Revisit dataChange - should this always be true?
-                    // Constant: true
-                    Expression::literal(true)
-                }
-                "tags" => {
-                    // Null MAP type
-                    Expression::null_literal(DataType::Map(Box::new(MapType::new(
-                        DataType::STRING,
-                        DataType::STRING,
-                        true, // values are nullable
-                    ))))
-                }
-                "deletionVector" => {
-                    // Null STRUCT type (DeletionVectorDescriptor schema)
-                    // Get the type from the Add schema
-                    Expression::null_literal(field.data_type().clone())
-                }
-                "clusteringProvider" => {
-                    // Null STRING type
-                    Expression::null_literal(DataType::STRING)
-                }
                 "deleteManifestPath" => {
-                    // Null STRING type
-                    Expression::null_literal(DataType::STRING)
+                    // Use the joined deleteManifestPath column
+                    Expression::column(["deleteManifestPath"])
                 }
                 "deleteManifestPosition" => {
-                    // Null LONG type
-                    Expression::null_literal(DataType::LONG)
+                    // Use the joined deleteManifestPosition column
+                    Expression::column(["deleteManifestPosition"])
                 }
-                _ => {
-                    // Unknown field, set to null with the field's type
-                    Expression::null_literal(field.data_type().clone())
-                }
+                // All other fields: delegate to base function
+                _ => Self::build_action_field_expression(
+                    field.name(),
+                    field.data_type(),
+                    "add",
+                    path_in_log,
+                )?,
             };
 
             add_field_exprs.push(Arc::new(expr));
         }
 
         // Create a struct expression with all Add fields
-        // We need explicit schema here because we're using mixed expression types
-        // (column references, literals, computed expressions) and need to ensure
-        // correct nullability for fields like partitionValues
         let add_struct_expr =
             Expression::struct_from_with_schema(add_field_exprs, (**add_struct_type).clone());
 
         // Wrap in outer struct for the top-level "add" field
-        let top_level_schema = StructType::new_unchecked(vec![crate::schema::StructField::new(
-            "add",
-            DataType::Struct(add_struct_type.clone()),
-            true,
-        )]);
-        let top_level_struct =
-            Expression::struct_from_with_schema(vec![Arc::new(add_struct_expr)], top_level_schema);
+        let top_level_expr =
+            Self::wrap_action_in_top_level("add", add_struct_expr, add_struct_type);
 
-        Ok(Arc::new(top_level_struct))
+        Ok(Arc::new(top_level_expr))
     }
 
     /// Builds a selection vector that excludes deleted and manifest entries from a metadata batch.
     ///
     /// Returns a vector of booleans where `true` means the row should be included.
+    ///
     /// Excludes:
     /// - Deleted entries: `trackingInfo.status == TrackingStatus::Deleted`
     /// - Manifest entries: `contentType == DataManifest` or `DeleteManifest`
-    fn build_metadata_selection_vector(batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-        use crate::schema::{ColumnName, DataType};
-        use std::sync::LazyLock;
+    ///
+    /// Processes a single metadata batch: applies filtering and transformation.
+    ///
+    /// # Parameters
+    /// - `batch`: The metadata batch to process
+    /// - `transform_evaluator`: The evaluator that transforms metadata to Add format
+    ///
+    /// # Returns
+    /// The transformed and filtered EngineData ready to be wrapped in ActionsBatch
+    fn has_deletion_vectors(&self) -> DeltaResult<bool> {
+        for batch in self.data.iter() {
+            let (_data_selection, dv_selection) =
+                Self::build_data_and_dv_selection_vectors(batch.as_ref())?;
+            if dv_selection.iter().any(|&b| b) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
-        // Handle empty batches
-        if batch.is_empty() {
-            return Ok(Vec::new());
+    /// Creates a lookup joiner for DV entries from metadata batches.
+    ///
+    /// Filters metadata to only DV entries and creates a LookupJoiner that maps
+    /// data file paths to their DV metadata.
+    ///
+    /// # Parameters
+    /// - `handler`: Evaluation handler for creating the joiner
+    /// - `metadata_schema`: Schema of the metadata entries
+    /// - `batches`: Metadata batches (will be filtered to only DV entries internally by joiner)
+    /// - `delete_manifest_path`: Path to the delete manifest (will be added as constant via transform)
+    ///
+    /// # Returns
+    /// A LookupJoiner ready to join DV fields onto data entries
+    ///
+    /// # Note
+    /// The joined fields will be raw (location as string, contentInfo as struct, etc.).
+    /// Post-processing is needed to parse location and build DeletionVectorDescriptor.
+    /// Creates a lookup joiner from borrowed metadata batches.
+    ///
+    /// Following user's suggestion: "We should do the parsing of DVs before converting to EngineData."
+    ///
+    /// Strategy:
+    /// 1. Extract DV entries using build_dv_map_from_batches (parses location strings in Rust)
+    /// 2. Convert parsed DV map to EngineData with proper storageType/pathOrInlineDv fields
+    /// 3. Use that EngineData to create the joiner
+    ///
+    /// This avoids complex string parsing in expressions or post-join visitor patterns.
+    fn build_dv_joiner_from_metadata(
+        handler: &dyn EvaluationHandler,
+        metadata_schema: SchemaRef,
+        batches: Vec<Box<dyn EngineData>>,
+    ) -> DeltaResult<Box<dyn LookupJoiner>> {
+        use crate::engine_data::FilteredEngineData;
+
+        // Collect batches with DV entries
+        // Note: batches already have parsed DV columns from prepare_batches_with_dv_columns
+        let mut filtered_batches: Vec<FilteredEngineData> = Vec::new();
+
+        for batch in batches.into_iter() {
+            let (_data_selection, dv_selection) =
+                Self::build_data_and_dv_selection_vectors(batch.as_ref())?;
+
+            if dv_selection.iter().any(|&b| b) {
+                // Wrap batch with DV selection vector
+                filtered_batches.push(FilteredEngineData::try_new(batch, dv_selection)?);
+            }
         }
 
-        // Focused visitor that only extracts content_type and tracking_info.status
+        if filtered_batches.is_empty() {
+            return Err(Error::generic("No DV entries found to build joiner"));
+        }
+
+        debug!("Building DV joiner with {} batches", filtered_batches.len());
+
+        // Create joiner configuration with flat DV columns
+        // The joiner appends flat columns which will be transformed into a struct later
+        let key_column = ColumnName::new(["referencedFile"]);
+        let version_column = ColumnName::new(["trackingInfo", "sequenceNumber"]);
+        let value_columns = vec![
+            ColumnName::new(["dv_storageType"]),
+            ColumnName::new(["dv_pathOrInlineDv"]),
+            ColumnName::new(["dv_offset"]),
+            ColumnName::new(["dv_sizeInBytes"]),
+            ColumnName::new(["dv_cardinality"]),
+            ColumnName::new(["deleteManifestPath"]),
+            ColumnName::new(["deleteManifestPosition"]),
+        ];
+
+        // Build the extended schema with appended DV fields
+        let extended_schema =
+            Self::extend_metadata_schema_with_dv_fields(&metadata_schema, &DV_COLUMNS_SCHEMA_FINAL);
+        let filtered_refs: Vec<&FilteredEngineData> = filtered_batches.iter().collect();
+        handler.new_lookup_join_handler(
+            extended_schema,
+            &key_column,
+            &value_columns,
+            &version_column,
+            &filtered_refs,
+        )
+    }
+
+    /// Creates a new batch with parsed DV columns for use in the DV joiner.
+    ///
+    /// This function efficiently builds a batch containing:
+    /// - Join keys: referencedFile, trackingInfo.sequenceNumber
+    /// - DV value columns (7 total): dv_storageType, dv_pathOrInlineDv, dv_offset, dv_sizeInBytes,
+    ///   dv_cardinality, deleteManifestPath, deleteManifestPosition
+    ///
+    /// It uses two strategies for efficiency:
+    /// 1. **Expression evaluation** for simple columns (dv_cardinality, deleteManifestPath, deleteManifestPosition)
+    /// 2. **Visitor pattern** only for complex parsing (dv_storageType, dv_pathOrInlineDv, dv_offset, dv_sizeInBytes)
+    ///
+    /// # Parameters
+    /// - `batch`: Source metadata batch
+    /// - `table_root`: Table root URL for resolving DV paths
+    /// - `source_manifest_path`: Path to manifest (used as constant deleteManifestPath value)
+    /// - `evaluation_handler`: Handler for creating expression evaluators
+    /// - `metadata_schema`: Schema of the input metadata batch
+    ///
+    /// # Returns
+    /// A new batch with exactly the columns needed for the DV joiner
+    fn append_parsed_dv_columns(
+        batch: &dyn EngineData,
+        table_root: &Url,
+        source_manifest_path: &str,
+        evaluation_handler: &dyn EvaluationHandler,
+        metadata_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        use crate::actions::deletion_vector::DeletionVectorPath;
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+        use crate::expressions::{ArrayData, Expression, Scalar};
+        use crate::schema::{ArrayType, ColumnName, DataType};
+
+        // Step 1: Create a batch with join keys and transformable DV columns using expressions
+        // This includes: referencedFile, trackingInfo, dv_cardinality, deleteManifestPath, deleteManifestPosition
+
+        let projection_expr = Arc::new(Expression::Struct(
+            vec![
+                Arc::new(Expression::column(["contentType"])), // Needed by build_data_and_dv_selection_vectors
+                Arc::new(Expression::column(["referencedFile"])),
+                Arc::new(Expression::column(["trackingInfo"])), // Keep the whole struct
+                Arc::new(Expression::column(["recordCount"])),  // dv_cardinality
+                Arc::new(Expression::Literal(Scalar::String(
+                    source_manifest_path.to_string(),
+                ))), // deleteManifestPath
+                Arc::new(Expression::column(["_pos"])),         // deleteManifestPosition
+            ],
+            None,
+            None,
+        ));
+
+        // Use cached projection schema
+        let projection_evaluator = evaluation_handler.new_expression_evaluator(
+            metadata_schema,
+            projection_expr,
+            DataType::Struct(Box::new(DV_PROJECTION_SCHEMA.as_ref().clone())),
+        )?;
+
+        let batch_with_projected_columns = projection_evaluator.evaluate(batch)?;
+
+        /// Converts an i64 value to i32 with bounds checking and a descriptive error message.
+        fn i64_to_i32(value: i64, field_name: &str) -> DeltaResult<i32> {
+            i32::try_from(value).map_err(|_| {
+                Error::generic(format!(
+                    "DV {} {} out of i32 range ({}..={})",
+                    field_name,
+                    value,
+                    i32::MIN,
+                    i32::MAX
+                ))
+            })
+        }
+
+        // Visitor to build flat DV columns and manifest metadata
+        // Uses flat columns instead of struct for simpler construction
+        struct ParseDVFieldsVisitor {
+            // Flat DV fields
+            storage_types: Vec<Scalar>,
+            path_or_inline_dvs: Vec<Scalar>,
+            offsets: Vec<Scalar>,
+            size_in_bytes: Vec<Scalar>,
+            table_root: Url,
+        }
+
+        impl RowVisitor for ParseDVFieldsVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+                    vec![
+                        ColumnName::new(["contentType"]),
+                        ColumnName::new(["location"]),
+                        ColumnName::new(["contentInfo", "offset"]), // Nested in contentInfo struct
+                        ColumnName::new(["contentInfo", "sizeInBytes"]), // Nested in contentInfo struct
+                    ]
+                });
+                static TYPES: &[DataType] = &[
+                    DataType::INTEGER,
+                    DataType::STRING,
+                    DataType::LONG,
+                    DataType::LONG,
+                ];
+                (NAMES.as_slice(), TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                let content_type_getter = getters[0];
+                let location_getter = getters[1];
+                let offset_getter = getters[2];
+                let size_in_bytes_getter = getters[3];
+
+                for i in 0..row_count {
+                    let content_type: i32 = content_type_getter.get(i, "contentType")?;
+
+                    // Only process DV entries (contentType=1)
+                    if content_type == 1 {
+                        // Parse location
+                        let location_opt: Option<&str> = location_getter.get_opt(i, "location")?;
+
+                        let (storage_type, path_or_inline_dv) = if let Some(location) = location_opt
+                        {
+                            match DeletionVectorPath::parse_path(location, &self.table_root) {
+                                Ok((st, path)) => {
+                                    (Scalar::String(st.to_string()), Scalar::String(path))
+                                }
+                                Err(_) => (
+                                    Scalar::Null(DataType::STRING),
+                                    Scalar::Null(DataType::STRING),
+                                ),
+                            }
+                        } else {
+                            (
+                                Scalar::Null(DataType::STRING),
+                                Scalar::Null(DataType::STRING),
+                            )
+                        };
+
+                        // Cast offset from i64 to i32 with bounds checking
+                        let offset_opt: Option<i64> = offset_getter.get_opt(i, "offset")?;
+                        let offset_scalar = match offset_opt {
+                            Some(v) => {
+                                let offset_i32 = i64_to_i32(v, "offset")?;
+                                Scalar::Integer(offset_i32)
+                            }
+                            None => Scalar::Null(DataType::INTEGER),
+                        };
+
+                        // Cast sizeInBytes from i64 to i32 with bounds checking
+                        // Subtract 8 bytes to account for the deletion vector format's magic number
+                        let size_opt: Option<i64> =
+                            size_in_bytes_getter.get_opt(i, "sizeInBytes")?;
+                        let size_scalar = match size_opt {
+                            Some(v) => {
+                                let adjusted = v.checked_sub(8).ok_or_else(|| {
+                                    Error::generic(format!(
+                                        "DV sizeInBytes {} is less than 8 (magic number size)",
+                                        v
+                                    ))
+                                })?;
+                                let size_i32 = i64_to_i32(adjusted, "sizeInBytes")?;
+                                Scalar::Integer(size_i32)
+                            }
+                            None => Scalar::Null(DataType::INTEGER),
+                        };
+
+                        // Push flat DV fields
+                        self.storage_types.push(storage_type);
+                        self.path_or_inline_dvs.push(path_or_inline_dv);
+                        self.offsets.push(offset_scalar);
+                        self.size_in_bytes.push(size_scalar);
+                    } else {
+                        // Not a DV entry, use nulls for all flat columns
+                        self.storage_types.push(Scalar::Null(DataType::STRING));
+                        self.path_or_inline_dvs.push(Scalar::Null(DataType::STRING));
+                        self.offsets.push(Scalar::Null(DataType::INTEGER));
+                        self.size_in_bytes.push(Scalar::Null(DataType::INTEGER));
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        // Step 2: Use visitor to parse the complex DV columns from the ORIGINAL input batch
+        // The visitor extracts: dv_storageType, dv_pathOrInlineDv, dv_offset, dv_sizeInBytes
+        let batch_len = batch.len();
+        let mut visitor = ParseDVFieldsVisitor {
+            storage_types: Vec::with_capacity(batch_len),
+            path_or_inline_dvs: Vec::with_capacity(batch_len),
+            offsets: Vec::with_capacity(batch_len),
+            size_in_bytes: Vec::with_capacity(batch_len),
+            table_root: table_root.clone(),
+        };
+        // Visit the original input batch which has contentType, location, and contentInfo fields
+        visitor.visit_rows_of(batch)?;
+
+        // Step 3: Build ArrayData for the complex DV columns (parsed via visitor)
+        let storage_type_array = ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
+            visitor.storage_types,
+        )?;
+        let path_or_inline_dv_array = ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
+            visitor.path_or_inline_dvs,
+        )?;
+        let offset_array =
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), visitor.offsets)?;
+        let size_in_bytes_array = ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, true),
+            visitor.size_in_bytes,
+        )?;
+
+        // Append the complex DV columns to the batch with projected columns
+        // Final batch has: referencedFile, trackingInfo, dv_cardinality, deleteManifestPath,
+        // deleteManifestPosition, dv_storageType, dv_pathOrInlineDv, dv_offset, dv_sizeInBytes
+        batch_with_projected_columns.append_columns(
+            DV_COLUMNS_SCHEMA_VISITOR_NEEDED.clone(),
+            vec![
+                storage_type_array,
+                path_or_inline_dv_array,
+                offset_array,
+                size_in_bytes_array,
+            ],
+        )
+    }
+
+    /// Extract the maximum sequence number from DV entries in a batch
+    fn build_data_and_dv_selection_vectors(
+        batch: &dyn EngineData,
+    ) -> DeltaResult<(Vec<bool>, Vec<bool>)> {
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+        use crate::schema::DataType;
+
         struct SelectionVisitor {
-            selection: Vec<bool>,
+            data_selection: Vec<bool>,
+            dv_selection: Vec<bool>,
         }
 
         impl RowVisitor for SelectionVisitor {
@@ -712,117 +1142,474 @@ impl Metadata {
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
-                    let content_type_int: i32 = getters[0].get(i, "content_type")?;
-                    let tracking_status_int: i32 = getters[1].get(i, "tracking_info.status")?;
+                    let content_type: i32 = getters[0].get(i, "contentType")?;
+                    let status_opt: Option<i32> = getters[1].get_opt(i, "trackingInfo.status")?;
 
-                    // Exclude manifest entries (DataManifest=3, DeleteManifest=4)
-                    let is_manifest = content_type_int == 3 || content_type_int == 4;
+                    // Only include Existed (0) or Added (1) entries
+                    let is_active = status_opt.map(|s| s == 0 || s == 1).unwrap_or(false);
 
-                    // Exclude deleted entries (status=2)
-                    // TODO: This needs to be updated when we support DELETE actions
-                    let is_deleted = tracking_status_int == 2;
-
-                    self.selection.push(!is_manifest && !is_deleted);
+                    if is_active {
+                        if content_type == 0 {
+                            // Data
+                            self.data_selection.push(true);
+                            self.dv_selection.push(false);
+                        } else if content_type == 1 {
+                            // PositionDeletes
+                            self.data_selection.push(false);
+                            self.dv_selection.push(true);
+                        } else {
+                            // Other types (manifest entries, equality deletes)
+                            self.data_selection.push(false);
+                            self.dv_selection.push(false);
+                        }
+                    } else {
+                        // Deleted or unknown status
+                        self.data_selection.push(false);
+                        self.dv_selection.push(false);
+                    }
                 }
                 Ok(())
             }
         }
 
         let mut visitor = SelectionVisitor {
-            selection: Vec::new(),
+            data_selection: Vec::new(),
+            dv_selection: Vec::new(),
         };
+
         visitor.visit_rows_of(batch)?;
 
-        Ok(visitor.selection)
+        Ok((visitor.data_selection, visitor.dv_selection))
     }
 
-    /// Processes a single metadata batch: applies filtering and transformation.
+    /// Builds selection vectors for Add vs Remove entries based on trackingInfo.status.
+    ///
+    /// Returns (add_selection, remove_selection) where:
+    /// - add_selection[i] = true if entry i has status Existed (0) or Added (1)
+    /// - remove_selection[i] = true if entry i has status Deleted (2)
+    ///
+    /// Both exclude manifest entries (contentType 3, 4) and other non-data types.
+    fn build_add_remove_selection_vectors(
+        batch: &dyn EngineData,
+    ) -> DeltaResult<(Vec<bool>, Vec<bool>)> {
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+        use crate::schema::DataType;
+
+        struct AddRemoveVisitor {
+            add_selection: Vec<bool>,
+            remove_selection: Vec<bool>,
+        }
+
+        impl RowVisitor for AddRemoveVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+                    vec![
+                        ColumnName::new(["contentType"]),
+                        ColumnName::new(["trackingInfo", "status"]),
+                    ]
+                });
+                static TYPES: &[DataType] = &[DataType::INTEGER, DataType::INTEGER];
+                (NAMES.as_slice(), TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let content_type: i32 = getters[0].get(i, "contentType")?;
+                    let status: i32 = getters[1].get(i, "trackingInfo.status")?;
+
+                    // Only process Data entries (contentType=0)
+                    // Skip DVs (1), EqualityDeletes (2), and Manifests (3, 4)
+                    if content_type == 0 {
+                        match status {
+                            0 | 1 => {
+                                // Existed or Added -> Add action
+                                self.add_selection.push(true);
+                                self.remove_selection.push(false);
+                            }
+                            2 => {
+                                // Deleted -> Remove action
+                                self.add_selection.push(false);
+                                self.remove_selection.push(true);
+                            }
+                            _ => {
+                                // Unknown status
+                                self.add_selection.push(false);
+                                self.remove_selection.push(false);
+                            }
+                        }
+                    } else {
+                        // Not a data entry
+                        self.add_selection.push(false);
+                        self.remove_selection.push(false);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = AddRemoveVisitor {
+            add_selection: Vec::new(),
+            remove_selection: Vec::new(),
+        };
+
+        visitor.visit_rows_of(batch)?;
+
+        Ok((visitor.add_selection, visitor.remove_selection))
+    }
+
+    /// Helper to extend metadata schema with DV fields (_pos if missing, dv_schema.
+    fn extend_metadata_schema_with_dv_fields(
+        metadata_schema: &SchemaRef,
+        dv_schema: &SchemaRef,
+    ) -> SchemaRef {
+        let mut fields: Vec<_> = metadata_schema.fields().cloned().collect();
+
+        // Add _pos if not already present (it should be from parquet reader or test helper)
+        if !metadata_schema.contains("_pos") {
+            // TODO: check if this is still needed
+            fields.push(StructField::new("_pos", DataType::LONG, false));
+        }
+
+        // Add DV columns from cached schema
+        fields.extend(dv_schema.fields().cloned());
+
+        Arc::new(StructType::new_unchecked(fields))
+    }
+
+    /// Builds a deletion vector map from DV entry batches.
+    ///
+    /// Converts EngineData batches of DV entries into a HashMap for O(1) lookup.
     ///
     /// # Parameters
-    /// - `batch`: The metadata batch to process
-    /// - `transform_evaluator`: The evaluator that transforms metadata to Add format
+    /// - `evaluation_handler`: Handler for creating expression evaluators
+    /// - `metadata_schema`: Schema of the metadata entries
+    /// - `has_dvs`: Whether the metadata contains deletion vectors
     ///
     /// # Returns
-    /// The transformed and filtered EngineData ready to be wrapped in ActionsBatch
-    fn process_metadata_batch(
-        batch: &dyn EngineData,
-        transform_evaluator: &dyn crate::ExpressionEvaluator,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        use crate::engine_data::FilteredEngineData;
+    /// Vec of processed batches with parsed DV columns appended
+    fn prepare_batches_with_dv_columns(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
+        metadata_schema: SchemaRef,
+        has_dvs: bool,
+    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+        if !has_dvs {
+            return Ok(Vec::new());
+        }
 
-        // Build selection vector to exclude deleted and manifest entries
-        let selection_vector = Self::build_metadata_selection_vector(batch)?;
+        debug!("Appending parsed DV columns to metadata batches");
+        let mut processed = Vec::new();
+        for batch in self.data.iter() {
+            let batch_with_columns = Self::append_parsed_dv_columns(
+                batch.as_ref(),
+                &self.table_root,
+                &self.path_in_log,
+                evaluation_handler,
+                metadata_schema.clone(),
+            )?;
+            processed.push(batch_with_columns);
+        }
+        Ok(processed)
+    }
 
-        // Check if all rows are selected (no filtering needed)
-        let all_selected = selection_vector.iter().all(|&selected| selected);
-
-        // Evaluate the transform on the batch
-        let transformed_data = transform_evaluator.evaluate(batch)?;
-
-        // Apply selection vector if needed
-        if all_selected {
-            Ok(transformed_data)
+    /// Determine the evaluator schema based on whether we have parsed DV columns
+    fn get_evaluator_schema(has_dvs: bool, metadata_schema: &SchemaRef) -> SchemaRef {
+        if has_dvs {
+            // When we have DVs, use helper to extend with DV fields
+            Self::extend_metadata_schema_with_dv_fields(metadata_schema, &DV_COLUMNS_SCHEMA_FINAL)
         } else {
-            // Filter out deleted and manifest entries
-            let filtered = FilteredEngineData::try_new(transformed_data, selection_vector)?;
-            filtered.apply_selection_vector()
+            metadata_schema.clone()
         }
     }
 
-    /// Optimized path for converting root manifest entries to action batches.
+    /// Build Add and/or Remove evaluators based on the schema
+    fn build_action_evaluators(
+        evaluation_handler: &dyn EvaluationHandler,
+        evaluator_schema: SchemaRef,
+        output_schema: &SchemaRef,
+        path_in_log: &str,
+        has_add: bool,
+        has_remove: bool,
+        has_dvs: bool,
+    ) -> DeltaResult<EvaluatorPair> {
+        let add_evaluator_opt = if has_add {
+            let add_expr = if has_dvs {
+                Self::build_metadata_to_add_transform_with_dv(output_schema, path_in_log)?
+            } else {
+                Self::build_metadata_to_add_transform(output_schema, path_in_log)?
+            };
+            Some(evaluation_handler.new_expression_evaluator(
+                evaluator_schema.clone(),
+                add_expr,
+                output_schema.clone().into(),
+            )?)
+        } else {
+            None
+        };
+
+        let remove_evaluator_opt = if has_remove {
+            let remove_expr = Self::build_metadata_to_remove_transform(output_schema, path_in_log)?;
+            Some(evaluation_handler.new_expression_evaluator(
+                evaluator_schema.clone(),
+                remove_expr,
+                output_schema.clone().into(),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(EvaluatorPair {
+            add_evaluator: add_evaluator_opt,
+            remove_evaluator: remove_evaluator_opt,
+        })
+    }
+
+    /// Apply DV join to a single batch
+    fn apply_dv_join_to_batch(
+        batch: &dyn EngineData,
+        dv_joiner: &dyn LookupJoiner,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        debug!("Applying DV join to batch with {} rows", batch.len());
+        let all_selected = vec![true; batch.len()];
+        let result = dv_joiner.join_raw(
+            batch,
+            &all_selected,
+            &ColumnName::new(["location"]),
+            &ColumnName::new(["trackingInfo", "sequenceNumber"]),
+        )?;
+        debug!("DV join completed, result has {} rows", result.len());
+
+        Ok(result)
+    }
+
+    /// Process a single batch for a single action type (Add or Remove)
+    /// Helper method to build DV joiner for root manifest.
     ///
-    /// This method bypasses the expensive MetadataEntry → AddRemove → EngineData conversion
-    /// by transforming EngineData directly using engine expressions.
+    /// This handles the simpler case where DV information is embedded in the root manifest itself.
+    fn build_dv_joiner_for_root(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
+        metadata_schema: SchemaRef,
+    ) -> DeltaResult<Option<Box<dyn LookupJoiner>>> {
+        // Check if we have deletion vectors
+        let has_dvs = self.has_deletion_vectors()?;
+
+        if !has_dvs {
+            return Ok(None);
+        }
+
+        debug!("Building DV joiner for optimized path");
+
+        // Prepare batches by appending parsed DV columns (MUST be done before building joiner!)
+        let batches_with_dv_columns = self.prepare_batches_with_dv_columns(
+            evaluation_handler,
+            metadata_schema.clone(),
+            has_dvs,
+        )?;
+
+        // Build DV joiner using the processed batches with parsed DV columns
+        Ok(Some(Self::build_dv_joiner_from_metadata(
+            evaluation_handler,
+            metadata_schema,
+            batches_with_dv_columns,
+        )?))
+    }
+
+    /// Helper method to build DV joiner for leaf manifest processing.
     ///
-    /// Deleted entries and manifest entries are filtered out using a selection vector.
-    ///
-    /// # Prerequisites
-    /// This method assumes `can_use_optimized_path` has returned true.
-    ///
-    /// # Parameters
-    /// - `engine`: The engine for evaluation
-    /// - `schema`: The Add-only action schema
-    /// - `predicate`: Optional predicate for data skipping (currently not fully supported in optimized path)
+    /// This handles the complex case where DVs come from separate affiliated and unaffiliated
+    /// DV manifest files that need to be read, parsed, and combined.
+    fn build_dv_joiner_for_leaf(
+        evaluation_handler: Arc<dyn EvaluationHandler>,
+        parquet_handler: Arc<dyn ParquetHandler>,
+        metadata_schema: SchemaRef,
+        manifest_refs: &ManifestReference,
+        shared_state: &SharedLeafState,
+        table_root: &Url,
+    ) -> DeltaResult<Option<Box<dyn LookupJoiner>>> {
+        let has_affiliated_dvs = !manifest_refs.affiliated_dv_manifests.is_empty();
+        let has_unaffiliated_dvs = !shared_state.unaffiliated_dv_manifests.is_empty();
+
+        if !has_affiliated_dvs && !has_unaffiliated_dvs {
+            return Ok(None);
+        }
+
+        debug!(
+            "Building DV joiner for leaf manifest optimized path from {} affiliated + {} unaffiliated DV manifests",
+            manifest_refs.affiliated_dv_manifests.len(),
+            shared_state.unaffiliated_dv_manifests.len()
+        );
+
+        // Read all DV manifest files (both affiliated and unaffiliated), prepare them, and collect their batches
+        let mut all_prepared_dv_batches = Vec::new();
+
+        // Process all DV manifests (both affiliated and unaffiliated use the same logic)
+        for filtered_manifest in manifest_refs
+            .affiliated_dv_manifests
+            .iter()
+            .chain(shared_state.unaffiliated_dv_manifests.iter())
+        {
+            let delete_manifest_location = filtered_manifest
+                .manifest
+                .location
+                .clone()
+                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
+            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
+
+            let dv_metadata = Metadata::read_with_handler(
+                parquet_handler.clone(),
+                &delete_manifest_url,
+                delete_manifest_location.clone(),
+                table_root.clone(),
+            )?;
+
+            // Validate that the DV manifest doesn't contain unsupported row types (e.g., EqualityDeletes)
+            dv_metadata.validate_no_unsupported_rows()?;
+
+            // Prepare the DV batches (parse DV location strings and append columns)
+            let prepared = dv_metadata.prepare_batches_with_dv_columns(
+                evaluation_handler.as_ref(),
+                metadata_schema.clone(),
+                true,
+            )?;
+
+            // Apply manifest DV if present (filters out deleted DV entries)
+            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
+                let total_rows: usize = prepared.iter().map(|b| b.len()).sum();
+                let manifest_dv_sel = parse_manifest_dv_to_selection_vector(dv_bytes, total_rows)?;
+
+                // Apply selection vector to each batch
+                let mut offset = 0;
+                for batch in prepared {
+                    let batch_len = batch.len();
+                    let mut batch_selection = vec![true; batch_len];
+                    for (i, selected) in batch_selection.iter_mut().enumerate() {
+                        let global_idx = offset + i;
+                        if global_idx < manifest_dv_sel.len() {
+                            *selected = manifest_dv_sel[global_idx];
+                        }
+                    }
+                    // Only add batch if it has any selected rows
+                    if batch_selection.iter().any(|&b| b) {
+                        let filtered = batch.apply_selection_vector(batch_selection)?;
+                        all_prepared_dv_batches.push(filtered);
+                    }
+                    offset += batch_len;
+                }
+            } else {
+                all_prepared_dv_batches.extend(prepared);
+            }
+        }
+
+        // Build joiner from the prepared DV batches
+        if !all_prepared_dv_batches.is_empty() {
+            Ok(Some(Self::build_dv_joiner_from_metadata(
+                evaluation_handler.as_ref(),
+                metadata_schema,
+                all_prepared_dv_batches,
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn root_action_batches_optimized(
         &self,
         engine: &dyn Engine,
         schema: &SchemaRef,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Build the transform expression
-        let transform_expr = Self::build_metadata_to_add_transform(schema, &self.path_in_log)?;
+        use crate::actions::{ADD_NAME, REMOVE_NAME};
 
-        // Get evaluation handler
-        let evaluation_handler = engine.evaluation_handler();
-
-        // Create an expression evaluator for the transform
-        let metadata_schema = Arc::new(MetadataEntry::base_schema());
-        let transform_evaluator = evaluation_handler.new_expression_evaluator(
-            metadata_schema.clone(),
-            transform_expr,
-            schema.clone().into(),
-        )?;
-
-        // If we have a predicate, we need to filter entries
-        // For now, we'll apply filtering by extracting entries and filtering them
-        // TODO: Optimize this to work directly on EngineData batches
+        // Log if predicate is present (data skipping will be applied)
         if predicate.is_some() {
             debug!("Predicate present in optimized path - data skipping will be applied");
-            // For now, we still process all data but note that predicate-based filtering
-            // could be optimized in the future by applying it directly to EngineData
-            // The ScanFileVisitor will still filter out non-matching rows
         }
 
-        // Process each batch through the transform and filter pipeline
+        // Determine which action types are in the schema
+        let has_add = schema.contains(ADD_NAME);
+        let has_remove = schema.contains(REMOVE_NAME);
+
+        // Get evaluation handler and metadata schema
+        // Use base_schema with _pos added (matches what's in the batches)
+        let evaluation_handler = engine.evaluation_handler();
+        let metadata_schema = {
+            use crate::schema::MetadataColumnSpec;
+            let base_schema = MetadataEntry::base_schema();
+            let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
+            fields.push(StructField::create_metadata_column(
+                "_pos",
+                MetadataColumnSpec::RowIndex,
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        };
+
+        // Build DV joiner for root manifest
+        let dv_joiner_opt =
+            self.build_dv_joiner_for_root(evaluation_handler.as_ref(), metadata_schema.clone())?;
+
+        // Check if we have deletion vectors (needed for evaluator schema and evaluators)
+        let has_dvs = dv_joiner_opt.is_some();
+
+        // Determine evaluator schema (includes parsed DV columns if present)
+        let evaluator_schema = Self::get_evaluator_schema(has_dvs, &metadata_schema);
+
+        // Build evaluators for Add and/or Remove actions
+        let evaluators = Self::build_action_evaluators(
+            evaluation_handler.as_ref(),
+            evaluator_schema,
+            schema,
+            &self.path_in_log,
+            has_add,
+            has_remove,
+            has_dvs,
+        )?;
+        let add_evaluator_opt = evaluators.add_evaluator;
+        let remove_evaluator_opt = evaluators.remove_evaluator;
+
+        // Process each batch
         let mut result_batches = Vec::new();
-        for batch in self.data.iter() {
-            let processed_data =
-                Self::process_metadata_batch(batch.as_ref(), transform_evaluator.as_ref())?;
-            let actions_batch = ActionsBatch::new(processed_data, false);
-            result_batches.push(Ok(actions_batch));
+
+        for batch in &self.data {
+            // Optionally apply DV join to append DV columns
+            // We'll store the joined batch if present, otherwise work with original
+            let joined_batch;
+            let batch_ref: &dyn EngineData = if let Some(ref joiner) = dv_joiner_opt {
+                joined_batch = Self::apply_dv_join_to_batch(batch.as_ref(), joiner.as_ref())?;
+                joined_batch.as_ref()
+            } else {
+                batch.as_ref()
+            };
+
+            // Process Add entries if needed
+            if let Some(add_eval) = add_evaluator_opt.as_ref() {
+                let (add_selection, _) = Self::build_add_remove_selection_vectors(batch_ref)?;
+
+                if add_selection.iter().any(|&b| b) {
+                    let transformed = add_eval.evaluate(batch_ref)?;
+                    let filtered_data = transformed.apply_selection_vector(add_selection)?;
+                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
+                }
+            }
+
+            // Process Remove entries if needed
+            if let Some(remove_eval) = remove_evaluator_opt.as_ref() {
+                let (_, remove_selection) = Self::build_add_remove_selection_vectors(batch_ref)?;
+
+                if remove_selection.iter().any(|&b| b) {
+                    let transformed = remove_eval.evaluate(batch_ref)?;
+                    let filtered_data = transformed.apply_selection_vector(remove_selection)?;
+                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
+                }
+            }
         }
 
-        // Return as iterator
         Ok(Box::new(result_batches.into_iter()))
     }
 
@@ -838,136 +1625,16 @@ impl Metadata {
         _partition_keys: &[String],
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        use std::collections::HashMap;
-
-        // Check if we can use the optimized path
-        // This avoids expensive MetadataEntry conversions for Add-only scenarios
-        if self.can_use_optimized_path(schema)? {
-            debug!("Using optimized path for metadata reading (no Remove actions, no DVs)");
-            // Try the optimized path; if it fails due to missing _pos column (only happens
-            // in test scenarios with manually-created EngineData), fall back to standard path
-            match self.root_action_batches_optimized(engine, schema, predicate) {
-                Ok(result) => return Ok(result),
-                Err(e) if e.to_string().contains("No such field: _pos") => {
-                    debug!("Optimized path failed due to missing _pos column, falling back to standard path");
-                    // Continue to fallback below
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Fallback to the standard path for complex scenarios
-        debug!("Using standard path for metadata reading (Remove actions or DVs present)");
-
-        // Get all metadata entries
-        let entries = self.entries()?;
-
-        // Separate entries into data files, deletion vectors, and manifest entries
-        // Data entries: Data and EqualityDeletes (will be converted to Add/Remove actions)
-        // DV entries: PositionDeletes (will be used to build deletion vector map)
-        // Manifest entries: DataManifest, DeleteManifest, ManifestDV (handled by non_root_action_batches)
-        let (mut data_entries, dv_entries): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|entry| {
-                matches!(
-                    entry.content_type,
-                    DataContentType::Data | DataContentType::EqualityDeletes
-                )
-            });
-
-        // Build a map of deletion vectors from PositionDeletes entries
-        // Pre-size the map to avoid reallocation
-        // Key: referenced_file path, Value: DeletionVectorInfo
-        let mut deletion_vector_map: HashMap<String, DeletionVectorInfo> =
-            HashMap::with_capacity(dv_entries.len());
-        // Filter out manifest-related entries from data_entries (though they should already be excluded by the partition)
-        data_entries.retain(|entry| {
-            matches!(
-                entry.content_type,
-                DataContentType::Data | DataContentType::EqualityDeletes
-            )
-        });
-
-        // Apply predicate-based data skipping to filter out entries that cannot match
-        let data_entries =
-            filter_entries_by_predicate(data_entries, predicate, "root data entries");
-
-        // Process deletion vector entries (only if we have a path_in_log)
-        if !self.path_in_log.is_empty() {
-            for (i, dv_entry) in dv_entries.into_iter().enumerate() {
-                // Only include deletion vectors that are not marked as deleted
-                let is_deleted = dv_entry
-                    .tracking_info
-                    .as_ref()
-                    .map(|ti| ti.status == TrackingStatus::Deleted)
-                    .unwrap_or(false);
-                if !is_deleted && dv_entry.content_type == DataContentType::PositionDeletes {
-                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
-                        Error::generic("Deletion vector must have a referenced file")
-                    })?;
-                    let dv_info = metadata_entry_to_deletion_vector_info(
-                        dv_entry,
-                        i,
-                        &self.path_in_log,
-                        &self.table_root,
-                    )?;
-
-                    // Only insert if this DV has a higher sequence number than any existing one for this file
-                    deletion_vector_map
-                        .entry(referenced_file)
-                        .and_modify(|existing| {
-                            if dv_info.sequence_number > existing.sequence_number {
-                                *existing = dv_info.clone();
-                            }
-                        })
-                        .or_insert(dv_info);
-                }
-            }
-        }
-
-        // Convert each MetadataEntry to AddRemove
-        // For root_action_batches, there are no affiliated manifests, so we pass an empty affiliated map
-        // Note: Entries with Deleted status will be converted to Remove actions, which will have null
-        // paths when processed through the Add-only scan schema. These are filtered out by the
-        // ScanFileVisitor (see scan/state.rs:201) which skips rows where path is null.
-        let empty_affiliated_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
-        let dv_maps = DeletionVectorMaps::new(&deletion_vector_map, &empty_affiliated_map);
-
-        let add_removes: Vec<AddRemove> = data_entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                // Use the pre-computed path_in_log - no conversion needed!
-                entry_to_add_remove(entry, &dv_maps, i, self.path_in_log.clone())
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        // Return empty iterator if no add_removes
-        if add_removes.is_empty() {
+        // Return empty iterator if schema doesn't contain Add or Remove
+        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        // Create an evaluation handler reference
-        let evaluation_handler = engine.evaluation_handler();
+        // Validate no unsupported rows (e.g., EqualityDeletes)
+        self.validate_no_unsupported_rows()?;
 
-        // Cache schemas to avoid repeated construction in the loop
-        let schemas = ActionSchemas::new();
-
-        // Convert all AddRemove entries to rows of scalars
-        let scalar_rows: Vec<Vec<Scalar>> = add_removes
-            .into_iter()
-            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        // Convert to slices for the create_many API
-        let scalar_row_refs: Vec<&[Scalar]> =
-            scalar_rows.iter().map(|row| row.as_slice()).collect();
-
-        // Create multi-row EngineData in one call
-        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-
-        // Wrap in ActionsBatch and return as iterator with single item
-        let actions_batch = ActionsBatch::new(engine_data, false);
-        Ok(Box::new(std::iter::once(Ok(actions_batch))))
+        debug!("Using optimized path for metadata reading");
+        self.root_action_batches_optimized(engine, schema, predicate)
     }
 
     /// Discovers child manifest references in the root manifest.
@@ -979,8 +1646,9 @@ impl Metadata {
     ///   containing actual data file entries
     /// - **Delete manifest files** (content_type = DeleteManifest): References to manifests
     ///   containing deletion vectors, grouped by their affiliation to data manifests
-    /// - **Manifest deletion vectors** (content_type = ManifestDV): Deletion vectors that
-    ///   apply to manifest entries themselves (TODO: not yet implemented)
+    /// - **Manifest deletion vectors**: Stored inline in the `manifest_dv` field of
+    ///   DataManifest/DeleteManifest entries. Applied during manifest reading to filter
+    ///   out deleted entries without rewriting manifest files.
     ///
     /// The returned `ManifestReference` groups delete manifests into two categories:
     /// - `affiliated_dv_manifests`: Delete manifests that reference a specific data manifest
@@ -1034,53 +1702,6 @@ impl Metadata {
                 DataContentType::Data => data_file_entries.push(entry),
                 DataContentType::EqualityDeletes => {
                     return Err(Error::generic("Equality deletes are not supported"))
-                }
-            }
-        }
-
-        // Build a set of data files present in the root (for matching position deletes)
-        let root_data_files: std::collections::HashSet<String> = data_file_entries
-            .iter()
-            .filter_map(|entry| entry.location.clone())
-            .collect();
-
-        // Build a map of unmatched deletion vectors (DVs that reference files not in root)
-        // These need to be passed through to child manifests
-        let mut unmatched_dvs: HashMap<String, DeletionVectorInfo> = HashMap::new();
-
-        // Process deletion vector entries (only if we have a path_in_log)
-        if !self.path_in_log.is_empty() {
-            for (i, dv_entry) in position_delete_entries.into_iter().enumerate() {
-                let is_deleted = dv_entry
-                    .tracking_info
-                    .as_ref()
-                    .map(|ti| ti.status == TrackingStatus::Deleted)
-                    .unwrap_or(false);
-
-                if !is_deleted {
-                    let referenced_file = dv_entry.referenced_file.clone().ok_or_else(|| {
-                        Error::generic("Deletion vector must have a referenced file")
-                    })?;
-
-                    // Only add to unmatched_dvs if the referenced file is NOT in the root
-                    if !root_data_files.contains(&referenced_file) {
-                        // For DVs in root manifest, use the root manifest path
-                        let dv_info = metadata_entry_to_deletion_vector_info(
-                            dv_entry,
-                            i,
-                            &self.path_in_log,
-                            &self.table_root,
-                        )?;
-
-                        unmatched_dvs
-                            .entry(referenced_file)
-                            .and_modify(|existing| {
-                                if dv_info.sequence_number > existing.sequence_number {
-                                    *existing = dv_info.clone();
-                                }
-                            })
-                            .or_insert(dv_info);
-                    }
                 }
             }
         }
@@ -1147,7 +1768,6 @@ impl Metadata {
             manifest_references,
             shared_state: SharedLeafState {
                 unaffiliated_dv_manifests,
-                unmatched_dvs,
             },
         })
     }
@@ -1164,63 +1784,6 @@ impl Metadata {
     ///
     /// # Returns
     /// A HashMap mapping file paths to their deletion vector information.
-    pub(crate) fn build_shared_dv_map(
-        shared_state: &SharedLeafState,
-        engine: &dyn Engine,
-        table_root: &Url,
-    ) -> DeltaResult<HashMap<String, DeletionVectorInfo>> {
-        // Start with unmatched DVs from the root
-        let mut deletion_vector_map = shared_state.unmatched_dvs.clone();
-
-        // Process unaffiliated delete manifests
-        for filtered_manifest in shared_state.unaffiliated_dv_manifests.iter() {
-            let delete_manifest_location = filtered_manifest
-                .manifest
-                .location
-                .clone()
-                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
-
-            let mut delete_entries = Metadata::read(
-                engine,
-                &delete_manifest_url,
-                delete_manifest_location.clone(),
-                table_root.clone(),
-            )?
-            .entries()?;
-
-            // Apply manifest DV if present (stored inline on the manifest entry)
-            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
-            }
-
-            merge_deletion_vectors(
-                &mut deletion_vector_map,
-                delete_entries,
-                &delete_manifest_location,
-                table_root,
-            )?;
-        }
-
-        Ok(deletion_vector_map)
-    }
-
-    /// Processes a LeafReferences into action batches for all child manifests.
-    ///
-    /// This is a convenience method that:
-    /// 1. Builds the shared DV map once from the root state
-    /// 2. Processes each child manifest with the shared DV map
-    /// 3. Chains all the resulting action batch iterators
-    ///
-    /// # Parameters
-    /// - `root_state`: The leaf references from the root manifest
-    /// - `engine`: The engine for reading parquet files
-    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
-    /// - `predicate`: Optional predicate for data skipping. When provided, data file entries
-    ///   whose `content_stats` indicate they cannot contain matching data will be skipped.
-    ///
-    /// # Returns
-    /// An iterator over all action batches from all child manifests.
     pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         engine: &dyn Engine,
@@ -1228,13 +1791,6 @@ impl Metadata {
         table_root: &Url,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Build the shared DV map once and wrap in Arc for shared ownership across manifests
-        let shared_dv_map = Arc::new(Self::build_shared_dv_map(
-            &root_state.shared_state,
-            engine,
-            table_root,
-        )?);
-
         // Capture the handlers we need (both are Arc, so cheap to clone)
         let parquet_handler = engine.parquet_handler();
         let evaluation_handler = engine.evaluation_handler();
@@ -1242,7 +1798,7 @@ impl Metadata {
         // Create lazy iterator - manifests will be processed one at a time as needed
         let lazy_iter = LazyManifestBatchIterator {
             manifests: root_state.manifest_references.into_iter(),
-            shared_dv_map,
+            shared_state: root_state.shared_state,
             parquet_handler,
             evaluation_handler,
             schema: schema.clone(),
@@ -1281,7 +1837,7 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
-        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+        shared_state: &SharedLeafState,
         engine: &dyn Engine,
         schema: &SchemaRef,
         table_root: &Url,
@@ -1293,7 +1849,7 @@ impl Metadata {
 
         Self::manifest_to_action_batches_with_handlers(
             manifest_refs,
-            shared_dv_map,
+            shared_state,
             parquet_handler,
             evaluation_handler,
             schema,
@@ -1304,44 +1860,39 @@ impl Metadata {
 
     /// Checks if the optimized path can be used for a leaf manifest.
     ///
-    /// The optimization can be used when:
-    /// - Schema contains only Add actions (no Remove field)
-    /// - No affiliated DV manifests
-    /// - No shared DVs (empty map)
-    fn can_use_leaf_optimized_path(
-        manifest_refs: &ManifestReference,
-        shared_dv_map: &HashMap<String, DeletionVectorInfo>,
-        schema: &SchemaRef,
-    ) -> bool {
+    /// Checks if we can use the optimized path for leaf manifests.
+    ///
+    /// Requirements:
+    /// - Schema is Add-only (no Remove actions)
+    ///
+    /// Now allows:
+    /// - Affiliated DV manifests (will be handled via lookup join)
+    /// - Shared DVs (will be handled via lookup join)
+    fn can_use_leaf_optimized_path(schema: &SchemaRef) -> bool {
         use crate::actions::{ADD_NAME, REMOVE_NAME};
 
-        // Check if schema is Add-only
-        if !schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME) {
+        // Allow both Add and Remove actions in the optimized path
+        // They will be handled via separate selection vectors
+        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
             return false;
         }
 
-        // Check for affiliated DV manifests
-        if !manifest_refs.affiliated_dv_manifests.is_empty() {
-            return false;
-        }
-
-        // Check for shared DVs
-        if !shared_dv_map.is_empty() {
-            return false;
-        }
-
+        // Allow affiliated DV manifests and shared DVs - will be handled via lookup join
         true
     }
 
     /// Optimized path for processing leaf manifests using handlers.
     fn manifest_to_action_batches_optimized_with_handlers(
         manifest_refs: &ManifestReference,
+        shared_state: &SharedLeafState,
         parquet_handler: Arc<dyn ParquetHandler>,
         evaluation_handler: Arc<dyn EvaluationHandler>,
         schema: &SchemaRef,
         table_root: &Url,
         path_in_log: String,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        use crate::actions::{ADD_NAME, REMOVE_NAME};
+
         let data_manifest_location = manifest_refs
             .data_manifest
             .manifest
@@ -1352,83 +1903,171 @@ impl Metadata {
 
         // Read the metadata
         let metadata = Metadata::read_with_handler(
-            parquet_handler,
+            parquet_handler.clone(),
             &data_manifest_url,
             path_in_log.clone(),
             table_root.clone(),
         )?;
 
-        // Check if metadata can use optimized path (no DVs in entries)
-        if !metadata.can_use_optimized_path(schema)? {
-            return Err(Error::generic(
-                "Metadata contains DVs, cannot use optimized path",
-            ));
-        }
+        // Validate that the data manifest doesn't contain unsupported row types (e.g., EqualityDeletes)
+        metadata.validate_no_unsupported_rows()?;
 
-        // Build the transform expression
-        let transform_expr = Self::build_metadata_to_add_transform(schema, &path_in_log)?;
+        // Determine which action types are in the schema
+        let has_add = schema.contains(ADD_NAME);
+        let has_remove = schema.contains(REMOVE_NAME);
 
-        // Create an expression evaluator for the transform
+        // Build DV joiner if we have affiliated or unaffiliated deletion vector manifests
         let metadata_schema = Arc::new(MetadataEntry::base_schema());
-        let transform_evaluator = evaluation_handler.new_expression_evaluator(
+        let dv_joiner_opt = Self::build_dv_joiner_for_leaf(
+            evaluation_handler.clone(),
+            parquet_handler.clone(),
             metadata_schema.clone(),
-            transform_expr,
-            schema.clone().into(),
+            manifest_refs,
+            shared_state,
+            table_root,
         )?;
+
+        // When using a DV joiner, we don't prepare batches - the joiner will append DV columns
+        // The evaluator schema is the base metadata schema + the DV columns that the joiner will append
+        let has_dvs = dv_joiner_opt.is_some();
+        let evaluator_schema = if has_dvs {
+            // Build schema with DV columns that the joiner will append
+            let mut fields: Vec<_> = metadata_schema.fields().cloned().collect();
+            fields.push(crate::schema::StructField::new(
+                "storageType",
+                DataType::STRING,
+                true,
+            ));
+            fields.push(crate::schema::StructField::new(
+                "pathOrInlineDv",
+                DataType::STRING,
+                true,
+            ));
+            fields.push(crate::schema::StructField::new(
+                "dv_offset",
+                DataType::INTEGER,
+                true,
+            ));
+            fields.push(crate::schema::StructField::new(
+                "dv_sizeInBytes",
+                DataType::INTEGER,
+                true,
+            ));
+            fields.push(crate::schema::StructField::new(
+                "dv_cardinality",
+                DataType::LONG,
+                true,
+            ));
+            fields.push(crate::schema::StructField::new(
+                "dv_deleteManifestPosition",
+                DataType::LONG,
+                true,
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        } else {
+            metadata_schema.clone()
+        };
+
+        // Build evaluators for Add and/or Remove actions
+        let evaluators = Self::build_action_evaluators(
+            evaluation_handler.as_ref(),
+            evaluator_schema,
+            schema,
+            &path_in_log,
+            has_add,
+            has_remove,
+            has_dvs,
+        )?;
+        let add_evaluator_opt = evaluators.add_evaluator;
+        let remove_evaluator_opt = evaluators.remove_evaluator;
+
+        // Always use the original data manifest batches
+        // If we have a joiner, it will append DV columns during the join
+        let batch_source = &metadata.data;
 
         // Parse manifest_dv if present to get selection vector
         let manifest_dv_selection =
             if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
-                Some(parse_manifest_dv_to_selection_vector(
+                let sel = parse_manifest_dv_to_selection_vector(
                     dv_bytes,
                     metadata.data.iter().map(|b| b.len()).sum(),
-                )?)
+                )?;
+                Some(sel)
             } else {
                 None
             };
 
-        // Process each batch through the transform and filter pipeline
+        // Process each batch
         let mut result_batches = Vec::new();
         let mut offset = 0;
 
-        for batch in metadata.data.iter() {
+        for batch in batch_source {
             let batch_len = batch.len();
 
-            // Build selection vector to exclude deleted and manifest entries
-            let mut selection_vector = Self::build_metadata_selection_vector(batch.as_ref())?;
+            // Optionally apply DV join to append DV columns
+            let joined_batch;
+            let batch_ref: &dyn EngineData = if let Some(ref joiner) = dv_joiner_opt {
+                joined_batch = Self::apply_dv_join_to_batch(batch.as_ref(), joiner.as_ref())?;
+                joined_batch.as_ref()
+            } else {
+                batch.as_ref()
+            };
 
-            // Combine with manifest_dv selection if present
-            if let Some(ref manifest_dv_sel) = manifest_dv_selection {
-                for (i, selected) in selection_vector.iter_mut().enumerate() {
-                    let global_idx = offset + i;
-                    if global_idx < manifest_dv_sel.len() {
-                        *selected = *selected && manifest_dv_sel[global_idx];
+            // Build manifest_dv selection for this batch if present
+            let manifest_dv_batch_selection =
+                if let Some(ref manifest_dv_sel) = manifest_dv_selection {
+                    let mut selection = vec![true; batch_len];
+                    for (i, selected) in selection.iter_mut().enumerate() {
+                        let global_idx = offset + i;
+                        if global_idx < manifest_dv_sel.len() {
+                            *selected = manifest_dv_sel[global_idx];
+                        }
                     }
+                    Some(selection)
+                } else {
+                    None
+                };
+
+            // Process Add entries if needed
+            if let Some(add_eval) = add_evaluator_opt.as_ref() {
+                let (mut add_selection, _) = Self::build_add_remove_selection_vectors(batch_ref)?;
+
+                // Combine with manifest_dv selection
+                if let Some(ref manifest_dv_sel) = manifest_dv_batch_selection {
+                    for (i, selected) in add_selection.iter_mut().enumerate() {
+                        *selected = *selected && manifest_dv_sel[i];
+                    }
+                }
+
+                if add_selection.iter().any(|&b| b) {
+                    let transformed = add_eval.evaluate(batch_ref)?;
+                    let filtered_data = transformed.apply_selection_vector(add_selection)?;
+                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
                 }
             }
 
-            // Check if all rows are selected (no filtering needed)
-            let all_selected = selection_vector.iter().all(|&selected| selected);
+            // Process Remove entries if needed
+            if let Some(remove_eval) = remove_evaluator_opt.as_ref() {
+                let (_, mut remove_selection) =
+                    Self::build_add_remove_selection_vectors(batch_ref)?;
 
-            // Evaluate the transform on the batch
-            let transformed_data = transform_evaluator.evaluate(batch.as_ref())?;
+                // Combine with manifest_dv selection
+                if let Some(ref manifest_dv_sel) = manifest_dv_batch_selection {
+                    for (i, selected) in remove_selection.iter_mut().enumerate() {
+                        *selected = *selected && manifest_dv_sel[i];
+                    }
+                }
 
-            // Apply selection vector if needed
-            let processed_data = if all_selected {
-                transformed_data
-            } else {
-                use crate::engine_data::FilteredEngineData;
-                let filtered = FilteredEngineData::try_new(transformed_data, selection_vector)?;
-                filtered.apply_selection_vector()?
-            };
-
-            let actions_batch = ActionsBatch::new(processed_data, false);
-            result_batches.push(Ok(actions_batch));
+                if remove_selection.iter().any(|&b| b) {
+                    let transformed = remove_eval.evaluate(batch_ref)?;
+                    let filtered_data = transformed.apply_selection_vector(remove_selection)?;
+                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
+                }
+            }
 
             offset += batch_len;
         }
 
-        // Return as iterator
         Ok(Box::new(result_batches.into_iter()))
     }
 
@@ -1439,7 +2078,7 @@ impl Metadata {
     /// lifetime issues.
     fn manifest_to_action_batches_with_handlers(
         manifest_refs: ManifestReference,
-        shared_dv_map: Arc<HashMap<String, DeletionVectorInfo>>,
+        shared_state: &SharedLeafState,
         parquet_handler: Arc<dyn ParquetHandler>,
         evaluation_handler: Arc<dyn EvaluationHandler>,
         schema: &SchemaRef,
@@ -1453,120 +2092,24 @@ impl Metadata {
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
-        // Try optimized path if possible
-        if predicate.is_none()
-            && Self::can_use_leaf_optimized_path(&manifest_refs, &shared_dv_map, schema)
-        {
-            debug!("Using optimized path for leaf manifest with handlers (no DVs)");
-            return Self::manifest_to_action_batches_optimized_with_handlers(
-                &manifest_refs,
-                parquet_handler,
-                evaluation_handler,
-                schema,
-                table_root,
-                data_manifest_location,
-            );
+        // Check if we can use optimized path
+        if predicate.is_some() || !Self::can_use_leaf_optimized_path(schema) {
+            return Err(Error::generic(
+                "Cannot use optimized path for leaf manifest. \
+                 Predicate filtering on leaf manifests is not yet supported in optimized path.",
+            ));
         }
 
-        debug!("Using standard path for leaf manifest with handlers (DVs present or predicate filtering)");
-        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
-
-        // Read the data manifest entries using the handler
-        let mut data_manifest_entries = Metadata::read_with_handler(
-            parquet_handler.clone(),
-            &data_manifest_url,
-            data_manifest_location.clone(),
-            table_root.clone(),
-        )?
-        .entries()?;
-
-        // Apply manifest DV if present (stored inline on the manifest entry)
-        if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
-            data_manifest_entries = apply_manifest_dv(data_manifest_entries, dv_bytes)?;
-        }
-
-        // Apply predicate-based data skipping to filter out entries that cannot match
-        let data_manifest_entries =
-            filter_entries_by_predicate(data_manifest_entries, predicate, "leaf data entries");
-
-        // Build a separate map for affiliated delete manifests (specific to this data manifest)
-        let mut affiliated_dv_map: HashMap<String, DeletionVectorInfo> = HashMap::new();
-
-        // Process affiliated delete manifests for this specific data manifest
-        for filtered_manifest in manifest_refs.affiliated_dv_manifests.iter() {
-            let delete_manifest_location = filtered_manifest
-                .manifest
-                .location
-                .clone()
-                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
-
-            let mut delete_entries = Metadata::read_with_handler(
-                parquet_handler.clone(),
-                &delete_manifest_url,
-                delete_manifest_location.clone(),
-                table_root.clone(),
-            )?
-            .entries()?;
-
-            // Apply manifest DV if present (stored inline on the manifest entry)
-            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
-                delete_entries = apply_manifest_dv(delete_entries, dv_bytes)?;
-            }
-
-            merge_deletion_vectors(
-                &mut affiliated_dv_map,
-                delete_entries,
-                &delete_manifest_location,
-                table_root,
-            )?;
-        }
-
-        // Combine shared and affiliated DV maps (using references, no cloning)
-        let dv_maps = DeletionVectorMaps::new(&shared_dv_map, &affiliated_dv_map);
-
-        // Convert entries to AddRemove, filtering to only Data entries
-        let add_removes: Vec<AddRemove> = data_manifest_entries
-            .into_iter()
-            .filter_map(|entry| match entry.content_type {
-                DataContentType::Data => Some(Ok(entry)),
-                DataContentType::EqualityDeletes => {
-                    Some(Err(Error::generic("Equality deletes are not supported")))
-                }
-                _ => None, // Skip other entry types
-            })
-            .collect::<DeltaResult<Vec<_>>>()?
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                entry_to_add_remove(entry, &dv_maps, i, data_manifest_location.clone())
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        // Return empty iterator if no add_removes
-        if add_removes.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        // Cache schemas to avoid repeated construction in the loop
-        let schemas = ActionSchemas::new();
-
-        // Convert all AddRemove entries to rows of scalars
-        let scalar_rows: Vec<Vec<Scalar>> = add_removes
-            .into_iter()
-            .map(|add_remove| add_remove_to_scalars(add_remove, schema, &schemas))
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        // Convert to slices for the create_many API
-        let scalar_row_refs: Vec<&[Scalar]> =
-            scalar_rows.iter().map(|row| row.as_slice()).collect();
-
-        // Create multi-row EngineData in one call
-        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-
-        // Wrap in ActionsBatch and return as iterator with single item
-        let actions_batch = ActionsBatch::new(engine_data, false);
-        Ok(Box::new(std::iter::once(Ok(actions_batch))))
+        debug!("Using optimized path for leaf manifest with handlers");
+        Self::manifest_to_action_batches_optimized_with_handlers(
+            &manifest_refs,
+            shared_state,
+            parquet_handler,
+            evaluation_handler,
+            schema,
+            table_root,
+            data_manifest_location,
+        )
     }
 
     /// Creates Metadata from a Delta table snapshot by replaying add actions from the transaction log.
@@ -1762,60 +2305,17 @@ impl Metadata {
     }
 }
 
-/// Information about a deletion vector associated with a data file.
-#[derive(Clone, Debug)]
-pub(crate) struct DeletionVectorInfo {
-    /// The deletion vector descriptor
-    descriptor: DeletionVectorDescriptor,
-    /// Sequence number for versioning
-    sequence_number: i64,
-    /// Index of this entry in the metadata tree
-    entry_index: i64,
-    /// Path to the delete manifest containing this DV entry
-    delete_manifest_path: String,
-}
-
-/// Result of processing deletion vector information for a file entry.
-struct ProcessedDeletionVector {
-    /// The deletion vector descriptor, if applicable
-    descriptor: Option<DeletionVectorDescriptor>,
-    /// Path to the delete manifest
-    delete_manifest_path: Option<String>,
-    /// Position in the delete manifest
-    delete_manifest_position: Option<i64>,
-}
-
-/// Applies a manifest deletion vector to filter entries from a manifest.
+/// Parses a manifest DV into a selection vector.
 ///
-/// Manifest deletion vectors (ManifestDV, content_type = 5) can filter out entries
-/// from a manifest by ordinal position without rewriting the manifest file. This is
-/// useful for merge-on-read operations where we want to remove entries without
-/// physically rewriting the manifest.
-///
-/// # Arguments
-/// * `entries` - The manifest entries to filter
-/// * `manifest_dv` - The ManifestDV entry containing the deletion vector
-///
-/// # Returns
-/// A filtered list of entries with deleted positions removed.
-///
-/// # Implementation Notes
-/// Applies a manifest deletion vector to filter entries by position.
-///
-/// Takes deletion vector bytes (stored inline on manifest entries in the `manifest_dv` field)
-/// and filters out entries at positions specified in the DV.
-///
-/// The DV format is: 4-byte magic number + RoaringTreemap portable serialization
-#[allow(dead_code)]
-pub(crate) fn apply_manifest_dv(
-    entries: Vec<MetadataEntry>,
-    dv_bytes: &Bytes,
-) -> DeltaResult<Vec<MetadataEntry>> {
+/// Returns a boolean vector where `true` means the row should be included (NOT deleted).
+/// Parse manifest deletion vector bytes into a RoaringTreemap.
+/// Returns None if dv_bytes is empty, otherwise returns the set of deleted positions.
+pub(crate) fn parse_manifest_dv(dv_bytes: &Bytes) -> DeltaResult<Option<roaring::RoaringTreemap>> {
     use roaring::RoaringTreemap;
 
     // Check if we have DV data
     if dv_bytes.is_empty() {
-        return Ok(entries);
+        return Ok(None);
     }
 
     // Parse the magic number from the first 4 bytes
@@ -1848,213 +2348,25 @@ pub(crate) fn apply_manifest_dv(
         }
     };
 
-    // Filter entries: keep only those whose ordinal position is NOT in the deletion vector
-    let filtered_entries: Vec<MetadataEntry> = entries
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            // If this position is NOT deleted, keep the entry
-            if !deleted_positions.contains(index as u64) {
-                Some(entry)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Ok(filtered_entries)
+    Ok(Some(deleted_positions))
 }
 
-/// Parses a manifest DV into a selection vector.
-///
-/// Returns a boolean vector where `true` means the row should be included (NOT deleted).
 fn parse_manifest_dv_to_selection_vector(
     dv_bytes: &Bytes,
     total_rows: usize,
 ) -> DeltaResult<Vec<bool>> {
-    use roaring::RoaringTreemap;
-
-    // Check if we have DV data
-    if dv_bytes.is_empty() {
-        return Ok(vec![true; total_rows]);
-    }
-
-    // Parse the magic number from the first 4 bytes
-    if dv_bytes.len() < 4 {
-        return Err(Error::generic(
-            "Manifest deletion vector is too small (less than 4 bytes)",
-        ));
-    }
-
-    let magic = u32::from_be_bytes([dv_bytes[0], dv_bytes[1], dv_bytes[2], dv_bytes[3]]);
-
-    // Magic numbers from the deletion vector format
-    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-    const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
-
-    // Deserialize the RoaringTreemap
-    let deleted_positions = match magic {
-        ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&dv_bytes[4..])
-            .map_err(|err| Error::generic(format!("Failed to deserialize manifest DV: {}", err)))?,
-        ROARING_BITMAP_NATIVE_MAGIC => {
-            return Err(Error::generic(
-                "Native serialization format for manifest deletion vectors is not yet supported",
-            ));
-        }
-        _ => {
-            return Err(Error::generic(format!(
-                "Invalid magic number in manifest deletion vector: {}",
-                magic
-            )));
-        }
-    };
+    let deleted_positions = parse_manifest_dv(dv_bytes)?;
 
     // Build selection vector: true if NOT deleted
-    let selection_vector: Vec<bool> = (0..total_rows)
-        .map(|i| !deleted_positions.contains(i as u64))
-        .collect();
+    let selection_vector: Vec<bool> = if let Some(deleted_positions) = deleted_positions {
+        (0..total_rows)
+            .map(|i| !deleted_positions.contains(i as u64))
+            .collect()
+    } else {
+        vec![true; total_rows]
+    };
 
     Ok(selection_vector)
-}
-
-/// Merges deletion vectors from manifest entries into the deletion vector map.
-///
-/// Processes a list of MetadataEntry records (from a delete manifest) and adds
-/// their deletion vector information to the map, keeping the highest sequence number
-/// for each referenced file.
-#[allow(dead_code)]
-fn merge_deletion_vectors(
-    deletion_vector_map: &mut HashMap<String, DeletionVectorInfo>,
-    entries: Vec<MetadataEntry>,
-    delete_manifest_path: &str,
-    table_root: &Url,
-) -> DeltaResult<()> {
-    for (i, entry) in entries.into_iter().enumerate() {
-        // Only process PositionDeletes entries that are not deleted
-        let is_deleted = entry
-            .tracking_info
-            .as_ref()
-            .map(|ti| ti.status == TrackingStatus::Deleted)
-            .unwrap_or(false);
-
-        if !is_deleted && entry.content_type == DataContentType::PositionDeletes {
-            let referenced_file = entry
-                .referenced_file
-                .clone()
-                .ok_or_else(|| Error::generic("Deletion vector must have a referenced file"))?;
-
-            let dv_info =
-                metadata_entry_to_deletion_vector_info(entry, i, delete_manifest_path, table_root)?;
-
-            // Only insert if this DV has a higher sequence number than any existing one for this file
-            deletion_vector_map
-                .entry(referenced_file)
-                .and_modify(|existing| {
-                    if dv_info.sequence_number > existing.sequence_number {
-                        *existing = dv_info.clone();
-                    }
-                })
-                .or_insert(dv_info);
-        }
-    }
-
-    Ok(())
-}
-
-/// Converts a MetadataEntry representing a deletion vector into a DeletionVectorInfo entry.
-///
-/// Extracts and validates all required fields from the deletion vector entry and creates
-/// a DeletionVectorDescriptor with proper type conversions.
-///
-/// # Returns
-/// A DeletionVectorInfo struct containing the deletion vector descriptor and metadata.
-fn metadata_entry_to_deletion_vector_info(
-    dv_entry: MetadataEntry,
-    entry_index: usize,
-    delete_manifest_path: &str,
-    table_root: &Url,
-) -> DeltaResult<DeletionVectorInfo> {
-    let sequence_number = dv_entry
-        .tracking_info
-        .as_ref()
-        .and_then(|ti| ti.sequence_number)
-        .ok_or_else(|| Error::generic("Deletion vector must have a sequence number"))?;
-    let location = dv_entry
-        .location
-        .ok_or_else(|| Error::generic("Deletion vector must have a location"))?;
-
-    // Get offset and size from content_info
-    let content_info = dv_entry
-        .content_info
-        .ok_or_else(|| Error::generic(format!("{} missing content_info", location)))?;
-
-    // Convert offset from i64 to Option<i32>
-    let offset_i32: Option<i32> = Some(content_info.offset.try_into().map_err(|_| {
-        Error::generic(format!(
-            "Offset for {} is too large to convert to i32",
-            location
-        ))
-    })?);
-
-    // Convert size_in_bytes from i64 to i32
-    // Subtract 8 bytes to convert from Iceberg's size (full blob) back to Delta's size (bitmap only)
-    // Iceberg includes 4-byte size prefix + 4-byte CRC, Delta doesn't
-    let size_in_bytes_i32: i32 = (content_info.size_in_bytes - 8).try_into().map_err(|_| {
-        Error::generic(format!(
-            "Size in bytes for {} is too large to convert to i32",
-            location
-        ))
-    })?;
-
-    // Convert entry_index from usize to i64
-    let entry_index_i64: i64 = entry_index
-        .try_into()
-        .map_err(|_| Error::generic("Entry index is too large to convert to i64"))?;
-
-    // Parse the location to determine storage type and encoded path
-    use crate::actions::deletion_vector::DeletionVectorPath;
-    let (storage_type, path_or_inline_dv) = DeletionVectorPath::parse_path(&location, table_root)?;
-
-    Ok(DeletionVectorInfo {
-        descriptor: DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset: offset_i32,
-            size_in_bytes: size_in_bytes_i32,
-            cardinality: dv_entry.record_count,
-        },
-        sequence_number,
-        entry_index: entry_index_i64,
-        delete_manifest_path: delete_manifest_path.to_string(),
-    })
-}
-
-/// Processes deletion vector information and returns the DeletionVectorDescriptor if applicable.
-///
-/// Returns a ProcessedDeletionVector struct containing the deletion vector descriptor,
-/// delete_manifest_path, and delete_manifest_position if a deletion vector is found with a
-/// sequence number greater than or equal to the entry's sequence number.
-fn process_deletion_vector(
-    dv_maps: &DeletionVectorMaps<'_>,
-    full_path: &str,
-    entry_sequence_number: Option<i64>,
-) -> DeltaResult<ProcessedDeletionVector> {
-    let dv_info = dv_maps.get(full_path);
-
-    match dv_info {
-        Some(info) if info.sequence_number >= entry_sequence_number.unwrap_or(0) => {
-            Ok(ProcessedDeletionVector {
-                descriptor: Some(info.descriptor.clone()),
-                delete_manifest_path: Some(info.delete_manifest_path.clone()),
-                delete_manifest_position: Some(info.entry_index),
-            })
-        }
-        _ => Ok(ProcessedDeletionVector {
-            descriptor: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
-        }),
-    }
 }
 
 /// Helper that holds a URL and lazily computes/caches its relative path.
@@ -2082,368 +2394,7 @@ pub(crate) fn parse_or_join_url(path: &str, table_root: &Url) -> DeltaResult<Url
         .map_err(|e| Error::generic(format!("Failed to parse URL '{}': {}", path, e)))
 }
 
-/// Converts a MetadataEntry to an AddRemove enum.
-///
-/// Based on the tracking_info.status:
-/// - TrackingStatus::Added or TrackingStatus::Existed -> creates an Add action
-/// - TrackingStatus::Deleted -> creates a Remove action
-///
-/// The dv_maps are used to look up deletion vectors for the entry.
-/// The shared map is probed first (contains unaffiliated manifests and unmatched DVs from root),
-/// then the affiliated map (specific to this data manifest).
-fn entry_to_add_remove(
-    entry: MetadataEntry,
-    dv_maps: &DeletionVectorMaps<'_>,
-    entry_index: usize,
-    manifest_path: String,
-) -> DeltaResult<AddRemove> {
-    use std::collections::HashMap;
-
-    let path = entry.location.ok_or_else(|| {
-        Error::generic(format!(
-            "Action requires location (content_type: {:?})",
-            entry.content_type
-        ))
-    })?;
-
-    // The path in entry.location is already relative from the metadata builder
-    let sequence_number = entry
-        .tracking_info
-        .as_ref()
-        .and_then(|ti| ti.sequence_number);
-    let processed_dv = process_deletion_vector(dv_maps, &path, sequence_number)?;
-
-    let status = entry
-        .tracking_info
-        .as_ref()
-        .map(|ti| ti.status)
-        .unwrap_or(TrackingStatus::Added);
-    let first_row_id = entry.tracking_info.as_ref().and_then(|ti| ti.first_row_id);
-    // TODO: Check if this should be sequence_number instead of snapshot_id for default_row_commit_version
-    let snapshot_id = entry.tracking_info.as_ref().and_then(|ti| ti.snapshot_id);
-
-    match status {
-        TrackingStatus::Added | TrackingStatus::Existed => {
-            let add =
-                Add {
-                    path,
-                    partition_values: HashMap::new(), // TODO: Extract from partition_keys
-                    size: entry.file_size_in_bytes.unwrap_or(0),
-                    modification_time: i64::MIN,
-                    data_change: true,
-                    stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
-                    tags: None,
-                    deletion_vector: processed_dv.descriptor,
-                    base_row_id: first_row_id,
-                    default_row_commit_version: snapshot_id,
-                    clustering_provider: None, // TODO: Set from when final decision is made.
-                    data_manifest_path: Some(manifest_path.clone()),
-                    data_manifest_position: Some(entry_index.try_into().map_err(|_| {
-                        Error::generic("Entry index is too large to convert to i64")
-                    })?),
-                    delete_manifest_path: processed_dv.delete_manifest_path,
-                    delete_manifest_position: processed_dv.delete_manifest_position,
-                };
-            Ok(AddRemove::Add(add))
-        }
-        TrackingStatus::Deleted => {
-            let remove =
-                Remove {
-                    path,
-                    deletion_timestamp: Some(i64::MIN),
-                    data_change: true,
-                    extended_file_metadata: Some(true),
-                    partition_values: Some(HashMap::new()), // TODO: Extract from partition_keys
-                    size: entry.file_size_in_bytes,
-                    stats: Some(format!(r#"{{"numRecords":{}}}"#, entry.record_count)),
-                    tags: None, // TODO: Finalize once we set this from tags
-                    deletion_vector: processed_dv.descriptor,
-                    base_row_id: first_row_id,
-                    default_row_commit_version: snapshot_id,
-                    data_manifest_path: Some(manifest_path),
-                    data_manifest_position: Some(entry_index.try_into().map_err(|_| {
-                        Error::generic("Entry index is too large to convert to i64")
-                    })?),
-                    delete_manifest_path: processed_dv.delete_manifest_path,
-                    delete_manifest_position: processed_dv.delete_manifest_position,
-                };
-            Ok(AddRemove::Remove(remove))
-        }
-    }
-}
-
 /// Converts a DeletionVectorDescriptor to a Scalar representation
-fn deletion_vector_descriptor_to_scalar(
-    dv: &crate::actions::deletion_vector::DeletionVectorDescriptor,
-    schemas: &ActionSchemas,
-) -> Scalar {
-    use crate::expressions::StructData;
-
-    // Use cached fields to avoid repeated to_schema calls
-    let fields = schemas.dv_fields.clone();
-
-    let values = vec![
-        Scalar::from(dv.storage_type.to_string()), // Convert enum to string
-        Scalar::from(dv.path_or_inline_dv.clone()),
-        Scalar::from(dv.offset),
-        Scalar::from(dv.size_in_bytes),
-        Scalar::from(dv.cardinality),
-    ];
-
-    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
-    // to match exactly in count, order, type, and nullability.
-    Scalar::Struct(StructData::new_unchecked(fields, values))
-}
-
-/// Helper function to convert HashMap<String, String> to Scalar matching the schema's map type
-fn hashmap_to_scalar_matching_schema(
-    map: HashMap<String, String>,
-    expected_type: &DataType,
-) -> DeltaResult<Scalar> {
-    use crate::expressions::MapData;
-
-    // Extract the MapType from the expected type
-    let map_type = if let DataType::Map(map_type_box) = expected_type {
-        map_type_box.as_ref().clone()
-    } else {
-        return Err(Error::generic(format!(
-            "Expected Map type, got {:?}",
-            expected_type
-        )));
-    };
-
-    let map_data = MapData::try_new(map_type, map)?;
-    Ok(map_data.into())
-}
-
-/// Helper function to convert HashMap<String, Option<String>> to Scalar matching the schema's map type
-fn hashmap_option_to_scalar_matching_schema(
-    map: HashMap<String, Option<String>>,
-    expected_type: &DataType,
-) -> DeltaResult<Scalar> {
-    use crate::expressions::MapData;
-
-    // Extract the MapType from the expected type
-    let map_type = if let DataType::Map(map_type_box) = expected_type {
-        map_type_box.as_ref().clone()
-    } else {
-        return Err(Error::generic(format!(
-            "Expected Map type, got {:?}",
-            expected_type
-        )));
-    };
-
-    let map_data = MapData::try_new(map_type, map)?;
-    Ok(map_data.into())
-}
-
-/// Cached schemas and data types used for converting Add/Remove actions to Scalars.
-/// Caching these avoids expensive repeated construction and cloning when processing batches.
-struct ActionSchemas {
-    // Cached field vectors to avoid repeated cloning
-    add_fields: Vec<StructField>,
-    remove_fields: Vec<StructField>,
-
-    // Cached boxed data type for DeletionVectorDescriptor nulls
-    dv_null_type: DataType,
-
-    // Cached field data types to avoid repeated field lookups
-    add_partition_values_type: DataType,
-    add_tags_type: DataType,
-    remove_partition_values_type: DataType,
-    remove_tags_type: DataType,
-
-    // Cached deletion vector fields to avoid repeated to_schema calls
-    dv_fields: Vec<StructField>,
-}
-
-impl ActionSchemas {
-    fn new() -> Self {
-        use crate::actions::deletion_vector::DeletionVectorDescriptor;
-        use crate::schema::ToSchema;
-
-        let add_schema = Add::to_schema();
-        let remove_schema = Remove::to_schema();
-        let dv_schema = DeletionVectorDescriptor::to_schema();
-
-        // Cache frequently accessed field types to avoid repeated lookups
-        // These fields are guaranteed to exist in the schemas generated by ToSchema derive macro
-        #[allow(clippy::unwrap_used)]
-        let add_partition_values_type = add_schema
-            .field("partitionValues")
-            .unwrap()
-            .data_type()
-            .clone();
-        #[allow(clippy::unwrap_used)]
-        let add_tags_type = add_schema.field("tags").unwrap().data_type().clone();
-        #[allow(clippy::unwrap_used)]
-        let remove_partition_values_type = remove_schema
-            .field("partitionValues")
-            .unwrap()
-            .data_type()
-            .clone();
-        #[allow(clippy::unwrap_used)]
-        let remove_tags_type = remove_schema.field("tags").unwrap().data_type().clone();
-
-        Self {
-            add_fields: add_schema.fields().cloned().collect(),
-            remove_fields: remove_schema.fields().cloned().collect(),
-            dv_fields: dv_schema.fields().cloned().collect(),
-            dv_null_type: DataType::Struct(Box::new(dv_schema)),
-            add_partition_values_type,
-            add_tags_type,
-            remove_partition_values_type,
-            remove_tags_type,
-        }
-    }
-}
-
-/// Converts an Add action to a Scalar representation
-fn add_to_scalar(add: &Add, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
-    use crate::expressions::StructData;
-
-    // Use cached field types to avoid expensive field lookups
-    let partition_values_type = &schemas.add_partition_values_type;
-    let tags_type = &schemas.add_tags_type;
-
-    // Convert HashMap fields using schema types
-    let partition_values_scalar: Scalar =
-        hashmap_to_scalar_matching_schema(add.partition_values.clone(), partition_values_type)?;
-    let tags_scalar = match &add.tags {
-        Some(tags) => hashmap_option_to_scalar_matching_schema(tags.clone(), tags_type)?,
-        None => Scalar::Null(tags_type.clone()),
-    };
-
-    // Convert DeletionVectorDescriptor, using cached boxed type for nulls
-    let deletion_vector_scalar = match &add.deletion_vector {
-        Some(dv) => deletion_vector_descriptor_to_scalar(dv, schemas),
-        None => Scalar::Null(schemas.dv_null_type.clone()),
-    };
-
-    // Use cached fields vector to avoid cloning from schema
-    let fields = schemas.add_fields.clone();
-
-    let values = vec![
-        Scalar::from(add.path.clone()),
-        partition_values_scalar,
-        Scalar::from(add.size),
-        Scalar::from(add.modification_time),
-        Scalar::from(add.data_change),
-        Scalar::from(add.stats.clone()),
-        tags_scalar,
-        deletion_vector_scalar,
-        Scalar::from(add.base_row_id),
-        Scalar::from(add.default_row_commit_version),
-        Scalar::from(add.clustering_provider.clone()),
-        Scalar::from(add.data_manifest_path.clone()),
-        Scalar::from(add.data_manifest_position),
-        Scalar::from(add.delete_manifest_path.clone()),
-        Scalar::from(add.delete_manifest_position),
-    ];
-
-    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
-    // to match exactly in count, order, type, and nullability.
-    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
-}
-
-/// Converts a Remove action to a Scalar representation
-fn remove_to_scalar(remove: &Remove, schemas: &ActionSchemas) -> DeltaResult<Scalar> {
-    use crate::expressions::StructData;
-
-    // Use cached field types to avoid expensive field lookups
-    let partition_values_type = &schemas.remove_partition_values_type;
-    let tags_type = &schemas.remove_tags_type;
-
-    // Convert HashMap fields using schema types
-    let partition_values_scalar = match &remove.partition_values {
-        Some(pv) => hashmap_to_scalar_matching_schema(pv.clone(), partition_values_type)?,
-        None => Scalar::Null(partition_values_type.clone()),
-    };
-    let tags_scalar = match &remove.tags {
-        Some(tags) => hashmap_to_scalar_matching_schema(tags.clone(), tags_type)?,
-        None => Scalar::Null(tags_type.clone()),
-    };
-
-    // Convert DeletionVectorDescriptor, using cached boxed type for nulls
-    let deletion_vector_scalar = match &remove.deletion_vector {
-        Some(dv) => deletion_vector_descriptor_to_scalar(dv, schemas),
-        None => Scalar::Null(schemas.dv_null_type.clone()),
-    };
-
-    // Use cached fields vector to avoid cloning from schema
-    let fields = schemas.remove_fields.clone();
-
-    let values = vec![
-        Scalar::from(remove.path.clone()),
-        Scalar::from(remove.deletion_timestamp),
-        Scalar::from(remove.data_change),
-        Scalar::from(remove.extended_file_metadata),
-        partition_values_scalar,
-        Scalar::from(remove.size),
-        tags_scalar,
-        deletion_vector_scalar,
-        Scalar::from(remove.base_row_id),
-        Scalar::from(remove.default_row_commit_version),
-        Scalar::from(remove.data_manifest_path.clone()),
-        Scalar::from(remove.data_manifest_position),
-        Scalar::from(remove.delete_manifest_path.clone()),
-        Scalar::from(remove.delete_manifest_position),
-    ];
-
-    // SAFETY: Fields are generated by ToSchema derive macro and values are constructed
-    // to match exactly in count, order, type, and nullability.
-    Ok(Scalar::Struct(StructData::new_unchecked(fields, values)))
-}
-
-/// Converts a single AddRemove to a vector of structured scalars.
-///
-/// This function:
-/// - Checks which action fields (add/remove) are present in the schema
-/// - Creates a row of structured scalar values (one per top-level field)
-fn add_remove_to_scalars(
-    add_remove: AddRemove,
-    schema: &SchemaRef,
-    schemas: &ActionSchemas,
-) -> DeltaResult<Vec<Scalar>> {
-    use crate::actions::{ADD_NAME, REMOVE_NAME};
-    use crate::expressions::Scalar;
-
-    // Build a vector of structured scalars for the schema (one per top-level field)
-    // Pre-allocate with exact capacity since we know the field count
-    let mut scalars = Vec::with_capacity(schema.fields().len());
-
-    for field in schema.fields() {
-        let scalar = match field.name() {
-            name if name == ADD_NAME => {
-                // Convert Add to Scalar if present, otherwise null
-                match &add_remove {
-                    AddRemove::Add(add) => add_to_scalar(add, schemas)?,
-                    AddRemove::Remove(_) => Scalar::Null(field.data_type().clone()),
-                }
-            }
-            name if name == REMOVE_NAME => {
-                // Convert Remove to Scalar if present, otherwise null
-                match &add_remove {
-                    AddRemove::Remove(remove) => remove_to_scalar(remove, schemas)?,
-                    AddRemove::Add(_) => Scalar::Null(field.data_type().clone()),
-                }
-            }
-            _ => {
-                // For any other field not matching add/remove, use null
-                Scalar::Null(field.data_type().clone())
-            }
-        };
-
-        // Keep the structured scalar (don't flatten)
-        scalars.push(scalar);
-    }
-
-    Ok(scalars)
-}
-
-/// Converts a MetadataEntry to a vector of structured Scalar values matching the schema.
-/// This is used for bulk conversion with `create_many`.
-/// Unlike `into_engine_data` which uses flattened leaf values, this returns structured scalars.
 pub(crate) fn metadata_entry_to_scalars(
     entry: &MetadataEntry,
     schema: &crate::schema::SchemaRef,
@@ -4344,6 +4295,35 @@ mod tests {
         }
     }
 
+    /// Helper to add _pos column to EngineData for testing
+    /// Real parquet files have this added by the reader, but test data needs it manually
+    fn add_pos_column(data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
+        use crate::expressions::{ArrayData, Scalar};
+        use crate::schema::{ArrayType, DataType, StructField, StructType};
+
+        let num_rows = data.len();
+
+        // Build _pos values (0, 1, 2, ...) as LONG to match schema expectations
+        let pos_values: Vec<Scalar> = (0..num_rows as i64).map(Scalar::Long).collect();
+
+        let pos_array = ArrayData::try_new(ArrayType::new(DataType::LONG, false), pos_values)?;
+
+        let pos_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "_pos",
+            DataType::LONG,
+            false,
+        )]));
+
+        data.append_columns(pos_schema, vec![pos_array])
+    }
+
+    /// Helper to add _pos column to a vec of EngineData batches
+    fn add_pos_to_batches(
+        batches: Vec<Box<dyn EngineData>>,
+    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+        batches.into_iter().map(add_pos_column).collect()
+    }
+
     #[test]
     fn test_dv_with_earlier_sequence_number_not_included() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
@@ -4361,14 +4341,14 @@ mod tests {
 
         // Create metadata with both entries
         let metadata = Metadata {
-            data: vec![
+            data: add_pos_to_batches(vec![
                 data_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
+            ])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4412,14 +4392,14 @@ mod tests {
 
         // Create metadata with both entries
         let metadata = Metadata {
-            data: vec![
+            data: add_pos_to_batches(vec![
                 data_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
+            ])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4449,59 +4429,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dv_with_equal_sequence_number_included() -> DeltaResult<()> {
-        use crate::actions::visitors::AddVisitor;
-        use crate::engine_data::RowVisitor;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Create a data file with sequence number 100
-        let data_entry = create_data_entry("memory:///data.parquet", 100);
-
-        // Create a DV for the data file with sequence number 100 (equal)
-        let dv_entry = create_dv_entry("memory:///dv.parquet", "memory:///data.parquet", 100);
-
-        // Create metadata with both entries
-        let metadata = Metadata {
-            data: vec![
-                data_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                dv_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
-
-        // Get action batches (no data skipping for this test)
-        let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
-
-        // Get the Add action using visitor
-        let batch = action_batches.next().unwrap()?;
-        let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(batch.actions.as_ref())?;
-        assert_eq!(visitor.adds.len(), 1);
-        let add = &visitor.adds[0];
-
-        // Verify DV IS included (sequence number is equal)
-        assert!(
-            add.deletion_vector.is_some(),
-            "DV with equal sequence number should be included"
-        );
-        let dv = add.deletion_vector.as_ref().unwrap();
-        assert_eq!(dv.cardinality, 10);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_dv_not_present() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
         use crate::engine_data::RowVisitor;
@@ -4515,9 +4442,9 @@ mod tests {
 
         // Create metadata with only the data entry (no DV)
         let metadata = Metadata {
-            data: vec![data_entry
+            data: add_pos_to_batches(vec![data_entry
                 .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
+                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: String::new(),
@@ -4603,7 +4530,7 @@ mod tests {
 
         // Create metadata with all entries
         let metadata = Metadata {
-            data: vec![
+            data: add_pos_to_batches(vec![
                 data_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
@@ -4616,7 +4543,7 @@ mod tests {
                 dv_entry_3
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
+            ])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4668,14 +4595,14 @@ mod tests {
 
         // Create metadata with both entries
         let metadata = Metadata {
-            data: vec![
+            data: add_pos_to_batches(vec![
                 data_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
                 dv_entry
                     .clone()
                     .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
+            ])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4991,11 +4918,14 @@ mod tests {
 
         // Process manifest to action batches (empty shared DV map)
         let schema = crate::actions::get_log_add_schema().clone();
-        let shared_dv_map = Arc::new(HashMap::new());
+        // Create empty shared state for test
+        let shared_state = SharedLeafState {
+            unaffiliated_dv_manifests: Vec::new(),
+        };
         // No data skipping for this test
         let action_batches = Metadata::manifest_to_action_batches(
             manifest_refs,
-            shared_dv_map,
+            &shared_state,
             &engine,
             &schema,
             &table_root_url,
@@ -5018,207 +4948,6 @@ mod tests {
         let paths: Vec<_> = all_adds.iter().map(|a| a.path.as_str()).collect();
         assert!(paths.contains(&"child-data-1.parquet"));
         assert!(paths.contains(&"child-data-2.parquet"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_apply_manifest_dv_inline() -> DeltaResult<()> {
-        use roaring::RoaringTreemap;
-
-        // Create some test manifest entries
-        let entries = vec![
-            create_data_entry("memory:///file0.parquet", 50),
-            create_data_entry("memory:///file1.parquet", 60),
-            create_data_entry("memory:///file2.parquet", 70),
-            create_data_entry("memory:///file3.parquet", 80),
-            create_data_entry("memory:///file4.parquet", 90),
-        ];
-
-        // Create a RoaringTreemap that deletes positions 1 and 3
-        let mut deleted_positions = RoaringTreemap::new();
-        deleted_positions.insert(1);
-        deleted_positions.insert(3);
-
-        // Serialize to bytes with portable format
-        let mut serialized = Vec::new();
-        // Magic number for portable format
-        const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-        serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
-
-        // Serialize the roaring bitmap
-        deleted_positions
-            .serialize_into(&mut serialized)
-            .expect("Failed to serialize roaring bitmap");
-
-        // Create DV bytes
-        let dv_bytes = Bytes::from(serialized);
-
-        // Apply the manifest DV
-        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
-
-        // Verify we have 3 entries left (positions 0, 2, 4)
-        assert_eq!(filtered_entries.len(), 3);
-
-        // Verify the correct entries remain
-        assert_eq!(
-            filtered_entries[0].location.as_ref().unwrap(),
-            "memory:///file0.parquet"
-        );
-        assert_eq!(
-            filtered_entries[1].location.as_ref().unwrap(),
-            "memory:///file2.parquet"
-        );
-        assert_eq!(
-            filtered_entries[2].location.as_ref().unwrap(),
-            "memory:///file4.parquet"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_apply_manifest_dv_empty_dv() -> DeltaResult<()> {
-        // Create some test manifest entries
-        let entries = vec![
-            create_data_entry("memory:///file0.parquet", 50),
-            create_data_entry("memory:///file1.parquet", 60),
-        ];
-
-        // Empty DV bytes (no deletions)
-        let dv_bytes = Bytes::new();
-
-        // Apply the manifest DV (should return all entries)
-        let filtered_entries = apply_manifest_dv(entries, &dv_bytes)?;
-
-        // Verify all entries remain
-        assert_eq!(filtered_entries.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_unmatched_dvs_from_root() -> DeltaResult<()> {
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Create a data file that exists in the root
-        let root_data_entry = create_data_entry("memory:///root-file.parquet", 50);
-
-        // Create a DV that references a file NOT in the root (will be in child manifest)
-        let unmatched_dv = create_dv_entry(
-            "memory:///dv-for-child.parquet",
-            "memory:///child-file.parquet", // References file not in root
-            100,
-        );
-
-        // Create a DV that references a file IN the root (should not be in unmatched_dvs)
-        let matched_dv = create_dv_entry(
-            "memory:///dv-for-root.parquet",
-            "memory:///root-file.parquet", // References file in root
-            100,
-        );
-
-        // Create root metadata with both DVs
-        let metadata = Metadata {
-            data: vec![
-                root_data_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                unmatched_dv
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                matched_dv
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
-
-        // Get manifest references (no manifest-level skipping for this test)
-        let root_state = metadata.manifest_references(None)?;
-
-        // Verify we have one unmatched DV (for the child file) in shared_state
-        assert_eq!(root_state.shared_state.unmatched_dvs.len(), 1);
-        assert!(root_state
-            .shared_state
-            .unmatched_dvs
-            .contains_key("memory:///child-file.parquet"));
-
-        // Verify the matched DV is NOT in unmatched_dvs
-        assert!(!root_state
-            .shared_state
-            .unmatched_dvs
-            .contains_key("memory:///root-file.parquet"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_shared_dv_map() -> DeltaResult<()> {
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Create a delete manifest with some DVs
-        let dv_entry_1 = create_dv_entry("memory:///dv1.parquet", "memory:///data1.parquet", 100);
-        let dv_entry_2 = create_dv_entry("memory:///dv2.parquet", "memory:///data2.parquet", 150);
-
-        let delete_manifest = Metadata {
-            data: vec![
-                dv_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                dv_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write the delete manifest
-        let delete_manifest_writer = writer::MetadataWriter::try_new(delete_manifest)?;
-        let delete_manifest_url = delete_manifest_writer.write(&engine)?;
-
-        // Create unmatched DVs
-        let test_delete_manifest_url = Url::parse("memory:///test_delete_manifest.parquet")?;
-        let test_delete_manifest_path =
-            absolute_to_relative_path(&test_delete_manifest_url, &table_root_url)?;
-        let mut unmatched_dvs = HashMap::new();
-        unmatched_dvs.insert(
-            "memory:///data3.parquet".to_string(),
-            metadata_entry_to_deletion_vector_info(
-                create_dv_entry("memory:///dv3.parquet", "memory:///data3.parquet", 200),
-                0,
-                &test_delete_manifest_path,
-                &table_root_url,
-            )?,
-        );
-
-        // Create SharedLeafState
-        let shared_state = SharedLeafState {
-            unaffiliated_dv_manifests: vec![FilteredManifest::new(create_delete_manifest_entry(
-                delete_manifest_url.as_str(),
-                None,
-            ))],
-            unmatched_dvs,
-        };
-
-        // Build the shared DV map
-        let dv_map = Metadata::build_shared_dv_map(&shared_state, &engine, &table_root_url)?;
-
-        // Verify we have all 3 DVs
-        assert_eq!(dv_map.len(), 3);
-        assert!(dv_map.contains_key("memory:///data1.parquet"));
-        assert!(dv_map.contains_key("memory:///data2.parquet"));
-        assert!(dv_map.contains_key("memory:///data3.parquet"));
 
         Ok(())
     }
@@ -6159,6 +5888,118 @@ mod tests {
         //    - extract_deletion_vector_content (+8): builder.rs:98
         // 3. On read, metadata_entry_to_deletion_vector_info would subtract 8 bytes (metadata/mod.rs:1488)
         //    but we don't test that here since we'd need actual DV files
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_manifest_dv_with_deletions() -> DeltaResult<()> {
+        use roaring::RoaringTreemap;
+
+        // Create a RoaringTreemap with deleted positions 1, 3, 5
+        let mut deleted_positions = RoaringTreemap::new();
+        deleted_positions.insert(1);
+        deleted_positions.insert(3);
+        deleted_positions.insert(5);
+
+        // Serialize with portable format magic number
+        let mut serialized = Vec::new();
+        const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+        serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+        deleted_positions.serialize_into(&mut serialized)?;
+
+        let dv_bytes = Bytes::from(serialized);
+
+        // Test parse_manifest_dv
+        let parsed = parse_manifest_dv(&dv_bytes)?;
+        assert!(parsed.is_some());
+        let treemap = parsed.unwrap();
+        assert_eq!(treemap.len(), 3);
+        assert!(treemap.contains(1));
+        assert!(treemap.contains(3));
+        assert!(treemap.contains(5));
+        assert!(!treemap.contains(0));
+        assert!(!treemap.contains(2));
+
+        // Test parse_manifest_dv_to_selection_vector
+        let selection = parse_manifest_dv_to_selection_vector(&dv_bytes, 10)?;
+        assert_eq!(selection.len(), 10);
+        assert!(selection[0]); // not deleted
+        assert!(!selection[1]); // deleted
+        assert!(selection[2]); // not deleted
+        assert!(!selection[3]); // deleted
+        assert!(selection[4]); // not deleted
+        assert!(!selection[5]); // deleted
+        assert!(selection[6]); // not deleted
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_manifest_dv_empty() -> DeltaResult<()> {
+        let empty_bytes = Bytes::new();
+
+        // Test parse_manifest_dv with empty bytes
+        let parsed = parse_manifest_dv(&empty_bytes)?;
+        assert!(parsed.is_none());
+
+        // Test parse_manifest_dv_to_selection_vector with empty bytes
+        let selection = parse_manifest_dv_to_selection_vector(&empty_bytes, 5)?;
+        assert_eq!(selection.len(), 5);
+        assert!(selection.iter().all(|&b| b)); // all true (nothing deleted)
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_manifest_dv_invalid_magic() -> DeltaResult<()> {
+        // Create bytes with invalid magic number
+        let mut invalid = Vec::new();
+        let invalid_magic: u32 = 0xDEADBEEF;
+        invalid.extend_from_slice(&invalid_magic.to_be_bytes());
+        invalid.extend_from_slice(&[0u8; 10]); // some dummy data
+
+        let dv_bytes = Bytes::from(invalid);
+
+        // Should return error
+        let result = parse_manifest_dv(&dv_bytes);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid magic number"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_manifest_dv_too_small() -> DeltaResult<()> {
+        // Create bytes that are too small (less than 4 bytes)
+        let too_small = Bytes::from(vec![0u8, 1u8]);
+
+        let result = parse_manifest_dv(&too_small);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too small"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_manifest_dv_native_format_unsupported() -> DeltaResult<()> {
+        // Create bytes with native format magic number (unsupported)
+        let mut native = Vec::new();
+        const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
+        native.extend_from_slice(&ROARING_BITMAP_NATIVE_MAGIC.to_be_bytes());
+        native.extend_from_slice(&[0u8; 10]);
+
+        let dv_bytes = Bytes::from(native);
+
+        let result = parse_manifest_dv(&dv_bytes);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Native serialization format"));
 
         Ok(())
     }
