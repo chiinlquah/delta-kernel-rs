@@ -604,68 +604,41 @@ fn log_add_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRe
 fn get_add_transform_expr(stats_parsed_expr: Option<ExpressionRef>) -> ExpressionRef {
     use crate::expressions::column_expr_ref;
 
-    // Base expression without stats_parsed
-    static BASE_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
-        Arc::new(Expression::Struct(
+    static BASE_FIELDS: LazyLock<(Vec<ExpressionRef>, ExpressionRef)> = LazyLock::new(|| {
+        let file_constant_values = Arc::new(Expression::Struct(
             vec![
-                column_expr_ref!("add.path"),
-                column_expr_ref!("add.size"),
-                column_expr_ref!("add.modificationTime"),
-                column_expr_ref!("add.stats"),
-                column_expr_ref!("add.deletionVector"),
-                Arc::new(Expression::Struct(
-                    vec![
-                        column_expr_ref!("add.partitionValues"),
-                        column_expr_ref!("add.baseRowId"),
-                        column_expr_ref!("add.defaultRowCommitVersion"),
-                        column_expr_ref!("add.tags"),
-                        column_expr_ref!("add.clusteringProvider"),
-                        column_expr_ref!("add.dataManifestPath"),
-                        column_expr_ref!("add.dataManifestPosition"),
-                        column_expr_ref!("add.deleteManifestPath"),
-                        column_expr_ref!("add.deleteManifestPosition"),
-                    ],
-                    None,
-                    None,
-                )),
+                column_expr_ref!("add.partitionValues"),
+                column_expr_ref!("add.baseRowId"),
+                column_expr_ref!("add.defaultRowCommitVersion"),
+                column_expr_ref!("add.tags"),
+                column_expr_ref!("add.clusteringProvider"),
+                column_expr_ref!("add.dataManifestPath"),
+                column_expr_ref!("add.dataManifestPosition"),
+                column_expr_ref!("add.deleteManifestPath"),
+                column_expr_ref!("add.deleteManifestPosition"),
             ],
             None,
             None,
-        ))
-    });
-
-    let Some(stats_parsed_expr) = stats_parsed_expr else {
-        return BASE_EXPR.clone();
-    };
-
-    // Build expression with stats_parsed dynamically (can't be static since stats_parsed_expr varies)
-    Arc::new(Expression::Struct(
-        vec![
+        ));
+        let fields = vec![
             column_expr_ref!("add.path"),
             column_expr_ref!("add.size"),
             column_expr_ref!("add.modificationTime"),
             column_expr_ref!("add.stats"),
             column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(
-                vec![
-                    column_expr_ref!("add.partitionValues"),
-                    column_expr_ref!("add.baseRowId"),
-                    column_expr_ref!("add.defaultRowCommitVersion"),
-                    column_expr_ref!("add.tags"),
-                    column_expr_ref!("add.clusteringProvider"),
-                    column_expr_ref!("add.dataManifestPath"),
-                    column_expr_ref!("add.dataManifestPosition"),
-                    column_expr_ref!("add.deleteManifestPath"),
-                    column_expr_ref!("add.deleteManifestPosition"),
-                ],
-                None,
-                None,
-            )),
-            stats_parsed_expr,
-        ],
-        None,
-        None,
-    ))
+            file_constant_values,
+        ];
+        let base_expr = Arc::new(Expression::Struct(fields.clone(), None, None));
+        (fields, base_expr)
+    });
+
+    let Some(stats_parsed_expr) = stats_parsed_expr else {
+        return BASE_FIELDS.1.clone();
+    };
+
+    let mut fields = BASE_FIELDS.0.clone();
+    fields.push(stats_parsed_expr);
+    Arc::new(Expression::Struct(fields, None, None))
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
