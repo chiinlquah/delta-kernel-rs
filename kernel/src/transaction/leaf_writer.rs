@@ -1,5 +1,4 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::Add;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
 use crate::metadata::builder::MetadataBuilder;
@@ -210,66 +209,104 @@ struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
     add_type: AddType,
     selection_vector: Vec<bool>,
+    /// Whether to request the stats_parsed column. Starts as true and is set to false
+    /// by visit_rows_of if the data doesn't have the column.
+    request_stats_parsed: bool,
 }
+
+type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
+
+/// Base scan columns without stats_parsed.
+static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    use crate::schema::{column_name, MapType};
+    let names = vec![
+        column_name!("path"),
+        column_name!("size"),
+        column_name!("modificationTime"),
+        column_name!("stats"),
+        column_name!("deletionVector.storageType"),
+        column_name!("deletionVector.pathOrInlineDv"),
+        column_name!("deletionVector.offset"),
+        column_name!("deletionVector.sizeInBytes"),
+        column_name!("deletionVector.cardinality"),
+        column_name!("fileConstantValues.partitionValues"),
+        column_name!("fileConstantValues.baseRowId"),
+        column_name!("fileConstantValues.defaultRowCommitVersion"),
+        column_name!("fileConstantValues.dataManifestPath"),
+        column_name!("fileConstantValues.dataManifestPosition"),
+        column_name!("fileConstantValues.deleteManifestPath"),
+        column_name!("fileConstantValues.deleteManifestPosition"),
+    ];
+    let types = vec![
+        DataType::STRING,
+        DataType::LONG,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::STRING,
+        DataType::STRING,
+        DataType::INTEGER,
+        DataType::INTEGER,
+        DataType::LONG,
+        DataType::Map(Box::new(MapType::new(
+            DataType::STRING,
+            DataType::STRING,
+            true,
+        ))),
+        DataType::LONG,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::LONG,
+        DataType::STRING,
+        DataType::LONG,
+    ];
+    (names, types)
+});
+
+/// Extended scan columns including stats_parsed.
+static SCAN_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    use crate::schema::{column_name, StructType};
+    let mut names = BASE_SCAN_COLUMNS.0.clone();
+    names.push(column_name!("stats_parsed"));
+    let mut types = BASE_SCAN_COLUMNS.1.clone();
+    // Use an empty struct type: extract_columns only checks
+    // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
+    // as a single getter, so the exact fields don't matter here.
+    types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
+    (names, types)
+});
 
 impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType};
-        type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
+        if self.request_stats_parsed {
+            (
+                &SCAN_COLUMNS_WITH_STATS_PARSED.0,
+                &SCAN_COLUMNS_WITH_STATS_PARSED.1,
+            )
+        } else {
+            (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
+        }
+    }
 
-        // Request all columns for all AddTypes - we'll just choose which to use during extraction
-        static ALL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("path"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats"),
-                column_name!("deletionVector.storageType"),
-                column_name!("deletionVector.pathOrInlineDv"),
-                column_name!("deletionVector.offset"),
-                column_name!("deletionVector.sizeInBytes"),
-                column_name!("deletionVector.cardinality"),
-                column_name!("fileConstantValues.partitionValues"),
-                column_name!("fileConstantValues.baseRowId"),
-                column_name!("fileConstantValues.defaultRowCommitVersion"),
-                column_name!("fileConstantValues.dataManifestPath"),
-                column_name!("fileConstantValues.dataManifestPosition"),
-                column_name!("fileConstantValues.deleteManifestPath"),
-                column_name!("fileConstantValues.deleteManifestPosition"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::STRING,
-                DataType::STRING,
-                DataType::INTEGER,
-                DataType::INTEGER,
-                DataType::LONG,
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::LONG,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::LONG,
-                DataType::STRING,
-                DataType::LONG,
-            ];
-            (names, types)
-        });
-
-        (&ALL_COLUMNS.0, &ALL_COLUMNS.1)
+    fn visit_rows_of(&mut self, data: &dyn EngineData) -> DeltaResult<()> {
+        // Try with stats_parsed first. If the data doesn't have the column,
+        // fall back to requesting without it.
+        match data.visit_rows(self.selected_column_names_and_types().0, self) {
+            Ok(()) => Ok(()),
+            Err(crate::Error::MissingColumn(_)) => {
+                self.request_stats_parsed = false;
+                data.visit_rows(self.selected_column_names_and_types().0, self)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+        use crate::metadata::stats::struct_data_to_amt_stats;
+
         // Fixed getter indices for all columns (same layout for all AddTypes)
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
-        //         deleteManifestPath, deleteManifestPosition
+        //         deleteManifestPath, deleteManifestPosition, stats_parsed (optional)
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
@@ -284,12 +321,16 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
         const DATA_MANIFEST_POSITION_IDX: usize = 13;
         const DELETE_MANIFEST_PATH_IDX: usize = 14;
         const DELETE_MANIFEST_POSITION_IDX: usize = 15;
+        const STATS_PARSED_IDX: usize = 16; // Optional - only present if include_stats_columns was called
 
         let should_add_data_file = matches!(
             self.add_type,
             AddType::DataFileOnly | AddType::DataFileAndDV
         );
         let should_extract_dv = matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
+
+        // Check if stats_parsed column is present (getters includes it when include_stats_columns was called)
+        let has_stats_parsed = getters.len() > STATS_PARSED_IDX;
 
         // Use the pre-computed root manifest path passed from the transaction
         let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
@@ -308,6 +349,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
             };
 
             // Extract data file fields if needed
+            #[allow(unused_variables)]
             let (
                 size,
                 modification_time,
@@ -315,6 +357,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 partition_values,
                 base_row_id,
                 default_row_commit_version,
+                content_stats,
             ) = if should_add_data_file {
                 // Extract manifest metadata (always needed for tracking)
                 let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
@@ -348,6 +391,23 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 let default_row_commit_version: Option<i64> = getters
                     [DEFAULT_ROW_COMMIT_VERSION_IDX]
                     .get_opt(i, "fileConstantValues.defaultRowCommitVersion")?;
+
+                // Try to extract stats_parsed and convert to content_stats (AMT format)
+                // This is preferred over the JSON stats string when available
+                let content_stats = if has_stats_parsed {
+                    getters[STATS_PARSED_IDX]
+                        .get_struct(i, "stats_parsed")?
+                        .map(|struct_item| struct_item.materialize())
+                        .transpose()?
+                        .and_then(|stats_data| {
+                            // Convert from Delta JSON format (numRecords, minValues, maxValues, nullCount)
+                            // to AMT format (per-column stats with value_count, null_value_count, etc.)
+                            struct_data_to_amt_stats(&stats_data, &self.leaf_writer.table_schema)
+                        })
+                } else {
+                    None
+                };
+
                 (
                     Some(size),
                     Some(modification_time),
@@ -355,9 +415,10 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     Some(partition_values),
                     base_row_id,
                     default_row_commit_version,
+                    content_stats,
                 )
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
             // Extract deletion vector if needed
@@ -390,26 +451,9 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
             // Add data file if needed
             if should_add_data_file {
                 // Safety: When should_add_data_file is true, these values are guaranteed to be Some
-                let (Some(pv), Some(sz), Some(mt)) = (partition_values, size, modification_time)
+                let (Some(_pv), Some(sz), Some(_mt)) = (partition_values, size, modification_time)
                 else {
                     return Err(Error::generic("Missing required fields for data file"));
-                };
-                let add = Add {
-                    path: path.clone(),
-                    partition_values: pv,
-                    size: sz,
-                    modification_time: mt,
-                    data_change: true,
-                    stats,
-                    tags: None, // TODO: Extract tags once scan API supports nullable map values
-                    deletion_vector: None, // Will be tracked separately in deletion_vectors map
-                    base_row_id,
-                    default_row_commit_version,
-                    clustering_provider: None,
-                    data_manifest_path: None,
-                    data_manifest_position: None,
-                    delete_manifest_path: None,
-                    delete_manifest_position: None,
                 };
 
                 // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
@@ -420,8 +464,14 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 } else {
                     0
                 };
-                self.leaf_writer.data_builder.add_with_dedup(
-                    add,
+
+                // Use add_file_with_dedup which takes content_stats directly.
+                // If content_stats is None, the stats from checkpoint JSON will be parsed
+                // by the builder if available.
+                self.leaf_writer.data_builder.add_file_with_dedup(
+                    path.clone(),
+                    sz,
+                    content_stats,
                     file_version,
                     Some(self.leaf_writer.snapshot_id),
                 )?;
@@ -541,6 +591,7 @@ impl LeafNodeWriter {
             leaf_writer: self,
             add_type,
             selection_vector,
+            request_stats_parsed: true,
         };
 
         visitor.visit_rows_of(scan_metadata.data())?;
@@ -1563,6 +1614,7 @@ mod tests {
                     StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             ),
+            StructField::nullable("stats_parsed", DataType::struct_type_unchecked(vec![])),
         ]));
 
         // Create arrays
@@ -1697,6 +1749,9 @@ mod tests {
             ),
         ]);
 
+        // Create an empty stats_parsed struct array (no fields, all null)
+        let stats_parsed_struct = StructArray::new_empty_fields(num_files, None);
+
         let batch = RecordBatch::try_new(
             Arc::new(TryFromKernel::try_from_kernel(scan_schema.as_ref())?),
             vec![
@@ -1706,6 +1761,7 @@ mod tests {
                 Arc::new(stats_array) as ArrayRef,
                 Arc::new(deletion_vector_struct) as ArrayRef,
                 Arc::new(file_constant_values_struct) as ArrayRef,
+                Arc::new(stats_parsed_struct) as ArrayRef,
             ],
         )?;
 

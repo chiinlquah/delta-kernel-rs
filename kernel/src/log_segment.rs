@@ -903,7 +903,10 @@ impl LogSegment {
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let augmented_checkpoint_read_schema = if let (true, Some(add_field), Some(stats_schema)) =
+
+        // Schema for reading sidecar files - includes stats_parsed but NOT sidecar column
+        // (sidecar column is only in the main checkpoint file, not in sidecar parquet files)
+        let sidecar_read_schema = if let (true, Some(add_field), Some(stats_schema)) =
             (has_stats_parsed, action_schema.field("add"), stats_schema)
         {
             // Add stats_parsed to the "add" field
@@ -919,8 +922,8 @@ impl LogSegment {
                 DataType::Struct(Box::new(stats_schema.clone())),
             ));
 
-            // Rebuild schema with modified add field
-            let mut new_fields: Vec<StructField> = action_schema
+            // Rebuild schema with modified add field (no sidecar column for sidecar files)
+            let new_fields: Vec<StructField> = action_schema
                 .fields()
                 .map(|f| {
                     if f.name() == "add" {
@@ -936,20 +939,21 @@ impl LogSegment {
                 })
                 .collect();
 
-            // Add sidecar column at top-level for V2 checkpoints
-            if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-            }
-
             Arc::new(StructType::new_unchecked(new_fields))
-        } else if needs_sidecar {
-            // Only need to add sidecar, no stats_parsed
-            let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
+        } else {
+            // No stats_parsed needed, use action_schema as-is for sidecars
+            action_schema.clone()
+        };
+
+        // Schema for reading the main checkpoint file - includes both stats_parsed AND sidecar
+        let augmented_checkpoint_read_schema = if needs_sidecar {
+            // Add sidecar column at top-level for V2 checkpoints
+            let mut new_fields: Vec<StructField> = sidecar_read_schema.fields().cloned().collect();
             new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             Arc::new(StructType::new_unchecked(new_fields))
         } else {
-            // No modifications needed, use schema as-is
-            action_schema.clone()
+            // No sidecar needed (no sidecars in this checkpoint)
+            sidecar_read_schema.clone()
         };
 
         let checkpoint_info = CheckpointReadInfo {
@@ -1001,9 +1005,15 @@ impl LogSegment {
             None => Box::new(std::iter::empty()),
         };
 
-        // Read sidecars using cached sidecar files from earlier
+        // Read sidecars using cached sidecar files from earlier.
+        // Important: Use sidecar_read_schema (with stats_parsed but without sidecar column)
+        // because sidecar files contain Add actions with stats_parsed, not sidecar references.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            parquet_handler.read_parquet_files(&sidecar_files, action_schema, meta_predicate)?
+            parquet_handler.read_parquet_files(
+                &sidecar_files,
+                sidecar_read_schema,
+                meta_predicate,
+            )?
         } else {
             Box::new(std::iter::empty())
         };

@@ -1032,8 +1032,12 @@ impl Transaction {
         // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
         //
         // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
+        // Include stats columns so that parsed stats are available for AMT leaf population
         let scan_builder = crate::scan::ScanBuilder::new(self.read_snapshot.clone());
-        let scan = scan_builder.skip_leaf_manifests(true).build()?;
+        let scan = scan_builder
+            .skip_leaf_manifests(true)
+            .include_stats_columns()
+            .build()?;
 
         Ok(scan)
     }

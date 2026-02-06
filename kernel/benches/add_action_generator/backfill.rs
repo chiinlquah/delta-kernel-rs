@@ -935,11 +935,10 @@ fn partition_actions_into_leaves(
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::transaction::leaf_writer::AddType;
 
-    // TODO: Ideally this would be done with stats (stats_parsed.minValues.id) to partition
-    // actions by their actual ID values, but propagating stats through the scan is currently hard.
-    // Instead, we use a simple counting approach: create a new leaf for every N actions seen.
-    // Note: If a batch would span the N-action boundary, we finish the current leaf and start
-    // a new one with the entire batch (we don't split batches across leaves).
+    // TODO: Use stats_parsed.minValues.id to partition actions by actual ID values for better
+    // data skipping. Currently we use a simple counting approach: create a new leaf for every
+    // N actions seen. If a batch would span the N-action boundary, we finish the current leaf
+    // and start a new one with the entire batch (we don't split batches across leaves).
 
     println!("      Scanning and partitioning actions...");
     println!(

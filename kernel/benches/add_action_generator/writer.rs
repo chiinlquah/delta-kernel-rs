@@ -67,10 +67,13 @@ pub fn write_checkpoint_parquet(
 
 /// Build the checkpoint Add schema with structured stats_parsed
 fn build_checkpoint_add_schema() -> Arc<Schema> {
-    // Schema for minValues, maxValues, and nullCount (all have same structure)
+    // Schema for minValues and maxValues (use column types)
     // Fields are nullable but we always populate values (never null)
     // Use the same fields with field IDs as defined in get_stats_columns_fields()
     let stats_columns_fields = get_stats_columns_fields();
+
+    // For nullCount, all values are Int64 (counts), not the original column types
+    let null_count_fields = get_null_count_fields();
 
     // stats_parsed schema - nullable but always populated
     let stats_parsed_fields = Fields::from(vec![
@@ -80,12 +83,8 @@ fn build_checkpoint_add_schema() -> Arc<Schema> {
             DataType::Struct(stats_columns_fields.clone()),
             true,
         ),
-        Field::new(
-            "maxValues",
-            DataType::Struct(stats_columns_fields.clone()),
-            true,
-        ),
-        Field::new("nullCount", DataType::Struct(stats_columns_fields), true),
+        Field::new("maxValues", DataType::Struct(stats_columns_fields), true),
+        Field::new("nullCount", DataType::Struct(null_count_fields), true),
     ]);
 
     // deletionVector schema
@@ -308,11 +307,7 @@ fn build_stats_parsed_array(actions: &[AddActionMetadata]) -> DeltaResult<ArrayR
             DataType::Struct(get_stats_columns_fields()),
             true,
         ),
-        Field::new(
-            "nullCount",
-            DataType::Struct(get_stats_columns_fields()),
-            true,
-        ),
+        Field::new("nullCount", DataType::Struct(get_null_count_fields()), true),
     ]);
 
     Ok(Arc::new(StructArray::new(
@@ -365,6 +360,96 @@ fn get_stats_columns_fields() -> Fields {
             "8".to_string(),
         )])),
         Field::new("num6", DataType::Float64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "9".to_string(),
+        )])),
+        Field::new("num7", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "10".to_string(),
+        )])),
+        Field::new("num8", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "11".to_string(),
+        )])),
+        Field::new("num9", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "12".to_string(),
+        )])),
+        Field::new("num10", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "13".to_string(),
+        )])),
+        Field::new("num11", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "14".to_string(),
+        )])),
+        Field::new("num12", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "15".to_string(),
+        )])),
+        Field::new("num13", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "16".to_string(),
+        )])),
+        Field::new("num14", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "17".to_string(),
+        )])),
+        Field::new("num15", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "18".to_string(),
+        )])),
+        Field::new("num16", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "19".to_string(),
+        )])),
+        Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "20".to_string(),
+        )])),
+    ])
+}
+
+/// Get the fields for nullCount struct - all fields are Int64 (counts)
+/// regardless of the original column types
+fn get_null_count_fields() -> Fields {
+    use std::collections::HashMap;
+
+    // nullCount values are always Long (Int64) since they represent counts
+    Fields::from(vec![
+        Field::new("phonetic", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("city", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "2".to_string(),
+        )])),
+        Field::new("state", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "3".to_string(),
+        )])),
+        Field::new("num1", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "4".to_string(),
+        )])),
+        Field::new("num2", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "5".to_string(),
+        )])),
+        Field::new("num3", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "6".to_string(),
+        )])),
+        Field::new("num4", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "7".to_string(),
+        )])),
+        Field::new("num5", DataType::Int64, true).with_metadata(HashMap::from([(
+            "parquet.field.id".to_string(),
+            "8".to_string(),
+        )])),
+        Field::new("num6", DataType::Int64, true).with_metadata(HashMap::from([(
             "parquet.field.id".to_string(),
             "9".to_string(),
         )])),
@@ -532,38 +617,29 @@ where
 }
 
 fn build_null_count_struct(n: usize) -> DeltaResult<ArrayRef> {
-    // All null counts are zero
+    // All null counts are zero - all values are Int64 (counts)
     Ok(Arc::new(StructArray::new(
-        get_stats_columns_fields(),
+        get_null_count_fields(),
         vec![
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
-                Some("0");
-                n
-            ])),
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
-                Some("0");
-                n
-            ])),
-            Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
-                Some("0");
-                n
-            ])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Float64Array::from(vec![0.0f64; n])), // num6 is float64
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
-            Arc::new(Int64Array::from(vec![0i64; n])),
+            Arc::new(Int64Array::from(vec![0i64; n])), // phonetic
+            Arc::new(Int64Array::from(vec![0i64; n])), // city
+            Arc::new(Int64Array::from(vec![0i64; n])), // state
+            Arc::new(Int64Array::from(vec![0i64; n])), // num1
+            Arc::new(Int64Array::from(vec![0i64; n])), // num2
+            Arc::new(Int64Array::from(vec![0i64; n])), // num3
+            Arc::new(Int64Array::from(vec![0i64; n])), // num4
+            Arc::new(Int64Array::from(vec![0i64; n])), // num5
+            Arc::new(Int64Array::from(vec![0i64; n])), // num6 (count, not float)
+            Arc::new(Int64Array::from(vec![0i64; n])), // num7
+            Arc::new(Int64Array::from(vec![0i64; n])), // num8
+            Arc::new(Int64Array::from(vec![0i64; n])), // num9
+            Arc::new(Int64Array::from(vec![0i64; n])), // num10
+            Arc::new(Int64Array::from(vec![0i64; n])), // num11
+            Arc::new(Int64Array::from(vec![0i64; n])), // num12
+            Arc::new(Int64Array::from(vec![0i64; n])), // num13
+            Arc::new(Int64Array::from(vec![0i64; n])), // num14
+            Arc::new(Int64Array::from(vec![0i64; n])), // num15
+            Arc::new(Int64Array::from(vec![0i64; n])), // num16
             Arc::new(Int64Array::from(vec![0i64; n])),
         ],
         None,
