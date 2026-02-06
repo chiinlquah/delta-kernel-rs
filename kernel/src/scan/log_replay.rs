@@ -659,9 +659,11 @@ fn get_add_transform_expr(stats_parsed_expr: Option<ExpressionRef>) -> Expressio
                     column_expr_ref!("add.deleteManifestPosition"),
                 ],
                 None,
+                None,
             )),
             stats_parsed_expr,
         ],
+        None,
         None,
     ))
 }
