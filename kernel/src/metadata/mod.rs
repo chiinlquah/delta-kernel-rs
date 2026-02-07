@@ -1,4 +1,6 @@
 pub(crate) mod builder;
+pub(crate) mod bulk_processor;
+pub(crate) mod lazy_reader;
 pub(crate) mod reader;
 pub(crate) mod stats;
 pub(crate) mod writer;
@@ -6,11 +8,11 @@ pub(crate) mod writer;
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
-use crate::engine_data::EngineData;
+use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::kernel_predicates::KernelPredicateEvaluator;
-use crate::log_replay::ActionsBatch;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::metadata::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -26,6 +28,13 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tracing::debug;
 use url::Url;
+
+/// Type alias for the iterator returned by `open_stream`.
+type ParquetStreamResult = (
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+    Version,
+    String,
+);
 
 /// Cached schema for the projection of metadata columns used when building DV batches.
 /// Includes: contentType, referencedFile, trackingInfo, dv_cardinality, deleteManifestPath, deleteManifestPosition
@@ -290,69 +299,6 @@ impl FilteredManifest {
     }
 }
 
-/// Lazy iterator that processes manifests one at a time for true streaming.
-///
-/// This enables manifest-level streaming by deferring all I/O and processing
-/// until `.next()` is called. It captures only the Arc handlers from Engine,
-/// avoiding lifetime issues.
-struct LazyManifestBatchIterator {
-    /// Remaining manifests to process
-    manifests: std::vec::IntoIter<ManifestReference>,
-    /// Shared leaf state (for optimized path to access unaffiliated DV manifests)
-    shared_state: SharedLeafState,
-    /// Parquet handler for reading manifest files
-    parquet_handler: Arc<dyn ParquetHandler>,
-    /// Evaluation handler for creating batches
-    evaluation_handler: Arc<dyn EvaluationHandler>,
-    /// Schema for action batches
-    schema: SchemaRef,
-    /// Table root URL
-    table_root: Url,
-    /// Optional predicate for filtering
-    predicate: Option<PredicateRef>,
-    /// Current manifest's batch iterator (if any)
-    current_batch: Option<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>>,
-}
-
-impl Iterator for LazyManifestBatchIterator {
-    type Item = DeltaResult<ActionsBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Try to get next batch from current manifest
-            if let Some(ref mut batch_iter) = self.current_batch {
-                if let Some(batch) = batch_iter.next() {
-                    return Some(batch);
-                }
-                // Current manifest exhausted, clear it
-                self.current_batch = None;
-            }
-
-            // Get next manifest to process
-            let manifest_ref = self.manifests.next()?;
-
-            // Process this manifest NOW (lazy - only happens when we reach this point)
-            let result = Metadata::manifest_to_action_batches_with_handlers(
-                manifest_ref,
-                &self.shared_state,
-                self.parquet_handler.clone(),
-                self.evaluation_handler.clone(),
-                &self.schema,
-                &self.table_root,
-                self.predicate.as_ref(),
-            );
-
-            match result {
-                Ok(batch_iter) => {
-                    self.current_batch = Some(batch_iter);
-                    // Continue loop to pull from the new batch
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-}
-
 /// State shared across all leaf manifests (child data manifests).
 ///
 /// This contains deletion information that applies globally:
@@ -394,6 +340,52 @@ struct EvaluatorPair {
     remove_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
 }
 
+/// Stateful applicator for manifest deletion vectors.
+///
+/// Instead of materializing a full Vec<bool> selection vector upfront,
+/// this applicator queries the RoaringTreemap on-demand for each batch.
+struct ManifestDvApplicator {
+    /// Parsed deletion vector (None if no manifest DV present)
+    deleted_positions: Option<roaring::RoaringTreemap>,
+
+    /// Current cumulative row offset
+    offset: usize,
+}
+
+impl ManifestDvApplicator {
+    /// Create new applicator from manifest_dv bytes.
+    fn new(manifest_dv: Option<&Bytes>) -> DeltaResult<Self> {
+        let deleted_positions = if let Some(dv_bytes) = manifest_dv {
+            parse_manifest_dv(dv_bytes)?
+        } else {
+            None
+        };
+        Ok(Self {
+            deleted_positions,
+            offset: 0,
+        })
+    }
+
+    /// Process a batch and return it with its selection vector.
+    ///
+    /// Returns FilteredEngineData containing the batch and a selection vector.
+    /// If a manifest DV is present, the selection vector indicates which rows are NOT deleted.
+    /// If no manifest DV is present, all rows are marked as selected.
+    fn process_batch(&mut self, batch: Box<dyn EngineData>) -> DeltaResult<FilteredEngineData> {
+        let batch_len = batch.len();
+        let filtered = if let Some(deleted) = &self.deleted_positions {
+            let selection: Vec<bool> = (0..batch_len)
+                .map(|i| !deleted.contains((self.offset + i) as u64))
+                .collect();
+            FilteredEngineData::try_new(batch, selection)?
+        } else {
+            FilteredEngineData::with_all_rows_selected(batch)
+        };
+        self.offset += batch_len;
+        Ok(filtered)
+    }
+}
+
 impl Metadata {
     /// Creates a new empty Metadata instance for the specified table version.
     ///
@@ -428,6 +420,44 @@ impl Metadata {
             table_root,
             path_in_log: String::new(),
             leaf: Some(uuid::Uuid::new_v4()),
+        }
+    }
+
+    /// Creates a Metadata instance from pre-loaded batches.
+    ///
+    /// This is used for parallel IO optimization where batches are read upfront.
+    ///
+    /// # Parameters
+    /// - `data`: Pre-loaded batches containing metadata entries
+    /// - `path_in_log`: The path as it appears in the Delta log
+    /// - `table_root`: The root URL of the Delta table
+    pub(crate) fn from_batches(
+        data: Vec<Box<dyn EngineData>>,
+        path_in_log: String,
+        table_root: Url,
+    ) -> Self {
+        Self {
+            data,
+            version: 0, // Version not relevant for child manifests
+            table_root,
+            path_in_log,
+            leaf: None,
+        }
+    }
+
+    /// Construct Metadata from batches with a specific version (for content root reading).
+    pub(crate) fn from_batches_with_version(
+        data: Vec<Box<dyn EngineData>>,
+        version: Version,
+        path_in_log: String,
+        table_root: Url,
+    ) -> Self {
+        Self {
+            data,
+            version,
+            table_root,
+            path_in_log,
+            leaf: None,
         }
     }
 
@@ -1421,20 +1451,56 @@ impl Metadata {
         )?))
     }
 
-    /// Helper method to build DV joiner for leaf manifest processing.
+    /// Helper function to process a single DV manifest into prepared batches.
     ///
-    /// This handles the complex case where DVs come from separate affiliated and unaffiliated
-    /// DV manifest files that need to be read, parsed, and combined.
-    fn build_dv_joiner_for_leaf(
+    /// This function:
+    /// 1. Validates the metadata doesn't contain unsupported row types
+    /// 2. Prepares batches with DV columns
+    /// 3. Applies manifest DV filtering if present
+    fn process_dv_manifest(
+        dv_metadata: &Metadata,
+        filtered_manifest: &FilteredManifest,
+        evaluation_handler: &dyn EvaluationHandler,
+        metadata_schema: SchemaRef,
+    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+        // Validate that the DV manifest doesn't contain unsupported row types (e.g., EqualityDeletes)
+        dv_metadata.validate_no_unsupported_rows()?;
+
+        // Prepare the DV batches (parse DV location strings and append columns)
+        let prepared = dv_metadata.prepare_batches_with_dv_columns(
+            evaluation_handler,
+            metadata_schema,
+            true,
+        )?;
+
+        // Apply manifest DV if present (filters out deleted DV entries)
+        let mut applicator =
+            ManifestDvApplicator::new(filtered_manifest.manifest.manifest_dv.as_ref())?;
+
+        let mut filtered_batches = Vec::new();
+        for batch in prepared {
+            let filtered = applicator.process_batch(batch)?;
+
+            // Only include batches that have selected rows
+            if filtered.has_selected_rows() {
+                let batch = filtered.apply_selection_vector()?;
+                filtered_batches.push(batch);
+            }
+        }
+
+        Ok(filtered_batches)
+    }
+
+    pub(crate) fn build_dv_joiner_for_leaf(
         evaluation_handler: Arc<dyn EvaluationHandler>,
-        parquet_handler: Arc<dyn ParquetHandler>,
         metadata_schema: SchemaRef,
         manifest_refs: &ManifestReference,
-        shared_state: &SharedLeafState,
-        table_root: &Url,
+        affiliated_dv_metadata: Vec<Metadata>,
+        unaffiliated_dv_metadata: &[Arc<Metadata>],
+        unaffiliated_dv_manifests: &[FilteredManifest],
     ) -> DeltaResult<Option<Box<dyn LookupJoiner>>> {
         let has_affiliated_dvs = !manifest_refs.affiliated_dv_manifests.is_empty();
-        let has_unaffiliated_dvs = !shared_state.unaffiliated_dv_manifests.is_empty();
+        let has_unaffiliated_dvs = !unaffiliated_dv_manifests.is_empty();
 
         if !has_affiliated_dvs && !has_unaffiliated_dvs {
             return Ok(None);
@@ -1443,68 +1509,28 @@ impl Metadata {
         debug!(
             "Building DV joiner for leaf manifest optimized path from {} affiliated + {} unaffiliated DV manifests",
             manifest_refs.affiliated_dv_manifests.len(),
-            shared_state.unaffiliated_dv_manifests.len()
+            unaffiliated_dv_manifests.len()
         );
 
-        // Read all DV manifest files (both affiliated and unaffiliated), prepare them, and collect their batches
+        // Process all DV manifests (both affiliated and unaffiliated) in a single pass
         let mut all_prepared_dv_batches = Vec::new();
-
-        // Process all DV manifests (both affiliated and unaffiliated use the same logic)
-        for filtered_manifest in manifest_refs
-            .affiliated_dv_manifests
+        for (dv_metadata, filtered_manifest) in affiliated_dv_metadata
             .iter()
-            .chain(shared_state.unaffiliated_dv_manifests.iter())
+            .chain(unaffiliated_dv_metadata.iter().map(|arc| arc.as_ref()))
+            .zip(
+                manifest_refs
+                    .affiliated_dv_manifests
+                    .iter()
+                    .chain(unaffiliated_dv_manifests.iter()),
+            )
         {
-            let delete_manifest_location = filtered_manifest
-                .manifest
-                .location
-                .clone()
-                .ok_or_else(|| Error::generic("Delete manifest must have a location"))?;
-            let delete_manifest_url = parse_or_join_url(&delete_manifest_location, table_root)?;
-
-            let dv_metadata = Metadata::read_with_handler(
-                parquet_handler.clone(),
-                &delete_manifest_url,
-                delete_manifest_location.clone(),
-                table_root.clone(),
-            )?;
-
-            // Validate that the DV manifest doesn't contain unsupported row types (e.g., EqualityDeletes)
-            dv_metadata.validate_no_unsupported_rows()?;
-
-            // Prepare the DV batches (parse DV location strings and append columns)
-            let prepared = dv_metadata.prepare_batches_with_dv_columns(
+            let prepared = Self::process_dv_manifest(
+                dv_metadata,
+                filtered_manifest,
                 evaluation_handler.as_ref(),
                 metadata_schema.clone(),
-                true,
             )?;
-
-            // Apply manifest DV if present (filters out deleted DV entries)
-            if let Some(ref dv_bytes) = filtered_manifest.manifest.manifest_dv {
-                let total_rows: usize = prepared.iter().map(|b| b.len()).sum();
-                let manifest_dv_sel = parse_manifest_dv_to_selection_vector(dv_bytes, total_rows)?;
-
-                // Apply selection vector to each batch
-                let mut offset = 0;
-                for batch in prepared {
-                    let batch_len = batch.len();
-                    let mut batch_selection = vec![true; batch_len];
-                    for (i, selected) in batch_selection.iter_mut().enumerate() {
-                        let global_idx = offset + i;
-                        if global_idx < manifest_dv_sel.len() {
-                            *selected = manifest_dv_sel[global_idx];
-                        }
-                    }
-                    // Only add batch if it has any selected rows
-                    if batch_selection.iter().any(|&b| b) {
-                        let filtered = batch.apply_selection_vector(batch_selection)?;
-                        all_prepared_dv_batches.push(filtered);
-                    }
-                    offset += batch_len;
-                }
-            } else {
-                all_prepared_dv_batches.extend(prepared);
-            }
+            all_prepared_dv_batches.extend(prepared);
         }
 
         // Build joiner from the prepared DV batches
@@ -1519,9 +1545,23 @@ impl Metadata {
         }
     }
 
+    #[cfg(test)]
     fn root_action_batches_optimized(
         &self,
         engine: &dyn Engine,
+        schema: &SchemaRef,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        self.root_action_batches_optimized_with_handler(
+            engine.evaluation_handler().as_ref(),
+            schema,
+            predicate,
+        )
+    }
+
+    fn root_action_batches_optimized_with_handler(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
         schema: &SchemaRef,
         predicate: Option<&PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
@@ -1538,7 +1578,6 @@ impl Metadata {
 
         // Get evaluation handler and metadata schema
         // Use base_schema with _pos added (matches what's in the batches)
-        let evaluation_handler = engine.evaluation_handler();
         let metadata_schema = {
             use crate::schema::MetadataColumnSpec;
             let base_schema = MetadataEntry::base_schema();
@@ -1552,7 +1591,7 @@ impl Metadata {
 
         // Build DV joiner for root manifest
         let dv_joiner_opt =
-            self.build_dv_joiner_for_root(evaluation_handler.as_ref(), metadata_schema.clone())?;
+            self.build_dv_joiner_for_root(evaluation_handler, metadata_schema.clone())?;
 
         // Check if we have deletion vectors (needed for evaluator schema and evaluators)
         let has_dvs = dv_joiner_opt.is_some();
@@ -1562,7 +1601,7 @@ impl Metadata {
 
         // Build evaluators for Add and/or Remove actions
         let evaluators = Self::build_action_evaluators(
-            evaluation_handler.as_ref(),
+            evaluation_handler,
             evaluator_schema,
             schema,
             &self.path_in_log,
@@ -1618,6 +1657,7 @@ impl Metadata {
     /// # Parameters
     /// - `predicate`: Optional predicate for data skipping. When provided, entries whose
     ///   `content_stats` indicate they cannot contain matching data will be skipped.
+    #[cfg(test)]
     pub(crate) fn root_action_batches(
         &self,
         engine: &dyn Engine,
@@ -1635,6 +1675,26 @@ impl Metadata {
 
         debug!("Using optimized path for metadata reading");
         self.root_action_batches_optimized(engine, schema, predicate)
+    }
+
+    /// Version of root_action_batches that takes handlers directly (for lazy streaming).
+    pub(crate) fn root_action_batches_with_handler(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
+        schema: &SchemaRef,
+        _partition_keys: &[String],
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Return empty iterator if schema doesn't contain Add or Remove
+        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        // Validate no unsupported rows (e.g., EqualityDeletes)
+        self.validate_no_unsupported_rows()?;
+
+        debug!("Using optimized path for metadata reading");
+        self.root_action_batches_optimized_with_handler(evaluation_handler, schema, predicate)
     }
 
     /// Discovers child manifest references in the root manifest.
@@ -1784,6 +1844,7 @@ impl Metadata {
     ///
     /// # Returns
     /// A HashMap mapping file paths to their deletion vector information.
+    #[cfg(test)]
     pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         engine: &dyn Engine,
@@ -1794,20 +1855,37 @@ impl Metadata {
         // Capture the handlers we need (both are Arc, so cheap to clone)
         let parquet_handler = engine.parquet_handler();
         let evaluation_handler = engine.evaluation_handler();
-
-        // Create lazy iterator - manifests will be processed one at a time as needed
-        let lazy_iter = LazyManifestBatchIterator {
-            manifests: root_state.manifest_references.into_iter(),
-            shared_state: root_state.shared_state,
+        Self::non_root_action_batches_with_handlers(
+            root_state,
             parquet_handler,
             evaluation_handler,
-            schema: schema.clone(),
-            table_root: table_root.clone(),
-            predicate: predicate.cloned(),
-            current_batch: None,
-        };
+            schema,
+            table_root,
+            predicate,
+        )
+    }
 
-        Ok(Box::new(lazy_iter))
+    /// Version of non_root_action_batches that takes handlers directly (for lazy streaming).
+    pub(crate) fn non_root_action_batches_with_handlers(
+        root_state: LeafReferences,
+        parquet_handler: Arc<dyn ParquetHandler>,
+        evaluation_handler: Arc<dyn EvaluationHandler>,
+        schema: &SchemaRef,
+        table_root: &Url,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Use BulkManifestStreamProcessor for lazy processing of manifests
+        let processor = bulk_processor::BulkManifestStreamProcessor::new(
+            root_state.manifest_references.into_iter(),
+            root_state.shared_state,
+            parquet_handler,
+            evaluation_handler,
+            schema.clone(),
+            table_root.clone(),
+            predicate.cloned(),
+        )?;
+
+        Ok(Box::new(processor))
     }
 
     /// Processes a ManifestReference into action batches.
@@ -1881,7 +1959,94 @@ impl Metadata {
         true
     }
 
-    /// Optimized path for processing leaf manifests using handlers.
+    /// Merge manifest DV selection into an existing selection vector.
+    ///
+    /// Applies AND operation: selection[i] = selection[i] && manifest_dv_selection[i]
+    ///
+    /// Per FilteredEngineData contract: if manifest_dv_selection is shorter than selection,
+    /// rows beyond its length are considered selected (not deleted by manifest DV).
+    fn merge_manifest_dv_selection(
+        selection: &mut [bool],
+        manifest_dv_selection: &[bool],
+    ) -> DeltaResult<()> {
+        // Manifest DV selection should never be longer than the batch
+        if manifest_dv_selection.len() > selection.len() {
+            return Err(Error::generic(format!(
+                "Manifest DV selection is longer than batch: {} > {}",
+                manifest_dv_selection.len(),
+                selection.len()
+            )));
+        }
+
+        // Apply manifest DV by iterating over its selection vector
+        for (i, &dv_selected) in manifest_dv_selection.iter().enumerate() {
+            selection[i] = selection[i] && dv_selected;
+        }
+
+        Ok(())
+    }
+
+    /// Process a single filtered batch into action batches.
+    ///
+    /// Takes a FilteredEngineData containing a batch with its manifest DV selection vector,
+    /// combines it with Add/Remove selections, and produces ActionBatch results.
+    ///
+    /// # Parameters
+    /// - `filtered_batch`: Batch with manifest DV selection already applied
+    /// - `dv_joiner_opt`: Optional joiner for affiliated/unaffiliated DVs
+    /// - `add_evaluator_opt`: Optional evaluator for Add actions
+    /// - `remove_evaluator_opt`: Optional evaluator for Remove actions
+    fn process_filtered_batch_to_actions(
+        filtered_batch: FilteredEngineData,
+        dv_joiner_opt: Option<&dyn LookupJoiner>,
+        add_evaluator_opt: Option<&Arc<dyn ExpressionEvaluator>>,
+        remove_evaluator_opt: Option<&Arc<dyn ExpressionEvaluator>>,
+    ) -> DeltaResult<Vec<ActionsBatch>> {
+        // Extract batch and manifest DV selection vector
+        let (batch, manifest_dv_selection) = filtered_batch.into_parts();
+
+        // Apply DV join if present (appends DV columns)
+        let joined_batch;
+        let batch_ref: &dyn EngineData = if let Some(joiner) = dv_joiner_opt {
+            joined_batch = Self::apply_dv_join_to_batch(batch.as_ref(), joiner)?;
+            joined_batch.as_ref()
+        } else {
+            batch.as_ref()
+        };
+
+        // Build Add/Remove selection vectors once
+        let (mut add_selection, mut remove_selection) =
+            Self::build_add_remove_selection_vectors(batch_ref)?;
+
+        let mut result_batches = Vec::new();
+
+        // Process Add entries if needed
+        if let Some(add_eval) = add_evaluator_opt {
+            Self::merge_manifest_dv_selection(&mut add_selection, &manifest_dv_selection)?;
+            if add_selection.iter().any(|&b| b) {
+                let transformed = add_eval.evaluate(batch_ref)?;
+                let filtered_data = transformed.apply_selection_vector(add_selection)?;
+                result_batches.push(ActionsBatch::new(filtered_data, false));
+            }
+        }
+
+        // Process Remove entries if needed
+        if let Some(remove_eval) = remove_evaluator_opt {
+            Self::merge_manifest_dv_selection(&mut remove_selection, &manifest_dv_selection)?;
+            if remove_selection.iter().any(|&b| b) {
+                let transformed = remove_eval.evaluate(batch_ref)?;
+                let filtered_data = transformed.apply_selection_vector(remove_selection)?;
+                result_batches.push(ActionsBatch::new(filtered_data, false));
+            }
+        }
+
+        Ok(result_batches)
+    }
+
+    /// Process a manifest into action batches using the bulk processor.
+    ///
+    /// This wrapper converts a single manifest into a BulkManifestStreamProcessor
+    /// which handles parallel IO and lazy processing.
     fn manifest_to_action_batches_optimized_with_handlers(
         manifest_refs: &ManifestReference,
         shared_state: &SharedLeafState,
@@ -1889,186 +2054,26 @@ impl Metadata {
         evaluation_handler: Arc<dyn EvaluationHandler>,
         schema: &SchemaRef,
         table_root: &Url,
-        path_in_log: String,
+        _path_in_log: String,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
+        // Convert borrowed parameters to owned for the processor
+        let manifest_iter = std::iter::once(manifest_refs.clone());
+        let shared_state_owned = shared_state.clone();
+        let schema_owned = schema.clone();
+        let table_root_owned = table_root.clone();
 
-        let data_manifest_location = manifest_refs
-            .data_manifest
-            .manifest
-            .location
-            .clone()
-            .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-        let data_manifest_url = parse_or_join_url(&data_manifest_location, table_root)?;
-
-        // Read the metadata
-        let metadata = Metadata::read_with_handler(
-            parquet_handler.clone(),
-            &data_manifest_url,
-            path_in_log.clone(),
-            table_root.clone(),
+        // Create bulk processor for this single manifest
+        let processor = bulk_processor::BulkManifestStreamProcessor::new(
+            manifest_iter,
+            shared_state_owned,
+            parquet_handler,
+            evaluation_handler,
+            schema_owned,
+            table_root_owned,
+            None, // predicate
         )?;
 
-        // Validate that the data manifest doesn't contain unsupported row types (e.g., EqualityDeletes)
-        metadata.validate_no_unsupported_rows()?;
-
-        // Determine which action types are in the schema
-        let has_add = schema.contains(ADD_NAME);
-        let has_remove = schema.contains(REMOVE_NAME);
-
-        // Build DV joiner if we have affiliated or unaffiliated deletion vector manifests
-        let metadata_schema = Arc::new(MetadataEntry::base_schema());
-        let dv_joiner_opt = Self::build_dv_joiner_for_leaf(
-            evaluation_handler.clone(),
-            parquet_handler.clone(),
-            metadata_schema.clone(),
-            manifest_refs,
-            shared_state,
-            table_root,
-        )?;
-
-        // When using a DV joiner, we don't prepare batches - the joiner will append DV columns
-        // The evaluator schema is the base metadata schema + the DV columns that the joiner will append
-        let has_dvs = dv_joiner_opt.is_some();
-        let evaluator_schema = if has_dvs {
-            // Build schema with DV columns that the joiner will append
-            let mut fields: Vec<_> = metadata_schema.fields().cloned().collect();
-            fields.push(crate::schema::StructField::new(
-                "storageType",
-                DataType::STRING,
-                true,
-            ));
-            fields.push(crate::schema::StructField::new(
-                "pathOrInlineDv",
-                DataType::STRING,
-                true,
-            ));
-            fields.push(crate::schema::StructField::new(
-                "dv_offset",
-                DataType::INTEGER,
-                true,
-            ));
-            fields.push(crate::schema::StructField::new(
-                "dv_sizeInBytes",
-                DataType::INTEGER,
-                true,
-            ));
-            fields.push(crate::schema::StructField::new(
-                "dv_cardinality",
-                DataType::LONG,
-                true,
-            ));
-            fields.push(crate::schema::StructField::new(
-                "dv_deleteManifestPosition",
-                DataType::LONG,
-                true,
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        } else {
-            metadata_schema.clone()
-        };
-
-        // Build evaluators for Add and/or Remove actions
-        let evaluators = Self::build_action_evaluators(
-            evaluation_handler.as_ref(),
-            evaluator_schema,
-            schema,
-            &path_in_log,
-            has_add,
-            has_remove,
-            has_dvs,
-        )?;
-        let add_evaluator_opt = evaluators.add_evaluator;
-        let remove_evaluator_opt = evaluators.remove_evaluator;
-
-        // Always use the original data manifest batches
-        // If we have a joiner, it will append DV columns during the join
-        let batch_source = &metadata.data;
-
-        // Parse manifest_dv if present to get selection vector
-        let manifest_dv_selection =
-            if let Some(ref dv_bytes) = manifest_refs.data_manifest.manifest.manifest_dv {
-                let sel = parse_manifest_dv_to_selection_vector(
-                    dv_bytes,
-                    metadata.data.iter().map(|b| b.len()).sum(),
-                )?;
-                Some(sel)
-            } else {
-                None
-            };
-
-        // Process each batch
-        let mut result_batches = Vec::new();
-        let mut offset = 0;
-
-        for batch in batch_source {
-            let batch_len = batch.len();
-
-            // Optionally apply DV join to append DV columns
-            let joined_batch;
-            let batch_ref: &dyn EngineData = if let Some(ref joiner) = dv_joiner_opt {
-                joined_batch = Self::apply_dv_join_to_batch(batch.as_ref(), joiner.as_ref())?;
-                joined_batch.as_ref()
-            } else {
-                batch.as_ref()
-            };
-
-            // Build manifest_dv selection for this batch if present
-            let manifest_dv_batch_selection =
-                if let Some(ref manifest_dv_sel) = manifest_dv_selection {
-                    let mut selection = vec![true; batch_len];
-                    for (i, selected) in selection.iter_mut().enumerate() {
-                        let global_idx = offset + i;
-                        if global_idx < manifest_dv_sel.len() {
-                            *selected = manifest_dv_sel[global_idx];
-                        }
-                    }
-                    Some(selection)
-                } else {
-                    None
-                };
-
-            // Process Add entries if needed
-            if let Some(add_eval) = add_evaluator_opt.as_ref() {
-                let (mut add_selection, _) = Self::build_add_remove_selection_vectors(batch_ref)?;
-
-                // Combine with manifest_dv selection
-                if let Some(ref manifest_dv_sel) = manifest_dv_batch_selection {
-                    for (i, selected) in add_selection.iter_mut().enumerate() {
-                        *selected = *selected && manifest_dv_sel[i];
-                    }
-                }
-
-                if add_selection.iter().any(|&b| b) {
-                    let transformed = add_eval.evaluate(batch_ref)?;
-                    let filtered_data = transformed.apply_selection_vector(add_selection)?;
-                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
-                }
-            }
-
-            // Process Remove entries if needed
-            if let Some(remove_eval) = remove_evaluator_opt.as_ref() {
-                let (_, mut remove_selection) =
-                    Self::build_add_remove_selection_vectors(batch_ref)?;
-
-                // Combine with manifest_dv selection
-                if let Some(ref manifest_dv_sel) = manifest_dv_batch_selection {
-                    for (i, selected) in remove_selection.iter_mut().enumerate() {
-                        *selected = *selected && manifest_dv_sel[i];
-                    }
-                }
-
-                if remove_selection.iter().any(|&b| b) {
-                    let transformed = remove_eval.evaluate(batch_ref)?;
-                    let filtered_data = transformed.apply_selection_vector(remove_selection)?;
-                    result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
-                }
-            }
-
-            offset += batch_len;
-        }
-
-        Ok(Box::new(result_batches.into_iter()))
+        Ok(Box::new(processor))
     }
 
     /// Processes a ManifestReference into action batches using captured handlers.
@@ -2173,16 +2178,17 @@ impl Metadata {
         Self::read_with_handler(engine.parquet_handler(), path, path_in_log, table_root)
     }
 
-    /// Read metadata using a parquet handler directly (for lazy streaming).
+    /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
     ///
-    /// Uses `MetadataEntry::base_schema()` for reading, which excludes content_stats.
-    /// The visitor extracts all fields except content_stats which requires table schema.
-    fn read_with_handler(
+    /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
+    ///
+    /// # Returns
+    /// A tuple of (batch_iterator, version, path_in_log) that can be used to construct Metadata later.
+    pub(crate) fn open_stream(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
         path_in_log: String,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<ParquetStreamResult> {
         // Cached schema for reading MetadataEntry from parquet files.
         // Uses base_schema which excludes content_stats (requires table schema).
         // Includes _pos metadata column for tracking row positions within the manifest.
@@ -2213,11 +2219,27 @@ impl Metadata {
         let read_result_iter =
             parquet_handler.read_parquet_files(&[file], READ_SCHEMA.clone(), None)?;
 
+        Ok((read_result_iter, parsed.version, path_in_log))
+    }
+
+    /// Read metadata using a parquet handler directly (for lazy streaming).
+    ///
+    /// Uses `MetadataEntry::base_schema()` for reading, which excludes content_stats.
+    /// The visitor extracts all fields except content_stats which requires table schema.
+    fn read_with_handler(
+        parquet_handler: Arc<dyn ParquetHandler>,
+        path: &Url,
+        path_in_log: String,
+        table_root: Url,
+    ) -> DeltaResult<Self> {
+        let (read_result_iter, version, path_in_log) =
+            Self::open_stream(parquet_handler, path, path_in_log)?;
+
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
         Ok(Self {
             data,
-            version: parsed.version,
+            version,
             table_root,
             path_in_log,
             // When reading existing metadata, we don't know if it's a root or leaf
@@ -2351,6 +2373,11 @@ pub(crate) fn parse_manifest_dv(dv_bytes: &Bytes) -> DeltaResult<Option<roaring:
     Ok(Some(deleted_positions))
 }
 
+/// Parse manifest_dv bytes into a selection vector.
+///
+/// Returns a `Vec<bool>` where `true` means the row is NOT deleted.
+/// This is used in tests to validate manifest DV parsing.
+#[cfg(test)]
 fn parse_manifest_dv_to_selection_vector(
     dv_bytes: &Bytes,
     total_rows: usize,

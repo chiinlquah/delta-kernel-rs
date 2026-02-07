@@ -40,7 +40,7 @@ pub struct TableSetup {
     /// Engine with appropriate credentials/configuration
     pub engine: Arc<
         delta_kernel::engine::default::DefaultEngine<
-            delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor,
+            delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
         >,
     >,
     /// The path prefix within the object store (e.g., "uuid1/tables/table-uuid/" for S3)
@@ -82,7 +82,7 @@ pub async fn create_engine_with_uc_credentials(
     (
         Arc<
             delta_kernel::engine::default::DefaultEngine<
-                delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor,
+                delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
             >,
         >,
         Url,
@@ -138,9 +138,15 @@ pub async fn create_engine_with_uc_credentials(
 
     let (store, path) = object_store::parse_url_opts(&table_url, options)?;
 
-    let engine = Arc::new(delta_kernel::engine::default::DefaultEngine::new(
-        store.into(),
-    ));
+    // Use multi-threaded executor for better parallel IO performance
+    let executor = Arc::new(
+        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let engine = Arc::new(
+        delta_kernel::engine::default::DefaultEngine::new_with_executor(store.into(), executor),
+    );
 
     // Return both engine and table_url, plus the path prefix for writing
     // The path is what object_store strips from the URL
@@ -212,10 +218,23 @@ pub async fn setup_table_access(
     } else {
         // Direct path mode
         // Try to parse as URL first, if that fails, try as a local file path
+
+        // Use multi-threaded executor for better parallel IO performance
+        let executor = Arc::new(
+            delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            ),
+        );
+
         let (table_url, engine) = if let Ok(url) = Url::parse(table_path) {
             // Valid URL - use store_from_url for all URLs
             let store = delta_kernel::engine::default::storage::store_from_url(&url)?;
-            let engine = Arc::new(delta_kernel::engine::default::DefaultEngine::new(store));
+            let engine = Arc::new(
+                delta_kernel::engine::default::DefaultEngine::new_with_executor(
+                    store,
+                    executor.clone(),
+                ),
+            );
             (url, engine)
         } else {
             // Try to parse as a local file path
@@ -226,7 +245,12 @@ pub async fn setup_table_access(
 
             // Use store_from_url for consistency
             let store = delta_kernel::engine::default::storage::store_from_url(&table_url)?;
-            let engine = Arc::new(delta_kernel::engine::default::DefaultEngine::new(store));
+            let engine = Arc::new(
+                delta_kernel::engine::default::DefaultEngine::new_with_executor(
+                    store,
+                    executor.clone(),
+                ),
+            );
             (table_url, engine)
         };
 

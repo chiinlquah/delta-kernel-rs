@@ -1,0 +1,215 @@
+//! Lazy iterator for reading content root (Adaptive Metadata Tree) files.
+//!
+//! This module provides a lazy evaluation approach to reading content root metadata:
+//! - Opens the parquet I/O stream immediately
+//! - Defers metadata construction until the iterator is consumed
+//! - Defers leaf manifest reading until root manifests are exhausted
+
+use crate::log_replay::ActionsBatch;
+use crate::schema::SchemaRef;
+use crate::{DeltaResult, EngineData, EvaluationHandler, ParquetHandler, PredicateRef, Version};
+use std::sync::Arc;
+use url::Url;
+
+/// Lazy iterator that defers content root metadata construction until data is requested.
+///
+/// Opens the parquet I/O stream immediately but defers:
+/// 1. Collecting batches and constructing Metadata object
+/// 2. Getting root action batches
+/// 3. Getting leaf action batches (if not skipping)
+pub(crate) struct LazyContentRootIterator {
+    state: LazyContentRootState,
+}
+
+/// Shared context used across multiple states in the lazy content root iterator
+struct ContentRootContext {
+    parquet_handler: Arc<dyn ParquetHandler>,
+    evaluation_handler: Arc<dyn EvaluationHandler>,
+    checkpoint_read_schema: SchemaRef,
+    table_root: Url,
+    data_predicate: Option<PredicateRef>,
+    skip_leaf_manifests: bool,
+}
+
+enum LazyContentRootState {
+    /// Initial state - parquet stream is open but Metadata not yet constructed
+    NotStarted {
+        parquet_batches: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        version: Version,
+        path_in_log: String,
+        context: ContentRootContext,
+    },
+    /// Currently reading from root manifest batches
+    ReadingRoot {
+        root_iter: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+        metadata: Box<crate::metadata::Metadata>,
+        context: ContentRootContext,
+    },
+    /// Currently reading from leaf manifest batches
+    ReadingLeaves {
+        leaf_iter: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    },
+    /// All batches have been read
+    Done,
+}
+
+impl LazyContentRootIterator {
+    /// Factory method to create a lazy iterator from a content root.
+    ///
+    /// Opens the parquet stream immediately but defers metadata construction
+    /// and batch processing until the iterator is consumed.
+    ///
+    /// # Parameters
+    /// - `parquet_handler`: Handler for reading parquet files
+    /// - `evaluation_handler`: Handler for evaluating expressions
+    /// - `content_root_url`: URL to the content root metadata file
+    /// - `path_in_log`: Path as it appears in the Delta log
+    /// - `table_root`: Table root URL
+    /// - `checkpoint_read_schema`: Schema to use for reading actions
+    /// - `data_predicate`: Optional predicate for manifest-level data skipping
+    /// - `skip_leaf_manifests`: When true, only read root manifest
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_content_root(
+        parquet_handler: Arc<dyn ParquetHandler>,
+        evaluation_handler: Arc<dyn EvaluationHandler>,
+        content_root_url: &Url,
+        path_in_log: String,
+        table_root: Url,
+        checkpoint_read_schema: SchemaRef,
+        data_predicate: Option<PredicateRef>,
+        skip_leaf_manifests: bool,
+    ) -> DeltaResult<Self> {
+        // Open the parquet stream using the metadata helper
+        let (parquet_batches, version, path_in_log) = crate::metadata::Metadata::open_stream(
+            parquet_handler.clone(),
+            content_root_url,
+            path_in_log,
+        )?;
+
+        let context = ContentRootContext {
+            parquet_handler,
+            evaluation_handler,
+            checkpoint_read_schema,
+            table_root,
+            data_predicate,
+            skip_leaf_manifests,
+        };
+
+        Ok(Self {
+            state: LazyContentRootState::NotStarted {
+                parquet_batches,
+                version,
+                path_in_log,
+                context,
+            },
+        })
+    }
+}
+
+impl Iterator for LazyContentRootIterator {
+    type Item = DeltaResult<ActionsBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match std::mem::replace(&mut self.state, LazyContentRootState::Done) {
+                LazyContentRootState::NotStarted {
+                    parquet_batches,
+                    version,
+                    path_in_log,
+                    context,
+                } => {
+                    // Lazily construct the Metadata object on first access
+                    let data: Vec<Box<dyn EngineData>> =
+                        match parquet_batches.collect::<DeltaResult<Vec<_>>>() {
+                            Ok(d) => d,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                    // Construct metadata from collected batches with the parsed version
+                    let metadata = Box::new(crate::metadata::Metadata::from_batches_with_version(
+                        data,
+                        version,
+                        path_in_log,
+                        context.table_root.clone(),
+                    ));
+
+                    // Get root batches using the handler-based method
+                    let root_iter = match metadata.root_action_batches_with_handler(
+                        context.evaluation_handler.as_ref(),
+                        &context.checkpoint_read_schema,
+                        &[],
+                        context.data_predicate.as_ref(),
+                    ) {
+                        Ok(iter) => iter,
+                        Err(e) => return Some(Err(e)),
+                    };
+
+                    // Transition to ReadingRoot state
+                    self.state = LazyContentRootState::ReadingRoot {
+                        root_iter,
+                        metadata,
+                        context,
+                    };
+                    continue;
+                }
+                LazyContentRootState::ReadingRoot {
+                    mut root_iter,
+                    metadata,
+                    context,
+                } => {
+                    // Try to get next batch from root
+                    if let Some(batch) = root_iter.next() {
+                        self.state = LazyContentRootState::ReadingRoot {
+                            root_iter,
+                            metadata,
+                            context,
+                        };
+                        return Some(batch);
+                    }
+
+                    // Root batches exhausted. If skipping leaves, we're done
+                    if context.skip_leaf_manifests {
+                        self.state = LazyContentRootState::Done;
+                        return None;
+                    }
+
+                    // Lazily read leaf manifests now that root is exhausted
+                    let leaf_refs =
+                        match metadata.manifest_references(context.data_predicate.as_ref()) {
+                            Ok(refs) => refs,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                    let leaf_iter =
+                        match crate::metadata::Metadata::non_root_action_batches_with_handlers(
+                            leaf_refs,
+                            context.parquet_handler.clone(),
+                            context.evaluation_handler.clone(),
+                            &context.checkpoint_read_schema,
+                            &context.table_root,
+                            context.data_predicate.as_ref(),
+                        ) {
+                            Ok(iter) => iter,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                    // Transition to ReadingLeaves state
+                    self.state = LazyContentRootState::ReadingLeaves { leaf_iter };
+                    continue;
+                }
+                LazyContentRootState::ReadingLeaves { mut leaf_iter } => {
+                    // Try to get next batch from leaves
+                    if let Some(batch) = leaf_iter.next() {
+                        self.state = LazyContentRootState::ReadingLeaves { leaf_iter };
+                        return Some(batch);
+                    }
+
+                    // All batches exhausted
+                    self.state = LazyContentRootState::Done;
+                    return None;
+                }
+                LazyContentRootState::Done => return None,
+            }
+        }
+    }
+}

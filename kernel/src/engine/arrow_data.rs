@@ -484,6 +484,117 @@ impl EngineData for ArrowEngineData {
     }
 }
 
+/// Implement GetData for RunArray directly, so we can return it as a trait object
+/// without needing a wrapper struct or Box::leak.
+///
+/// This implementation supports multiple value types (strings, integers, booleans, etc.)
+/// by runtime downcasting of the values array.
+impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
+    fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // Downcast values to StringArray
+        let values = self
+            .values()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::StringArray>()
+            .ok_or_else(|| Error::generic("Expected StringArray values in RunArray"))?;
+
+        if values.is_null(physical_idx) {
+            Ok(None)
+        } else {
+            Ok(Some(values.value(physical_idx)))
+        }
+    }
+
+    fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // Downcast values to Int32Array
+        let values = self
+            .values()
+            .as_primitive_opt::<Int32Type>()
+            .ok_or_else(|| Error::generic("Expected Int32Array values in RunArray"))?;
+
+        if values.is_null(physical_idx) {
+            Ok(None)
+        } else {
+            Ok(Some(values.value(physical_idx)))
+        }
+    }
+
+    fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // Downcast values to Int64Array
+        let values = self
+            .values()
+            .as_primitive_opt::<Int64Type>()
+            .ok_or_else(|| Error::generic("Expected Int64Array values in RunArray"))?;
+
+        if values.is_null(physical_idx) {
+            Ok(None)
+        } else {
+            Ok(Some(values.value(physical_idx)))
+        }
+    }
+
+    fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // Downcast values to BooleanArray
+        let values = self
+            .values()
+            .as_boolean_opt()
+            .ok_or_else(|| Error::generic("Expected BooleanArray values in RunArray"))?;
+
+        if values.is_null(physical_idx) {
+            Ok(None)
+        } else {
+            Ok(Some(values.value(physical_idx)))
+        }
+    }
+}
+
+/// Helper function to validate row index and get physical index for RunArray.
+///
+/// Returns:
+/// - `Ok(Some(physical_idx))` if the row is valid and not null
+/// - `Ok(None)` if the row is null
+/// - `Err(...)` if the row index is out of bounds
+fn validate_and_get_physical_index(
+    run_array: &crate::arrow::array::RunArray<Int64Type>,
+    row_index: usize,
+    field_name: &str,
+) -> DeltaResult<Option<usize>> {
+    if row_index >= run_array.len() {
+        return Err(Error::generic(format!(
+            "Row index {} out of bounds for field '{}'",
+            row_index, field_name
+        )));
+    }
+
+    if !run_array.is_valid(row_index) {
+        return Ok(None);
+    }
+
+    // Map logical index to physical index through run ends
+    let physical_idx = run_array.run_ends().get_physical_index(row_index);
+    Ok(Some(physical_idx))
+}
+
 impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
@@ -551,7 +662,30 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                // Try as direct string array first
+                if let Some(array) = col.as_string_opt() {
+                    Ok(array as _)
+                } else {
+                    // Check if it's RLE-encoded (RunEndEncoded with Utf8 values)
+                    use crate::arrow::array::RunArray;
+                    use crate::arrow::datatypes::DataType as ArrowDataType;
+
+                    match col.data_type() {
+                        ArrowDataType::RunEndEncoded(_, _) => {
+                            // RunArray implements GetData directly, so we can return it as a trait object
+                            // Just like StringArray - no wrapper struct or Box::leak needed!
+                            if let Some(run_array) =
+                                col.as_any().downcast_ref::<RunArray<Int64Type>>()
+                            {
+                                Ok(run_array as &'a dyn GetData<'a>)
+                            } else {
+                                // Error will be formatted by map_err to include column path and actual type
+                                Err("string (RLE-encoded)")
+                            }
+                        }
+                        _ => Err("string"),
+                    }
+                }
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
@@ -1238,6 +1372,212 @@ mod tests {
             .as_ref()
             .expect("stats should be present");
         assert_eq!(stats2.fields().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_str() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{RunArray, StringArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with string values: ["a", "a", "a", "b", "b"]
+        // Run ends: [3, 5] means first 3 rows have "a", next 2 have "b"
+        let run_ends = crate::arrow::array::Int64Array::from(vec![3, 5]);
+        let values = StringArray::from(vec!["a", "b"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        // Test accessing values
+        assert_eq!(run_array.get_str(0, "test_field")?, Some("a"));
+        assert_eq!(run_array.get_str(1, "test_field")?, Some("a"));
+        assert_eq!(run_array.get_str(2, "test_field")?, Some("a"));
+        assert_eq!(run_array.get_str(3, "test_field")?, Some("b"));
+        assert_eq!(run_array.get_str(4, "test_field")?, Some("b"));
+
+        // Test out of bounds
+        let result = run_array.get_str(5, "test_field");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds"));
+        assert!(err_msg.contains("test_field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_str_with_nulls() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{RunArray, StringArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with nulls: ["a", "a", null, null, "b"]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![2, 4, 5]);
+        let values = StringArray::from(vec![Some("a"), None, Some("b")]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_str(0, "field")?, Some("a"));
+        assert_eq!(run_array.get_str(1, "field")?, Some("a"));
+        assert_eq!(run_array.get_str(2, "field")?, None); // null
+        assert_eq!(run_array.get_str(3, "field")?, None); // null
+        assert_eq!(run_array.get_str(4, "field")?, Some("b"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_int() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{Int32Array, RunArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with int values: [10, 10, 20, 20, 20]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![2, 5]);
+        let values = Int32Array::from(vec![10, 20]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_int(0, "field")?, Some(10));
+        assert_eq!(run_array.get_int(1, "field")?, Some(10));
+        assert_eq!(run_array.get_int(2, "field")?, Some(20));
+        assert_eq!(run_array.get_int(3, "field")?, Some(20));
+        assert_eq!(run_array.get_int(4, "field")?, Some(20));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_int_with_nulls() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{Int32Array, RunArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with nulls: [1, null, null, 2]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![1, 3, 4]);
+        let values = Int32Array::from(vec![Some(1), None, Some(2)]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_int(0, "field")?, Some(1));
+        assert_eq!(run_array.get_int(1, "field")?, None);
+        assert_eq!(run_array.get_int(2, "field")?, None);
+        assert_eq!(run_array.get_int(3, "field")?, Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_long() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{Int64Array, RunArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with long values: [100, 100, 100, 200]
+        let run_ends = Int64Array::from(vec![3, 4]);
+        let values = Int64Array::from(vec![100i64, 200i64]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_long(0, "field")?, Some(100));
+        assert_eq!(run_array.get_long(1, "field")?, Some(100));
+        assert_eq!(run_array.get_long(2, "field")?, Some(100));
+        assert_eq!(run_array.get_long(3, "field")?, Some(200));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_bool() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{BooleanArray, RunArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with bool values: [true, true, false, false, true]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![2, 4, 5]);
+        let values = BooleanArray::from(vec![true, false, true]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_bool(0, "field")?, Some(true));
+        assert_eq!(run_array.get_bool(1, "field")?, Some(true));
+        assert_eq!(run_array.get_bool(2, "field")?, Some(false));
+        assert_eq!(run_array.get_bool(3, "field")?, Some(false));
+        assert_eq!(run_array.get_bool(4, "field")?, Some(true));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_bool_with_nulls() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{BooleanArray, RunArray};
+        use crate::engine_data::GetData;
+
+        // Create a RunArray with nulls: [true, null, false]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![1, 2, 3]);
+        let values = BooleanArray::from(vec![Some(true), None, Some(false)]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        assert_eq!(run_array.get_bool(0, "field")?, Some(true));
+        assert_eq!(run_array.get_bool(1, "field")?, None);
+        assert_eq!(run_array.get_bool(2, "field")?, Some(false));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_out_of_bounds_errors() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{RunArray, StringArray};
+        use crate::engine_data::GetData;
+
+        let run_ends = crate::arrow::array::Int64Array::from(vec![2]);
+        let values = StringArray::from(vec!["test"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        // Test that out of bounds errors include field name
+        let err = run_array.get_str(2, "my_field").unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("out of bounds"),
+            "Error should mention out of bounds: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("my_field"),
+            "Error should include field name: {}",
+            err_msg
+        );
+
+        let err = run_array.get_int(5, "another_field").unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("out of bounds"));
+        assert!(err_msg.contains("another_field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_rle_compression() -> DeltaResult<()> {
+        use crate::arrow::array::types::Int64Type;
+        use crate::arrow::array::{RunArray, StringArray};
+        use crate::engine_data::GetData;
+
+        // Create a highly compressed RunArray: 1000 rows with only 2 distinct values
+        // This tests that RLE encoding is working correctly
+        let run_ends = crate::arrow::array::Int64Array::from(vec![500, 1000]);
+        let values = StringArray::from(vec!["repeated_value_1", "repeated_value_2"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values).unwrap();
+
+        // Test first run
+        assert_eq!(run_array.get_str(0, "field")?, Some("repeated_value_1"));
+        assert_eq!(run_array.get_str(250, "field")?, Some("repeated_value_1"));
+        assert_eq!(run_array.get_str(499, "field")?, Some("repeated_value_1"));
+
+        // Test second run
+        assert_eq!(run_array.get_str(500, "field")?, Some("repeated_value_2"));
+        assert_eq!(run_array.get_str(750, "field")?, Some("repeated_value_2"));
+        assert_eq!(run_array.get_str(999, "field")?, Some("repeated_value_2"));
+
+        // Verify the RLE efficiency: 1000 logical rows, only 2 physical values
+        assert_eq!(run_array.len(), 1000);
+        assert_eq!(run_array.values().len(), 2);
 
         Ok(())
     }

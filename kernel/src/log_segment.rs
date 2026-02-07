@@ -679,6 +679,9 @@ impl LogSegment {
 
     /// Creates an iterator over action batches from a content root (AMT manifest).
     ///
+    /// This opens the parquet I/O stream immediately but defers metadata construction
+    /// and batch processing until the iterator is consumed.
+    ///
     /// # Parameters
     /// - `data_predicate`: Optional predicate for manifest-level data skipping. When provided,
     ///   child manifests whose `content_stats` indicate they cannot contain matching data
@@ -695,41 +698,20 @@ impl LogSegment {
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        let metadata = crate::metadata::Metadata::read(
-            engine,
+
+        // Create lazy iterator that opens the stream and defers processing
+        let lazy_iter = crate::metadata::lazy_reader::LazyContentRootIterator::from_content_root(
+            engine.parquet_handler(),
+            engine.evaluation_handler(),
             &content_root_url,
             content_root.path.clone(),
             table_root.clone(),
+            checkpoint_read_schema,
+            data_predicate,
+            skip_leaf_manifests,
         )?;
 
-        // Get actions from root manifest
-        // TODO: Provide partition keys
-        // Pass the data predicate for data skipping based on content_stats
-        let root_batches = metadata.root_action_batches(
-            engine,
-            &checkpoint_read_schema,
-            &[],
-            data_predicate.as_ref(),
-        )?;
-
-        // Get actions from leaf manifests (DataManifest entries) unless skipping
-        // Pass the data predicate for manifest-level skipping based on content_stats
-        if skip_leaf_manifests {
-            // Only return root actions
-            Ok(Box::new(root_batches))
-        } else {
-            let leaf_refs = metadata.manifest_references(data_predicate.as_ref())?;
-            let leaf_batches = crate::metadata::Metadata::non_root_action_batches(
-                leaf_refs,
-                engine,
-                &checkpoint_read_schema,
-                table_root,
-                data_predicate.as_ref(),
-            )?;
-
-            // Chain root and leaf actions together
-            Ok(Box::new(root_batches.chain(leaf_batches)))
-        }
+        Ok(Box::new(lazy_iter))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
