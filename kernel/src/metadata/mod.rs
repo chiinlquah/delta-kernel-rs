@@ -2611,38 +2611,46 @@ impl From<TrackingStatus> for Scalar {
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ContentInfo {
     /// The offset in the file where the content starts.
+    #[field_id = 144]
     pub(crate) offset: i64,
 
     /// The length of thea referenced content stored in the file;
     /// required if content_offset is present.
+    #[field_id = 145]
     pub(crate) size_in_bytes: i64,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub struct TrackingInfo {
+    #[field_id = 0]
     pub(crate) status: TrackingStatus,
 
     /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when null.
     /// Must be written in the root file.
+    #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
     /// Data sequence number of the file. Inherited in when null and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
     /// Must be written in the root file.
+    #[field_id = 3]
     pub(crate) sequence_number: Option<i64>,
 
     /// File sequence number indicating when the file was added. Inherited when null and status is added.
     /// Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
+    #[field_id = 4]
     pub(crate) file_sequence_number: Option<i64>,
 
     /// The _row_id for the first row in the data file if content_type is Data.
     /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
+    #[field_id = 142]
     pub(crate) first_row_id: Option<i64>,
 
     /// Deletion vector tracking changes made in the current commit for manifest entries.
     /// Only used when content_type is DataManifest or DeleteManifest.
     /// This field tracks what was added/changed in the current commit and is cleared between commits.
+    #[field_id = 153]
     pub(crate) changes_dv: Option<Bytes>,
 }
 
@@ -2676,14 +2684,21 @@ impl From<TrackingInfo> for Scalar {
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ManifestStats {
+    #[field_id = 504]
     pub(crate) added_files_count: i64,
+    #[field_id = 505]
     pub(crate) existing_files_count: i64,
+    #[field_id = 506]
     pub(crate) deletes_files_count: i64,
 
+    #[field_id = 512]
     pub(crate) added_rows_count: i64,
+    #[field_id = 513]
     pub(crate) existing_rows_count: i64,
+    #[field_id = 514]
     pub(crate) delete_rows_count: i64,
 
+    #[field_id = 516]
     pub(crate) min_sequence_number: i64,
 }
 
@@ -3782,6 +3797,151 @@ mod tests {
             Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
 
         // Verify
+        let entries = read_metadata.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_metadata_entry_eq(&original_entry, &entries[0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_field_id_annotations_in_schema() -> DeltaResult<()> {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+
+        // Verify that TrackingInfo::to_schema() has the field_id metadata from #[field_id] annotations
+        let tracking_info_schema = TrackingInfo::to_schema();
+
+        // Helper to check field_id metadata
+        fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
+            let field = schema
+                .field(field_name)
+                .unwrap_or_else(|| panic!("{} field should exist in schema", field_name));
+            let metadata = field.metadata();
+            assert!(
+                metadata.contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
+                "{} field should have parquet.field.id in metadata",
+                field_name
+            );
+            match metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()) {
+                Some(MetadataValue::Number(n)) => assert_eq!(
+                    *n, expected_id,
+                    "{} field should have field_id = {}",
+                    field_name, expected_id
+                ),
+                other => panic!(
+                    "{} field should have Number metadata, got {:?}",
+                    field_name, other
+                ),
+            }
+        }
+
+        // Verify field IDs from TrackingInfo (defined with #[field_id = X] annotations)
+        // status: #[field_id = 0]
+        assert_field_id(&tracking_info_schema, "status", 0);
+
+        // snapshotId: #[field_id = 1]
+        assert_field_id(&tracking_info_schema, "snapshotId", 1);
+
+        // sequenceNumber: #[field_id = 3]
+        assert_field_id(&tracking_info_schema, "sequenceNumber", 3);
+
+        // fileSequenceNumber: #[field_id = 4]
+        assert_field_id(&tracking_info_schema, "fileSequenceNumber", 4);
+
+        // firstRowId: #[field_id = 142]
+        assert_field_id(&tracking_info_schema, "firstRowId", 142);
+
+        // changesDv: #[field_id = 153]
+        assert_field_id(&tracking_info_schema, "changesDv", 153);
+
+        // Verify ManifestStats field IDs
+        let manifest_stats_schema = ManifestStats::to_schema();
+        assert_field_id(&manifest_stats_schema, "addedFilesCount", 504);
+        assert_field_id(&manifest_stats_schema, "existingFilesCount", 505);
+        assert_field_id(&manifest_stats_schema, "deletesFilesCount", 506);
+        assert_field_id(&manifest_stats_schema, "addedRowsCount", 512);
+        assert_field_id(&manifest_stats_schema, "existingRowsCount", 513);
+        assert_field_id(&manifest_stats_schema, "deleteRowsCount", 514);
+        assert_field_id(&manifest_stats_schema, "minSequenceNumber", 516);
+
+        // Verify ContentInfo field IDs
+        let content_info_schema = ContentInfo::to_schema();
+        assert_field_id(&content_info_schema, "offset", 144);
+        assert_field_id(&content_info_schema, "sizeInBytes", 145);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_field_ids_in_metadata_entry_schema() -> DeltaResult<()> {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+        // Verify that the test_metadata_entry_schema() includes field_id metadata
+        // for nested structs like TrackingInfo
+        let schema = test_metadata_entry_schema();
+
+        // Get the trackingInfo field
+        let tracking_info_field = schema
+            .field("trackingInfo")
+            .expect("trackingInfo field should exist");
+
+        // Get the nested struct type
+        let tracking_info_struct = match tracking_info_field.data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("Expected trackingInfo to be a struct"),
+        };
+
+        // Verify that nested fields have field_id metadata
+        let status_field = tracking_info_struct
+            .field("status")
+            .expect("status field should exist");
+        assert!(
+            status_field
+                .metadata()
+                .contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            "status field should have parquet.field.id in metadata"
+        );
+        assert_eq!(
+            status_field
+                .metadata()
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            Some(&MetadataValue::Number(0)),
+            "status field should have field_id = 0"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_data_with_field_id_schema() -> DeltaResult<()> {
+        // This test verifies that metadata entries with field_id annotations
+        // can be written and read back correctly (data roundtrip)
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Create original metadata
+        let original_entry = create_simple_metadata_entry();
+        let metadata = Metadata {
+            data: vec![original_entry
+                .clone()
+                .into_engine_data(test_metadata_entry_schema(), &engine)?],
+            version: 0,
+            table_root: table_root_url.clone(),
+            path_in_log: String::new(),
+            leaf: None,
+        };
+
+        // Write metadata
+        let writer = writer::MetadataWriter::try_new(metadata)?;
+        let written_file = writer.write(&engine)?;
+
+        // Read metadata back
+        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
+        let read_metadata =
+            Metadata::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+
+        // Verify data was preserved
         let entries = read_metadata.entries()?;
         assert_eq!(entries.len(), 1);
         assert_metadata_entry_eq(&original_entry, &entries[0]);
