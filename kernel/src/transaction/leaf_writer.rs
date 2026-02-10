@@ -1,10 +1,11 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::ColumnName;
-use crate::metadata::builder::MetadataBuilder;
-use crate::metadata::{
+use crate::content_tree::builder::MetadataBuilder;
+use crate::content_tree::stats::try_pre_convert_stats_column;
+use crate::content_tree::{
     DataContentType, DataFileFormat, MetadataEntry, TrackingInfo, TrackingStatus,
 };
+use crate::engine_data::{GetData, TypedGetData};
+use crate::expressions::ColumnName;
 use crate::schema::{DataType, MapType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
@@ -589,7 +590,7 @@ impl LeafNodeWriter {
         engine: &dyn Engine,
         add_metadata: Box<dyn EngineData>,
     ) -> DeltaResult<()> {
-        let converted = crate::metadata::stats::try_pre_convert_stats_column(
+        let converted = crate::content_tree::stats::try_pre_convert_stats_column(
             engine,
             add_metadata.as_ref(),
             "stats",
@@ -600,7 +601,7 @@ impl LeafNodeWriter {
             Some(c) => c.as_ref(),
             None => add_metadata.as_ref(),
         };
-        let mut visitor = crate::metadata::builder::WriteMetadataWithStatsVisitor::default();
+        let mut visitor = crate::content_tree::builder::WriteMetadataWithStatsVisitor::default();
         visitor.visit_rows_of(data)?;
 
         // Tuple: (path, partition_values, size, modification_time, content_stats)
@@ -645,7 +646,7 @@ impl LeafNodeWriter {
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
         // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
-        let converted = crate::metadata::stats::try_pre_convert_stats_column(
+        let converted = try_pre_convert_stats_column(
             engine,
             scan_metadata.data(),
             "stats_parsed",
@@ -813,7 +814,7 @@ impl LeafNodeWriter {
         // Convert DV descriptors to MetadataEntry
         for (data_file_path, dv_descriptor, _) in self.deletion_vectors.values() {
             let (content_info, location) =
-                crate::metadata::builder::extract_deletion_vector_content(dv_descriptor)?;
+                crate::content_tree::builder::extract_deletion_vector_content(dv_descriptor)?;
 
             // Use relative path for referenced_file to match data file paths in manifests
             // Data file paths are stored as relative, so DV references must also be relative
@@ -1301,7 +1302,7 @@ mod tests {
 
         // Build a schema that includes the content_stats columns we want to read
         let content_stats_schema =
-            crate::metadata::stats::stats_schema(&StructType::try_new(vec![
+            crate::content_tree::stats::stats_schema(&StructType::try_new(vec![
                 StructField::not_null("id", DataType::INTEGER).with_metadata([(
                     ColumnMetadataKey::ParquetFieldId.as_ref(),
                     MetadataValue::Number(1),
@@ -1861,8 +1862,8 @@ mod tests {
             .expect("Manifest should have location");
 
         // Read back the manifest file to verify contents
-        use crate::metadata::reader::MetadataEntryVisitor;
-        use crate::metadata::Metadata;
+        use crate::content_tree::reader::MetadataEntryVisitor;
+        use crate::content_tree::Metadata;
 
         // manifest_location is now a relative path, join with table_root
         let manifest_url = table_root.join(manifest_location)?;

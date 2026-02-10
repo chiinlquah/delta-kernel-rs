@@ -558,8 +558,8 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     // Create metadata for content_root using MetadataBuilder
     let content_root_url = {
         use crate::actions::Add;
-        use crate::metadata::builder::MetadataBuilder;
-        use crate::metadata::writer::MetadataWriter;
+        use crate::content_tree::builder::MetadataBuilder;
+        use crate::content_tree::writer::MetadataWriter;
 
         let mut builder = MetadataBuilder::new_for(table_root.clone(), 3, test_table_schema());
 
@@ -765,8 +765,8 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     // Create metadata for content_root using MetadataBuilder
     let content_root_url = {
         use crate::actions::Add;
-        use crate::metadata::builder::MetadataBuilder;
-        use crate::metadata::writer::MetadataWriter;
+        use crate::content_tree::builder::MetadataBuilder;
+        use crate::content_tree::writer::MetadataWriter;
 
         let mut builder = MetadataBuilder::new_for(table_root.clone(), 10, test_table_schema());
 

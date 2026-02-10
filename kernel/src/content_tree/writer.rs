@@ -1,4 +1,4 @@
-use crate::metadata::Metadata;
+use crate::content_tree::Metadata;
 use crate::path::ParsedLogPath;
 use crate::{DeltaResult, Engine};
 use url::Url;
