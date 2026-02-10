@@ -3,15 +3,16 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{Expression, ExpressionRef, Scalar, StructData, Transform};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
-use crate::DeltaResult;
+use crate::{DeltaResult, Engine, EngineData};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Number of stats slots reserved per column.
 const NUM_STATS_PER_COLUMN: i32 = 200;
@@ -1071,144 +1072,261 @@ pub(crate) fn delta_json_stats_to_content_stats(
     Ok(Some(content_stats))
 }
 
-/// Converts a StructData in Delta JSON format to AMT (Adaptive Metadata Tree) format.
+/// Checks if a schema's stats column is in Delta JSON format (has numRecords).
+fn is_delta_json_stats_schema(schema: &StructType, stats_column_name: &str) -> bool {
+    schema
+        .field(stats_column_name)
+        .and_then(|f| match f.data_type() {
+            DataType::Struct(s) => Some(s),
+            _ => None,
+        })
+        .is_some_and(|s| s.field("numRecords").is_some())
+}
+
+/// Builds a Transform expression that replaces a Delta JSON stats column with AMT format.
+/// Returns (expression, amt_stats_schema).
 ///
-/// This function takes a StructData that has the Delta Protocol JSON stats structure
-/// (numRecords, minValues, maxValues, nullCount, tightBounds) and converts it to the
-/// AMT per-column stats format used in manifests.
-///
-/// # Arguments
-///
-/// * `struct_data` - The StructData in Delta JSON format
-/// * `table_schema` - The table's data schema (used to determine column types)
-///
-/// # Returns
-///
-/// Returns `Some(StructData)` in AMT format if conversion succeeds, `None` if the
-/// input doesn't have the expected Delta JSON structure.
-#[allow(dead_code)]
-pub(crate) fn struct_data_to_amt_stats(
-    struct_data: &StructData,
+/// When `known_stats_schema` is `None`, the expression assumes all Delta JSON stat fields
+/// exist in the data (numRecords, minValues, maxValues, nullCount, tightBounds). When
+/// `Some`, only fields present in the known schema generate column references; others
+/// become null literals.
+pub(crate) fn build_delta_to_amt_pivot_expression(
     table_schema: &StructType,
-) -> Option<StructData> {
-    // Check if this is Delta JSON format by looking for numRecords field
-    let has_num_records = struct_data
-        .fields()
-        .iter()
-        .any(|f| f.name() == "numRecords");
-    if !has_num_records {
-        return None;
-    }
-
-    // Extract values from the StructData
-    let num_records = extract_long_field(struct_data, "numRecords");
-    let tight_bounds = extract_bool_field(struct_data, "tightBounds").unwrap_or(true);
-    let min_values = extract_nested_struct(struct_data, "minValues");
-    let max_values = extract_nested_struct(struct_data, "maxValues");
-    let null_count = extract_nested_struct(struct_data, "nullCount");
-
-    // Build DeltaJsonStats from extracted values
-    let delta_stats = DeltaJsonStats {
-        num_records,
-        min_values: struct_to_json_map(&min_values),
-        max_values: struct_to_json_map(&max_values),
-        null_count: struct_to_null_count_map(&null_count),
-        tight_bounds,
-    };
-
-    // Generate the AMT-style stats schema and build content_stats
-    let stats_struct = stats_schema(table_schema).ok()?;
-    Some(build_struct_stats(
+    stats_column_name: &str,
+    known_stats_schema: Option<&StructType>,
+) -> DeltaResult<(Expression, StructType)> {
+    let amt_stats_schema = stats_schema(table_schema)?;
+    let amt_struct_expr = build_amt_struct_expr(
         table_schema,
-        &stats_struct,
-        &delta_stats,
-        "",
-    ))
+        &amt_stats_schema,
+        stats_column_name,
+        &[],
+        known_stats_schema,
+    );
+    let transform = Expression::transform(
+        Transform::new_top_level()
+            .with_replaced_field(stats_column_name, Arc::new(amt_struct_expr)),
+    );
+    Ok((transform, amt_stats_schema))
 }
 
-/// Extract a Long field from a StructData.
-fn extract_long_field(data: &StructData, field_name: &str) -> Option<i64> {
-    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
-    match data.values().get(idx)? {
-        Scalar::Long(v) => Some(*v),
-        Scalar::Integer(v) => Some(*v as i64),
-        _ => None,
+/// Builds a struct expression for one level of the AMT hierarchy.
+///
+/// Walks `table_schema` and `amt_schema` together. For struct fields it recurses;
+/// for primitive fields it calls [`build_amt_leaf_expr`].
+fn build_amt_struct_expr(
+    table_schema: &StructType,
+    amt_schema: &StructType,
+    stats_col: &str,
+    col_path: &[&str],
+    known_stats_schema: Option<&StructType>,
+) -> Expression {
+    let exprs: Vec<ExpressionRef> = amt_schema
+        .fields()
+        .map(|amt_field| {
+            let table_field = table_schema.field(amt_field.name());
+            let expr = if let Some(tf) = table_field {
+                match tf.data_type() {
+                    DataType::Struct(nested_table_struct) => {
+                        let nested_amt_struct = match amt_field.data_type() {
+                            DataType::Struct(s) => s.as_ref(),
+                            _ => unreachable!("AMT schema for struct field must be struct"),
+                        };
+                        let mut new_path = col_path.to_vec();
+                        new_path.push(amt_field.name().as_str());
+                        build_amt_struct_expr(
+                            nested_table_struct,
+                            nested_amt_struct,
+                            stats_col,
+                            &new_path,
+                            known_stats_schema,
+                        )
+                    }
+                    _ => {
+                        let amt_leaf_struct = match amt_field.data_type() {
+                            DataType::Struct(s) => s.as_ref(),
+                            _ => unreachable!("AMT schema for primitive field must be struct"),
+                        };
+                        let mut leaf_path = col_path.to_vec();
+                        leaf_path.push(amt_field.name().as_str());
+                        build_amt_leaf_expr(
+                            amt_leaf_struct,
+                            stats_col,
+                            &leaf_path,
+                            known_stats_schema,
+                        )
+                    }
+                }
+            } else {
+                Expression::null_literal(amt_field.data_type().clone())
+            };
+            Arc::new(expr)
+        })
+        .collect();
+
+    Expression::Struct(exprs, None, None)
+}
+
+/// Checks if a nested field path exists in a struct type.
+/// For example, `has_nested_field(schema, &["minValues", "id"])` checks if
+/// `schema.minValues.id` exists.
+fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
+    match path {
+        [] => true,
+        [first, rest @ ..] => match schema.field(*first) {
+            Some(f) => {
+                if rest.is_empty() {
+                    true
+                } else {
+                    match f.data_type() {
+                        DataType::Struct(s) => has_nested_field(s, rest),
+                        _ => false,
+                    }
+                }
+            }
+            None => false,
+        },
     }
 }
 
-/// Extract a Boolean field from a StructData.
-fn extract_bool_field(data: &StructData, field_name: &str) -> Option<bool> {
-    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
-    match data.values().get(idx)? {
-        Scalar::Boolean(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// Extract a nested StructData field.
-fn extract_nested_struct(data: &StructData, field_name: &str) -> Option<StructData> {
-    let idx = data.fields().iter().position(|f| f.name() == field_name)?;
-    match data.values().get(idx)? {
-        Scalar::Struct(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// Convert a StructData to a HashMap<String, JsonValue> for minValues/maxValues.
-fn struct_to_json_map(data: &Option<StructData>) -> HashMap<String, JsonValue> {
-    let Some(data) = data else {
-        return HashMap::new();
+/// Builds per-column stats struct expression for a leaf (primitive) column.
+///
+/// The field ordering matches the AMT stats schema from [`stats_schema`]:
+/// value_count, null_value_count, nan_value_count, avg_value_size,
+/// max_value_size, lower_bound, upper_bound, exact_bounds.
+///
+/// When `known_stats_schema` is `Some`, column references are only created for fields
+/// that exist in the known schema. When `None`, all Delta JSON fields are assumed to exist.
+fn build_amt_leaf_expr(
+    amt_leaf_schema: &StructType,
+    stats_col: &str,
+    col_path: &[&str],
+    known_stats_schema: Option<&StructType>,
+) -> Expression {
+    // Helper: check if a Delta JSON field path exists. When known_stats_schema is None,
+    // assume all fields exist (optimistic mode).
+    let field_exists = |delta_field: &str, nested_path: &[&str]| -> bool {
+        match known_stats_schema {
+            None => true,
+            Some(schema) => {
+                let mut full_path = vec![delta_field];
+                full_path.extend_from_slice(nested_path);
+                has_nested_field(schema, &full_path)
+            }
+        }
     };
 
-    let mut map = HashMap::new();
-    for (field, value) in data.fields().iter().zip(data.values().iter()) {
-        if let Some(json_val) = scalar_to_json_value(value) {
-            map.insert(field.name().to_string(), json_val);
+    let exprs: Vec<ExpressionRef> = amt_leaf_schema
+        .fields()
+        .map(|field| {
+            let expr = match field.name().as_str() {
+                "value_count" if field_exists("numRecords", &[]) => {
+                    Expression::column([stats_col, "numRecords"])
+                }
+                "null_value_count" if field_exists("nullCount", col_path) => {
+                    let mut path: Vec<&str> = vec![stats_col, "nullCount"];
+                    path.extend_from_slice(col_path);
+                    Expression::column(path)
+                }
+                "lower_bound" if field_exists("minValues", col_path) => {
+                    let mut path: Vec<&str> = vec![stats_col, "minValues"];
+                    path.extend_from_slice(col_path);
+                    Expression::column(path)
+                }
+                "upper_bound" if field_exists("maxValues", col_path) => {
+                    let mut path: Vec<&str> = vec![stats_col, "maxValues"];
+                    path.extend_from_slice(col_path);
+                    Expression::column(path)
+                }
+                "exact_bounds" if field_exists("tightBounds", &[]) => {
+                    Expression::column([stats_col, "tightBounds"])
+                }
+                // Field not in Delta JSON stats or not present in known schema → null literal
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            Arc::new(expr)
+        })
+        .collect();
+
+    Expression::Struct(exprs, None, None)
+}
+
+/// Engine-agnostic pre-conversion of a stats column from Delta JSON to AMT format.
+///
+/// Returns `Ok(Some(converted_data))` if conversion succeeded, `Ok(None)` if the data
+/// doesn't appear to have Delta JSON format stats (e.g., empty stats, already AMT format,
+/// or the stats column is missing).
+pub(crate) fn try_pre_convert_stats_column(
+    engine: &dyn Engine,
+    data: &dyn EngineData,
+    stats_column_name: &str,
+    table_schema: &StructType,
+    input_schema: &StructType,
+) -> DeltaResult<Option<Box<dyn EngineData>>> {
+    // Quick check: does the known schema suggest Delta JSON format?
+    if !is_delta_json_stats_schema(input_schema, stats_column_name) {
+        return Ok(None);
+    }
+
+    // Extract the input stats struct schema for conservative field-existence checks
+    let input_stats_struct =
+        input_schema
+            .field(stats_column_name)
+            .and_then(|f| match f.data_type() {
+                DataType::Struct(s) => Some(s.as_ref().clone()),
+                _ => None,
+            });
+
+    // Helper to build output schema and evaluator for a given expression
+    let build_evaluator = |expr: Expression,
+                           amt_stats_schema: &StructType|
+     -> DeltaResult<Arc<dyn crate::ExpressionEvaluator>> {
+        let output_fields: Vec<StructField> = input_schema
+            .fields()
+            .map(|f| {
+                if f.name() == stats_column_name {
+                    StructField::new(
+                        f.name(),
+                        DataType::Struct(Box::new(amt_stats_schema.clone())),
+                        f.nullable,
+                    )
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let output_schema = StructType::new_unchecked(output_fields);
+        engine.evaluation_handler().new_expression_evaluator(
+            Arc::new(input_schema.clone()),
+            Arc::new(expr),
+            DataType::Struct(Box::new(output_schema)),
+        )
+    };
+
+    // Step 1: Try optimistic conversion assuming all Delta JSON fields exist in the data.
+    // The actual data may have more fields than input_schema declares.
+    let (expr, amt_stats_schema) =
+        build_delta_to_amt_pivot_expression(table_schema, stats_column_name, None)?;
+    let evaluator = build_evaluator(expr, &amt_stats_schema)?;
+    if let Ok(result) = evaluator.evaluate(data) {
+        return Ok(Some(result));
+    }
+
+    // Step 2: If optimistic evaluation failed (e.g., data only has numRecords),
+    // try a conservative approach using only fields declared in input_schema.
+    if let Some(ref known_schema) = input_stats_struct {
+        let (expr, amt_stats_schema) = build_delta_to_amt_pivot_expression(
+            table_schema,
+            stats_column_name,
+            Some(known_schema),
+        )?;
+        let evaluator = build_evaluator(expr, &amt_stats_schema)?;
+        if let Ok(result) = evaluator.evaluate(data) {
+            return Ok(Some(result));
         }
     }
-    map
-}
 
-/// Convert a StructData to a HashMap<String, i64> for nullCount.
-fn struct_to_null_count_map(data: &Option<StructData>) -> HashMap<String, i64> {
-    let Some(data) = data else {
-        return HashMap::new();
-    };
-
-    let mut map = HashMap::new();
-    for (field, value) in data.fields().iter().zip(data.values().iter()) {
-        let count = match value {
-            Scalar::Long(v) => *v,
-            Scalar::Integer(v) => *v as i64,
-            _ => continue,
-        };
-        map.insert(field.name().to_string(), count);
-    }
-    map
-}
-
-/// Convert a Scalar to a JsonValue.
-fn scalar_to_json_value(scalar: &Scalar) -> Option<JsonValue> {
-    match scalar {
-        Scalar::Integer(v) => Some(JsonValue::Number((*v).into())),
-        Scalar::Long(v) => Some(JsonValue::Number((*v).into())),
-        Scalar::Short(v) => Some(JsonValue::Number((*v as i64).into())),
-        Scalar::Byte(v) => Some(JsonValue::Number((*v as i64).into())),
-        Scalar::Float(v) => serde_json::Number::from_f64(*v as f64).map(JsonValue::Number),
-        Scalar::Double(v) => serde_json::Number::from_f64(*v).map(JsonValue::Number),
-        Scalar::String(s) => Some(JsonValue::String(s.clone())),
-        Scalar::Boolean(b) => Some(JsonValue::Bool(*b)),
-        Scalar::Null(_) => None,
-        // For other types, convert to string representation
-        Scalar::Timestamp(v) => Some(JsonValue::String(v.to_string())),
-        Scalar::TimestampNtz(v) => Some(JsonValue::String(v.to_string())),
-        Scalar::Date(v) => Some(JsonValue::String(v.to_string())),
-        Scalar::Binary(_) => None, // Binary not expected in stats min/max values
-        Scalar::Decimal(d) => Some(JsonValue::String(d.bits().to_string())),
-        Scalar::Struct(_) => None, // Nested structs not expected in min/max values
-        Scalar::Array(_) => None,  // Arrays not expected in min/max values
-        Scalar::Map(_) => None,    // Maps not expected in min/max values
-    }
+    Ok(None)
 }
 
 #[cfg(test)]

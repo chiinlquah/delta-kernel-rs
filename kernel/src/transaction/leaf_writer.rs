@@ -1,18 +1,67 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::content_tree::builder::MetadataBuilder;
+use crate::content_tree::stats::try_pre_convert_stats_column;
 use crate::content_tree::{
     DataContentType, DataFileFormat, MetadataEntry, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
-use crate::schema::DataType;
+use crate::schema::{DataType, MapType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use url::Url;
+
+/// Schema for scan row data that includes stats_parsed with Delta JSON format marker.
+/// Used as the `input_schema` hint for [`crate::metadata::stats::try_pre_convert_stats_column`]
+/// when converting stats_parsed in `add_existing_actions()`.
+static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modificationTime", DataType::LONG),
+        StructField::nullable("stats", DataType::STRING),
+        StructField::nullable(
+            "deletionVector",
+            DataType::struct_type_unchecked(vec![
+                StructField::nullable("storageType", DataType::STRING),
+                StructField::nullable("pathOrInlineDv", DataType::STRING),
+                StructField::nullable("offset", DataType::INTEGER),
+                StructField::nullable("sizeInBytes", DataType::INTEGER),
+                StructField::nullable("cardinality", DataType::LONG),
+            ]),
+        ),
+        StructField::not_null(
+            "fileConstantValues",
+            DataType::struct_type_unchecked(vec![
+                StructField::not_null(
+                    "partitionValues",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("dataManifestPath", DataType::STRING),
+                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("deleteManifestPath", DataType::STRING),
+                StructField::nullable("deleteManifestPosition", DataType::LONG),
+            ]),
+        ),
+        StructField::nullable(
+            "stats_parsed",
+            DataType::struct_type_unchecked(vec![StructField::nullable(
+                "numRecords",
+                DataType::LONG,
+            )]),
+        ),
+    ]))
+});
 
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
@@ -301,8 +350,6 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
-        use crate::content_tree::stats::struct_data_to_amt_stats;
-
         // Fixed getter indices for all columns (same layout for all AddTypes)
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
@@ -392,18 +439,15 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     [DEFAULT_ROW_COMMIT_VERSION_IDX]
                     .get_opt(i, "fileConstantValues.defaultRowCommitVersion")?;
 
-                // Try to extract stats_parsed and convert to content_stats (AMT format)
-                // This is preferred over the JSON stats string when available
+                // Extract stats_parsed as content_stats (already in AMT format after
+                // batch-level pre-conversion). Preferred over JSON stats string when available.
+                // Filter out empty structs (e.g. placeholder columns with no fields).
                 let content_stats = if has_stats_parsed {
                     getters[STATS_PARSED_IDX]
                         .get_struct(i, "stats_parsed")?
                         .map(|struct_item| struct_item.materialize())
                         .transpose()?
-                        .and_then(|stats_data| {
-                            // Convert from Delta JSON format (numRecords, minValues, maxValues, nullCount)
-                            // to AMT format (per-column stats with value_count, null_value_count, etc.)
-                            struct_data_to_amt_stats(&stats_data, &self.leaf_writer.table_schema)
-                        })
+                        .filter(|s| !s.fields().is_empty())
                 } else {
                     None
                 };
@@ -541,11 +585,24 @@ impl LeafNodeWriter {
     ///   modificationTime, stats as StructData). Stats can be in either AMT format (per-column
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let mut visitor = crate::content_tree::builder::WriteMetadataWithStatsVisitor::new(
-            self.table_schema.clone(),
-        );
-        visitor.visit_rows_of(add_metadata.as_ref())?;
+    pub fn add_files(
+        &mut self,
+        engine: &dyn Engine,
+        add_metadata: Box<dyn EngineData>,
+    ) -> DeltaResult<()> {
+        let converted = crate::content_tree::stats::try_pre_convert_stats_column(
+            engine,
+            add_metadata.as_ref(),
+            "stats",
+            &self.table_schema,
+            &crate::transaction::BASE_ADD_FILES_SCHEMA,
+        )?;
+        let data: &dyn EngineData = match &converted {
+            Some(c) => c.as_ref(),
+            None => add_metadata.as_ref(),
+        };
+        let mut visitor = crate::content_tree::builder::WriteMetadataWithStatsVisitor::default();
+        visitor.visit_rows_of(data)?;
 
         // Tuple: (path, partition_values, size, modification_time, content_stats)
         for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
@@ -581,11 +638,25 @@ impl LeafNodeWriter {
     ///   2.  the data file in the root root is also moved to a leaf manifest separately with DataFileOnly.
     pub fn add_existing_actions(
         &mut self,
+        engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
         add_type: AddType,
     ) -> DeltaResult<()> {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
+
+        // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
+        let converted = try_pre_convert_stats_column(
+            engine,
+            scan_metadata.data(),
+            "stats_parsed",
+            &self.table_schema,
+            &SCAN_ROW_SCHEMA_WITH_STATS_PARSED,
+        )?;
+        let data: &dyn EngineData = match &converted {
+            Some(c) => c.as_ref(),
+            None => scan_metadata.data(),
+        };
 
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
@@ -595,7 +666,7 @@ impl LeafNodeWriter {
             request_stats_parsed: true,
         };
 
-        visitor.visit_rows_of(scan_metadata.data())?;
+        visitor.visit_rows_of(data)?;
 
         // If we're adding DVOnly, mark that we have DV-only entries
         // This forces the DV manifest to be unaffiliated since we can't guarantee
@@ -1179,7 +1250,7 @@ mod tests {
             Some("zoe"),   // value max
             5,             // value null count
         )])?;
-        writer.add_files(metadata)?;
+        writer.add_files(engine.as_ref(), metadata)?;
 
         // Finish and verify result
         let result = writer.finish(engine.as_ref())?;
@@ -1441,7 +1512,7 @@ mod tests {
             .collect();
 
         let metadata = create_test_add_metadata(files)?;
-        writer.add_files(metadata)?;
+        writer.add_files(engine.as_ref(), metadata)?;
 
         // Finish and verify result
         let result = writer.finish(engine.as_ref())?;
@@ -1773,7 +1844,7 @@ mod tests {
         let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
 
         // Add the existing actions with the filtered data
-        writer.add_existing_actions(filtered_data, AddType::DataFileOnly)?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data, AddType::DataFileOnly)?;
 
         // Finish and check the result
         let result = writer.finish(engine.as_ref())?;

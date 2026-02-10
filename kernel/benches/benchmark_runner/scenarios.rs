@@ -326,7 +326,7 @@ fn add_batches_to_txn(
 
         for batch in batches {
             let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
-            leaf.add_files(batch)?;
+            leaf.add_files(engine.as_ref(), batch)?;
 
             // Clone engine for thread
             let engine_clone = engine.clone();

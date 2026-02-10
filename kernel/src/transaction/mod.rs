@@ -1000,7 +1000,7 @@ impl Transaction {
     ///     // Write to leaf manifests
     ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
     ///     for action in actions {
-    ///         leaf.add_existing_actions(action, AddType::DataFileAndDV)?;
+    ///         leaf.add_existing_actions(engine, action, AddType::DataFileAndDV)?;
     ///     }
     ///     let leaf_result = leaf.finish(engine)?;
     ///     txn.add_leaf(leaf_result)?;
@@ -3610,12 +3610,12 @@ mod tests {
             "leaf1-file-1.parquet",
             "leaf1-file-2.parquet",
         ])?;
-        leaf1.add_files(leaf1_metadata)?;
+        leaf1.add_files(&engine, leaf1_metadata)?;
 
         // Add files to leaf2
         let leaf2_metadata =
             create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
-        leaf2.add_files(leaf2_metadata)?;
+        leaf2.add_files(&engine, leaf2_metadata)?;
 
         // Step 5: Finish leaf writers and add to transaction
         txn.add_leaf(leaf1.finish(&engine)?)?;

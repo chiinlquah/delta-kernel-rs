@@ -1005,6 +1005,8 @@ fn reorder_map(
     Ok(Some((new_field, map)))
 }
 
+/// Pre-converts a stats column from Delta JSON format to AMT format at the batch level.
+///
 /// Use this function to recursively compute properly unioned null masks for all nested
 /// columns of a record batch, making it safe to project out and consume nested columns.
 ///
