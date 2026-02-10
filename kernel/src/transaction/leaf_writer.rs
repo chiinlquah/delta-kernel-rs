@@ -14,6 +14,35 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
+/// Pre-converts a stats column from Delta JSON format to AMT format at the batch level.
+/// Returns `Ok(None)` when arrow-conversion is not available (no-op fallback).
+#[cfg(any(
+    feature = "default-engine-native-tls",
+    feature = "default-engine-rustls",
+    feature = "arrow-conversion"
+))]
+fn try_pre_convert_stats(
+    data: &dyn EngineData,
+    stats_column_name: &str,
+    table_schema: &crate::schema::StructType,
+) -> DeltaResult<Option<Box<dyn EngineData>>> {
+    crate::engine::arrow_utils::try_pre_convert_stats_column(data, stats_column_name, table_schema)
+}
+
+/// No-op fallback when arrow-conversion features are not available.
+#[cfg(not(any(
+    feature = "default-engine-native-tls",
+    feature = "default-engine-rustls",
+    feature = "arrow-conversion"
+)))]
+fn try_pre_convert_stats(
+    _data: &dyn EngineData,
+    _stats_column_name: &str,
+    _table_schema: &crate::schema::StructType,
+) -> DeltaResult<Option<Box<dyn EngineData>>> {
+    Ok(None)
+}
+
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
 pub(crate) type DVUniqueId = String;
@@ -537,7 +566,7 @@ impl LeafNodeWriter {
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let converted = crate::engine::arrow_utils::try_pre_convert_stats_column(
+        let converted = try_pre_convert_stats(
             add_metadata.as_ref(),
             "stats",
             &self.table_schema,
@@ -590,7 +619,7 @@ impl LeafNodeWriter {
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
         // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
-        let converted = crate::engine::arrow_utils::try_pre_convert_stats_column(
+        let converted = try_pre_convert_stats(
             scan_metadata.data(),
             "stats_parsed",
             &self.table_schema,
