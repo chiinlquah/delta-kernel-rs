@@ -1113,6 +1113,7 @@ pub(crate) fn pivot_delta_stats_to_amt(
 
 /// Recursively builds AMT-format struct columns by walking the table schema and AMT schema
 /// together. For each field, it either recurses into nested structs or assembles leaf stats.
+#[allow(clippy::too_many_arguments)]
 fn build_amt_struct_columns(
     table_schema: &StructType,
     amt_stats_schema: &StructType,
@@ -3793,22 +3794,16 @@ mod tests {
                 .values(),
             &[50, 100]
         );
-        assert_eq!(
-            id_exact
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(0),
-            true
-        );
-        assert_eq!(
-            id_exact
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(1),
-            false
-        );
+        assert!(id_exact
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0));
+        assert!(!id_exact
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(1));
 
         // Check "name" column stats
         let name_stats = result.column_by_name("name").unwrap();
