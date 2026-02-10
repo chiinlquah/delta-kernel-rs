@@ -8,8 +8,9 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
+use serde_json::json;
 use test_utils::{
-    actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
+    actions_to_string, add_commit, add_crc, add_staged_commit, delta_path_for_version, TestAction,
 };
 
 /// Helper function to create a LogPath for a commit at the given version
@@ -321,6 +322,197 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .unwrap_err()
         .to_string()
         .contains("LogSegment end version 3 not the same as the specified end version 4"));
+
+    Ok(())
+}
+
+// ========================
+// CRC + log_tail tests
+// ========================
+
+/// Helper: standard metadata JSON used in CRC files. Must match the METADATA constant's
+/// metaData action (same id, schemaString, etc.).
+fn crc_metadata_json() -> serde_json::Value {
+    json!({
+        "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        "format": {
+            "provider": "parquet",
+            "options": {}
+        },
+        "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+        "partitionColumns": [],
+        "configuration": {},
+        "createdTime": 1587968585495i64
+    })
+}
+
+fn crc_protocol_json() -> serde_json::Value {
+    json!({
+        "minReaderVersion": 1,
+        "minWriterVersion": 2
+    })
+}
+
+#[tokio::test]
+async fn snapshot_with_log_tail_picks_up_crc_before_tail() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Scenario: filesystem has commits 0, 1 and a CRC at version 1.
+    // log_tail provides commits 2, 3 (latest).
+    // The CRC at version 1 is *before* the log_tail start, so it should always be picked up.
+    let (storage, engine, table_root) = setup_test();
+
+    let actions = vec![TestAction::Metadata];
+    add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
+
+    // CRC at version 1 (before the log_tail range)
+    add_crc(
+        storage.as_ref(),
+        1,
+        &crc_metadata_json(),
+        &crc_protocol_json(),
+        1,
+        100,
+    )
+    .await?;
+
+    // Commits 2 and 3 only in log_tail
+    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    add_commit(storage.as_ref(), 2, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    add_commit(storage.as_ref(), 3, actions_to_string(actions)).await?;
+
+    let log_tail = vec![
+        create_log_path(&table_root, delta_path_for_version(2, "json")),
+        create_log_path(&table_root, delta_path_for_version(3, "json")),
+    ];
+
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(log_tail)
+        .build(engine.as_ref())?;
+
+    assert_eq!(snapshot.version(), 3);
+
+    // CRC at version 1 should be captured in the log segment
+    let crc_file = snapshot
+        .log_segment()
+        .latest_crc_file
+        .as_ref()
+        .expect("CRC file should be present");
+    assert_eq!(crc_file.version, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_snapshot_with_log_tail_picks_up_new_crc(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Scenario: base snapshot at version 1 with CRC at 0.
+    // Filesystem gains commits 2, 3, 4 with a CRC at version 2 (before the log_tail start).
+    // log_tail provides commits 3, 4 (latest).
+    // The incremental snapshot should pick up the newer CRC at version 2.
+    let (storage, engine, table_root) = setup_test();
+
+    let actions = vec![TestAction::Metadata];
+    add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
+
+    // CRC at version 0
+    add_crc(
+        storage.as_ref(),
+        0,
+        &crc_metadata_json(),
+        &crc_protocol_json(),
+        0,
+        0,
+    )
+    .await?;
+
+    // Base snapshot at version 1
+    let base_snapshot = Snapshot::builder_for(table_root.clone())
+        .at_version(1)
+        .build(engine.as_ref())?;
+    assert_eq!(base_snapshot.version(), 1);
+    // Base snapshot should have CRC at version 0
+    assert_eq!(
+        base_snapshot
+            .log_segment()
+            .latest_crc_file
+            .as_ref()
+            .unwrap()
+            .version,
+        0
+    );
+
+    // Now add commits 2, 3, 4 and a CRC at version 2
+    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    add_commit(storage.as_ref(), 2, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    add_commit(storage.as_ref(), 3, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_4.parquet".to_string())];
+    add_commit(storage.as_ref(), 4, actions_to_string(actions)).await?;
+
+    // CRC at version 2 (before the log_tail start)
+    add_crc(
+        storage.as_ref(),
+        2,
+        &crc_metadata_json(),
+        &crc_protocol_json(),
+        2,
+        200,
+    )
+    .await?;
+
+    // Build incremental snapshot with log_tail for commits 3, 4
+    let log_tail = vec![
+        create_log_path(&table_root, delta_path_for_version(3, "json")),
+        create_log_path(&table_root, delta_path_for_version(4, "json")),
+    ];
+
+    let new_snapshot = Snapshot::builder_from(base_snapshot)
+        .with_log_tail(log_tail)
+        .build(engine.as_ref())?;
+
+    assert_eq!(new_snapshot.version(), 4);
+
+    // The new CRC at version 2 should be preferred over the old one at version 0
+    let crc_file = new_snapshot
+        .log_segment()
+        .latest_crc_file
+        .as_ref()
+        .expect("CRC file should be present");
+    assert_eq!(crc_file.version, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_with_log_tail_no_crc() -> Result<(), Box<dyn std::error::Error>> {
+    // Scenario: no CRC files exist at all. log_tail provides latest commits.
+    // Verify that snapshot building still works and latest_crc_file is None.
+    let (storage, engine, table_root) = setup_test();
+
+    let actions = vec![TestAction::Metadata];
+    add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
+
+    let log_tail = vec![create_log_path(
+        &table_root,
+        delta_path_for_version(1, "json"),
+    )];
+
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(log_tail)
+        .build(engine.as_ref())?;
+
+    assert_eq!(snapshot.version(), 1);
+    assert!(
+        snapshot.log_segment().latest_crc_file.is_none(),
+        "No CRC file should be present when none exist on filesystem"
+    );
 
     Ok(())
 }

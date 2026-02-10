@@ -228,6 +228,41 @@ pub async fn add_staged_commit(
     Ok(path)
 }
 
+/// Put a CRC (version checksum) file into the specified object store.
+///
+/// Creates a minimal valid CRC JSON file at `_delta_log/{version}.crc`. The CRC content includes
+/// the required `table_size_bytes`, `num_files`, `num_metadata`, `num_protocol`, `metadata`, and
+/// `protocol` fields. The `metadata` and `protocol` JSON values must be provided by the caller
+/// (matching the table's actual metadata/protocol at that version).
+///
+/// # Example
+///
+/// ```ignore
+/// let metadata = json!({ "id": "...", "format": { ... }, ... });
+/// let protocol = json!({ "minReaderVersion": 1, "minWriterVersion": 2 });
+/// add_crc(store.as_ref(), 1, &metadata, &protocol, 1, 100).await?;
+/// ```
+pub async fn add_crc(
+    store: &dyn ObjectStore,
+    version: u64,
+    metadata_json: &serde_json::Value,
+    protocol_json: &serde_json::Value,
+    num_files: i64,
+    table_size_bytes: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let crc = json!({
+        "tableSizeBytes": table_size_bytes,
+        "numFiles": num_files,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "metadata": metadata_json,
+        "protocol": protocol_json,
+    });
+    let path = delta_path_for_version(version, "crc");
+    store.put(&path, crc.to_string().into()).await?;
+    Ok(())
+}
+
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
 /// the default module
 pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
