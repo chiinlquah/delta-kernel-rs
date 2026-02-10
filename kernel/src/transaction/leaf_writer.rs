@@ -566,11 +566,7 @@ impl LeafNodeWriter {
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let converted = try_pre_convert_stats(
-            add_metadata.as_ref(),
-            "stats",
-            &self.table_schema,
-        )?;
+        let converted = try_pre_convert_stats(add_metadata.as_ref(), "stats", &self.table_schema)?;
         let data: &dyn EngineData = match &converted {
             Some(c) => c.as_ref(),
             None => add_metadata.as_ref(),
@@ -619,11 +615,8 @@ impl LeafNodeWriter {
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
         // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
-        let converted = try_pre_convert_stats(
-            scan_metadata.data(),
-            "stats_parsed",
-            &self.table_schema,
-        )?;
+        let converted =
+            try_pre_convert_stats(scan_metadata.data(), "stats_parsed", &self.table_schema)?;
         let data: &dyn EngineData = match &converted {
             Some(c) => c.as_ref(),
             None => scan_metadata.data(),
