@@ -301,8 +301,6 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
-        use crate::metadata::stats::struct_data_to_amt_stats;
-
         // Fixed getter indices for all columns (same layout for all AddTypes)
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
@@ -392,18 +390,15 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     [DEFAULT_ROW_COMMIT_VERSION_IDX]
                     .get_opt(i, "fileConstantValues.defaultRowCommitVersion")?;
 
-                // Try to extract stats_parsed and convert to content_stats (AMT format)
-                // This is preferred over the JSON stats string when available
+                // Extract stats_parsed as content_stats (already in AMT format after
+                // batch-level pre-conversion). Preferred over JSON stats string when available.
+                // Filter out empty structs (e.g. placeholder columns with no fields).
                 let content_stats = if has_stats_parsed {
                     getters[STATS_PARSED_IDX]
                         .get_struct(i, "stats_parsed")?
                         .map(|struct_item| struct_item.materialize())
                         .transpose()?
-                        .and_then(|stats_data| {
-                            // Convert from Delta JSON format (numRecords, minValues, maxValues, nullCount)
-                            // to AMT format (per-column stats with value_count, null_value_count, etc.)
-                            struct_data_to_amt_stats(&stats_data, &self.leaf_writer.table_schema)
-                        })
+                        .filter(|s| !s.fields().is_empty())
                 } else {
                     None
                 };
@@ -542,9 +537,17 @@ impl LeafNodeWriter {
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let mut visitor =
-            crate::metadata::builder::WriteMetadataWithStatsVisitor::new(self.table_schema.clone());
-        visitor.visit_rows_of(add_metadata.as_ref())?;
+        let converted = crate::engine::arrow_utils::try_pre_convert_stats_column(
+            add_metadata.as_ref(),
+            "stats",
+            &self.table_schema,
+        )?;
+        let data: &dyn EngineData = match &converted {
+            Some(c) => c.as_ref(),
+            None => add_metadata.as_ref(),
+        };
+        let mut visitor = crate::metadata::builder::WriteMetadataWithStatsVisitor::default();
+        visitor.visit_rows_of(data)?;
 
         // Tuple: (path, partition_values, size, modification_time, content_stats)
         for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
@@ -586,6 +589,17 @@ impl LeafNodeWriter {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
+        // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
+        let converted = crate::engine::arrow_utils::try_pre_convert_stats_column(
+            scan_metadata.data(),
+            "stats_parsed",
+            &self.table_schema,
+        )?;
+        let data: &dyn EngineData = match &converted {
+            Some(c) => c.as_ref(),
+            None => scan_metadata.data(),
+        };
+
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
@@ -594,7 +608,7 @@ impl LeafNodeWriter {
             request_stats_parsed: true,
         };
 
-        visitor.visit_rows_of(scan_metadata.data())?;
+        visitor.visit_rows_of(data)?;
 
         // If we're adding DVOnly, mark that we have DV-only entries
         // This forces the DV manifest to be unaffiliated since we can't guarantee
