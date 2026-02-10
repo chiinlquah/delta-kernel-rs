@@ -44,6 +44,17 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
+# Helper function to extract JSON from a file (handles files with debug output before JSON)
+extract_json() {
+    local file=$1
+    if [ ! -f "$file" ]; then
+        echo "{}"
+        return
+    fi
+    # Extract everything from the first '{' to the end
+    sed -n '/{/,$ p' "$file" 2>/dev/null || echo "{}"
+}
+
 ANALYSIS_FILE="${RUN_DIR}/analysis.txt"
 
 echo "Generating analysis..." > "${ANALYSIS_FILE}"
@@ -76,10 +87,11 @@ analyze_scan_metrics() {
                 result_file="${dataset_dir}/${pattern}.json"
 
                 if [ -f "${result_file}" ]; then
-                    duration=$(jq -r '.total_duration_ms // "N/A"' "${result_file}" 2>/dev/null)
-                    num_tasks=$(jq -r '.scan_metrics.num_tasks // "N/A"' "${result_file}" 2>/dev/null)
-                    num_files=$(jq -r '.scan_metrics.num_files // "N/A"' "${result_file}" 2>/dev/null)
-                    num_dv=$(jq -r '.scan_metrics.num_dv_descriptors // "N/A"' "${result_file}" 2>/dev/null)
+                    json_content=$(extract_json "${result_file}")
+                    duration=$(echo "$json_content" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null)
+                    num_tasks=$(echo "$json_content" | jq -r '.scan_metrics.num_tasks // "N/A"' 2>/dev/null)
+                    num_files=$(echo "$json_content" | jq -r '.scan_metrics.num_files // "N/A"' 2>/dev/null)
+                    num_dv=$(echo "$json_content" | jq -r '.scan_metrics.num_dv_descriptors // "N/A"' 2>/dev/null)
 
                     printf "%-35s %12s %12s %12s %12s\n" \
                         "${dataset}" "${duration}" "${num_tasks}" "${num_files}" "${num_dv}" >> "${ANALYSIS_FILE}"
@@ -111,10 +123,11 @@ analyze_write_metrics() {
                 result_file="${dataset_dir}/${pattern}.json"
 
                 if [ -f "${result_file}" ]; then
-                    duration=$(jq -r '.total_duration_ms // "N/A"' "${result_file}" 2>/dev/null)
-                    txn_duration=$(jq -r '.write_metrics.transaction_duration_ms // "N/A"' "${result_file}" 2>/dev/null)
-                    num_files=$(jq -r '.write_metrics.num_files_written // "N/A"' "${result_file}" 2>/dev/null)
-                    success=$(jq -r '.write_metrics.commit_succeeded // "N/A"' "${result_file}" 2>/dev/null)
+                    json_content=$(extract_json "${result_file}")
+                    duration=$(echo "$json_content" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null)
+                    txn_duration=$(echo "$json_content" | jq -r '.write_metrics.transaction_duration_ms // "N/A"' 2>/dev/null)
+                    num_files=$(echo "$json_content" | jq -r '.write_metrics.num_files_written // "N/A"' 2>/dev/null)
+                    success=$(echo "$json_content" | jq -r '.write_metrics.commit_succeeded // "N/A"' 2>/dev/null)
 
                     printf "%-35s %12s %12s %12s %15s\n" \
                         "${dataset}" "${duration}" "${txn_duration}" "${num_files}" "${success}" >> "${ANALYSIS_FILE}"
@@ -158,11 +171,14 @@ for dv_pct in 0 50 100; do
     cr_file="${RUN_DIR}/dv_${dv_pct}_pct_with_content_root/01_pre_scan_full_table.json"
 
     if [ -f "${base_file}" ] && [ -f "${cr_file}" ]; then
-        base_duration=$(jq -r '.total_duration_ms' "${base_file}" 2>/dev/null)
-        cr_duration=$(jq -r '.total_duration_ms' "${cr_file}" 2>/dev/null)
+        base_json=$(extract_json "${base_file}")
+        cr_json=$(extract_json "${cr_file}")
 
-        base_files=$(jq -r '.scan_metrics.num_files' "${base_file}" 2>/dev/null)
-        cr_files=$(jq -r '.scan_metrics.num_files' "${cr_file}" 2>/dev/null)
+        base_duration=$(echo "$base_json" | jq -r '.total_duration_ms' 2>/dev/null)
+        cr_duration=$(echo "$cr_json" | jq -r '.total_duration_ms' 2>/dev/null)
+
+        base_files=$(echo "$base_json" | jq -r '.scan_metrics.num_files' 2>/dev/null)
+        cr_files=$(echo "$cr_json" | jq -r '.scan_metrics.num_files' 2>/dev/null)
 
         echo "  Without content root: ${base_duration} ms (${base_files} files)" >> "${ANALYSIS_FILE}"
         echo "  With content root:    ${cr_duration} ms (${cr_files} files)" >> "${ANALYSIS_FILE}"
@@ -189,8 +205,11 @@ for dataset in "dv_0_pct" "dv_50_pct" "dv_100_pct" "dv_0_pct_with_content_root" 
     bulk_file="${RUN_DIR}/${dataset}/06_dml_bulk_write_bulk.json"
 
     if [ -f "${non_bulk_file}" ] && [ -f "${bulk_file}" ]; then
-        non_bulk_duration=$(jq -r '.write_metrics.transaction_duration_ms' "${non_bulk_file}" 2>/dev/null)
-        bulk_duration=$(jq -r '.write_metrics.transaction_duration_ms' "${bulk_file}" 2>/dev/null)
+        non_bulk_json=$(extract_json "${non_bulk_file}")
+        bulk_json=$(extract_json "${bulk_file}")
+
+        non_bulk_duration=$(echo "$non_bulk_json" | jq -r '.write_metrics.transaction_duration_ms' 2>/dev/null)
+        bulk_duration=$(echo "$bulk_json" | jq -r '.write_metrics.transaction_duration_ms' 2>/dev/null)
 
         echo "  Non-bulk mode: ${non_bulk_duration} ms" >> "${ANALYSIS_FILE}"
         echo "  Bulk mode:     ${bulk_duration} ms" >> "${ANALYSIS_FILE}"
@@ -223,7 +242,8 @@ for dataset_dir in "${RUN_DIR}"/dv_*; do
         result_file="${dataset_dir}/01_pre_scan_full_table.json"
 
         if [ -f "${result_file}" ]; then
-            duration=$(jq -r '.total_duration_ms' "${result_file}" 2>/dev/null)
+            json_content=$(extract_json "${result_file}")
+            duration=$(echo "$json_content" | jq -r '.total_duration_ms' 2>/dev/null)
 
             if [ "${duration}" != "N/A" ] && [ "${duration}" != "null" ]; then
                 if [ "${duration}" -lt "${fastest_time}" ]; then
@@ -444,31 +464,37 @@ generate_dv_comparison_table_from_files() {
         local baseline_file="${baseline_dir}/${scenario}.json"
         local content_root_file="${content_root_dir}/${scenario}.json"
 
-        # Check if baseline file exists and is valid JSON
-        if [ ! -f "$baseline_file" ] || ! jq empty "$baseline_file" 2>/dev/null; then
+        # Check if baseline file exists
+        if [ ! -f "$baseline_file" ]; then
+            continue
+        fi
+
+        # Extract JSON and check if valid
+        local baseline_json=$(extract_json "$baseline_file")
+        if ! echo "$baseline_json" | jq empty 2>/dev/null; then
             continue
         fi
 
         # Detect if this is a write operation (has write_metrics instead of scan_metrics)
         local is_write_op=false
-        if jq -e '.write_metrics' "${baseline_file}" >/dev/null 2>&1; then
+        if echo "$baseline_json" | jq -e '.write_metrics' >/dev/null 2>&1; then
             is_write_op=true
         fi
 
         # Extract baseline metrics
-        local base_total=$(jq -r '.total_duration_ms // "N/A"' "${baseline_file}" 2>/dev/null)
+        local base_total=$(echo "$baseline_json" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null)
         local base_ttfa base_files base_dvs
 
         if [ "$is_write_op" = true ]; then
             # For write operations, use write_metrics
-            base_ttfa=$(jq -r '.write_metrics.transaction_duration_ms // "N/A"' "${baseline_file}" 2>/dev/null)
-            base_files=$(jq -r '.write_metrics.num_files_written // "N/A"' "${baseline_file}" 2>/dev/null)
+            base_ttfa=$(echo "$baseline_json" | jq -r '.write_metrics.transaction_duration_ms // "N/A"' 2>/dev/null)
+            base_files=$(echo "$baseline_json" | jq -r '.write_metrics.num_files_written // "N/A"' 2>/dev/null)
             base_dvs="N/A"  # Write operations don't have DV descriptors
         else
             # For scan operations, use scan_metrics
-            base_ttfa=$(jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' "${baseline_file}" 2>/dev/null)
-            base_files=$(jq -r '.scan_metrics.num_files // "N/A"' "${baseline_file}" 2>/dev/null)
-            base_dvs=$(jq -r '.scan_metrics.num_dv_descriptors // "N/A"' "${baseline_file}" 2>/dev/null)
+            base_ttfa=$(echo "$baseline_json" | jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' 2>/dev/null)
+            base_files=$(echo "$baseline_json" | jq -r '.scan_metrics.num_files // "N/A"' 2>/dev/null)
+            base_dvs=$(echo "$baseline_json" | jq -r '.scan_metrics.num_dv_descriptors // "N/A"' 2>/dev/null)
         fi
 
         # Extract content_root metrics
@@ -477,19 +503,22 @@ generate_dv_comparison_table_from_files() {
         local cr_files="N/A"
         local cr_dvs="N/A"
 
-        if [ -f "$content_root_file" ] && jq empty "$content_root_file" 2>/dev/null; then
-            cr_total=$(jq -r '.total_duration_ms // "N/A"' "${content_root_file}" 2>/dev/null)
+        if [ -f "$content_root_file" ]; then
+            local cr_json=$(extract_json "$content_root_file")
+            if echo "$cr_json" | jq empty 2>/dev/null; then
+                cr_total=$(echo "$cr_json" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null)
 
-            if [ "$is_write_op" = true ]; then
-                # For write operations, use write_metrics
-                cr_ttfa=$(jq -r '.write_metrics.transaction_duration_ms // "N/A"' "${content_root_file}" 2>/dev/null)
-                cr_files=$(jq -r '.write_metrics.num_files_written // "N/A"' "${content_root_file}" 2>/dev/null)
-                cr_dvs="N/A"
-            else
-                # For scan operations, use scan_metrics
-                cr_ttfa=$(jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' "${content_root_file}" 2>/dev/null)
-                cr_files=$(jq -r '.scan_metrics.num_files // "N/A"' "${content_root_file}" 2>/dev/null)
-                cr_dvs=$(jq -r '.scan_metrics.num_dv_descriptors // "N/A"' "${content_root_file}" 2>/dev/null)
+                if [ "$is_write_op" = true ]; then
+                    # For write operations, use write_metrics
+                    cr_ttfa=$(echo "$cr_json" | jq -r '.write_metrics.transaction_duration_ms // "N/A"' 2>/dev/null)
+                    cr_files=$(echo "$cr_json" | jq -r '.write_metrics.num_files_written // "N/A"' 2>/dev/null)
+                    cr_dvs="N/A"
+                else
+                    # For scan operations, use scan_metrics
+                    cr_ttfa=$(echo "$cr_json" | jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' 2>/dev/null)
+                    cr_files=$(echo "$cr_json" | jq -r '.scan_metrics.num_files // "N/A"' 2>/dev/null)
+                    cr_dvs=$(echo "$cr_json" | jq -r '.scan_metrics.num_dv_descriptors // "N/A"' 2>/dev/null)
+                fi
             fi
         fi
 
@@ -531,19 +560,22 @@ generate_dv_comparison_table_from_files() {
         if [ -n "$bulk_scenario" ]; then
             local bulk_file="${content_root_dir}/${bulk_scenario}.json"
 
-            if [ -f "$bulk_file" ] && jq empty "$bulk_file" 2>/dev/null; then
-                bulk_total=$(jq -r '.total_duration_ms // "N/A"' "${bulk_file}" 2>/dev/null)
+            if [ -f "$bulk_file" ]; then
+                local bulk_json=$(extract_json "$bulk_file")
+                if echo "$bulk_json" | jq empty 2>/dev/null; then
+                    bulk_total=$(echo "$bulk_json" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null)
 
-                if [ "$is_write_op" = true ]; then
-                    # For write operations, use write_metrics
-                    bulk_ttfa=$(jq -r '.write_metrics.transaction_duration_ms // "N/A"' "${bulk_file}" 2>/dev/null)
-                    bulk_files=$(jq -r '.write_metrics.num_files_written // "N/A"' "${bulk_file}" 2>/dev/null)
-                    bulk_dvs="N/A"
-                else
-                    # For scan operations, use scan_metrics
-                    bulk_ttfa=$(jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' "${bulk_file}" 2>/dev/null)
-                    bulk_files=$(jq -r '.scan_metrics.num_files // "N/A"' "${bulk_file}" 2>/dev/null)
-                    bulk_dvs=$(jq -r '.scan_metrics.num_dv_descriptors // "N/A"' "${bulk_file}" 2>/dev/null)
+                    if [ "$is_write_op" = true ]; then
+                        # For write operations, use write_metrics
+                        bulk_ttfa=$(echo "$bulk_json" | jq -r '.write_metrics.transaction_duration_ms // "N/A"' 2>/dev/null)
+                        bulk_files=$(echo "$bulk_json" | jq -r '.write_metrics.num_files_written // "N/A"' 2>/dev/null)
+                        bulk_dvs="N/A"
+                    else
+                        # For scan operations, use scan_metrics
+                        bulk_ttfa=$(echo "$bulk_json" | jq -r '.scan_metrics.time_to_first_task_ms // "N/A"' 2>/dev/null)
+                        bulk_files=$(echo "$bulk_json" | jq -r '.scan_metrics.num_files // "N/A"' 2>/dev/null)
+                        bulk_dvs=$(echo "$bulk_json" | jq -r '.scan_metrics.num_dv_descriptors // "N/A"' 2>/dev/null)
+                    fi
                 fi
             fi
         fi
