@@ -658,7 +658,7 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
                 ("part-002.parquet", 3072, 1000001, 75),
             ],
         )?;
-        leaf.add_files(metadata)?;
+        leaf.add_files(&engine, metadata)?;
 
         // Step 3: Finish leaf and add to transaction
         let result = leaf.finish(&engine)?;
@@ -721,7 +721,7 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
                 ),
             ];
             let metadata = create_add_files_metadata(add_files_schema, files)?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -773,7 +773,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ("fileB.parquet", 2048, 1000001, 20),
                 ],
             )?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -799,7 +799,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ("fileD.parquet", 4096, 1000003, 40),
                 ],
             )?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -825,7 +825,7 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
                     ("fileF.parquet", 6144, 1000005, 60),
                 ],
             )?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -885,7 +885,7 @@ async fn test_leaf_with_affiliated_dvs() -> Result<(), Box<dyn std::error::Error
                     ("fileB.parquet", 3072, 1000001, 75),
                 ],
             )?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             let result = leaf.finish(&engine)?;
             txn.add_leaf(result)?;
@@ -1098,7 +1098,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                 add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
-            leaf1.add_files(metadata1)?;
+            leaf1.add_files(&engine, metadata1)?;
             let result1 = leaf1.finish(&engine)?;
             txn.add_leaf(result1)?;
 
@@ -1108,7 +1108,7 @@ async fn test_leaf_with_unaffiliated_dvs() -> Result<(), Box<dyn std::error::Err
                 add_files_schema,
                 vec![("fileB.parquet", 3072, 1000001, 75)],
             )?;
-            leaf2.add_files(metadata2)?;
+            leaf2.add_files(&engine, metadata2)?;
             let result2 = leaf2.finish(&engine)?;
             txn.add_leaf(result2)?;
 
@@ -1395,7 +1395,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
             // Create leaf and move files from root
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
-            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
+            leaf.add_existing_actions(&engine, scan_metadata.scan_files, AddType::DataFileOnly)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -1557,7 +1557,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                     ("fileB.parquet", 3072, 1000001, 75),
                 ],
             )?;
-            leaf.add_files(metadata)?;
+            leaf.add_files(&engine, metadata)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -1623,7 +1623,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             // Create new leaf (leaf B) and move files from leaf A
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
-            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
+            leaf.add_existing_actions(&engine, scan_metadata.scan_files, AddType::DataFileOnly)?;
 
             // Finish leaf and add to transaction
             let result = leaf.finish(&engine)?;
@@ -1699,7 +1699,11 @@ async fn test_dv_update_marks_root_dv_deleted() -> Result<(), Box<dyn std::error
             // Rescan to get file from root
             for scan_metadata_result in scan.scan_metadata(&engine)? {
                 let scan_metadata = scan_metadata_result?;
-                leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileOnly)?;
+                leaf.add_existing_actions(
+                    &engine,
+                    scan_metadata.scan_files,
+                    AddType::DataFileOnly,
+                )?;
             }
 
             let result = leaf.finish(&engine)?;
@@ -1831,7 +1835,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 txn.add_files_schema(),
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
-            leaf1.add_files(metadata)?;
+            leaf1.add_files(&engine, metadata)?;
 
             let result = leaf1.finish(&engine)?;
             txn.add_leaf(result)?;
@@ -1854,7 +1858,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
                 txn.add_files_schema(),
                 vec![("fileB.parquet", 3072, 1000001, 75)],
             )?;
-            leaf2.add_files(metadata)?;
+            leaf2.add_files(&engine, metadata)?;
 
             let result = leaf2.finish(&engine)?;
             txn.add_leaf(result)?;
@@ -1967,7 +1971,7 @@ async fn test_add_type_data_file_and_dv() -> Result<(), Box<dyn std::error::Erro
             let mut leaf = txn.new_leaf_node_writer(&engine)?;
 
             // Use DataFileAndDV - should extract both files and DVs
-            leaf.add_existing_actions(scan_metadata.scan_files, AddType::DataFileAndDV)?;
+            leaf.add_existing_actions(&engine, scan_metadata.scan_files, AddType::DataFileAndDV)?;
 
             let result = leaf.finish(&engine)?;
             txn.add_leaf(result)?;
@@ -2023,7 +2027,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
                 add_files_schema,
                 vec![("fileA.parquet", 2048, 1000000, 50)],
             )?;
-            leaf1.add_files(metadata)?;
+            leaf1.add_files(&engine, metadata)?;
             let result = leaf1.finish(&engine)?;
             txn.add_leaf(result)?;
 
@@ -2123,7 +2127,7 @@ async fn test_dv_only_forces_unaffiliated_manifest() -> Result<(), Box<dyn std::
             // Use DVOnly mode - this should force unaffiliated DV manifest
             // The unit test in leaf_writer.rs verifies the internal behavior
             for scan_metadata in scan_metadatas {
-                leaf.add_existing_actions(scan_metadata.scan_files, AddType::DVOnly)?;
+                leaf.add_existing_actions(&engine, scan_metadata.scan_files, AddType::DVOnly)?;
             }
 
             let result = leaf.finish(&engine)?;

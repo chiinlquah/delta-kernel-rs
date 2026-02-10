@@ -992,7 +992,11 @@ fn partition_actions_into_leaves(
         }
 
         let leaf_writer = current_leaf_writer.as_mut().unwrap();
-        leaf_writer.add_existing_actions(scan_metadata.scan_files, AddType::DataFileAndDV)?;
+        leaf_writer.add_existing_actions(
+            engine,
+            scan_metadata.scan_files,
+            AddType::DataFileAndDV,
+        )?;
         actions_in_current_leaf += selected_count;
 
         // If we've reached or exceeded batch_size, finish this leaf

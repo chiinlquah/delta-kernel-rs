@@ -5735,7 +5735,7 @@ mod tests {
 
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(batch));
-            leaf.add_files(metadata_engine_data)?;
+            leaf.add_files(engine.as_ref(), metadata_engine_data)?;
 
             let result = leaf.finish(engine.as_ref())?;
             txn.add_leaf(result)?;

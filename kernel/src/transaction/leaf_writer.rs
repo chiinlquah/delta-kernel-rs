@@ -5,43 +5,62 @@ use crate::metadata::builder::MetadataBuilder;
 use crate::metadata::{
     DataContentType, DataFileFormat, MetadataEntry, TrackingInfo, TrackingStatus,
 };
-use crate::schema::DataType;
+use crate::schema::{DataType, MapType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
-/// Pre-converts a stats column from Delta JSON format to AMT format at the batch level.
-/// Returns `Ok(None)` when arrow-conversion is not available (no-op fallback).
-#[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
-))]
-fn try_pre_convert_stats(
-    data: &dyn EngineData,
-    stats_column_name: &str,
-    table_schema: &crate::schema::StructType,
-) -> DeltaResult<Option<Box<dyn EngineData>>> {
-    crate::engine::arrow_utils::try_pre_convert_stats_column(data, stats_column_name, table_schema)
-}
-
-/// No-op fallback when arrow-conversion features are not available.
-#[cfg(not(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
-)))]
-fn try_pre_convert_stats(
-    _data: &dyn EngineData,
-    _stats_column_name: &str,
-    _table_schema: &crate::schema::StructType,
-) -> DeltaResult<Option<Box<dyn EngineData>>> {
-    Ok(None)
-}
+/// Schema for scan row data that includes stats_parsed with Delta JSON format marker.
+/// Used as the `input_schema` hint for [`crate::metadata::stats::try_pre_convert_stats_column`]
+/// when converting stats_parsed in `add_existing_actions()`.
+static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modificationTime", DataType::LONG),
+        StructField::nullable("stats", DataType::STRING),
+        StructField::nullable(
+            "deletionVector",
+            DataType::struct_type_unchecked(vec![
+                StructField::nullable("storageType", DataType::STRING),
+                StructField::nullable("pathOrInlineDv", DataType::STRING),
+                StructField::nullable("offset", DataType::INTEGER),
+                StructField::nullable("sizeInBytes", DataType::INTEGER),
+                StructField::nullable("cardinality", DataType::LONG),
+            ]),
+        ),
+        StructField::not_null(
+            "fileConstantValues",
+            DataType::struct_type_unchecked(vec![
+                StructField::not_null(
+                    "partitionValues",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("dataManifestPath", DataType::STRING),
+                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("deleteManifestPath", DataType::STRING),
+                StructField::nullable("deleteManifestPosition", DataType::LONG),
+            ]),
+        ),
+        StructField::nullable(
+            "stats_parsed",
+            DataType::struct_type_unchecked(vec![StructField::nullable(
+                "numRecords",
+                DataType::LONG,
+            )]),
+        ),
+    ]))
+});
 
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
@@ -565,8 +584,18 @@ impl LeafNodeWriter {
     ///   modificationTime, stats as StructData). Stats can be in either AMT format (per-column
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let converted = try_pre_convert_stats(add_metadata.as_ref(), "stats", &self.table_schema)?;
+    pub fn add_files(
+        &mut self,
+        engine: &dyn Engine,
+        add_metadata: Box<dyn EngineData>,
+    ) -> DeltaResult<()> {
+        let converted = crate::metadata::stats::try_pre_convert_stats_column(
+            engine,
+            add_metadata.as_ref(),
+            "stats",
+            &self.table_schema,
+            &crate::transaction::BASE_ADD_FILES_SCHEMA,
+        )?;
         let data: &dyn EngineData = match &converted {
             Some(c) => c.as_ref(),
             None => add_metadata.as_ref(),
@@ -608,6 +637,7 @@ impl LeafNodeWriter {
     ///   2.  the data file in the root root is also moved to a leaf manifest separately with DataFileOnly.
     pub fn add_existing_actions(
         &mut self,
+        engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
         add_type: AddType,
     ) -> DeltaResult<()> {
@@ -615,8 +645,13 @@ impl LeafNodeWriter {
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
         // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
-        let converted =
-            try_pre_convert_stats(scan_metadata.data(), "stats_parsed", &self.table_schema)?;
+        let converted = crate::metadata::stats::try_pre_convert_stats_column(
+            engine,
+            scan_metadata.data(),
+            "stats_parsed",
+            &self.table_schema,
+            &SCAN_ROW_SCHEMA_WITH_STATS_PARSED,
+        )?;
         let data: &dyn EngineData = match &converted {
             Some(c) => c.as_ref(),
             None => scan_metadata.data(),
@@ -1214,7 +1249,7 @@ mod tests {
             Some("zoe"),   // value max
             5,             // value null count
         )])?;
-        writer.add_files(metadata)?;
+        writer.add_files(engine.as_ref(), metadata)?;
 
         // Finish and verify result
         let result = writer.finish(engine.as_ref())?;
@@ -1476,7 +1511,7 @@ mod tests {
             .collect();
 
         let metadata = create_test_add_metadata(files)?;
-        writer.add_files(metadata)?;
+        writer.add_files(engine.as_ref(), metadata)?;
 
         // Finish and verify result
         let result = writer.finish(engine.as_ref())?;
@@ -1808,7 +1843,7 @@ mod tests {
         let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
 
         // Add the existing actions with the filtered data
-        writer.add_existing_actions(filtered_data, AddType::DataFileOnly)?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data, AddType::DataFileOnly)?;
 
         // Finish and check the result
         let result = writer.finish(engine.as_ref())?;
