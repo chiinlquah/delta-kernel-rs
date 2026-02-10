@@ -1,10 +1,10 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::ColumnName;
 use crate::content_tree::builder::MetadataBuilder;
 use crate::content_tree::{
     DataContentType, DataFileFormat, MetadataEntry, TrackingInfo, TrackingStatus,
 };
+use crate::engine_data::{GetData, TypedGetData};
+use crate::expressions::ColumnName;
 use crate::schema::DataType;
 use crate::{
     DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
@@ -542,8 +542,9 @@ impl LeafNodeWriter {
     ///   stats) or Delta JSON format (numRecords, minValues, etc.) - Delta JSON format is
     ///   automatically converted to AMT format.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
-        let mut visitor =
-            crate::content_tree::builder::WriteMetadataWithStatsVisitor::new(self.table_schema.clone());
+        let mut visitor = crate::content_tree::builder::WriteMetadataWithStatsVisitor::new(
+            self.table_schema.clone(),
+        );
         visitor.visit_rows_of(add_metadata.as_ref())?;
 
         // Tuple: (path, partition_values, size, modification_time, content_stats)

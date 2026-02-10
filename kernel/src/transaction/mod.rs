@@ -14,12 +14,12 @@ use crate::actions::{
     PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::content_tree::writer::MetadataWriter;
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
-use crate::content_tree::writer::MetadataWriter;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
@@ -2934,8 +2934,8 @@ mod tests {
     #[test]
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
-        use crate::engine::sync::SyncEngine;
         use crate::content_tree::builder::MetadataBuilder;
+        use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3062,12 +3062,12 @@ mod tests {
     #[test]
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
-        use crate::engine::sync::SyncEngine;
         use crate::content_tree::builder::MetadataBuilder;
         use crate::content_tree::{
             ContentInfo, DataContentType, DataFileFormat, MetadataEntry, TrackingInfo,
             TrackingStatus,
         };
+        use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();

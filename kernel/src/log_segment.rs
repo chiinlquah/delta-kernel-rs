@@ -700,16 +700,17 @@ impl LogSegment {
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
 
         // Create lazy iterator that opens the stream and defers processing
-        let lazy_iter = crate::content_tree::lazy_reader::LazyContentRootIterator::from_content_root(
-            engine.parquet_handler(),
-            engine.evaluation_handler(),
-            &content_root_url,
-            content_root.path.clone(),
-            table_root.clone(),
-            checkpoint_read_schema,
-            data_predicate,
-            skip_leaf_manifests,
-        )?;
+        let lazy_iter =
+            crate::content_tree::lazy_reader::LazyContentRootIterator::from_content_root(
+                engine.parquet_handler(),
+                engine.evaluation_handler(),
+                &content_root_url,
+                content_root.path.clone(),
+                table_root.clone(),
+                checkpoint_read_schema,
+                data_predicate,
+                skip_leaf_manifests,
+            )?;
 
         Ok(Box::new(lazy_iter))
     }

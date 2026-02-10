@@ -8,12 +8,12 @@ pub(crate) mod writer;
 // Metadata based on Adaptive Metadata Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
+use crate::content_tree::builder::MetadataBuilder;
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::kernel_predicates::KernelPredicateEvaluator;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::content_tree::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};

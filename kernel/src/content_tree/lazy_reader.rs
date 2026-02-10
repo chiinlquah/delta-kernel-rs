@@ -126,12 +126,13 @@ impl Iterator for LazyContentRootIterator {
                         };
 
                     // Construct metadata from collected batches with the parsed version
-                    let metadata = Box::new(crate::content_tree::Metadata::from_batches_with_version(
-                        data,
-                        version,
-                        path_in_log,
-                        context.table_root.clone(),
-                    ));
+                    let metadata =
+                        Box::new(crate::content_tree::Metadata::from_batches_with_version(
+                            data,
+                            version,
+                            path_in_log,
+                            context.table_root.clone(),
+                        ));
 
                     // Get root batches using the handler-based method
                     let root_iter = match metadata.root_action_batches_with_handler(

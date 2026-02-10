@@ -1,7 +1,6 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::content_tree::stats::{
     aggregate_content_stats, delta_json_stats_to_content_stats, struct_data_to_amt_stats,
 };
@@ -10,10 +9,11 @@ use crate::content_tree::{
     absolute_to_relative_path, ContentInfo, DataContentType, DataFileFormat, Metadata,
     MetadataEntry, TrackingInfo, TrackingStatus,
 };
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
-use crate::expressions::StructData;
 #[cfg(test)]
 use crate::content_tree::ManifestStats;
+use crate::expressions::StructData;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::try_parse_uri;
@@ -1212,8 +1212,8 @@ impl MetadataBuilder {
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<Metadata> {
-        use crate::expressions::Scalar;
         use crate::content_tree::metadata_entry_to_scalars;
+        use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
@@ -1286,8 +1286,8 @@ impl MetadataBuilder {
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<Metadata> {
-        use crate::expressions::Scalar;
         use crate::content_tree::metadata_entry_to_scalars;
+        use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
@@ -1344,8 +1344,8 @@ impl MetadataBuilder {
         leaf_uuid: uuid::Uuid,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<Metadata> {
-        use crate::expressions::Scalar;
         use crate::content_tree::metadata_entry_to_scalars;
+        use crate::expressions::Scalar;
 
         // Serialize all in-memory DVs back to entries
         self.serialize_dvs_to_entries(snapshot_id)?;
@@ -1998,8 +1998,8 @@ mod tests {
     #[test]
     fn test_content_stats_from_json_stats() -> Result<(), Box<dyn std::error::Error>> {
         use crate::actions::Add;
-        use crate::expressions::Scalar;
         use crate::content_tree::stats::delta_json_stats_to_content_stats;
+        use crate::expressions::Scalar;
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
 
         // Create a table schema with field IDs and column mapping annotations
@@ -2181,9 +2181,9 @@ mod tests {
 
     #[test]
     fn test_write_leaf_aggregates_content_stats() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::content_tree::stats::delta_json_stats_to_content_stats;
         use crate::engine::sync::SyncEngine;
         use crate::expressions::Scalar;
-        use crate::content_tree::stats::delta_json_stats_to_content_stats;
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
         use tempfile::tempdir;
 
@@ -2524,8 +2524,8 @@ mod tests {
 
     #[test]
     fn test_write_root_with_leaf() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::engine::sync::SyncEngine;
         use crate::content_tree::{DataContentType, Metadata};
+        use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -2636,7 +2636,8 @@ mod tests {
         );
 
         // Step 5: Read back the root and verify
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let read_root = Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = read_root.entries()?;
         assert_eq!(root_entries.len(), 1);
@@ -2747,7 +2748,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Step 4: Read back the root and verify manifest DV is stored inline
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata =
             Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
@@ -2844,7 +2846,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata =
             Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
@@ -2928,7 +2931,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify the manifest is marked as deleted
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
@@ -3079,7 +3083,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify manifest DV is stored inline
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
@@ -3165,7 +3170,8 @@ mod tests {
         let root_url = root_builder.write_root(&engine)?;
 
         // Read back and verify the manifest is marked as deleted
-        let root_path_in_log = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root_path_in_log =
+            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
@@ -3256,7 +3262,8 @@ mod tests {
         let root_url_v1 = root_builder.write_root(&engine)?;
 
         // Step 3: Read back and verify changes_dv from first commit
-        let root_path_v1 = crate::content_tree::absolute_to_relative_path(&root_url_v1, &table_root)?;
+        let root_path_v1 =
+            crate::content_tree::absolute_to_relative_path(&root_url_v1, &table_root)?;
         let root_metadata_v1 =
             Metadata::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
         let entries_v1 = root_metadata_v1.entries()?;
@@ -3303,7 +3310,8 @@ mod tests {
         let root_url_v2 = root_builder_v2.write_root(&engine)?;
 
         // Step 7: Read back and verify changes_dv only contains NEW deletions
-        let root_path_v2 = crate::content_tree::absolute_to_relative_path(&root_url_v2, &table_root)?;
+        let root_path_v2 =
+            crate::content_tree::absolute_to_relative_path(&root_url_v2, &table_root)?;
         let root_metadata_v2 =
             Metadata::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
         let entries_v2 = root_metadata_v2.entries()?;
@@ -3363,7 +3371,8 @@ mod tests {
         let root_url_v3 = root_builder_v3.write_root(&engine)?;
 
         // Step 10: Read back and verify changes_dv only contains NEW deletion
-        let root_path_v3 = crate::content_tree::absolute_to_relative_path(&root_url_v3, &table_root)?;
+        let root_path_v3 =
+            crate::content_tree::absolute_to_relative_path(&root_url_v3, &table_root)?;
         let root_metadata_v3 =
             Metadata::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
         let entries_v3 = root_metadata_v3.entries()?;
@@ -3456,7 +3465,8 @@ mod tests {
         let root_url_v4 = root_builder_v4.write_root(&engine)?;
 
         // Step 13: Read back and verify changes_dv is None (no deletions)
-        let root_path_v4 = crate::content_tree::absolute_to_relative_path(&root_url_v4, &table_root)?;
+        let root_path_v4 =
+            crate::content_tree::absolute_to_relative_path(&root_url_v4, &table_root)?;
         let root_metadata_v4 =
             Metadata::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
         let entries_v4 = root_metadata_v4.entries()?;
