@@ -153,13 +153,13 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub(crate) mod metadata;
+pub(crate) mod content_tree;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 // Export metadata types needed for testing
-pub use metadata::{DataContentType, Metadata, MetadataEntry, TrackingInfo, TrackingStatus};
+pub use content_tree::{DataContentType, Metadata, MetadataEntry, TrackingInfo, TrackingStatus};
 // Export metadata reader for testing
-pub use metadata::reader::MetadataEntryVisitor;
+pub use content_tree::reader::MetadataEntryVisitor;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
