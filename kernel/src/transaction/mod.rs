@@ -19,7 +19,7 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
-use crate::metadata::writer::MetadataWriter;
+use crate::content_tree::writer::MetadataWriter;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
@@ -302,7 +302,7 @@ pub struct Transaction {
     // Aggregated root DV actions to remove from root DV manifest
     aggregated_root_dv_actions: HashSet<String>,
     // Leaf manifest entries to include in root
-    leaf_manifests: Vec<crate::metadata::MetadataEntry>,
+    leaf_manifests: Vec<crate::content_tree::MetadataEntry>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
     /// Whether the root has been released to the client via release_root_and_delta_actions().
@@ -670,7 +670,7 @@ impl Transaction {
                 if let Some((content_root_action, content_root_version)) = latest_content_root {
                     // Load metadata from content root (gets root manifest + leaf references)
                     let root_path = content_root_action.path.clone();
-                    let metadata = crate::metadata::Metadata::new_from_content_root(
+                    let metadata = crate::content_tree::Metadata::new_from_content_root(
                         engine,
                         &content_root_action,
                         table_root.clone(),
@@ -683,7 +683,7 @@ impl Transaction {
                 } else {
                     // No content root found, start with empty metadata
                     // Use commit_version for the new metadata, not the current snapshot version
-                    let builder = crate::metadata::builder::MetadataBuilder::new_for(
+                    let builder = crate::content_tree::builder::MetadataBuilder::new_for(
                         table_root.clone(),
                         commit_version,
                         physical_table_schema.clone(),
@@ -904,7 +904,7 @@ impl Transaction {
 
             let new_metadata = metadata_builder.build(engine, snapshot_id)?;
             let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
-            let path = crate::metadata::absolute_to_relative_path(
+            let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
             )?;
@@ -1072,7 +1072,7 @@ impl Transaction {
         let root_manifest_path = root_manifest_url
             .as_ref()
             .map(|url| {
-                crate::metadata::absolute_to_relative_path(url, self.read_snapshot.table_root())
+                crate::content_tree::absolute_to_relative_path(url, self.read_snapshot.table_root())
             })
             .transpose()?;
 
@@ -2935,7 +2935,7 @@ mod tests {
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::engine::sync::SyncEngine;
-        use crate::metadata::builder::MetadataBuilder;
+        use crate::content_tree::builder::MetadataBuilder;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3063,8 +3063,8 @@ mod tests {
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::engine::sync::SyncEngine;
-        use crate::metadata::builder::MetadataBuilder;
-        use crate::metadata::{
+        use crate::content_tree::builder::MetadataBuilder;
+        use crate::content_tree::{
             ContentInfo, DataContentType, DataFileFormat, MetadataEntry, TrackingInfo,
             TrackingStatus,
         };
@@ -3275,8 +3275,8 @@ mod tests {
         // Step 7: Verify the ManifestDV for the delete manifest
         // When delete_from_leaf is used, it creates a ManifestDV entry that marks which
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
-        use crate::metadata::reader::MetadataEntryVisitor;
-        use crate::metadata::Metadata;
+        use crate::content_tree::reader::MetadataEntryVisitor;
+        use crate::content_tree::Metadata;
         use crate::RowVisitor;
 
         // Read the ContentRoot action from version 2 to get the new manifest path

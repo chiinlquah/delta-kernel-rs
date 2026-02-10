@@ -13,7 +13,7 @@ use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::kernel_predicates::KernelPredicateEvaluator;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::metadata::builder::MetadataBuilder;
+use crate::content_tree::builder::MetadataBuilder;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
@@ -2277,7 +2277,7 @@ impl Metadata {
         table_schema: StructType,
         new_version: Version,
     ) -> MetadataBuilder {
-        use crate::metadata::reader::MetadataEntryVisitor;
+        use crate::content_tree::reader::MetadataEntryVisitor;
         use crate::RowVisitor;
 
         let mut builder =
@@ -5108,7 +5108,7 @@ mod tests {
                     ),
                 ])]);
 
-        let content_stats_schema = crate::metadata::stats::stats_schema(&table_schema)?;
+        let content_stats_schema = crate::content_tree::stats::stats_schema(&table_schema)?;
         let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
 
         // Build the 'id' stats struct (4 fields for non-nullable int: value_count, lower_bound, upper_bound, exact_bounds)

@@ -42,7 +42,7 @@ enum LazyContentRootState {
     /// Currently reading from root manifest batches
     ReadingRoot {
         root_iter: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-        metadata: Box<crate::metadata::Metadata>,
+        metadata: Box<crate::content_tree::Metadata>,
         context: ContentRootContext,
     },
     /// Currently reading from leaf manifest batches
@@ -80,7 +80,7 @@ impl LazyContentRootIterator {
         skip_leaf_manifests: bool,
     ) -> DeltaResult<Self> {
         // Open the parquet stream using the metadata helper
-        let (parquet_batches, version, path_in_log) = crate::metadata::Metadata::open_stream(
+        let (parquet_batches, version, path_in_log) = crate::content_tree::Metadata::open_stream(
             parquet_handler.clone(),
             content_root_url,
             path_in_log,
@@ -126,7 +126,7 @@ impl Iterator for LazyContentRootIterator {
                         };
 
                     // Construct metadata from collected batches with the parsed version
-                    let metadata = Box::new(crate::metadata::Metadata::from_batches_with_version(
+                    let metadata = Box::new(crate::content_tree::Metadata::from_batches_with_version(
                         data,
                         version,
                         path_in_log,
@@ -181,7 +181,7 @@ impl Iterator for LazyContentRootIterator {
                         };
 
                     let leaf_iter =
-                        match crate::metadata::Metadata::non_root_action_batches_with_handlers(
+                        match crate::content_tree::Metadata::non_root_action_batches_with_handlers(
                             leaf_refs,
                             context.parquet_handler.clone(),
                             context.evaluation_handler.clone(),
