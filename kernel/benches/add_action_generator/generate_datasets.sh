@@ -12,7 +12,7 @@ DATASETS_DIR=""
 NUM_ACTIONS=50000
 SEED=42
 UC_MODE=false
-UC_ENDPOINT=""
+UC_ENDPOINT="https://e2-dogfood.staging.cloud.databricks.com"
 UC_TOKEN=""
 TABLE_PREFIX=""
 
@@ -27,6 +27,7 @@ OPTIONS:
     -t, --table-prefix PREFIX      Unity Catalog table prefix (e.g., catalog.schema)
                                    Enables UC mode when provided
     --uc-endpoint URL              Unity Catalog endpoint URL
+                                   (default: https://e2-dogfood.staging.cloud.databricks.com)
     --uc-token TOKEN               Unity Catalog access token
     --num-actions N                Number of actions per dataset (default: 50000)
     --seed N                       Random seed (default: 42)
@@ -40,9 +41,7 @@ EXAMPLES:
     $0 datasets
 
     # Unity Catalog mode
-    $0 -t managed_iceberg_bugbash_pupr.micah \\
-       --uc-endpoint "https://e2-dogfood.staging.cloud.databricks.com" \\
-       --uc-token "dapi..."
+    $0 -t managed_iceberg_bugbash_pupr.micah --uc-token "dapi..."
 
 EOF
     exit 1
@@ -87,10 +86,6 @@ done
 
 # Validate UC mode parameters
 if [ "$UC_MODE" = true ]; then
-    if [ -z "$UC_ENDPOINT" ]; then
-        echo -e "${RED}Error: --uc-endpoint is required for Unity Catalog mode${NC}"
-        usage
-    fi
     if [ -z "$UC_TOKEN" ]; then
         echo -e "${RED}Error: --uc-token is required for Unity Catalog mode${NC}"
         usage

@@ -1,12 +1,6 @@
 #!/bin/bash
 set -e
 
-# Configuration
-DATASETS_DIR="${1:-datasets}"
-RESULTS_DIR="${2:-benchmark_results}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_DIR="${RESULTS_DIR}/run_${TIMESTAMP}"
-
 # Colors for output
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -14,29 +8,143 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# Default configuration
+DATASETS_DIR=""
+RESULTS_DIR="benchmark_results"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+UC_MODE=false
+UC_ENDPOINT="https://e2-dogfood.staging.cloud.databricks.com"
+UC_TOKEN=""
+TABLE_PREFIX=""
+
+# Parse command line arguments
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS] [DATASETS_DIR] [RESULTS_DIR]
+
+Run all benchmark scenarios either locally or against Unity Catalog.
+
+OPTIONS (for Unity Catalog mode):
+    -t, --table-prefix PREFIX      Unity Catalog table prefix (e.g., catalog.schema)
+    --uc-endpoint URL              Unity Catalog endpoint URL
+                                   (default: https://e2-dogfood.staging.cloud.databricks.com)
+    --uc-token TOKEN               Unity Catalog access token
+    -h, --help                     Show this help message
+
+ARGUMENTS:
+    DATASETS_DIR                   Output directory for local mode (default: datasets)
+    RESULTS_DIR                    Results directory (default: benchmark_results)
+
+NOTES:
+    - Unity Catalog mode runs SCAN-ONLY tests (no DML operations)
+    - Data generation is skipped in UC mode (tables must already exist)
+
+EXAMPLES:
+    # Local mode
+    $0 datasets benchmark_results
+
+    # Unity Catalog mode (scan-only)
+    $0 -t catalog.schema --uc-token "..." "" benchmark_results
+
+EOF
+    exit 1
+}
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--table-prefix)
+            TABLE_PREFIX="$2"
+            UC_MODE=true
+            shift 2
+            ;;
+        --uc-endpoint)
+            UC_ENDPOINT="$2"
+            shift 2
+            ;;
+        --uc-token)
+            UC_TOKEN="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}"
+            usage
+            ;;
+        *)
+            if [ -z "$DATASETS_DIR" ]; then
+                DATASETS_DIR="$1"
+            elif [ -z "$RESULTS_DIR" ]; then
+                RESULTS_DIR="$1"
+            else
+                echo -e "${RED}Too many arguments${NC}"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate UC mode parameters
+if [ "$UC_MODE" = true ]; then
+    if [ -z "$UC_TOKEN" ]; then
+        echo -e "${RED}Error: --uc-token is required for Unity Catalog mode${NC}"
+        usage
+    fi
+    if [ -z "$TABLE_PREFIX" ]; then
+        echo -e "${RED}Error: --table-prefix is required for Unity Catalog mode${NC}"
+        usage
+    fi
+else
+    # Local mode: set default datasets directory
+    DATASETS_DIR="${DATASETS_DIR:-datasets}"
+fi
+
+RUN_DIR="${RESULTS_DIR}/run_${TIMESTAMP}"
+
 # Ensure we're in the kernel directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${KERNEL_DIR}/.." && pwd)"
 cd "${KERNEL_DIR}"
 
-# Create datasets directory if it doesn't exist and convert to absolute path
-mkdir -p "${DATASETS_DIR}"
-DATASETS_DIR="$(cd "${DATASETS_DIR}" && pwd)"
+# Setup based on mode
+if [ "$UC_MODE" = true ]; then
+    echo "================================================"
+    echo "Delta Kernel Benchmark Runner - Unity Catalog Mode"
+    echo "================================================"
+    echo "UC Endpoint: ${UC_ENDPOINT}"
+    echo "Table prefix: ${TABLE_PREFIX}"
+    echo "Results directory: ${RUN_DIR}"
+    echo "Timestamp: ${TIMESTAMP}"
+    echo ""
+    echo -e "${YELLOW}⚠️  WARNING: Unity Catalog mode - scan-only tests${NC}"
+    echo -e "${YELLOW}   - Data generation will be SKIPPED${NC}"
+    echo -e "${YELLOW}   - DML operations will be SKIPPED${NC}"
+    echo -e "${YELLOW}   - Only scan benchmarks will be executed${NC}"
+    echo -e "${YELLOW}   - Tables must already exist in Unity Catalog${NC}"
+    echo ""
+else
+    # Create datasets directory if it doesn't exist and convert to absolute path
+    mkdir -p "${DATASETS_DIR}"
+    DATASETS_DIR="$(cd "${DATASETS_DIR}" && pwd)"
+
+    echo "================================================"
+    echo "Delta Kernel Benchmark Runner - Local Mode"
+    echo "================================================"
+    echo "Datasets directory: ${DATASETS_DIR}"
+    echo "Results directory: ${RUN_DIR}"
+    echo "Timestamp: ${TIMESTAMP}"
+    echo ""
+fi
 
 # Create results directory
 mkdir -p "${RUN_DIR}"
 
 # Features to build with
 FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
-
-echo "================================================"
-echo "Delta Kernel Benchmark Runner"
-echo "================================================"
-echo "Datasets directory: ${DATASETS_DIR}"
-echo "Results directory: ${RUN_DIR}"
-echo "Timestamp: ${TIMESTAMP}"
-echo ""
 
 # Build benchmark-runner once
 echo -e "${BLUE}Building benchmark-runner...${NC}"
@@ -51,11 +159,13 @@ echo ""
 # Path to the benchmark runner binary
 BENCHMARK_RUNNER="${REPO_ROOT}/target/release/benchmark-runner"
 
-# Check if datasets exist, if not generate them
-if [ ! -d "${DATASETS_DIR}/dv_0_pct" ]; then
-    echo -e "${YELLOW}Datasets not found. Generating datasets...${NC}"
-    bash "${SCRIPT_DIR}/add_action_generator/generate_datasets.sh" "${DATASETS_DIR}"
-    echo ""
+# Check if datasets exist, if not generate them (only in local mode)
+if [ "$UC_MODE" = false ]; then
+    if [ ! -d "${DATASETS_DIR}/dv_0_pct" ]; then
+        echo -e "${YELLOW}Datasets not found. Generating datasets...${NC}"
+        bash "${SCRIPT_DIR}/add_action_generator/generate_datasets.sh" "${DATASETS_DIR}"
+        echo ""
+    fi
 fi
 
 # List of all generated datasets
@@ -85,17 +195,32 @@ run_benchmark() {
     local phase=$4
     local output_file=$5
 
-    local table_path="${DATASETS_DIR}/${dataset}"
+    if [ "$UC_MODE" = true ]; then
+        local table_path="${TABLE_PREFIX}.${dataset}"
+    else
+        local table_path="${DATASETS_DIR}/${dataset}"
+    fi
 
     echo -e "${GREEN}  Running: ${scenario} ${args}${NC}"
 
-    if ${BENCHMARK_RUNNER} -t "${table_path}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
-        echo -e "    ${GREEN}✓ Success${NC}"
-        return 0
+    if [ "$UC_MODE" = true ]; then
+        if ${BENCHMARK_RUNNER} -t "${table_path}" --uc-endpoint "${UC_ENDPOINT}" --uc-token "${UC_TOKEN}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+            echo -e "    ${GREEN}✓ Success${NC}"
+            return 0
+        else
+            echo -e "    ${RED}✗ Failed${NC}"
+            echo "    Error output saved to: ${output_file}"
+            return 1
+        fi
     else
-        echo -e "    ${RED}✗ Failed${NC}"
-        echo "    Error output saved to: ${output_file}"
-        return 1
+        if ${BENCHMARK_RUNNER} -t "${table_path}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+            echo -e "    ${GREEN}✓ Success${NC}"
+            return 0
+        else
+            echo -e "    ${RED}✗ Failed${NC}"
+            echo "    Error output saved to: ${output_file}"
+            return 1
+        fi
     fi
 }
 
@@ -164,44 +289,49 @@ process_dataset() {
     run_benchmark "${dataset}" "needle-in-haystack" "-p 1" "pre_dml" \
         "${dataset_dir}/02_pre_scan_needle.json" || true
 
-    # Phase 2: DML Operations (each on a clean copy)
-    echo ""
-    echo -e "${YELLOW}Phase 2: DML Operations (each on clean copy)${NC}"
-
-    # Small write (5 files, non-bulk)
-    run_dml_scenario "${dataset}" "small-write" "-n 5" \
-        "${dataset_dir}/03_dml_small_write.json" "small_write"
-
-    if [ "${has_content_root}" = true ]; then
-        # Small write (5 files, bulk mode) - only for content_root datasets
-        run_dml_scenario "${dataset}" "small-write" "-n 5 -m" \
-            "${dataset_dir}/04_dml_small_write_bulk.json" "small_write_bulk"
+    # Phase 2: DML Operations (each on a clean copy) - SKIP IN UC MODE
+    if [ "$UC_MODE" = true ]; then
+        echo ""
+        echo -e "${YELLOW}Phase 2: DML Operations - SKIPPED (Unity Catalog mode)${NC}"
     else
-        echo -e "  ${YELLOW}Skipping small-write bulk mode (requires content_root)${NC}"
-    fi
+        echo ""
+        echo -e "${YELLOW}Phase 2: DML Operations (each on clean copy)${NC}"
 
-    # Bulk write (100000 files, 10000 batch size, non-bulk)
-    run_dml_scenario "${dataset}" "bulk-write" "-n 100000 -b 10000" \
-        "${dataset_dir}/05_dml_bulk_write.json" "bulk_write"
+        # Small write (5 files, non-bulk)
+        run_dml_scenario "${dataset}" "small-write" "-n 5" \
+            "${dataset_dir}/03_dml_small_write.json" "small_write"
 
-    if [ "${has_content_root}" = true ]; then
-        # Bulk write (100000 files, 10000 batch size, bulk mode) - only for content_root datasets
-        run_dml_scenario "${dataset}" "bulk-write" "-n 100000 -b 10000 -m" \
-            "${dataset_dir}/06_dml_bulk_write_bulk.json" "bulk_write_bulk"
-    else
-        echo -e "  ${YELLOW}Skipping bulk-write bulk mode (requires content_root)${NC}"
-    fi
+        if [ "${has_content_root}" = true ]; then
+            # Small write (5 files, bulk mode) - only for content_root datasets
+            run_dml_scenario "${dataset}" "small-write" "-n 5 -m" \
+                "${dataset_dir}/04_dml_small_write_bulk.json" "small_write_bulk"
+        else
+            echo -e "  ${YELLOW}Skipping small-write bulk mode (requires content_root)${NC}"
+        fi
 
-    # Vacuum delete (threshold 5, non-bulk)
-    run_dml_scenario "${dataset}" "vacuum-delete" "-p 5" \
-        "${dataset_dir}/07_dml_vacuum_delete.json" "vacuum_delete"
+        # Bulk write (100000 files, 10000 batch size, non-bulk)
+        run_dml_scenario "${dataset}" "bulk-write" "-n 100000 -b 10000" \
+            "${dataset_dir}/05_dml_bulk_write.json" "bulk_write"
 
-    if [ "${has_content_root}" = true ]; then
-        # Vacuum delete (threshold 5, bulk mode) - only for content_root datasets
-        run_dml_scenario "${dataset}" "vacuum-delete" "-p 5 -m" \
-            "${dataset_dir}/08_dml_vacuum_delete_bulk.json" "vacuum_delete_bulk"
-    else
-        echo -e "  ${YELLOW}Skipping vacuum-delete bulk mode (requires content_root)${NC}"
+        if [ "${has_content_root}" = true ]; then
+            # Bulk write (100000 files, 10000 batch size, bulk mode) - only for content_root datasets
+            run_dml_scenario "${dataset}" "bulk-write" "-n 100000 -b 10000 -m" \
+                "${dataset_dir}/06_dml_bulk_write_bulk.json" "bulk_write_bulk"
+        else
+            echo -e "  ${YELLOW}Skipping bulk-write bulk mode (requires content_root)${NC}"
+        fi
+
+        # Vacuum delete (threshold 5, non-bulk)
+        run_dml_scenario "${dataset}" "vacuum-delete" "-p 5" \
+            "${dataset_dir}/07_dml_vacuum_delete.json" "vacuum_delete"
+
+        if [ "${has_content_root}" = true ]; then
+            # Vacuum delete (threshold 5, bulk mode) - only for content_root datasets
+            run_dml_scenario "${dataset}" "vacuum-delete" "-p 5 -m" \
+                "${dataset_dir}/08_dml_vacuum_delete_bulk.json" "vacuum_delete_bulk"
+        else
+            echo -e "  ${YELLOW}Skipping vacuum-delete bulk mode (requires content_root)${NC}"
+        fi
     fi
 
     # Aggregate results for this dataset
@@ -239,10 +369,17 @@ process_dataset() {
 
 # Process each dataset
 for dataset in "${DATASETS[@]}"; do
-    if [ -d "${DATASETS_DIR}/${dataset}" ]; then
+    if [ "$UC_MODE" = true ]; then
+        # In UC mode, assume tables exist (we can't easily check without calling UC)
+        echo -e "${BLUE}Assuming UC table exists: ${TABLE_PREFIX}.${dataset}${NC}"
         process_dataset "${dataset}"
     else
-        echo -e "${RED}Warning: Dataset ${dataset} not found, skipping...${NC}"
+        # In local mode, check if dataset directory exists
+        if [ -d "${DATASETS_DIR}/${dataset}" ]; then
+            process_dataset "${dataset}"
+        else
+            echo -e "${RED}Warning: Dataset ${dataset} not found, skipping...${NC}"
+        fi
     fi
 done
 
@@ -272,15 +409,18 @@ for dataset in "${DATASETS[@]}"; do
 
                 # Extract key metrics using jq if available
                 if command -v jq &> /dev/null; then
-                    scenario=$(jq -r '.scenario // "N/A"' "${result_file}" 2>/dev/null || echo "N/A")
-                    duration=$(jq -r '.total_duration_ms // "N/A"' "${result_file}" 2>/dev/null || echo "N/A")
+                    # Extract JSON portion (in case there's debug output before the JSON)
+                    json_content=$(sed -n '/{/,$ p' "${result_file}" 2>/dev/null)
+
+                    scenario=$(echo "$json_content" | jq -r '.scenario // "N/A"' 2>/dev/null || echo "N/A")
+                    duration=$(echo "$json_content" | jq -r '.total_duration_ms // "N/A"' 2>/dev/null || echo "N/A")
 
                     # Try to get scan metrics
-                    num_files=$(jq -r '.scan_metrics.num_files // "N/A"' "${result_file}" 2>/dev/null || echo "N/A")
-                    num_dv=$(jq -r '.scan_metrics.num_dv_descriptors // "N/A"' "${result_file}" 2>/dev/null || echo "N/A")
+                    num_files=$(echo "$json_content" | jq -r '.scan_metrics.num_files // "N/A"' 2>/dev/null || echo "N/A")
+                    num_dv=$(echo "$json_content" | jq -r '.scan_metrics.num_dv_descriptors // "N/A"' 2>/dev/null || echo "N/A")
 
                     # Try to get write metrics
-                    files_written=$(jq -r '.write_metrics.num_files_written // "N/A"' "${result_file}" 2>/dev/null || echo "N/A")
+                    files_written=$(echo "$json_content" | jq -r '.write_metrics.num_files_written // "N/A"' 2>/dev/null || echo "N/A")
 
                     echo "  ${filename}:" >> "${SUMMARY_TXT}"
                     echo "    Scenario: ${scenario}" >> "${SUMMARY_TXT}"
