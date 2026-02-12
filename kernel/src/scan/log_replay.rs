@@ -2,16 +2,14 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
-
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
+use crate::expressions::{
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 pub(crate) use crate::log_replay::{
@@ -26,6 +24,8 @@ use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -102,10 +102,10 @@ pub struct SerializableScanState {
 pub struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
-    /// Transform for checkpoint batches - may include stats_parsed if available
-    add_transform: Arc<dyn ExpressionEvaluator>,
-    /// Transform for commit batches - never includes stats_parsed (commits don't have it)
-    add_transform_for_commits: Arc<dyn ExpressionEvaluator>,
+    /// Transform for log batches (commit files) - uses ParseJson for stats
+    log_transform: Arc<dyn ExpressionEvaluator>,
+    /// Transform for checkpoint batches - uses coalesce(stats_parsed, ParseJson) when available
+    checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -148,80 +148,53 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
     ) -> DeltaResult<Self> {
-        // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
-        // The DataSkippingFilter and partition_filter components expect the predicate
-        // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
-        // the enum representation to the tuple format.
+        let CheckpointReadInfo {
+            has_stats_parsed,
+            checkpoint_read_schema,
+        } = checkpoint_info;
+
+        let output_schema =
+            scan_row_schema_with_stats_parsed(state_info.physical_stats_schema.clone());
+
+        // Extract the physical predicate for data skipping and partition filtering.
+        // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
         let physical_predicate = match &state_info.physical_predicate {
-            PhysicalPredicate::Some(predicate, schema) => {
-                // Valid predicate that can be used for data skipping and partition filtering
-                Some((predicate.clone(), schema.clone()))
-            }
-            PhysicalPredicate::StaticSkipAll => {
-                debug_assert!(false, "StaticSkipAll case should be handled at a higher level and not reach this code");
-                None
-            }
-            PhysicalPredicate::None => {
-                // No predicate provided
-                None
-            }
+            PhysicalPredicate::Some(predicate, schema) => Some((predicate.clone(), schema.clone())),
+            _ => None,
         };
 
-        // Determine if we should include stats_parsed in the output schema.
-        // This requires BOTH:
-        // 1. The scan explicitly requested stats columns via include_stats_columns()
-        //    (logical_stats_schema is set only for write operations, not for data skipping predicates)
-        // 2. The checkpoint actually has compatible stats_parsed (has_stats_parsed is true)
-        // Note: We use logical_stats_schema (not physical_stats_schema) because physical_stats_schema
-        // is also set for data skipping predicates, but those scans don't need stats_parsed output.
-        let include_stats_parsed =
-            state_info.logical_stats_schema.is_some() && checkpoint_info.has_stats_parsed;
-
-        // Build the scan row schema, optionally including stats_parsed
-        let stats_schema_for_output = if include_stats_parsed {
-            state_info.physical_stats_schema.clone()
-        } else {
-            None
-        };
-        let scan_row_schema = scan_row_schema_with_stats_parsed(stats_schema_for_output.clone());
-        let scan_row_datatype: DataType = scan_row_schema.as_ref().clone().into();
-
-        // Build input schema for the checkpoint transform evaluator
-        // When include_stats_parsed is true, we need to add stats_parsed to the Add schema
-        // so the expression evaluator can resolve the add.stats_parsed column reference
-        let checkpoint_input_schema =
-            log_add_schema_with_stats_parsed(stats_schema_for_output.clone());
-
-        // Build expressions for stats_parsed:
-        // - For checkpoints: extract the column from the input
-        // - For commits: produce null values (commits don't have stats_parsed)
-        // Both must produce the same output schema for consistent downstream processing.
-        use crate::expressions::column_expr_ref;
-        let (checkpoint_stats_expr, commit_stats_expr) = match &stats_schema_for_output {
-            Some(schema) => {
-                let stats_type = DataType::Struct(Box::new(schema.as_ref().clone()));
-                (
-                    Some(column_expr_ref!("add.stats_parsed")),
-                    Some(Arc::new(Expression::Literal(Scalar::Null(stats_type)))),
-                )
-            }
-            None => (None, None),
-        };
+        // Create data skipping filter that reads stats_parsed from the transformed batch.
+        // This avoids double JSON parsing - the transform parses JSON once, then data skipping
+        // reads the already-parsed stats_parsed column from the transform output.
+        let data_skipping_filter =
+            state_info
+                .physical_stats_schema
+                .as_ref()
+                .and_then(|physical_stats_schema| {
+                    DataSkippingFilter::new(
+                        engine,
+                        // these are all cheap arc clones
+                        physical_predicate.as_ref().map(|(p, _)| p.clone()),
+                        physical_stats_schema.clone(),
+                        output_schema.clone(),
+                        column_expr_ref!("stats_parsed"),
+                    )
+                });
 
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
-            add_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_input_schema,
-                get_add_transform_expr(checkpoint_stats_expr),
-                scan_row_datatype.clone(),
+            partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
+            data_skipping_filter,
+            // Log transform: always parse JSON (no stats_parsed in JSON commit files)
+            log_transform: engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_read_schema.clone(),
+                get_add_transform_expr(state_info.physical_stats_schema.clone(), false),
+                output_schema.clone().into(),
             )?,
-            // For commits, we use the same output schema but produce null for stats_parsed
-            // This ensures all batches have consistent schema for downstream consumers
-            add_transform_for_commits: engine.evaluation_handler().new_expression_evaluator(
-                get_log_add_schema().clone(),
-                get_add_transform_expr(commit_stats_expr),
-                scan_row_datatype,
+            // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
+            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_read_schema,
+                get_add_transform_expr(state_info.physical_stats_schema.clone(), has_stats_parsed),
+                output_schema.into(),
             )?,
             seen_file_keys,
             state_info,
@@ -593,52 +566,65 @@ fn log_add_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRe
     )]))
 }
 
-/// Creates the expression for transforming add actions into scan rows.
+/// Build the scan row schema with optional stats_parsed column.
 ///
-/// The `stats_parsed_expr` parameter controls how stats_parsed is handled:
-/// - `None`: Base expression without stats_parsed field
-/// - `Some(expr)`: Expression with stats_parsed field using the provided expression
+/// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
+fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
+    match stats_schema {
+        Some(schema) => {
+            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+            fields.push(StructField::nullable(
+                "stats_parsed",
+                schema.as_ref().clone(),
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        }
+        None => SCAN_ROW_SCHEMA.clone(),
+    }
+}
+
+/// Build the add transform expression with optional stats parsing.
 ///
-/// For checkpoints, use `column_expr_ref!("add.stats_parsed")` to extract stats_parsed.
-/// For commits, use `Expression::Literal(Scalar::Null(stats_type))` to produce null values.
-fn get_add_transform_expr(stats_parsed_expr: Option<ExpressionRef>) -> ExpressionRef {
-    use crate::expressions::column_expr_ref;
+/// # Parameters
+/// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
+///   names), or None if stats should not be included in output.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+///
+/// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
+/// Stats are output using physical column names. Engines can use `Scan::logical_stats_schema()`
+/// to map physical names back to logical names when column mapping is enabled.
+fn get_add_transform_expr(
+    physical_stats_schema: Option<SchemaRef>,
+    has_stats_parsed: bool,
+) -> ExpressionRef {
+    let mut fields = vec![
+        column_expr_ref!("add.path"),
+        column_expr_ref!("add.size"),
+        column_expr_ref!("add.modificationTime"),
+        column_expr_ref!("add.stats"),
+        column_expr_ref!("add.deletionVector"),
+        Arc::new(Expression::Struct(vec![
+            column_expr_ref!("add.partitionValues"),
+            column_expr_ref!("add.baseRowId"),
+            column_expr_ref!("add.defaultRowCommitVersion"),
+            column_expr_ref!("add.tags"),
+            column_expr_ref!("add.clusteringProvider"),
+        ])),
+    ];
 
-    static BASE_FIELDS: LazyLock<(Vec<ExpressionRef>, ExpressionRef)> = LazyLock::new(|| {
-        let file_constant_values = Arc::new(Expression::Struct(
-            vec![
-                column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId"),
-                column_expr_ref!("add.defaultRowCommitVersion"),
-                column_expr_ref!("add.tags"),
-                column_expr_ref!("add.clusteringProvider"),
-                column_expr_ref!("add.dataManifestPath"),
-                column_expr_ref!("add.dataManifestPosition"),
-                column_expr_ref!("add.deleteManifestPath"),
-                column_expr_ref!("add.deleteManifestPosition"),
-            ],
-            None,
-            None,
-        ));
-        let fields = vec![
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.size"),
-            column_expr_ref!("add.modificationTime"),
-            column_expr_ref!("add.stats"),
-            column_expr_ref!("add.deletionVector"),
-            file_constant_values,
-        ];
-        let base_expr = Arc::new(Expression::Struct(fields.clone(), None, None));
-        (fields, base_expr)
-    });
+    // Add stats_parsed when stats output is requested (using physical column names)
+    if let Some(stats_schema) = physical_stats_schema {
+        let stats_parsed_expr = if has_stats_parsed {
+            // Checkpoint has stats_parsed column - read directly
+            column_expr!("add.stats_parsed")
+        } else {
+            // No stats_parsed available (JSON log files) - parse JSON
+            Expression::parse_json(column_expr!("add.stats"), stats_schema)
+        };
+        fields.push(Arc::new(stats_parsed_expr));
+    }
 
-    let Some(stats_parsed_expr) = stats_parsed_expr else {
-        return BASE_FIELDS.1.clone();
-    };
-
-    let mut fields = BASE_FIELDS.0.clone();
-    fields.push(stats_parsed_expr);
-    Arc::new(Expression::Struct(fields, None, None))
+    Arc::new(Expression::Struct(fields))
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -694,12 +680,34 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
         );
 
-        // Build an initial selection vector for the batch which has had the data skipping filter
-        // applied. The selection vector is further updated by the deduplication visitor to remove
-        // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
-        assert_eq!(selection_vector.len(), actions.len());
+        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed).
+        // This is done before data skipping so we can read the already-parsed stats.
+        // We use the checkpoint_transform because we checked above that we're reading a checkpoint.
+        let transformed = self.checkpoint_transform.evaluate(actions.as_ref())?;
+        debug_assert_eq!(transformed.len(), actions.len());
+        require!(
+            transformed.len() == actions.len(),
+            Error::internal_error(format!(
+                "checkpoint transform output length {} != actions length {}",
+                transformed.len(),
+                actions.len()
+            ))
+        );
 
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
+        // This avoids double JSON parsing - the transform already parsed the stats.
+        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        debug_assert_eq!(selection_vector.len(), actions.len());
+        require!(
+            selection_vector.len() == actions.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != actions length {}",
+                selection_vector.len(),
+                actions.len()
+            ))
+        );
+
+        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
@@ -713,10 +721,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
-        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions.as_ref())?;
+        // Step 4: Return transformed batch with updated selection vector
         ScanMetadata::try_new(
-            result,
+            transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
         )
@@ -727,22 +734,50 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
-    // performed to this function probably also need to be applied to the other copy of the
-    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
-    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
-    // cannot easily be unified.
+    // ParallelLogReplayProcessor>::process_actions_batch`]! Any changes performed to this function
+    // probably also need to be applied to the other copy. The copy exists because
+    // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
+    // `&self`. Presently, the different in mutabilities cannot easily be unified.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
         } = actions_batch;
-        // Build an initial selection vector for the batch which has had the data skipping filter
-        // applied. The selection vector is further updated by the deduplication visitor to remove
-        // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
-        assert_eq!(selection_vector.len(), actions.len());
 
+        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // Use the correct transform based on batch type:
+        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
+        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
+        let transform = if is_log_batch {
+            &self.log_transform
+        } else {
+            &self.checkpoint_transform
+        };
+        let transformed = transform.evaluate(actions.as_ref())?;
+        debug_assert_eq!(transformed.len(), actions.len());
+        require!(
+            transformed.len() == actions.len(),
+            Error::internal_error(format!(
+                "transform output length {} != actions length {}",
+                transformed.len(),
+                actions.len()
+            ))
+        );
+
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
+        // This avoids double JSON parsing - the transform already parsed the stats.
+        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        debug_assert_eq!(selection_vector.len(), actions.len());
+        require!(
+            selection_vector.len() == actions.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != actions length {}",
+                selection_vector.len(),
+                actions.len()
+            ))
+        );
+
+        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
             is_log_batch,
@@ -769,8 +804,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &self.add_transform
         };
         let result = transform.evaluate(actions.as_ref())?;
+
+        // Step 4: Return transformed batch with updated selection vector
         ScanMetadata::try_new(
-            result,
+            transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
         )

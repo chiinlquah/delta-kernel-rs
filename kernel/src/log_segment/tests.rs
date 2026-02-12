@@ -1,9 +1,8 @@
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use test_log::test;
 use url::Url;
 
 use crate::actions::{
@@ -28,7 +27,7 @@ use crate::scan::test_utils::{
 use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
     StorageHandler,
 };
 use test_utils::{
@@ -951,39 +950,34 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
-#[test]
-fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
+#[test_log::test(rstest::rstest)]
+#[case::simple_path("example.parquet", "file:///var/_delta_log/_sidecars/example.parquet")]
+#[case::full_path(
+    "file:///var/_delta_log/_sidecars/example.parquet",
+    "file:///var/_delta_log/_sidecars/example.parquet"
+)]
+#[case::nested_path(
+    "test/test/example.parquet",
+    "file:///var/_delta_log/_sidecars/test/test/example.parquet"
+)]
+fn test_sidecar_to_filemeta_valid_paths(
+    #[case] input_path: &str,
+    #[case] expected_url: &str,
+) -> DeltaResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
-    let test_cases = [
-        (
-            "example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "file:///var/_delta_log/_sidecars/example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "test/test/example.parquet",
-            "file:///var/_delta_log/_sidecars/test/test/example.parquet",
-        ),
-    ];
+    let sidecar = Sidecar {
+        path: expected_url.to_string(),
+        modification_time: 0,
+        size_in_bytes: 1000,
+        tags: None,
+    };
 
-    for (input_path, expected_url) in test_cases.into_iter() {
-        let sidecar = Sidecar {
-            path: expected_url.to_string(),
-            modification_time: 0,
-            size_in_bytes: 1000,
-            tags: None,
-        };
-
-        let filemeta = sidecar.to_filemeta(&log_root)?;
-        assert_eq!(
-            filemeta.location.as_str(),
-            expected_url,
-            "Mismatch for input path: {input_path}"
-        );
-    }
+    let filemeta = sidecar.to_filemeta(&log_root)?;
+    assert_eq!(
+        filemeta.location.as_str(),
+        expected_url,
+        "Mismatch for input path: {input_path}"
+    );
     Ok(())
 }
 
@@ -1366,7 +1360,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
+    // Sidecar batches now use the same schema as checkpoint (including sidecar column)
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
@@ -3094,4 +3089,144 @@ async fn test_get_unpublished_catalog_commits() {
     let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
     let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
     assert_eq!(versions, vec![3, 4]);
+}
+
+// ============================================================================
+// Tests: segment_after_crc / segment_through_crc
+// ============================================================================
+
+fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
+    seg.ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect()
+}
+
+fn extract_compaction_ranges(seg: &LogSegment) -> Vec<(u64, u64)> {
+    seg.ascending_compaction_files
+        .iter()
+        .map(|c| match c.file_type {
+            LogPathFileType::CompactedCommit { hi } => (c.version, hi),
+            _ => panic!("expected compaction"),
+        })
+        .collect()
+}
+
+struct CrcPruningCase {
+    commits: &'static [u64],
+    compactions: &'static [(u64, u64)],
+    checkpoint: Option<u64>,
+    crc_version: u64,
+    after_commits: &'static [u64],
+    after_compactions: &'static [(u64, u64)],
+    through_commits: &'static [u64],
+    through_compactions: &'static [(u64, u64)],
+}
+
+#[rstest::rstest]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+#[case::only_deltas_no_checkpoint(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// checkpoint:                |
+// commits:                      x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:              x  x
+#[case::only_deltas_with_checkpoint(CrcPruningCase {
+    commits: &[3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: Some(2),
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:                        [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// after compactions:                  [-----]
+// through commits:     x  x  x  x  x
+#[case::compaction_after_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(5, 7)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[(5, 7)],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:               [-----------]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions:
+#[case::compaction_overlaps_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(2, 6)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:         [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions: [-----]
+#[case::compaction_before_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(0, 2)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[(0, 2)],
+})]
+#[tokio::test]
+async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
+    let seg = create_segment_for(LogSegmentConfig {
+        published_commit_versions: case.commits,
+        compaction_versions: case.compactions,
+        checkpoint_version: case.checkpoint,
+        ..Default::default()
+    })
+    .await;
+
+    let after = seg.segment_after_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&after), case.after_commits);
+    assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
+    assert!(after.checkpoint_version.is_none());
+    assert!(after.checkpoint_parts.is_empty());
+
+    let through = seg.segment_through_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&through), case.through_commits);
+    assert_eq!(
+        extract_compaction_ranges(&through),
+        case.through_compactions
+    );
+    assert_eq!(through.checkpoint_version, case.checkpoint);
 }
