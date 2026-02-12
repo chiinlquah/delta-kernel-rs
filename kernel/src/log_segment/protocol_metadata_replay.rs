@@ -10,7 +10,6 @@ use crate::crc::LazyCrc;
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, Error, Expression, Predicate, PredicateRef};
 
-
 use super::LogSegment;
 
 impl LogSegment {
