@@ -8,7 +8,7 @@
 mod lazy;
 mod reader;
 
-pub(crate) use lazy::{CrcLoadResult, LazyCrc};
+pub(crate) use lazy::LazyCrc;
 pub(crate) use reader::try_read_crc_file;
 
 use std::sync::LazyLock;

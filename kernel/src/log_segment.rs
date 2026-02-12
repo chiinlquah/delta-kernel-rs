@@ -17,8 +17,8 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, PredicateRef, RowVisitor, StorageHandler, Version,
-    PRE_COMMIT_VERSION,
+    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 use std::num::NonZero;
@@ -30,7 +30,6 @@ pub use crate::listed_log_files::ListedLogFiles;
 use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
-use crate::crc::{CrcLoadResult, LazyCrc};
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
@@ -1145,7 +1144,7 @@ impl LogSegment {
         // Cache whether content root was enabled at start to determine early termination behavior
         let root_enabled_at_start = root_enabled;
 
-        let actions_batches = self.replay_for_metadata(engine)?;
+        let actions_batches = self.replay_for_pmc(engine)?;
         let (mut metadata_opt, mut protocol_opt, mut content_root_opt) = (None, None, None);
 
         for actions_batch in actions_batches {
@@ -1192,39 +1191,29 @@ impl LogSegment {
         Ok((metadata_opt, protocol_opt, content_root_opt))
     }
 
-    // TOOD: Implement crc
-    // /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
-    // ///
-    // /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    // /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
-    // /// in `(start_v_exclusive, end_version]` are retained.
-    // pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
-    //     let (commits, compactions) =
-    //         self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
-    //     LogSegment {
-    //         end_version: self.end_version,
-    //         checkpoint_version: None,
-    //         log_root: self.log_root.clone(),
-    //         ascending_commit_files: commits,
-    //         ascending_compaction_files: compactions,
-    //         checkpoint_parts: vec![],
-    //         latest_crc_file: None,
-    //         latest_commit_file: None,
-    //         checkpoint_schema: None,
-    //         max_published_version: None,
-    //     }
-    //
-    //     // Final validation: if we found content root but protocol doesn't support it, error
-    //     if let (Some(protocol), Some(_)) = (protocol_opt.as_ref(), content_root_opt.as_ref()) {
-    //         if !protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental) {
-    //             return Err(Error::invalid_protocol(
-    //                 "Found ContentRoot action but protocol does not have MetadataTreeExperimental reader feature enabled"
-    //             ));
-    //         }
-    //     }
-    //
-    //     Ok((metadata_opt, protocol_opt, content_root_opt))
-    // }
+    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
+    ///
+    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
+    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// in `(start_v_exclusive, end_version]` are retained.
+    #[allow(dead_code)]
+    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: None,
+            log_root: self.log_root.clone(),
+            table_root: self.table_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
+        }
+    }
 
     /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
     ///
@@ -1232,6 +1221,7 @@ impl LogSegment {
     /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
     /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
     /// needed for this replay path (CRC file, latest commit file) are dropped.
+    #[allow(dead_code)]
     pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
         let (commits, compactions) =
             self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
@@ -1239,6 +1229,7 @@ impl LogSegment {
             end_version: self.end_version,
             checkpoint_version: self.checkpoint_version,
             log_root: self.log_root.clone(),
+            table_root: self.table_root.clone(),
             ascending_commit_files: commits,
             ascending_compaction_files: compactions,
             checkpoint_parts: self.checkpoint_parts.clone(),
@@ -1249,9 +1240,8 @@ impl LogSegment {
         }
     }
 
-    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
-    /// If `lo_exclusive` is `None`, there is no lower bound.
-    fn filtered_commits_and_compactions(
+    /// Reads protocol, metadata, and content root actions from the log segment.
+    fn replay_for_pmc(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
@@ -1271,34 +1261,35 @@ impl LogSegment {
         self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 
-    // TODO: Implement CRC
-    //     /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
-    //     /// If `lo_exclusive` is `None`, there is no lower bound.
-    //     fn filtered_commits_and_compactions(
-    //         lo_exclusive: Option<Version>,
-    //         hi_inclusive: Version,
-    //     ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
-    //         let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
-    //         let commits = self
-    //             .ascending_commit_files
-    //             .iter()
-    //             .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
-    //             .cloned()
-    //             .collect();
-    //         let compactions = self
-    //             .ascending_compaction_files
-    //             .iter()
-    //             .filter(|c| {
-    //                 matches!(
-    //                     c.file_type,
-    //                     LogPathFileType::CompactedCommit { hi }
-    //                         if above_lo(c.version) && hi <= hi_inclusive
-    //                 )
-    //             })
-    //             .cloned()
-    //             .collect();
-    //         (commits, compactions)
-    //     }
+    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
+    /// If `lo_exclusive` is `None`, there is no lower bound.
+    #[allow(dead_code)]
+    fn filtered_commits_and_compactions(
+        &self,
+        lo_exclusive: Option<Version>,
+        hi_inclusive: Version,
+    ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
+        let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
+        let commits = self
+            .ascending_commit_files
+            .iter()
+            .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
+            .cloned()
+            .collect();
+        let compactions = self
+            .ascending_compaction_files
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.file_type,
+                    LogPathFileType::CompactedCommit { hi }
+                        if above_lo(c.version) && hi <= hi_inclusive
+                )
+            })
+            .cloned()
+            .collect();
+        (commits, compactions)
+    }
 
     /// How many commits since a checkpoint, according to this log segment.
     /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).

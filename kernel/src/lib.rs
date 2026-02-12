@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+#[allow(dead_code)]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;

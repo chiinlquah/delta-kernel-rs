@@ -420,7 +420,7 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
-        clustering_columns: Option<Vec<ColumnName>>,
+        _clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
@@ -3067,10 +3067,10 @@ mod tests {
 
     #[test]
     fn test_blind_append_sets_commit_info_flag() -> Result<(), Box<dyn std::error::Error>> {
-        let commit_info = CommitInfo::new(1, None, None, None, true);
+        let commit_info = CommitInfo::new(1, None, None, None, 0, true);
         assert_eq!(commit_info.is_blind_append, Some(true));
 
-        let commit_info_false = CommitInfo::new(1, None, None, None, false);
+        let commit_info_false = CommitInfo::new(1, None, None, None, 0, false);
         assert_eq!(commit_info_false.is_blind_append, None);
         Ok(())
     }

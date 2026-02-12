@@ -85,14 +85,16 @@ fn process_sidecars(
 // txn.version  INT64   0      "4390" / "4390"
 #[test]
 fn test_replay_for_metadata() {
+    use std::path::PathBuf;
+
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();
 
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let snapshot = crate::Snapshot::builder_for(url).build(&engine).unwrap();
     let data: Vec<_> = snapshot
         .log_segment()
-        .replay_for_metadata(&engine)
+        .replay_for_pmc(&engine)
         .unwrap()
         .try_collect()
         .unwrap();

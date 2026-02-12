@@ -545,8 +545,9 @@ pub(crate) fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>)
 /// This is needed for the expression evaluator input schema when we want to extract
 /// stats_parsed from checkpoint data. The standard get_log_add_schema() doesn't include
 /// stats_parsed, so we need to build a dynamic schema that includes it.
+#[allow(dead_code)]
 fn log_add_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
-    use crate::actions::{Add, ADD_NAME};
+    use crate::actions::{get_log_add_schema, Add, ADD_NAME};
 
     let Some(stats_schema) = stats_schema else {
         return get_log_add_schema().clone();
@@ -564,23 +565,6 @@ fn log_add_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRe
         ADD_NAME,
         StructType::new_unchecked(add_fields),
     )]))
-}
-
-/// Build the scan row schema with optional stats_parsed column.
-///
-/// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
-    match stats_schema {
-        Some(schema) => {
-            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-            fields.push(StructField::nullable(
-                "stats_parsed",
-                schema.as_ref().clone(),
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        }
-        None => SCAN_ROW_SCHEMA.clone(),
-    }
 }
 
 /// Build the add transform expression with optional stats parsing.
@@ -603,7 +587,7 @@ fn get_add_transform_expr(
         column_expr_ref!("add.modificationTime"),
         column_expr_ref!("add.stats"),
         column_expr_ref!("add.deletionVector"),
-        Arc::new(Expression::Struct(vec![
+        Arc::new(Expression::struct_from(vec![
             column_expr_ref!("add.partitionValues"),
             column_expr_ref!("add.baseRowId"),
             column_expr_ref!("add.defaultRowCommitVersion"),
@@ -624,7 +608,7 @@ fn get_add_transform_expr(
         fields.push(Arc::new(stats_parsed_expr));
     }
 
-    Arc::new(Expression::Struct(fields))
+    Arc::new(Expression::struct_from(fields))
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -793,17 +777,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.partition_filter.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
-
-        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        // Use appropriate transform based on batch type:
-        // - Commit batches (is_log_batch=true) don't have stats_parsed, use base transform
-        // - Checkpoint batches (is_log_batch=false) may have stats_parsed
-        let transform = if is_log_batch {
-            &self.add_transform_for_commits
-        } else {
-            &self.add_transform
-        };
-        let result = transform.evaluate(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
         ScanMetadata::try_new(

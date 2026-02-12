@@ -15,7 +15,6 @@ use crate::actions::{ContentRoot, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;

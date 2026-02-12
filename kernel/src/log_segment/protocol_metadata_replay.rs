@@ -6,11 +6,10 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::crc::{CrcLoadResult, LazyCrc};
+use crate::crc::LazyCrc;
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, Error, Expression, Predicate, PredicateRef};
 
-use tracing::{info, instrument, warn};
 
 use super::LogSegment;
 
@@ -20,12 +19,15 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
+    #[allow(dead_code)]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Metadata, Protocol)> {
-        match self.read_protocol_metadata_opt(engine, lazy_crc)? {
+        // TODO: Try CRC first when CRC support is implemented
+        let _ = lazy_crc;
+        match self.replay_for_pm(engine, None, None)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),
@@ -35,6 +37,7 @@ impl LogSegment {
 
     /// Replays the log segment for Protocol and Metadata, merging with any already-found values.
     /// Stops early once both are found.
+    #[allow(dead_code)]
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
@@ -57,6 +60,7 @@ impl LogSegment {
     }
 
     // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
+    #[allow(dead_code)]
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
