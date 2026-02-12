@@ -44,6 +44,7 @@ pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 ///
 /// TODO(#1794): This limit is a Delta-Spark connector configuration, not a protocol requirement.
 /// Consider removing or making this configurable.
+#[allow(dead_code)]
 pub(crate) const MAX_CLUSTERING_COLUMNS: usize = 4;
 
 /// Validates clustering columns against the table schema.
@@ -63,6 +64,7 @@ pub(crate) const MAX_CLUSTERING_COLUMNS: usize = 4;
 /// # Errors
 ///
 /// Returns an error if any validation fails.
+#[allow(dead_code)]
 pub(crate) fn validate_clustering_columns(
     schema: &StructType,
     columns: &[ColumnName],
@@ -144,6 +146,7 @@ pub(crate) fn validate_clustering_columns(
 ///
 /// The JSON format is: `{"clusteringColumns": [["col1"], ["col2"]]}`
 /// Each column is represented as an array of path components to support nested columns.
+#[allow(dead_code)]
 pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> DomainMetadata {
     let metadata = ClusteringDomainMetadata {
         clustering_columns: columns
