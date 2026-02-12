@@ -593,6 +593,10 @@ fn get_add_transform_expr(
             column_expr_ref!("add.defaultRowCommitVersion"),
             column_expr_ref!("add.tags"),
             column_expr_ref!("add.clusteringProvider"),
+            column_expr_ref!("add.dataManifestPath"),
+            column_expr_ref!("add.dataManifestPosition"),
+            column_expr_ref!("add.deleteManifestPath"),
+            column_expr_ref!("add.deleteManifestPosition"),
         ])),
     ];
 
