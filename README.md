@@ -1,5 +1,6 @@
 # Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.85+]][rustc]
 
+
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
 [latest-version]: https://img.shields.io/crates/v/delta_kernel.svg
