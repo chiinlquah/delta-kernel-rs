@@ -30,6 +30,7 @@ pub use crate::listed_log_files::ListedLogFiles;
 use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
+use crate::crc::LazyCrc;
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
@@ -1114,26 +1115,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         existing_protocol: Option<&Protocol>,
-        // TODO: Implement CRC
-        // lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<ContentRoot>)> {
-        // TODO: To be added with content-root
-        // let crc_version = lazy_crc.crc_version();
-        //
-        // // Case 1: If CRC at target version, use it directly and exit early.
-        // if crc_version == Some(self.end_version) {
-        //     if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-        //         info!("P&M from CRC at target version {}", self.end_version);
-        //         return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
-        //     }
-        //     warn!(
-        //         "CRC at target version {} failed to load, falling back to log replay",
-        //         self.end_version
-        //     );
-        // }
+        // Try CRC-optimized path for P&M
+        let lazy_crc = LazyCrc::new(self.latest_crc_file.clone());
+        let (mut metadata_opt, mut protocol_opt) =
+            self.read_protocol_metadata_opt(engine, &lazy_crc)?;
 
-        // Determine if content root is enabled based on existing protocol knowledge
-        let mut root_enabled = match existing_protocol {
+        // Determine if content root is enabled based on found or existing protocol
+        let effective_protocol = protocol_opt.as_ref().or(existing_protocol);
+        let mut root_enabled = match effective_protocol {
             Some(protocol) => protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental),
             None => {
                 // No existing protocol - start optimistically
@@ -1141,16 +1131,20 @@ impl LogSegment {
             }
         };
 
-        // Cache whether content root was enabled at start to determine early termination behavior
+        // If P&M already found and no ContentRoot needed, return early
+        if metadata_opt.is_some() && protocol_opt.is_some() && !root_enabled {
+            return Ok((metadata_opt, protocol_opt, None));
+        }
+
+        // Need to search for ContentRoot (and possibly remaining P&M if not found).
+        // Do full replay, skipping P&M search if already populated from CRC.
         let root_enabled_at_start = root_enabled;
+        let mut content_root_opt = None;
 
-        let actions_batches = self.replay_for_pmc(engine)?;
-        let (mut metadata_opt, mut protocol_opt, mut content_root_opt) = (None, None, None);
-
-        for actions_batch in actions_batches {
+        for actions_batch in self.replay_for_pmc(engine)? {
             let actions = actions_batch?.actions;
 
-            // Always search for Protocol and Metadata
+            // Search for Protocol and Metadata if not already found via CRC
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
@@ -1189,6 +1183,62 @@ impl LogSegment {
             }
         }
         Ok((metadata_opt, protocol_opt, content_root_opt))
+    }
+
+    /// Try to get P&M via CRC-optimized path.
+    ///
+    /// Uses CRC files when available to avoid full log replay for Protocol and Metadata.
+    fn read_protocol_metadata_opt(
+        &self,
+        engine: &dyn Engine,
+        lazy_crc: &LazyCrc,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        use crate::crc::CrcLoadResult;
+
+        let crc_version = lazy_crc.crc_version();
+
+        // Case 1: CRC at target version → use directly
+        if crc_version == Some(self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                info!("P&M from CRC at target version {}", self.end_version);
+                return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
+            }
+            warn!(
+                "CRC at target version {} failed to load, falling back to log replay",
+                self.end_version
+            );
+        }
+
+        // Case 2: CRC at earlier version → try pruned replay, then CRC fallback
+        if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
+            info!("Pruning log segment to commits after CRC version {}", crc_v);
+            let pruned = self.segment_after_crc(crc_v);
+            let (metadata_opt, protocol_opt): (Option<Metadata>, Option<Protocol>) =
+                pruned.replay_for_pm(engine, None, None)?;
+
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                return Ok((metadata_opt, protocol_opt));
+            }
+
+            // Fall back to CRC for missing P&M
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                return Ok((
+                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                ));
+            }
+
+            // CRC failed, replay remaining segment
+            warn!(
+                "CRC at version {} failed to load, replaying remaining segment",
+                crc_v
+            );
+            let remaining = self.segment_through_crc(crc_v);
+            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
+        }
+
+        // Case 3/4: No CRC → return empty, let caller do full replay
+        Ok((None, None))
     }
 
     /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.

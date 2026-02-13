@@ -420,7 +420,7 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
-        _clustering_columns: Option<Vec<ColumnName>>,
+        clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
@@ -455,10 +455,7 @@ impl Transaction {
             snapshot_id: generate_snapshot_id(),
             root_released: false,
             cached_root_manifest_url: std::cell::OnceCell::new(),
-            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
-            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
-            // return the correct columns for the new table.
-            clustering_columns: None,
+            clustering_columns,
             is_blind_append: false,
         })
     }

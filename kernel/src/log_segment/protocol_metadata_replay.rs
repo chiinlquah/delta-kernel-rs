@@ -36,8 +36,7 @@ impl LogSegment {
 
     /// Replays the log segment for Protocol and Metadata, merging with any already-found values.
     /// Stops early once both are found.
-    #[allow(dead_code)]
-    fn replay_for_pm(
+    pub(super) fn replay_for_pm(
         &self,
         engine: &dyn Engine,
         mut metadata_opt: Option<Metadata>,
