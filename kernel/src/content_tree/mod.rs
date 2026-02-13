@@ -1471,6 +1471,8 @@ impl Metadata {
             engine.evaluation_handler().as_ref(),
             schema,
             predicate,
+            None, // table_schema not available in this code path
+            None, // stats_schema not available in this code path
         )
     }
 
@@ -1493,25 +1495,9 @@ impl Metadata {
         let has_add = schema.contains(ADD_NAME);
         let has_remove = schema.contains(REMOVE_NAME);
 
-        // Get evaluation handler and metadata schema
-        // Use schema with content_stats if table_schema is available (matches what's in the batches from open_stream)
-        let metadata_schema = {
-            use crate::schema::MetadataColumnSpec;
-
-            let base_schema = if let Some(ts) = table_schema {
-                // Batches have content_stats when table_schema was provided to open_stream
-                MetadataEntry::to_schema_with_content_stats(ts)?
-            } else {
-                MetadataEntry::base_schema()
-            };
-
-            let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
-            fields.push(StructField::create_metadata_column(
-                "_pos",
-                MetadataColumnSpec::RowIndex,
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        };
+        // Get metadata schema that matches actual batches from open_stream
+        // (includes _pos and content_stats if table_schema was provided)
+        let metadata_schema = MetadataEntry::processing_schema_with_pos(table_schema)?;
 
         // Build DV joiner for root manifest
         let dv_joiner_opt =
@@ -1542,75 +1528,13 @@ impl Metadata {
 
         // Create stats_parsed transformation evaluator if needed
         // This transforms content_stats to stats_parsed and adds it as a top-level field in the metadata batch
-        let stats_transform_opt = if let (Some(table_sch), Some(stats_sch)) =
-            (table_schema, stats_schema)
-        {
-            // Check if metadata_schema has content_stats field (only present when table_schema was used at read time)
-            let has_content_stats = metadata_schema
-                .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
-                .is_some();
-
-            // Check if the output schema expects stats_parsed
-            let needs_stats_parsed = schema
-                .field("add")
-                .and_then(|f| match f.data_type() {
-                    crate::schema::DataType::Struct(s) => s.field("stats_parsed"),
-                    _ => None,
-                })
-                .is_some();
-
-            debug!(
-                "Stats transformation check: has_content_stats={}, needs_stats_parsed={}",
-                has_content_stats, needs_stats_parsed
-            );
-
-            if has_content_stats && needs_stats_parsed {
-                debug!("Creating stats transformation: content_stats → stats_parsed");
-                // Build transform expression: augments metadata batch with stats_parsed field
-                // Creates a struct with all original fields plus stats_parsed
-                use crate::expressions::Expression;
-
-                // Get all fields from metadata_schema and create column expressions for them
-                let mut field_exprs: Vec<Arc<Expression>> = metadata_schema
-                    .fields()
-                    .map(|f| Arc::new(Expression::column([f.name().as_str()])))
-                    .collect();
-
-                // Add stats_parsed transformation
-                let stats_parsed_expr =
-                    crate::content_tree::stats::create_content_stats_to_stats_parsed_expr(
-                        table_sch, stats_sch,
-                    )?;
-                field_exprs.push(stats_parsed_expr);
-
-                // Build augmented schema
-                let augmented_output_schema = {
-                    let mut fields: Vec<StructField> = metadata_schema.fields().cloned().collect();
-                    fields.push(StructField::nullable(
-                        "stats_parsed",
-                        crate::schema::DataType::Struct(Box::new(stats_sch.clone())),
-                    ));
-                    Arc::new(StructType::new_unchecked(fields))
-                };
-
-                // Create struct expression with all fields
-                let augment_expr = Expression::struct_from_with_schema(
-                    field_exprs,
-                    (*augmented_output_schema).clone(),
-                );
-
-                // Create evaluator
-                Some(evaluation_handler.new_expression_evaluator(
-                    metadata_schema.clone(),
-                    Arc::new(augment_expr),
-                    augmented_output_schema.clone().into(),
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let stats_transform_opt = MetadataEntry::create_stats_transformation_evaluator(
+            evaluation_handler,
+            &metadata_schema,
+            schema,
+            table_schema,
+            stats_schema,
+        )?;
 
         // Process each batch
         let mut result_batches = Vec::new();
@@ -2963,6 +2887,117 @@ impl MetadataEntry {
             // split_offsets intentionally excluded - not used by Delta today
             // equality_ids intentionally excluded - not used by Delta today
         ])
+    }
+
+    /// Helper to create metadata schema for reading/processing manifest batches.
+    ///
+    /// This includes `_pos` metadata column and optionally `content_stats` based on table_schema.
+    /// Use this when you need a schema that matches actual manifest batch data.
+    pub(crate) fn processing_schema_with_pos(
+        table_schema: Option<&StructType>,
+    ) -> DeltaResult<SchemaRef> {
+        use crate::schema::MetadataColumnSpec;
+
+        let base_schema = if let Some(ts) = table_schema {
+            Self::to_schema_with_content_stats(ts)?
+        } else {
+            Self::base_schema()
+        };
+
+        let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
+        fields.push(StructField::create_metadata_column(
+            "_pos",
+            MetadataColumnSpec::RowIndex,
+        ));
+        Ok(Arc::new(StructType::new_unchecked(fields)))
+    }
+
+    /// Creates a stats transformation evaluator that transforms content_stats to stats_parsed.
+    ///
+    /// This evaluator augments metadata batches by reading content_stats and producing stats_parsed.
+    /// Returns None if:
+    /// - table_schema or stats_schema is not provided
+    /// - metadata_schema doesn't have content_stats field
+    /// - output_schema doesn't expect stats_parsed
+    ///
+    /// # Parameters
+    /// - `evaluation_handler`: Handler for creating the evaluator
+    /// - `metadata_schema`: Schema of the input metadata batch (must include content_stats)
+    /// - `output_schema`: Expected output schema (checked for add.stats_parsed field)
+    /// - `table_schema`: Table physical schema (with field IDs) for transformation
+    /// - `stats_schema`: Stats schema for the stats_parsed output
+    pub(crate) fn create_stats_transformation_evaluator(
+        evaluation_handler: &dyn EvaluationHandler,
+        metadata_schema: &SchemaRef,
+        output_schema: &SchemaRef,
+        table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
+    ) -> DeltaResult<Option<Arc<dyn crate::ExpressionEvaluator>>> {
+        let (Some(table_sch), Some(stats_sch)) = (table_schema, stats_schema) else {
+            return Ok(None);
+        };
+
+        // Check if metadata_schema has content_stats field (only present when table_schema was used at read time)
+        let has_content_stats = metadata_schema
+            .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+            .is_some();
+
+        // Check if the output schema expects stats_parsed
+        let needs_stats_parsed = output_schema
+            .field("add")
+            .and_then(|f| match f.data_type() {
+                crate::schema::DataType::Struct(s) => s.field("stats_parsed"),
+                _ => None,
+            })
+            .is_some();
+
+        debug!(
+            "Stats transformation check: has_content_stats={}, needs_stats_parsed={}",
+            has_content_stats, needs_stats_parsed
+        );
+
+        if !has_content_stats || !needs_stats_parsed {
+            return Ok(None);
+        }
+
+        debug!("Creating stats transformation: content_stats → stats_parsed");
+
+        // Build augmented transform that adds stats_parsed to metadata batch
+        use crate::expressions::Expression;
+
+        // Get all fields from metadata_schema
+        let mut field_exprs: Vec<Arc<Expression>> = metadata_schema
+            .fields()
+            .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+            .collect();
+
+        // Add stats_parsed transformation
+        let stats_parsed_expr =
+            crate::content_tree::stats::create_content_stats_to_stats_parsed_expr(
+                table_sch, stats_sch,
+            )?;
+        field_exprs.push(stats_parsed_expr);
+
+        // Build augmented output schema
+        let augmented_output_schema = {
+            let mut fields: Vec<StructField> = metadata_schema.fields().cloned().collect();
+            fields.push(StructField::nullable(
+                "stats_parsed",
+                crate::schema::DataType::Struct(Box::new(stats_sch.clone())),
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        };
+
+        // Create struct expression with all fields
+        let augment_expr =
+            Expression::struct_from_with_schema(field_exprs, (*augmented_output_schema).clone());
+
+        // Create evaluator
+        Ok(Some(evaluation_handler.new_expression_evaluator(
+            metadata_schema.clone(),
+            Arc::new(augment_expr),
+            augmented_output_schema.clone().into(),
+        )?))
     }
 
     /// Returns MetadataEntry schema with content_stats based on the given table schema.

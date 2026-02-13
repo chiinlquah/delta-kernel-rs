@@ -395,25 +395,11 @@ impl BulkManifestStreamProcessor {
             Vec::new()
         };
 
-        // Build DV joiner from pre-loaded metadata (both affiliated and unaffiliated)
-        // Leaf manifests DO have content_stats for individual file entries when table_schema is available
-        // Need to add _pos to match what's in the actual batches from parquet (added to read_schema)
-        let metadata_schema = {
-            use crate::schema::MetadataColumnSpec;
-
-            let base = if let Some(ref ts) = self.table_schema {
-                super::MetadataEntry::to_schema_with_content_stats(ts.as_ref())?
-            } else {
-                super::MetadataEntry::base_schema()
-            };
-
-            let mut fields: Vec<StructField> = base.fields().cloned().collect();
-            fields.push(StructField::create_metadata_column(
-                "_pos",
-                MetadataColumnSpec::RowIndex,
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        };
+        // Build metadata schema that matches actual batches from parquet
+        // (includes _pos and content_stats if table_schema was provided)
+        let metadata_schema = super::MetadataEntry::processing_schema_with_pos(
+            self.table_schema.as_ref().map(|s| s.as_ref()),
+        )?;
         let dv_joiner_opt = Metadata::build_dv_joiner_for_leaf(
             self.evaluation_handler.clone(),
             metadata_schema.clone(),
@@ -442,70 +428,13 @@ impl BulkManifestStreamProcessor {
         );
 
         // Build stats transformation evaluator if needed
-        let stats_transform_opt = if let (Some(table_sch), Some(stats_sch)) =
-            (self.table_schema.as_ref(), self.stats_schema.as_ref())
-        {
-            // Check if metadata_schema has content_stats field (only present when table_schema was used at read time)
-            let has_content_stats = metadata_schema
-                .field(super::CONTENT_STATS_FIELD_NAME)
-                .is_some();
-
-            // Check if the output schema expects stats_parsed
-            let needs_stats_parsed = self
-                .schema
-                .field("add")
-                .and_then(|f| match f.data_type() {
-                    crate::schema::DataType::Struct(s) => s.field("stats_parsed"),
-                    _ => None,
-                })
-                .is_some();
-
-            if has_content_stats && needs_stats_parsed {
-                // Build augmented transform that adds stats_parsed to metadata batch
-                use crate::expressions::Expression;
-
-                // Get all fields from metadata_schema
-                let mut field_exprs: Vec<Arc<Expression>> = metadata_schema
-                    .fields()
-                    .map(|f| Arc::new(Expression::column([f.name().as_str()])))
-                    .collect();
-
-                // Add stats_parsed transformation
-                let stats_parsed_expr =
-                    crate::content_tree::stats::create_content_stats_to_stats_parsed_expr(
-                        table_sch.as_ref(),
-                        stats_sch.as_ref(),
-                    )?;
-                field_exprs.push(stats_parsed_expr);
-
-                // Build augmented output schema
-                let augmented_output_schema = {
-                    let mut fields: Vec<StructField> = metadata_schema.fields().cloned().collect();
-                    fields.push(StructField::nullable(
-                        "stats_parsed",
-                        crate::schema::DataType::Struct(Box::new(stats_sch.as_ref().clone())),
-                    ));
-                    Arc::new(StructType::new_unchecked(fields))
-                };
-
-                // Create struct expression with all fields
-                let augment_expr = Expression::struct_from_with_schema(
-                    field_exprs,
-                    (*augmented_output_schema).clone(),
-                );
-
-                // Create evaluator
-                Some(self.evaluation_handler.new_expression_evaluator(
-                    metadata_schema.clone(),
-                    Arc::new(augment_expr),
-                    augmented_output_schema.clone().into(),
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let stats_transform_opt = super::MetadataEntry::create_stats_transformation_evaluator(
+            self.evaluation_handler.as_ref(),
+            &metadata_schema,
+            &self.schema,
+            self.table_schema.as_ref().map(|s| s.as_ref()),
+            self.stats_schema.as_ref().map(|s| s.as_ref()),
+        )?;
 
         let manifest_location = manifest_ref
             .data_manifest
