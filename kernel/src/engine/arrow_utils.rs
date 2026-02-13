@@ -823,7 +823,8 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::Nested(children) => {
                     let input_field_name = input_fields[parquet_position].name();
-                    match input_cols[parquet_position].data_type() {
+                    let actual_type = input_cols[parquet_position].data_type();
+                    match actual_type {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
                             let result_array = Arc::new(reorder_struct_array(
@@ -857,9 +858,10 @@ pub(crate) fn reorder_struct_array(
                                 reorder_map(map_array, input_field_name, children)?;
                         }
                         _ => {
-                            return Err(Error::internal_error(
-                                "Nested reorder can only apply to struct/list/map.",
-                            ));
+                            return Err(Error::internal_error(format!(
+                                "Nested reorder can only apply to struct/list/map. Field '{}' has type {:?}, expected nested type",
+                                input_field_name, actual_type
+                            )));
                         }
                     }
                 }

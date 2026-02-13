@@ -544,6 +544,7 @@ impl LogSegment {
         data_predicate: Option<PredicateRef>,
         content_root: Option<&ContentRoot>,
         skip_leaf_manifests: bool,
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -561,6 +562,7 @@ impl LogSegment {
             content_root,
             data_predicate,
             skip_leaf_manifests,
+            table_schema,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -595,6 +597,7 @@ impl LogSegment {
             None,  // No data predicate for manifest-level skipping
             None,  // No content root available in this context
             false, // Don't skip leaf manifests by default
+            None,  // No table schema available in this context
         )?;
         Ok(action_with_checkpoint_info.actions)
     }
@@ -718,6 +721,7 @@ impl LogSegment {
     ///   child manifests whose `content_stats` indicate they cannot contain matching data
     ///   will be skipped (not opened).
     /// - `skip_leaf_manifests`: When true, only read the root manifest, not the leaf manifests.
+    #[allow(clippy::too_many_arguments)]
     fn create_content_root_reader(
         engine: &dyn Engine,
         content_root: &ContentRoot,
@@ -725,12 +729,15 @@ impl LogSegment {
         table_root: &Url,
         data_predicate: Option<PredicateRef>,
         skip_leaf_manifests: bool,
+        stats_schema: Option<&StructType>,
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
 
         // Create lazy iterator that opens the stream and defers processing
+        // Stats schema and table schema are passed for AMT content_stats reading and data skipping
         let lazy_iter =
             crate::content_tree::lazy_reader::LazyContentRootIterator::from_content_root(
                 engine.parquet_handler(),
@@ -741,6 +748,8 @@ impl LogSegment {
                 checkpoint_read_schema,
                 data_predicate,
                 skip_leaf_manifests,
+                stats_schema,
+                table_schema,
             )?;
 
         Ok(Box::new(lazy_iter))
@@ -868,6 +877,7 @@ impl LogSegment {
         content_root: Option<&ContentRoot>,
         data_predicate: Option<PredicateRef>,
         skip_leaf_manifests: bool,
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -878,6 +888,27 @@ impl LogSegment {
         // The content root serves the same purpose as a checkpoint file for file actions,
         // so remove file actions from the schema if they are present for actually reading
         // the checkpoint files.
+        // If stats_schema is provided, extend action_schema to include stats_parsed for content root
+        let action_schema_for_content_root = if let Some(stats_schema) = stats_schema {
+            use crate::actions::{Add, ADD_NAME};
+            use crate::schema::{DataType, StructField, StructType};
+
+            // Get the base Add schema and add stats_parsed to it
+            let add_struct = Add::to_schema();
+            let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+            add_fields.push(StructField::nullable(
+                "stats_parsed",
+                DataType::Struct(Box::new(stats_schema.clone())),
+            ));
+
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                ADD_NAME,
+                StructType::new_unchecked(add_fields),
+            )]))
+        } else {
+            action_schema.clone()
+        };
+
         let (content_root_stream, read_schema): (
             Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
             SchemaRef,
@@ -886,10 +917,12 @@ impl LogSegment {
                 Self::create_content_root_reader(
                     engine,
                     cr,
-                    action_schema.clone(),
+                    action_schema_for_content_root,
                     &self.table_root,
                     data_predicate,
                     skip_leaf_manifests,
+                    stats_schema,
+                    table_schema,
                 )?,
                 Self::remove_file_actions_from_schema(action_schema.clone())?,
             )

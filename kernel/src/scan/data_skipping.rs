@@ -192,7 +192,7 @@ impl DataSkippingFilter {
     }
 }
 
-struct DataSkippingPredicateCreator;
+pub(crate) struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type Output = Pred;

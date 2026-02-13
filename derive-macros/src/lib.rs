@@ -158,7 +158,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
             // Then, add field-id metadata if present
             match get_field_id(&field.attrs) {
                 Ok(Some(id)) => {
-                    quote_spanned! { field.span() => #base_call.add_metadata([("parquet.field.id", #id)]) }
+                    quote_spanned! { field.span() => #base_call.add_metadata([(delta_kernel::schema::ColumnMetadataKey::ParquetFieldId.as_ref(), #id)]) }
                 }
                 Ok(None) => quote_spanned! { field.span() => #base_call },
                 Err(err) => err.to_compile_error(),
@@ -357,7 +357,9 @@ mod tests {
         assert!(result.is_ok(), "field_id = 0 should be valid");
         let token_stream = result.unwrap().to_string();
         assert!(
-            token_stream.contains("(\"parquet.field.id\" , 0i64)"),
+            token_stream.contains(
+                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , 0i64)"
+            ),
             "Expected 0, found: {}",
             token_stream
         );
@@ -373,7 +375,9 @@ mod tests {
         assert!(result.is_ok(), "field_id = -1 should be valid");
         let token_stream = result.unwrap().to_string();
         assert!(
-            token_stream.contains("(\"parquet.field.id\" , - 1i64)"),
+            token_stream.contains(
+                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , - 1i64)"
+            ),
             "Expected -1, found: {}",
             token_stream
         );
@@ -389,7 +393,9 @@ mod tests {
         assert!(result.is_ok(), "Large field_id should be valid");
         let token_stream = result.unwrap().to_string();
         assert!(
-            token_stream.contains("(\"parquet.field.id\" , 9223372036854775807i64)"),
+            token_stream.contains(
+                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , 9223372036854775807i64)"
+            ),
             "Expected 9223372036854775807, found: {}",
             token_stream
         );

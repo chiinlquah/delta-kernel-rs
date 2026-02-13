@@ -6,7 +6,7 @@
 //! - Defers leaf manifest reading until root manifests are exhausted
 
 use crate::log_replay::ActionsBatch;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, EngineData, EvaluationHandler, ParquetHandler, PredicateRef, Version};
 use std::sync::Arc;
 use url::Url;
@@ -29,6 +29,10 @@ struct ContentRootContext {
     table_root: Url,
     data_predicate: Option<PredicateRef>,
     skip_leaf_manifests: bool,
+    /// Stats schema (from table configuration or predicate columns)
+    stats_schema: Option<StructType>,
+    /// Table schema (physical schema with field IDs for AMT)
+    table_schema: Option<StructType>,
 }
 
 enum LazyContentRootState {
@@ -68,6 +72,8 @@ impl LazyContentRootIterator {
     /// - `checkpoint_read_schema`: Schema to use for reading actions
     /// - `data_predicate`: Optional predicate for manifest-level data skipping
     /// - `skip_leaf_manifests`: When true, only read root manifest
+    /// - `stats_schema`: Optional stats schema (from table configuration or predicate columns)
+    /// - `table_schema`: Optional table physical schema (with field IDs) for AMT content_stats reading
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_content_root(
         parquet_handler: Arc<dyn ParquetHandler>,
@@ -78,12 +84,20 @@ impl LazyContentRootIterator {
         checkpoint_read_schema: SchemaRef,
         data_predicate: Option<PredicateRef>,
         skip_leaf_manifests: bool,
+        stats_schema: Option<&StructType>,
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<Self> {
+        // Convert schemas to owned for storage in context
+        let stats_schema = stats_schema.cloned();
+        let table_schema = table_schema.cloned();
+
         // Open the parquet stream using the metadata helper
+        // Pass table_schema so content_stats field is included in the read schema
         let (parquet_batches, version, path_in_log) = crate::content_tree::Metadata::open_stream(
             parquet_handler.clone(),
             content_root_url,
             path_in_log,
+            table_schema.as_ref(),
         )?;
 
         let context = ContentRootContext {
@@ -93,6 +107,8 @@ impl LazyContentRootIterator {
             table_root,
             data_predicate,
             skip_leaf_manifests,
+            stats_schema,
+            table_schema,
         };
 
         Ok(Self {
@@ -175,11 +191,23 @@ impl Iterator for LazyContentRootIterator {
                     }
 
                     // Lazily read leaf manifests now that root is exhausted
-                    let leaf_refs =
-                        match metadata.manifest_references(context.data_predicate.as_ref()) {
-                            Ok(refs) => refs,
-                            Err(e) => return Some(Err(e)),
-                        };
+                    // Construct manifest batch schema with content_stats for data skipping
+                    let manifest_batch_schema = context.table_schema.as_ref().and_then(|ts| {
+                        crate::content_tree::MetadataEntry::to_schema_with_content_stats(ts)
+                            .ok()
+                            .map(Arc::new)
+                    });
+
+                    let leaf_refs = match metadata.manifest_references(
+                        context.data_predicate.as_ref(),
+                        Some(&context.evaluation_handler),
+                        context.stats_schema.as_ref(),
+                        context.table_schema.as_ref(),
+                        manifest_batch_schema.as_ref(),
+                    ) {
+                        Ok(refs) => refs,
+                        Err(e) => return Some(Err(e)),
+                    };
 
                     let leaf_iter =
                         match crate::content_tree::Metadata::non_root_action_batches_with_handlers(

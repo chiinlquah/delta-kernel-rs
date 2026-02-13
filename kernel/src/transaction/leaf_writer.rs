@@ -6,7 +6,7 @@ use crate::content_tree::{
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
-use crate::schema::{DataType, MapType, StructField, StructType};
+use crate::schema::{DataType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
 };
@@ -16,51 +16,24 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 /// Schema for scan row data that includes stats_parsed with Delta JSON format marker.
-/// Used as the `input_schema` hint for [`crate::metadata::stats::try_pre_convert_stats_column`]
+/// Used as the `input_schema` hint for [`crate::content_tree::stats::try_pre_convert_stats_column`]
 /// when converting stats_parsed in `add_existing_actions()`.
+///
+/// Built by extending SCAN_ROW_SCHEMA with a placeholder stats_parsed field.
+/// The actual stats_parsed structure will be determined by the checkpoint data.
 static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null("size", DataType::LONG),
-        StructField::not_null("modificationTime", DataType::LONG),
-        StructField::nullable("stats", DataType::STRING),
-        StructField::nullable(
-            "deletionVector",
-            DataType::struct_type_unchecked(vec![
-                StructField::nullable("storageType", DataType::STRING),
-                StructField::nullable("pathOrInlineDv", DataType::STRING),
-                StructField::nullable("offset", DataType::INTEGER),
-                StructField::nullable("sizeInBytes", DataType::INTEGER),
-                StructField::nullable("cardinality", DataType::LONG),
-            ]),
-        ),
-        StructField::not_null(
-            "fileConstantValues",
-            DataType::struct_type_unchecked(vec![
-                StructField::not_null(
-                    "partitionValues",
-                    DataType::Map(Box::new(MapType::new(
-                        DataType::STRING,
-                        DataType::STRING,
-                        true,
-                    ))),
-                ),
-                StructField::nullable("baseRowId", DataType::LONG),
-                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                StructField::nullable("dataManifestPath", DataType::STRING),
-                StructField::nullable("dataManifestPosition", DataType::LONG),
-                StructField::nullable("deleteManifestPath", DataType::STRING),
-                StructField::nullable("deleteManifestPosition", DataType::LONG),
-            ]),
-        ),
-        StructField::nullable(
-            "stats_parsed",
-            DataType::struct_type_unchecked(vec![StructField::nullable(
-                "numRecords",
-                DataType::LONG,
-            )]),
-        ),
-    ]))
+    use crate::scan::log_replay::SCAN_ROW_SCHEMA;
+
+    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+
+    // Add a placeholder stats_parsed field with minimal structure (just numRecords).
+    // This signals that stats_parsed is expected and should be converted from Delta JSON format.
+    fields.push(StructField::nullable(
+        "stats_parsed",
+        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
+    ));
+
+    Arc::new(StructType::new_unchecked(fields))
 });
 
 /// Composite identifier for deletion vectors.
@@ -540,7 +513,7 @@ impl LeafNodeWriter {
     /// * `table_root` - The root URL of the Delta table
     /// * `version` - The version this leaf is being written for
     /// * `snapshot_id` - The snapshot ID for tracking info
-    /// * `table_schema` - The table's data schema with parquet.field.id metadata
+    /// * `table_schema` - The table's data schema with PARQUET:field_id metadata
     /// * `track_root_removals` - Whether to track root entries for removal
     /// * `root_manifest_url` - Optional URL of the root manifest for validation
     pub(crate) fn new(
@@ -1232,8 +1205,14 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
 
         // Add files with Delta JSON format stats (like the engine produces when writing parquet).
         // The stats will be automatically converted to AMT format by WriteMetadataWithStatsVisitor.
@@ -1300,27 +1279,10 @@ mod tests {
 
         let parquet_handler = engine.parquet_handler();
 
-        // Build a schema that includes the content_stats columns we want to read
-        let content_stats_schema =
-            crate::content_tree::stats::stats_schema(&StructType::try_new(vec![
-                StructField::not_null("id", DataType::INTEGER).with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(1),
-                )]),
-                StructField::nullable("value", DataType::STRING).with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(2),
-                )]),
-            ])?)?;
-
-        // Build the full read schema including content_stats
-        let read_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("location", DataType::STRING),
-            StructField::nullable(
-                "contentStats",
-                DataType::Struct(Box::new(content_stats_schema)),
-            ),
-        ]));
+        // Use the production schema to ensure test matches actual behavior
+        // This generates the full MetadataEntry schema with content_stats based on table schema
+        let read_schema =
+            Arc::new(crate::content_tree::MetadataEntry::to_schema_with_content_stats(&schema)?);
 
         let read_result_iter =
             parquet_handler.read_parquet_files(&[file_meta], read_schema, None)?;
@@ -1334,11 +1296,12 @@ mod tests {
                 .expect("Expected ArrowEngineData");
             let record_batch = arrow_data.record_batch();
 
-            // Check that contentStats column exists and has data
-            let content_stats_col = record_batch.column_by_name("contentStats");
+            // Check that content_stats column exists and has data
+            let content_stats_col =
+                record_batch.column_by_name(crate::content_tree::CONTENT_STATS_FIELD_NAME);
             assert!(
                 content_stats_col.is_some(),
-                "contentStats column should exist in manifest"
+                "content_stats column should exist in manifest"
             );
 
             let stats_array = content_stats_col.unwrap();
@@ -1347,18 +1310,18 @@ mod tests {
             // Verify the stats are not null
             assert!(
                 stats_array.is_valid(0),
-                "contentStats should not be null for the entry"
+                "content_stats should not be null for the entry"
             );
 
             // Access the struct array to verify nested values
             let stats_struct = stats_array
                 .as_any()
                 .downcast_ref::<crate::arrow::array::StructArray>()
-                .expect("contentStats should be a struct array");
+                .expect("content_stats should be a struct array");
 
             // Verify 'id' column stats exist
             let id_stats = stats_struct.column_by_name("id");
-            assert!(id_stats.is_some(), "id stats should exist in contentStats");
+            assert!(id_stats.is_some(), "id stats should exist in content_stats");
             let id_struct = id_stats
                 .unwrap()
                 .as_any()
@@ -1409,7 +1372,7 @@ mod tests {
             let value_stats = stats_struct.column_by_name("value");
             assert!(
                 value_stats.is_some(),
-                "value stats should exist in contentStats"
+                "value stats should exist in content_stats"
             );
             let value_struct = value_stats
                 .unwrap()
@@ -1431,19 +1394,15 @@ mod tests {
                 "value.value_count should be 100"
             );
 
-            // Verify value.null_value_count
+            // Verify value.null_count
             let value_null_count = value_struct
-                .column_by_name("null_value_count")
-                .expect("value.null_value_count should exist");
+                .column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                .expect("value.null_count should exist");
             let value_nc_array = value_null_count
                 .as_any()
                 .downcast_ref::<crate::arrow::array::Int64Array>()
-                .expect("null_value_count should be Int64");
-            assert_eq!(
-                value_nc_array.value(0),
-                5,
-                "value.null_value_count should be 5"
-            );
+                .expect("null_count should be Int64");
+            assert_eq!(value_nc_array.value(0), 5, "value.null_count should be 5");
 
             // Verify value.lower_bound
             let value_lower = value_struct

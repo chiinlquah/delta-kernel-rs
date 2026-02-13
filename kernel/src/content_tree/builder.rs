@@ -220,7 +220,7 @@ pub(crate) struct MetadataBuilder {
     /// Table schema for converting stats JSON to content_stats format.
     /// The builder will populate content_stats from the Delta JSON stats blob.
     /// This schema must match the schema used to write the files and must include
-    /// parquet.field.id metadata on fields for proper stats mapping.
+    /// PARQUET:field_id metadata on fields for proper stats mapping.
     table_schema: Schema,
     /// Set of seen file paths to prevent duplicate entries.
     /// Only populated when processing existing actions, not new actions.
@@ -253,10 +253,10 @@ impl MetadataBuilder {
     /// # Arguments
     /// * `table_root` - The root URL of the table
     /// * `version` - The version of the metadata being built
-    /// * `table_schema` - The table schema with parquet.field.id metadata for stats conversion.
+    /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion.
     ///   This parameter is essential for converting Delta JSON stats (minValues, maxValues, nullCount)
     ///   to the content_stats StructData format when adding entries via `add()`. The schema must
-    ///   match the schema used to write the files and must include parquet.field.id metadata on
+    ///   match the schema used to write the files and must include PARQUET:field_id metadata on
     ///   fields for proper stats field mapping
     #[allow(dead_code)]
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     /// Helper function to create a minimal table schema for tests.
-    /// This schema has the required parquet.field.id metadata for content_stats generation.
+    /// This schema has the required PARQUET:field_id metadata for content_stats generation.
     fn test_table_schema() -> Schema {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
 
@@ -2086,7 +2086,11 @@ mod tests {
 
         // Check name stats
         assert_eq!(
-            get_column_stat(&content_stats, "name", "null_value_count"),
+            get_column_stat(
+                &content_stats,
+                "name",
+                crate::content_tree::NULL_COUNT_FIELD_NAME
+            ),
             Some(&Scalar::Long(5))
         );
         assert_eq!(
@@ -2299,9 +2303,13 @@ mod tests {
             Some(&Scalar::Long(100))
         );
 
-        // Check name stats: null_value_count=15, lower_bound="alice", upper_bound="zoe"
+        // Check name stats: null_count=15, lower_bound="alice", upper_bound="zoe"
         assert_eq!(
-            get_column_stat(aggregated_stats, "name", "null_value_count"),
+            get_column_stat(
+                aggregated_stats,
+                "name",
+                crate::content_tree::NULL_COUNT_FIELD_NAME
+            ),
             Some(&Scalar::Long(15)) // 5 + 10
         );
         assert_eq!(
