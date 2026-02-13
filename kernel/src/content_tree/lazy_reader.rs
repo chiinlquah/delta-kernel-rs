@@ -156,6 +156,8 @@ impl Iterator for LazyContentRootIterator {
                         &context.checkpoint_read_schema,
                         &[],
                         context.data_predicate.as_ref(),
+                        context.table_schema.as_ref(),
+                        context.stats_schema.as_ref(),
                     ) {
                         Ok(iter) => iter,
                         Err(e) => return Some(Err(e)),
@@ -217,6 +219,8 @@ impl Iterator for LazyContentRootIterator {
                             &context.checkpoint_read_schema,
                             &context.table_root,
                             context.data_predicate.as_ref(),
+                            context.table_schema.as_ref(),
+                            context.stats_schema.as_ref(),
                         ) {
                             Ok(iter) => iter,
                             Err(e) => return Some(Err(e)),

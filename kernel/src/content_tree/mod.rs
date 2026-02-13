@@ -430,6 +430,7 @@ impl Metadata {
         field_type: &DataType,
         action_name: &str,
         path_in_log: &str,
+        has_stats_parsed: bool,
     ) -> DeltaResult<crate::expressions::Expression> {
         use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
         use crate::schema::{DataType, MapType};
@@ -484,6 +485,17 @@ impl Metadata {
             "deleteManifestPosition" if action_name == "add" => {
                 Expression::null_literal(DataType::LONG)
             }
+            "stats_parsed" if action_name == "add" => {
+                if has_stats_parsed {
+                    // Read stats_parsed from the augmented metadata batch
+                    // The stats_parsed field is added to the batch by the stats transformation evaluator
+                    // (see root_action_batches_optimized_with_handler)
+                    Expression::column(["stats_parsed"])
+                } else {
+                    // Stats transformation not available, return null
+                    Expression::null_literal(field_type.clone())
+                }
+            }
 
             // Remove-specific fields
             "deletionTimestamp" if action_name == "remove" => Expression::literal(i64::MIN),
@@ -499,6 +511,7 @@ impl Metadata {
         action_schema: &SchemaRef,
         action_name: &str,
         path_in_log: &str,
+        has_stats_parsed: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
         use crate::expressions::Expression;
         use crate::schema::DataType;
@@ -522,6 +535,7 @@ impl Metadata {
                 field.data_type(),
                 action_name,
                 path_in_log,
+                has_stats_parsed,
             )?;
             field_exprs.push(Arc::new(expr));
         }
@@ -558,16 +572,18 @@ impl Metadata {
     fn build_metadata_to_add_transform(
         add_schema: &SchemaRef,
         path_in_log: &str,
+        has_stats_parsed: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        Self::build_metadata_to_action_transform(add_schema, "add", path_in_log)
+        Self::build_metadata_to_action_transform(add_schema, "add", path_in_log, has_stats_parsed)
     }
 
     /// Builds a Transform expression to convert MetadataEntry → Remove fields.
     fn build_metadata_to_remove_transform(
         remove_schema: &SchemaRef,
         path_in_log: &str,
+        has_stats_parsed: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        Self::build_metadata_to_action_transform(remove_schema, "remove", path_in_log)
+        Self::build_metadata_to_action_transform(remove_schema, "remove", path_in_log, has_stats_parsed)
     }
 
     /// Builds a Transform expression to convert joined MetadataEntry + DV fields → Add fields.
@@ -589,6 +605,7 @@ impl Metadata {
     fn build_metadata_to_add_transform_with_dv(
         add_schema: &SchemaRef,
         path_in_log: &str,
+        has_stats_parsed: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
         use crate::expressions::Expression;
         use crate::schema::DataType;
@@ -651,6 +668,7 @@ impl Metadata {
                     field.data_type(),
                     "add",
                     path_in_log,
+                    has_stats_parsed,
                 )?,
             };
 
@@ -1222,6 +1240,36 @@ impl Metadata {
         }
     }
 
+    /// Determine the evaluator schema with stats_parsed if needed
+    fn get_evaluator_schema_with_stats(
+        has_dvs: bool,
+        metadata_schema: &SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> SchemaRef {
+        let mut schema = Self::get_evaluator_schema(has_dvs, metadata_schema);
+
+        // Only add stats_parsed and content_stats if:
+        // 1. stats_schema is provided
+        // 2. content_stats field exists in metadata (meaning it was read with table_schema)
+        if let Some(stats_sch) = stats_schema {
+            if let Some(content_stats_field) = metadata_schema
+                .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+            {
+                let mut fields: Vec<StructField> = schema.fields().cloned().collect();
+                // Add content_stats so it can be read by the stats transformation
+                fields.push(content_stats_field.clone());
+                // Add stats_parsed as the transformed output
+                fields.push(StructField::nullable(
+                    "stats_parsed",
+                    crate::schema::DataType::Struct(Box::new(stats_sch.clone())),
+                ));
+                schema = Arc::new(StructType::new_unchecked(fields));
+            }
+        }
+
+        schema
+    }
+
     /// Build Add and/or Remove evaluators based on the schema
     fn build_action_evaluators(
         evaluation_handler: &dyn EvaluationHandler,
@@ -1232,11 +1280,14 @@ impl Metadata {
         has_remove: bool,
         has_dvs: bool,
     ) -> DeltaResult<EvaluatorPair> {
+        // Check if stats_parsed is available in evaluator schema (indicates stats transformation is enabled)
+        let has_stats_parsed = evaluator_schema.field("stats_parsed").is_some();
+
         let add_evaluator_opt = if has_add {
             let add_expr = if has_dvs {
-                Self::build_metadata_to_add_transform_with_dv(output_schema, path_in_log)?
+                Self::build_metadata_to_add_transform_with_dv(output_schema, path_in_log, has_stats_parsed)?
             } else {
-                Self::build_metadata_to_add_transform(output_schema, path_in_log)?
+                Self::build_metadata_to_add_transform(output_schema, path_in_log, has_stats_parsed)?
             };
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
@@ -1248,7 +1299,7 @@ impl Metadata {
         };
 
         let remove_evaluator_opt = if has_remove {
-            let remove_expr = Self::build_metadata_to_remove_transform(output_schema, path_in_log)?;
+            let remove_expr = Self::build_metadata_to_remove_transform(output_schema, path_in_log, has_stats_parsed)?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
                 remove_expr,
@@ -1428,6 +1479,8 @@ impl Metadata {
         evaluation_handler: &dyn EvaluationHandler,
         schema: &SchemaRef,
         predicate: Option<&PredicateRef>,
+        table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         use crate::actions::{ADD_NAME, REMOVE_NAME};
 
@@ -1441,10 +1494,17 @@ impl Metadata {
         let has_remove = schema.contains(REMOVE_NAME);
 
         // Get evaluation handler and metadata schema
-        // Use base_schema with _pos added (matches what's in the batches)
+        // Use schema with content_stats if table_schema is available (matches what's in the batches from open_stream)
         let metadata_schema = {
             use crate::schema::MetadataColumnSpec;
-            let base_schema = MetadataEntry::base_schema();
+
+            let base_schema = if let Some(ts) = table_schema {
+                // Batches have content_stats when table_schema was provided to open_stream
+                MetadataEntry::to_schema_with_content_stats(ts)?
+            } else {
+                MetadataEntry::base_schema()
+            };
+
             let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
             fields.push(StructField::create_metadata_column(
                 "_pos",
@@ -1460,8 +1520,12 @@ impl Metadata {
         // Check if we have deletion vectors (needed for evaluator schema and evaluators)
         let has_dvs = dv_joiner_opt.is_some();
 
-        // Determine evaluator schema (includes parsed DV columns if present)
-        let evaluator_schema = Self::get_evaluator_schema(has_dvs, &metadata_schema);
+        // Determine evaluator schema (includes parsed DV columns if present, and stats_parsed if needed)
+        let evaluator_schema = Self::get_evaluator_schema_with_stats(
+            has_dvs,
+            &metadata_schema,
+            stats_schema,
+        );
 
         // Build evaluators for Add and/or Remove actions
         let evaluators = Self::build_action_evaluators(
@@ -1476,6 +1540,78 @@ impl Metadata {
         let add_evaluator_opt = evaluators.add_evaluator;
         let remove_evaluator_opt = evaluators.remove_evaluator;
 
+        // Create stats_parsed transformation evaluator if needed
+        // This transforms content_stats to stats_parsed and adds it as a top-level field in the metadata batch
+        let stats_transform_opt = if let (Some(table_sch), Some(stats_sch)) =
+            (table_schema, stats_schema)
+        {
+            // Check if metadata_schema has content_stats field (only present when table_schema was used at read time)
+            let has_content_stats = metadata_schema
+                .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+                .is_some();
+
+            // Check if the output schema expects stats_parsed
+            let needs_stats_parsed = schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    crate::schema::DataType::Struct(s) => s.field("stats_parsed"),
+                    _ => None,
+                })
+                .is_some();
+
+            debug!(
+                "Stats transformation check: has_content_stats={}, needs_stats_parsed={}",
+                has_content_stats, needs_stats_parsed
+            );
+
+            if has_content_stats && needs_stats_parsed {
+                debug!("Creating stats transformation: content_stats → stats_parsed");
+                // Build transform expression: augments metadata batch with stats_parsed field
+                // Creates a struct with all original fields plus stats_parsed
+                use crate::expressions::Expression;
+
+                // Get all fields from metadata_schema and create column expressions for them
+                let mut field_exprs: Vec<Arc<Expression>> = metadata_schema
+                    .fields()
+                    .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+                    .collect();
+
+                // Add stats_parsed transformation
+                let stats_parsed_expr =
+                    crate::content_tree::stats::create_content_stats_to_stats_parsed_expr(
+                        table_sch, stats_sch,
+                    )?;
+                field_exprs.push(stats_parsed_expr);
+
+                // Build augmented schema
+                let augmented_output_schema = {
+                    let mut fields: Vec<StructField> = metadata_schema.fields().cloned().collect();
+                    fields.push(StructField::nullable(
+                        "stats_parsed",
+                        crate::schema::DataType::Struct(Box::new(stats_sch.clone())),
+                    ));
+                    Arc::new(StructType::new_unchecked(fields))
+                };
+
+                // Create struct expression with all fields
+                let augment_expr = Expression::struct_from_with_schema(
+                    field_exprs,
+                    (*augmented_output_schema).clone(),
+                );
+
+                // Create evaluator
+                Some(evaluation_handler.new_expression_evaluator(
+                    metadata_schema.clone(),
+                    Arc::new(augment_expr),
+                    augmented_output_schema.clone().into(),
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Process each batch
         let mut result_batches = Vec::new();
 
@@ -1483,12 +1619,19 @@ impl Metadata {
             // Optionally apply DV join to append DV columns
             // We'll store the joined batch if present, otherwise work with original
             let joined_batch;
-            let batch_ref: &dyn EngineData = if let Some(ref joiner) = dv_joiner_opt {
+            let mut batch_ref: &dyn EngineData = if let Some(ref joiner) = dv_joiner_opt {
                 joined_batch = Self::apply_dv_join_to_batch(batch.as_ref(), joiner.as_ref())?;
                 joined_batch.as_ref()
             } else {
                 batch.as_ref()
             };
+
+            // Optionally transform content_stats to stats_parsed and augment batch
+            let stats_augmented_batch;
+            if let Some(ref stats_eval) = stats_transform_opt {
+                stats_augmented_batch = stats_eval.evaluate(batch_ref)?;
+                batch_ref = stats_augmented_batch.as_ref();
+            }
 
             // Process Add entries if needed
             if let Some(add_eval) = add_evaluator_opt.as_ref() {
@@ -1548,6 +1691,8 @@ impl Metadata {
         schema: &SchemaRef,
         _partition_keys: &[String],
         predicate: Option<&PredicateRef>,
+        table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Return empty iterator if schema doesn't contain Add or Remove
         if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
@@ -1558,7 +1703,13 @@ impl Metadata {
         self.validate_no_unsupported_rows()?;
 
         debug!("Using optimized path for metadata reading");
-        self.root_action_batches_optimized_with_handler(evaluation_handler, schema, predicate)
+        self.root_action_batches_optimized_with_handler(
+            evaluation_handler,
+            schema,
+            predicate,
+            table_schema,
+            stats_schema,
+        )
     }
 
     /// Discovers child manifest references in the root manifest.
@@ -1807,6 +1958,8 @@ impl Metadata {
             schema,
             table_root,
             predicate,
+            None, // table_schema not available in test path
+            None, // stats_schema not available in test path
         )
     }
 
@@ -1818,6 +1971,8 @@ impl Metadata {
         schema: &SchemaRef,
         table_root: &Url,
         predicate: Option<&PredicateRef>,
+        table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         // Use BulkManifestStreamProcessor for lazy processing of manifests
         let processor = bulk_processor::BulkManifestStreamProcessor::new(
@@ -1828,6 +1983,8 @@ impl Metadata {
             schema.clone(),
             table_root.clone(),
             predicate.cloned(),
+            table_schema.map(|s| Arc::new(s.clone())),
+            stats_schema.map(|s| Arc::new(s.clone())),
         )?;
 
         Ok(Box::new(processor))
@@ -2016,6 +2173,8 @@ impl Metadata {
             schema_owned,
             table_root_owned,
             None, // predicate
+            None, // table_schema not available in test path
+            None, // stats_schema not available in test path
         )?;
 
         Ok(Box::new(processor))
