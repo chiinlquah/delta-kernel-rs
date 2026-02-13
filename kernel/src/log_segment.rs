@@ -30,10 +30,15 @@ pub use crate::listed_log_files::ListedLogFiles;
 use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
+use crate::crc::LazyCrc;
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+mod protocol_metadata_replay;
+
+#[cfg(test)]
+mod crc_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -91,7 +96,7 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
+    /// Latest CRC (checksum) file, only if version >= checkpoint version.
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
@@ -221,7 +226,7 @@ impl LogSegment {
             );
         }
 
-        Ok(LogSegment {
+        let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
@@ -233,7 +238,32 @@ impl LogSegment {
             latest_commit_file,
             checkpoint_schema,
             max_published_version,
-        })
+        };
+
+        info!(segment = %log_segment.summary());
+
+        Ok(log_segment)
+    }
+
+    /// Succinct summary string for logging purposes.
+    fn summary(&self) -> String {
+        format!(
+            "{{v={}, commits={}, checkpoint_v={}, checkpoint_parts={}, compactions={}, crc_v={}, max_pub_v={}}}",
+            self.end_version,
+            self.ascending_commit_files.len(),
+            self.checkpoint_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".into()),
+            self.checkpoint_parts.len(),
+            self.ascending_compaction_files.len(),
+            self.latest_crc_file
+                .as_ref()
+                .map(|f| f.version.to_string())
+                .unwrap_or_else(|| "none".into()),
+            self.max_published_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".into()),
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for [`Snapshot`]. For a `Snapshot` at version `n`:
@@ -248,6 +278,7 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
+    #[instrument(name = "log_seg.for_snap", skip_all, err)]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
@@ -1118,8 +1149,14 @@ impl LogSegment {
         engine: &dyn Engine,
         existing_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<ContentRoot>)> {
-        // Determine if content root is enabled based on existing protocol knowledge
-        let mut root_enabled = match existing_protocol {
+        // Try CRC-optimized path for P&M
+        let lazy_crc = LazyCrc::new(self.latest_crc_file.clone());
+        let (mut metadata_opt, mut protocol_opt) =
+            self.read_protocol_metadata_opt(engine, &lazy_crc)?;
+
+        // Determine if content root is enabled based on found or existing protocol
+        let effective_protocol = protocol_opt.as_ref().or(existing_protocol);
+        let mut root_enabled = match effective_protocol {
             Some(protocol) => protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental),
             None => {
                 // No existing protocol - start optimistically
@@ -1127,16 +1164,20 @@ impl LogSegment {
             }
         };
 
-        // Cache whether content root was enabled at start to determine early termination behavior
+        // If P&M already found and no ContentRoot needed, return early
+        if metadata_opt.is_some() && protocol_opt.is_some() && !root_enabled {
+            return Ok((metadata_opt, protocol_opt, None));
+        }
+
+        // Need to search for ContentRoot (and possibly remaining P&M if not found).
+        // Do full replay, skipping P&M search if already populated from CRC.
         let root_enabled_at_start = root_enabled;
+        let mut content_root_opt = None;
 
-        let actions_batches = self.replay_for_metadata(engine)?;
-        let (mut metadata_opt, mut protocol_opt, mut content_root_opt) = (None, None, None);
-
-        for actions_batch in actions_batches {
+        for actions_batch in self.replay_for_pmc(engine)? {
             let actions = actions_batch?.actions;
 
-            // Always search for Protocol and Metadata
+            // Search for Protocol and Metadata if not already found via CRC
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
@@ -1174,21 +1215,116 @@ impl LogSegment {
                 }
             }
         }
-
-        // Final validation: if we found content root but protocol doesn't support it, error
-        if let (Some(protocol), Some(_)) = (protocol_opt.as_ref(), content_root_opt.as_ref()) {
-            if !protocol.has_reader_feature(&TableFeature::MetadataTreeExperimental) {
-                return Err(Error::invalid_protocol(
-                    "Found ContentRoot action but protocol does not have MetadataTreeExperimental reader feature enabled"
-                ));
-            }
-        }
-
         Ok((metadata_opt, protocol_opt, content_root_opt))
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
-    fn replay_for_metadata(
+    /// Try to get P&M via CRC-optimized path.
+    ///
+    /// Uses CRC files when available to avoid full log replay for Protocol and Metadata.
+    fn read_protocol_metadata_opt(
+        &self,
+        engine: &dyn Engine,
+        lazy_crc: &LazyCrc,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        use crate::crc::CrcLoadResult;
+
+        let crc_version = lazy_crc.crc_version();
+
+        // Case 1: CRC at target version → use directly
+        if crc_version == Some(self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                info!("P&M from CRC at target version {}", self.end_version);
+                return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
+            }
+            warn!(
+                "CRC at target version {} failed to load, falling back to log replay",
+                self.end_version
+            );
+        }
+
+        // Case 2: CRC at earlier version → try pruned replay, then CRC fallback
+        if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
+            info!("Pruning log segment to commits after CRC version {}", crc_v);
+            let pruned = self.segment_after_crc(crc_v);
+            let (metadata_opt, protocol_opt): (Option<Metadata>, Option<Protocol>) =
+                pruned.replay_for_pm(engine, None, None)?;
+
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                return Ok((metadata_opt, protocol_opt));
+            }
+
+            // Fall back to CRC for missing P&M
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                return Ok((
+                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                ));
+            }
+
+            // CRC failed, replay remaining segment
+            warn!(
+                "CRC at version {} failed to load, replaying remaining segment",
+                crc_v
+            );
+            let remaining = self.segment_through_crc(crc_v);
+            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
+        }
+
+        // Case 3/4: No CRC → return empty, let caller do full replay
+        Ok((None, None))
+    }
+
+    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
+    ///
+    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
+    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// in `(start_v_exclusive, end_version]` are retained.
+    #[allow(dead_code)]
+    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: None,
+            log_root: self.log_root.clone(),
+            table_root: self.table_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
+        }
+    }
+
+    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
+    ///
+    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
+    /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
+    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
+    /// needed for this replay path (CRC file, latest commit file) are dropped.
+    #[allow(dead_code)]
+    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: self.checkpoint_version,
+            log_root: self.log_root.clone(),
+            table_root: self.table_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: self.checkpoint_parts.clone(),
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: self.checkpoint_schema.clone(),
+            max_published_version: None,
+        }
+    }
+
+    /// Reads protocol, metadata, and content root actions from the log segment.
+    fn replay_for_pmc(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
@@ -1206,6 +1342,36 @@ impl LogSegment {
         });
         // read the same protocol and metadata schema for both commits and checkpoints
         self.read_actions(engine, schema, META_PREDICATE.clone())
+    }
+
+    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
+    /// If `lo_exclusive` is `None`, there is no lower bound.
+    #[allow(dead_code)]
+    fn filtered_commits_and_compactions(
+        &self,
+        lo_exclusive: Option<Version>,
+        hi_inclusive: Version,
+    ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
+        let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
+        let commits = self
+            .ascending_commit_files
+            .iter()
+            .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
+            .cloned()
+            .collect();
+        let compactions = self
+            .ascending_compaction_files
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.file_type,
+                    LogPathFileType::CompactedCommit { hi }
+                        if above_lo(c.version) && hi <= hi_inclusive
+                )
+            })
+            .cloned()
+            .collect();
+        (commits, compactions)
     }
 
     /// How many commits since a checkpoint, according to this log segment.

@@ -31,7 +31,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod crc;
 pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -273,7 +272,7 @@ impl Metadata {
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
-        schema: StructType,
+        schema: SchemaRef,
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
@@ -364,6 +363,30 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_unchecked(
+        id: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: impl Into<String>,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            description,
+            format,
+            schema_string: schema_string.into(),
+            partition_columns,
+            created_time,
+            configuration,
+        }
     }
 }
 
@@ -609,6 +632,21 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+    ) -> Self {
+        Self {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
@@ -634,6 +672,8 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
+    /// Whether this commit is a blind append.
+    pub(crate) is_blind_append: Option<bool>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
@@ -667,6 +707,7 @@ impl CommitInfo {
         operation: Option<String>,
         engine_info: Option<String>,
         snapshot_id: i64,
+        is_blind_append: bool,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
@@ -674,6 +715,7 @@ impl CommitInfo {
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
             snapshot_id: Some(snapshot_id),
@@ -1386,6 +1428,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
                 StructField::nullable("snapshotId", DataType::LONG),
@@ -1681,7 +1724,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None, 0);
+        let commit_info = CommitInfo::new(0, None, None, None, 0, false);
         let commit_info_txn_id = commit_info.txn_id.clone();
         let commit_info_snapshot_id = commit_info.snapshot_id;
 
@@ -1700,6 +1743,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
                 Arc::new(Int64Array::from(vec![commit_info_snapshot_id])),
@@ -1739,7 +1783,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1764,7 +1811,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1774,7 +1824,10 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1861,7 +1914,10 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1909,7 +1965,10 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),

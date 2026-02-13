@@ -1113,6 +1113,7 @@ impl ColumnNamesAndTypes {
         (&self.0, &self.1)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn extend(&mut self, other: ColumnNamesAndTypes) {
         self.0.extend(other.0);
         self.1.extend(other.1);
@@ -1333,6 +1334,11 @@ impl PrimitiveType {
                 | (Integer, Long)
                 // Float widening: float can be read as double
                 | (Float, Double)
+                // Timestamp equivalence: both are i64 microseconds since epoch, differing only
+                // in timezone semantics. The parquet representation is identical, so reading
+                // one as the other is safe at the data layer.
+                | (Timestamp, TimestampNtz)
+                | (TimestampNtz, Timestamp)
         )
     }
 }

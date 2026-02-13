@@ -261,14 +261,14 @@ impl TableConfiguration {
     /// Partition columns are excluded because statistics are only collected for data columns
     /// that are physically stored in the parquet files. Partition values are stored in the
     /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> StructType {
+    fn logical_data_schema(&self) -> SchemaRef {
         let partition_columns = self.metadata().partition_columns();
-        StructType::new_unchecked(
-            self.schema()
+        Arc::new(StructType::new_unchecked(
+            self.schema
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
-        )
+        ))
     }
 
     /// Generates the expected schema for partition values when written in struct format.
@@ -543,7 +543,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.schema().as_ref())
+            && InvariantChecker::has_invariants(self.schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -716,7 +716,7 @@ mod test {
 
     use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnName;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
@@ -728,19 +728,22 @@ mod test {
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
     fn create_mock_table_config(
-        props_to_enable: &[&str],
+        props_to_enable: &[(&str, &str)],
         features: &[TableFeature],
     ) -> TableConfiguration {
         create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
     }
 
     fn create_mock_table_config_with_version(
-        props_to_enable: &[&str],
+        props_to_enable: &[(&str, &str)],
         features_opt: Option<&[TableFeature]>,
         min_reader_version: i32,
         min_writer_version: i32,
     ) -> TableConfiguration {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -750,7 +753,7 @@ mod test {
             HashMap::from_iter(
                 props_to_enable
                     .iter()
-                    .map(|key| (key.to_string(), "true".to_string())),
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
             ),
         )
         .unwrap();
@@ -807,14 +810,19 @@ mod test {
 
     #[test]
     fn dv_supported_not_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -833,7 +841,12 @@ mod test {
 
     #[test]
     fn dv_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -841,11 +854,8 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
+                (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
             ]),
         )
         .unwrap();
@@ -865,17 +875,18 @@ mod test {
 
     #[test]
     fn write_with_cdf() {
+        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
         use TableFeature::*;
         let cases = [
             (
                 // Writing to CDF-enabled table is supported for writes
-                create_mock_table_config(&["delta.enableChangeDataFeed"], &[ChangeDataFeed]),
+                create_mock_table_config(&[(ENABLE_CHANGE_DATA_FEED, "true")], &[ChangeDataFeed]),
                 Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
@@ -883,21 +894,26 @@ mod test {
             (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed", "delta.appendOnly"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
             ),
             (
                 // Writer version > 7 is not supported
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
+                create_mock_table_config_with_version(
+                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
+                    None,
+                    1,
+                    8,
+                ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
             // Column mapping for writes is now supported
             (
                 // Should succeed with change data feed and column mapping features both present
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed", "delta.appendOnly"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
                 Ok(()),
@@ -905,14 +921,14 @@ mod test {
             (
                 // Should succeed with column mapping enabled
                 create_mock_table_config(
-                    &["delta.appendOnly"],
+                    &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
                 Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
-                create_mock_table_config(&["delta.appendOnly"], &[AppendOnly]),
+                create_mock_table_config(&[(APPEND_ONLY, "true")], &[AppendOnly]),
                 Ok(()),
             ),
         ];
@@ -934,17 +950,19 @@ mod test {
     }
     #[test]
     fn ict_enabled_from_table_creation() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
             schema,
             vec![],
             0, // Table creation version
-            HashMap::from_iter([(
-                "delta.enableInCommitTimestamps".to_string(),
-                "true".to_string(),
-            )]),
+            HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -969,7 +987,15 @@ mod test {
     }
     #[test]
     fn ict_supported_and_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::{
+            ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+            IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+        };
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -977,16 +1003,13 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
+                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
                 (
-                    "delta.enableInCommitTimestamps".to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
                     "5".to_string(),
                 ),
                 (
-                    "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP.to_string(),
                     "100".to_string(),
                 ),
             ]),
@@ -1014,7 +1037,14 @@ mod test {
     }
     #[test]
     fn ict_enabled_with_partial_enablement_info() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::{
+            ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+        };
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1022,12 +1052,9 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
+                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
                 (
-                    "delta.enableInCommitTimestamps".to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
                     "5".to_string(),
                 ),
                 // Missing enablement timestamp
@@ -1053,7 +1080,10 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1072,7 +1102,10 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1084,14 +1117,19 @@ mod test {
     }
     #[test]
     fn dv_not_supported() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -1110,14 +1148,19 @@ mod test {
 
     #[test]
     fn test_try_new_from() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
+
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -1131,8 +1174,10 @@ mod test {
         let table_config =
             TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
 
-        let new_schema =
-            StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let new_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let new_metadata = Metadata::try_new(
             None,
             None,
@@ -1140,14 +1185,8 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
-                (
-                    "delta.enableChangeDataFeed".to_string(),
-                    "false".to_string(),
-                ),
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "false".to_string()),
+                (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
             ]),
         )
         .unwrap();
@@ -1194,8 +1233,10 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema =
-            StructType::new_unchecked([StructField::nullable("ts", DataType::TIMESTAMP_NTZ)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NTZ,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features = Protocol::try_new(
@@ -1241,8 +1282,10 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema =
-            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "v",
+            DataType::unshredded_variant(),
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features = Protocol::try_new(
@@ -1410,6 +1453,8 @@ mod test {
 
     #[test]
     fn test_is_feature_info_enabled_with_custom_property_check() {
+        use crate::table_properties::APPEND_ONLY;
+
         // Create a custom feature with a property check function
         let custom_feature_info = FeatureInfo {
             name: "customPropertyFeature",
@@ -1429,7 +1474,7 @@ mod test {
         assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
 
         // Test when property check passes - should be both supported and enabled
-        let config = create_mock_table_config_with_version(&["delta.appendOnly"], None, 1, 2);
+        let config = create_mock_table_config_with_version(&[(APPEND_ONLY, "true")], None, 1, 2);
         assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
         assert!(config.is_feature_info_enabled(&feature, &custom_feature_info));
     }
@@ -1504,7 +1549,10 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1523,7 +1571,10 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1554,7 +1605,7 @@ mod test {
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
-    fn schema_with_column_mapping() -> StructType {
+    fn schema_with_column_mapping() -> SchemaRef {
         let field_a: StructField = serde_json::from_str(
             r#"{
                 "name": "col_a",
@@ -1581,16 +1632,18 @@ mod test {
         )
         .unwrap();
 
-        StructType::new_unchecked([field_a, field_b])
+        Arc::new(StructType::new_unchecked([field_a, field_b]))
     }
 
     fn create_table_config_with_column_mapping(
-        schema: StructType,
+        schema: SchemaRef,
         column_mapping_mode: &str,
     ) -> TableConfiguration {
+        use crate::table_properties::COLUMN_MAPPING_MODE;
+
         let mut props = HashMap::new();
         props.insert(
-            "delta.columnMapping.mode".to_string(),
+            COLUMN_MAPPING_MODE.to_string(),
             column_mapping_mode.to_string(),
         );
 
@@ -1605,10 +1658,10 @@ mod test {
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
         // Without column mapping, logical and physical schemas should be identical
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("col_a", DataType::LONG),
             StructField::nullable("col_b", DataType::STRING),
-        ]);
+        ]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1694,6 +1747,64 @@ mod test {
     }
 
     #[test]
+    fn test_build_expected_stats_schemas_id_mode_has_no_parquet_field_ids() {
+        // With column mapping mode `id`, make_physical() injects ParquetFieldId metadata for
+        // data file reading. But the physical stats schema must NOT contain these field IDs
+        // because stats are read from JSON commit files or checkpoint Parquet files, neither of
+        // which use parquet field IDs.
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "id");
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
+
+        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+
+        // Verify physical schema has physical names
+        let physical_min_values = stats_schemas
+            .physical
+            .field("minValues")
+            .unwrap()
+            .data_type();
+        let DataType::Struct(inner) = physical_min_values else {
+            panic!("Expected minValues to be a struct");
+        };
+        assert!(
+            inner.field("phys_col_a").is_some(),
+            "Physical schema should have phys_col_a"
+        );
+        assert!(
+            inner.field("phys_col_b").is_some(),
+            "Physical schema should have phys_col_b"
+        );
+        assert!(inner.field("col_a").is_none());
+
+        // Verify no field has ParquetFieldId metadata
+        for field in inner.fields() {
+            assert!(
+                field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none(),
+                "Physical stats schema field '{}' should not have ParquetFieldId metadata",
+                field.name()
+            );
+        }
+
+        // Verify that make_physical on the same schema DOES produce ParquetFieldId (sanity check)
+        let data_schema = schema_with_column_mapping();
+        let physical_data = data_schema.make_physical(ColumnMappingMode::Id);
+        let data_field = physical_data.field("phys_col_a").unwrap();
+        assert!(
+            matches!(
+                data_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(MetadataValue::Number(_))
+            ),
+            "make_physical should inject ParquetFieldId for data schemas in Id mode"
+        );
+    }
+
+    #[test]
     fn test_stats_column_names_returns_logical_names() {
         // stats_column_names should return logical column names
         let schema = schema_with_column_mapping();
@@ -1706,5 +1817,33 @@ mod test {
         assert!(column_names.contains(&ColumnName::new(["col_b"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
+    }
+
+    #[cfg(feature = "clustered-table")]
+    #[test]
+    fn test_clustered_table_writes() {
+        // ClusteredTable requires DomainMetadata to be supported
+        let config = create_mock_table_config(
+            &[],
+            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
+        );
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_ok(),
+            "ClusteredTable with DomainMetadata should be supported for writes"
+        );
+    }
+
+    #[cfg(not(feature = "clustered-table"))]
+    #[test]
+    fn test_clustered_table_writes_not_supported() {
+        // Without the clustered-table feature, writes to clustered tables should fail
+        let config = create_mock_table_config(
+            &[],
+            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
+        );
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_err(),
+            "ClusteredTable should not be supported for writes without feature flag"
+        );
     }
 }
