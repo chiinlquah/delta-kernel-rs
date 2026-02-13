@@ -107,7 +107,12 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == data.fields().len(),
-                    Error::generic("Struct builder has wrong number of fields")
+                    Error::generic(format!(
+                        "Struct builder has wrong number of fields: builder has {} fields, data has {} fields. Data field names: {:?}",
+                        builder.num_fields(),
+                        data.fields().len(),
+                        data.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>()
+                    ))
                 );
                 for _ in 0..num_rows {
                     let field_builders = builder.field_builders_mut().iter_mut();
@@ -189,7 +194,12 @@ impl Scalar {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == stype.num_fields(),
-                    Error::generic("Struct builder has wrong number of fields")
+                    Error::generic(format!(
+                        "Struct builder has wrong number of fields: builder has {} fields, struct type has {} fields. StructType field names: {:?}",
+                        builder.num_fields(),
+                        stype.num_fields(),
+                        stype.fields().map(|f| f.name().as_str()).collect::<Vec<_>>()
+                    ))
                 );
                 for _ in 0..num_rows {
                     let field_builders = builder.field_builders_mut().iter_mut();

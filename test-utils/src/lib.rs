@@ -287,7 +287,7 @@ pub async fn create_table(
 
     // Check if the schema has column mapping IDs before converting to string
     // Column mapping ID determines whether to use "id" or "name" mode
-    // Note: parquet.field.id is derived from column mapping ID by make_physical()
+    // Note: PARQUET:field_id is derived from column mapping ID by make_physical()
     let has_column_mapping_ids = schema.fields().any(|field| {
         field
             .get_config_value(&delta_kernel::schema::ColumnMetadataKey::ColumnMappingId)

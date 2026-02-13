@@ -880,7 +880,7 @@ pub trait ParquetHandler: AsAny {
     /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
-    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
+    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"PARQUET:field_id": 1`
     /// - Column 1: `"s"` (string, nullable) with no field ID metadata
     /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
     ///

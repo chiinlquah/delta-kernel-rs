@@ -22,9 +22,7 @@ mod output;
 mod scenarios;
 
 use clap::{Parser, Subcommand};
-use delta_kernel::expressions::{
-    column_expr, BinaryPredicate, BinaryPredicateOp, Expression, Predicate, Scalar,
-};
+use delta_kernel::expressions::{column_expr, Expression, Scalar};
 use std::process;
 use std::sync::Arc;
 use url::Url;
@@ -161,11 +159,9 @@ fn run_scenario(
     match scenario {
         Scenario::FullTableScan => scenarios::scan(table_url, engine, /*predicate=*/ None),
         Scenario::NeedleInHaystack { partition_id } => {
-            let predicate = Some(Arc::new(Predicate::Binary(BinaryPredicate {
-                op: BinaryPredicateOp::Equal,
-                left: Box::new(column_expr!("id")),
-                right: Box::new(Expression::Literal(Scalar::Long(*partition_id))),
-            })));
+            let predicate = Some(Arc::new(
+                column_expr!("id").eq(Expression::Literal(Scalar::Long(*partition_id))),
+            ));
             scenarios::scan(table_url, engine, predicate)
         }
         Scenario::BulkWrite {

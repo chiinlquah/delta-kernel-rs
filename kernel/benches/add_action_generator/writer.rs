@@ -27,6 +27,7 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::properties::WriterProperties;
+use delta_kernel::schema::ColumnMetadataKey;
 use delta_kernel::DeltaResult;
 use std::fs::File;
 use std::sync::Arc;
@@ -328,83 +329,83 @@ fn get_stats_columns_fields() -> Fields {
     // Add field IDs to match the table schema's column mapping
     Fields::from(vec![
         Field::new("phonetic", DataType::Utf8, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "1".to_string(),
         )])),
         Field::new("city", DataType::Utf8, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "2".to_string(),
         )])),
         Field::new("state", DataType::Utf8, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "3".to_string(),
         )])),
         Field::new("num1", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "4".to_string(),
         )])),
         Field::new("num2", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "5".to_string(),
         )])),
         Field::new("num3", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "6".to_string(),
         )])),
         Field::new("num4", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "7".to_string(),
         )])),
         Field::new("num5", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "8".to_string(),
         )])),
         Field::new("num6", DataType::Float64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "9".to_string(),
         )])),
         Field::new("num7", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "10".to_string(),
         )])),
         Field::new("num8", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "11".to_string(),
         )])),
         Field::new("num9", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "12".to_string(),
         )])),
         Field::new("num10", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "13".to_string(),
         )])),
         Field::new("num11", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "14".to_string(),
         )])),
         Field::new("num12", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "15".to_string(),
         )])),
         Field::new("num13", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "16".to_string(),
         )])),
         Field::new("num14", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "17".to_string(),
         )])),
         Field::new("num15", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "18".to_string(),
         )])),
         Field::new("num16", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "19".to_string(),
         )])),
         Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "20".to_string(),
         )])),
     ])
@@ -418,83 +419,83 @@ fn get_null_count_fields() -> Fields {
     // nullCount values are always Long (Int64) since they represent counts
     Fields::from(vec![
         Field::new("phonetic", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "1".to_string(),
         )])),
         Field::new("city", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "2".to_string(),
         )])),
         Field::new("state", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "3".to_string(),
         )])),
         Field::new("num1", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "4".to_string(),
         )])),
         Field::new("num2", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "5".to_string(),
         )])),
         Field::new("num3", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "6".to_string(),
         )])),
         Field::new("num4", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "7".to_string(),
         )])),
         Field::new("num5", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "8".to_string(),
         )])),
         Field::new("num6", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "9".to_string(),
         )])),
         Field::new("num7", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "10".to_string(),
         )])),
         Field::new("num8", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "11".to_string(),
         )])),
         Field::new("num9", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "12".to_string(),
         )])),
         Field::new("num10", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "13".to_string(),
         )])),
         Field::new("num11", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "14".to_string(),
         )])),
         Field::new("num12", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "15".to_string(),
         )])),
         Field::new("num13", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "16".to_string(),
         )])),
         Field::new("num14", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "17".to_string(),
         )])),
         Field::new("num15", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "18".to_string(),
         )])),
         Field::new("num16", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "19".to_string(),
         )])),
         Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
-            "parquet.field.id".to_string(),
+            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
             "20".to_string(),
         )])),
     ])

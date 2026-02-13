@@ -3,11 +3,12 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
+use crate::content_tree::NULL_COUNT_FIELD_NAME;
 use crate::expressions::{Expression, ExpressionRef, Scalar, StructData, Transform};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, PrimitiveType,
+    StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData};
 use serde_json::Value as JsonValue;
@@ -193,8 +194,9 @@ impl SchemaVisitor for StatsSchemaVisitor {
         // Get the field ID from metadata
         let field_id = get_field_id(field).ok_or_else(|| {
             crate::Error::generic(format!(
-                "Field '{}' is missing parquet.field.id metadata",
-                field.name()
+                "Field '{}' is missing field ID! Metadata: {:#?}",
+                field.name(),
+                field.metadata()
             ))
         })?;
 
@@ -219,6 +221,9 @@ impl SchemaVisitor for StatsSchemaVisitor {
             field.name(),
             DataType::Struct(Box::new(stats_struct)),
             true,
+        )
+        .with_metadata(
+            field.metadata.iter().map(|(k, v)| (k.as_str(), v.clone())),
         )])
     }
 
@@ -252,7 +257,7 @@ impl SchemaVisitor for StatsSchemaVisitor {
 ///
 /// The stats struct contains the following fields (with field IDs as offsets from the base):
 /// - offset 1: `value_count` (long)
-/// - offset 2: `null_value_count` (long) - only if the field is nullable
+/// - offset 2: `null_count` (long) - only if the field is nullable
 /// - offset 3: `nan_value_count` (long) - only for float/double types
 /// - offset 4: `avg_value_size` (long) - only for variable-length types (e.g. string/binary)
 /// - offset 5: `max_value_size` (long) - only for variable-length types (e.g. string/binary)
@@ -266,7 +271,7 @@ fn build_primitive_stats_struct(
 ) -> StructType {
     // Base fields: value_count, lower_bound, upper_bound, exact_bounds.
     // Optional fields:
-    // - null_value_count (if nullable)
+    // - null_count (if nullable)
     // - nan_value_count (if float/double)
     // - avg_value_size/max_value_size (if variable-length: string/binary)
     let (has_nan_count, has_size_stats) = match &data_type {
@@ -289,10 +294,10 @@ fn build_primitive_stats_struct(
         base_field_id + STATS_OFFSET_VALUE_COUNT,
     ));
 
-    // null_value_count: only if the field is nullable
+    // null_count: only if the field is nullable
     if nullable {
         fields.push(field_with_id(
-            "null_value_count",
+            crate::content_tree::NULL_COUNT_FIELD_NAME,
             DataType::LONG,
             true,
             base_field_id + STATS_OFFSET_NULL_VALUE_COUNT,
@@ -362,7 +367,7 @@ fn build_primitive_stats_struct(
 ///
 /// Each primitive field's stats struct contains:
 /// - `value_count` (long): count of values
-/// - `null_value_count` (long): count of null values (only if field is nullable)
+/// - `null_count` (long): count of null values (only if field is nullable)
 /// - `nan_value_count` (long): count of NaN values (only for float/double types)
 /// - `avg_value_size` (long): average size of values (only for variable-length types)
 /// - `max_value_size` (long): maximum size of values (only for variable-length types)
@@ -373,7 +378,7 @@ fn build_primitive_stats_struct(
 /// ## Field IDs
 ///
 /// Field IDs in the stats schema are computed using [`field_id_to_statistics_base`]
-/// based on the original field's `parquet.field.id` metadata.
+/// based on the original field's `PARQUET:field_id` metadata.
 ///
 /// # Arguments
 ///
@@ -382,7 +387,7 @@ fn build_primitive_stats_struct(
 /// # Returns
 ///
 /// Returns `Ok(StructType)` containing the stats schema, or an error if:
-/// - Any field is missing the `parquet.field.id` metadata
+/// - Any field is missing the `PARQUET:field_id` metadata
 /// - Field ID computation fails (e.g., overflow)
 #[allow(dead_code)]
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
@@ -527,7 +532,7 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
 
 /// Builds a content_stats StructData for a single column from Delta JSON stats.
 ///
-/// Creates a struct with the stats schema fields (value_count, null_value_count,
+/// Creates a struct with the stats schema fields (value_count, null_count,
 /// lower_bound, upper_bound, exact_bounds) populated from the Delta JSON stats.
 ///
 /// # Arguments
@@ -554,7 +559,9 @@ fn build_column_stats(
     for stats_field in &fields {
         let scalar = match stats_field.name().as_str() {
             "value_count" => num_records.map(Scalar::Long),
-            "null_value_count" => null_count.map(Scalar::Long),
+            field if field == crate::content_tree::NULL_COUNT_FIELD_NAME => {
+                null_count.map(Scalar::Long)
+            }
             "nan_value_count" => None, // Not available in Delta JSON stats
             "avg_value_size" => None,  // Not available in Delta JSON stats
             "max_value_size" => None,  // Not available in Delta JSON stats
@@ -665,7 +672,7 @@ fn build_struct_stats(
 ///
 /// For AMT-style format (per-column stats with lower_bound, upper_bound, etc.):
 /// - `value_count`: sum of all value_counts
-/// - `null_value_count`: sum of all null_value_counts
+/// - `null_count`: sum of all null_counts
 /// - `nan_value_count`: sum of all nan_value_counts
 /// - `avg_value_size`: set to null (would require weighted average calculation)
 /// - `max_value_size`: max of all max_value_sizes
@@ -903,7 +910,8 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
 
         let aggregated = match field_name {
             // Sum fields
-            "value_count" | "null_value_count" | "nan_value_count" => {
+            "value_count" | "nan_value_count" => sum_long_scalars(&field_scalars),
+            field if field == crate::content_tree::NULL_COUNT_FIELD_NAME => {
                 sum_long_scalars(&field_scalars)
             }
             // Max fields
@@ -1103,6 +1111,8 @@ pub(crate) fn build_delta_to_amt_pivot_expression(
         &[],
         known_stats_schema,
     );
+
+    // Use Transform to replace the stats_parsed field while preserving other fields
     let transform = Expression::transform(
         Transform::new_top_level()
             .with_replaced_field(stats_column_name, Arc::new(amt_struct_expr)),
@@ -1164,7 +1174,7 @@ fn build_amt_struct_expr(
         })
         .collect();
 
-    Expression::Struct(exprs, None, None)
+    Expression::Struct(exprs, Some(Box::new(amt_schema.clone())), None)
 }
 
 /// Checks if a nested field path exists in a struct type.
@@ -1192,7 +1202,7 @@ fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
 /// Builds per-column stats struct expression for a leaf (primitive) column.
 ///
 /// The field ordering matches the AMT stats schema from [`stats_schema`]:
-/// value_count, null_value_count, nan_value_count, avg_value_size,
+/// value_count, null_count, nan_value_count, avg_value_size,
 /// max_value_size, lower_bound, upper_bound, exact_bounds.
 ///
 /// When `known_stats_schema` is `Some`, column references are only created for fields
@@ -1223,7 +1233,7 @@ fn build_amt_leaf_expr(
                 "value_count" if field_exists("numRecords", &[]) => {
                     Expression::column([stats_col, "numRecords"])
                 }
-                "null_value_count" if field_exists("nullCount", col_path) => {
+                name if name == NULL_COUNT_FIELD_NAME && field_exists("nullCount", col_path) => {
                     let mut path: Vec<&str> = vec![stats_col, "nullCount"];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
@@ -1248,7 +1258,7 @@ fn build_amt_leaf_expr(
         })
         .collect();
 
-    Expression::Struct(exprs, None, None)
+    Expression::Struct(exprs, Some(Box::new(amt_leaf_schema.clone())), None)
 }
 
 /// Engine-agnostic pre-conversion of a stats column from Delta JSON to AMT format.
@@ -1305,11 +1315,18 @@ pub(crate) fn try_pre_convert_stats_column(
 
     // Step 1: Try optimistic conversion assuming all Delta JSON fields exist in the data.
     // The actual data may have more fields than input_schema declares.
+    // This code should now be unreachable due to the Map type check above,
+    // but keeping it for potential future use with non-Map schemas
     let (expr, amt_stats_schema) =
         build_delta_to_amt_pivot_expression(table_schema, stats_column_name, None)?;
     let evaluator = build_evaluator(expr, &amt_stats_schema)?;
-    if let Ok(result) = evaluator.evaluate(data) {
-        return Ok(Some(result));
+    match evaluator.evaluate(data) {
+        Ok(result) => {
+            return Ok(Some(result));
+        }
+        Err(_e) => {
+            // Optimistic conversion failed, try conservative approach
+        }
     }
 
     // Step 2: If optimistic evaluation failed (e.g., data only has numRecords),
@@ -1321,12 +1338,269 @@ pub(crate) fn try_pre_convert_stats_column(
             Some(known_schema),
         )?;
         let evaluator = build_evaluator(expr, &amt_stats_schema)?;
-        if let Ok(result) = evaluator.evaluate(data) {
-            return Ok(Some(result));
+        match evaluator.evaluate(data) {
+            Ok(result) => {
+                return Ok(Some(result));
+            }
+            Err(_e) => {
+                // Conservative conversion also failed
+            }
         }
     }
 
+    // Return None means conversion failed - caller will use NULL for content_stats
+    // This will result in manifest-level data skipping being unable to filter manifests
     Ok(None)
+}
+
+pub(crate) fn create_content_stats_to_stats_parsed_expr(
+    table_schema: &StructType,
+    stats_schema: &StructType,
+) -> DeltaResult<ExpressionRef> {
+    // Build a map from physical column names (with "." for nested) to field IDs
+    // These are the physical names as they appear in the provided schema
+    let mut column_to_field_id: HashMap<String, i32> = HashMap::new();
+    build_column_to_field_id_map(table_schema, "", &mut column_to_field_id)?;
+
+    // If no columns have field IDs, return early
+    if column_to_field_id.is_empty() {
+        return Err(crate::Error::generic(
+            "No fields with field IDs found in table schema",
+        ));
+    }
+
+    // Extract the minValues schema from stats_schema to determine which columns we need stats for
+    let needed_columns_schema = stats_schema
+        .field("minValues")
+        .and_then(|f| match f.data_type() {
+            DataType::Struct(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .ok_or_else(|| crate::Error::generic("stats_schema missing minValues field"))?;
+
+    // Build expressions for each stat type, but only for columns in stats_schema
+    let mut null_count_exprs = Vec::new();
+    let mut min_values_exprs = Vec::new();
+    let mut max_values_exprs = Vec::new();
+    let mut null_count_fields = Vec::new();
+    let mut min_max_fields = Vec::new();
+
+    // Collect stats expressions only for columns present in the stats_schema
+    collect_stats_expressions_filtered(
+        table_schema,
+        needed_columns_schema,
+        "",
+        &column_to_field_id,
+        &mut null_count_exprs,
+        &mut min_values_exprs,
+        &mut max_values_exprs,
+        &mut null_count_fields,
+        &mut min_max_fields,
+    )?;
+
+    // Build the stats_parsed struct schema
+    let null_count_schema = StructType::new_unchecked(null_count_fields);
+    let min_max_schema = StructType::new_unchecked(min_max_fields);
+
+    // Build nested struct expressions
+    let null_count_struct = if null_count_exprs.is_empty() {
+        Expression::literal(Scalar::Null(DataType::Struct(Box::new(
+            StructType::new_unchecked(Vec::new()),
+        ))))
+    } else {
+        Expression::struct_from_with_schema(null_count_exprs, null_count_schema.clone())
+    };
+
+    let min_values_struct = if min_values_exprs.is_empty() {
+        Expression::literal(Scalar::Null(DataType::Struct(Box::new(
+            StructType::new_unchecked(Vec::new()),
+        ))))
+    } else {
+        Expression::struct_from_with_schema(min_values_exprs.clone(), min_max_schema.clone())
+    };
+
+    let max_values_struct = if max_values_exprs.is_empty() {
+        Expression::literal(Scalar::Null(DataType::Struct(Box::new(
+            StructType::new_unchecked(Vec::new()),
+        ))))
+    } else {
+        Expression::struct_from_with_schema(max_values_exprs, min_max_schema.clone())
+    };
+
+    // Project numRecords from the manifest entry's recordCount field
+    // This expression will be evaluated against the manifest batch data which includes recordCount
+    let num_records_expr = Expression::column(["recordCount"]);
+
+    // Build the final stats_parsed struct
+    let stats_parsed_schema = StructType::new_unchecked(vec![
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", DataType::Struct(Box::new(null_count_schema))),
+        StructField::nullable(
+            "minValues",
+            DataType::Struct(Box::new(min_max_schema.clone())),
+        ),
+        StructField::nullable("maxValues", DataType::Struct(Box::new(min_max_schema))),
+    ]);
+
+    Ok(Arc::new(Expression::struct_from_with_schema(
+        vec![
+            num_records_expr,
+            null_count_struct,
+            min_values_struct,
+            max_values_struct,
+        ],
+        stats_parsed_schema,
+    )))
+}
+
+/// Builds a map from physical column names (with "." for nested) to field IDs.
+///
+/// The column names are taken from the provided schema, which should be the physical schema.
+fn build_column_to_field_id_map(
+    schema: &StructType,
+    prefix: &str,
+    map: &mut HashMap<String, i32>,
+) -> DeltaResult<()> {
+    for field in schema.fields() {
+        let field_name = if prefix.is_empty() {
+            field.name().to_string()
+        } else {
+            format!("{}.{}", prefix, field.name())
+        };
+
+        // Get field ID from metadata
+        if let Some(field_id) = get_field_id(field) {
+            map.insert(field_name.clone(), field_id);
+        }
+
+        // Recurse into nested structs
+        if let DataType::Struct(nested_schema) = field.data_type() {
+            build_column_to_field_id_map(nested_schema, &field_name, map)?;
+        }
+    }
+    Ok(())
+}
+
+/// Like `collect_stats_expressions` but only processes columns present in `needed_columns_schema`.
+/// This is used when we only need stats for a subset of columns (e.g., predicate columns only).
+#[allow(clippy::too_many_arguments)]
+fn collect_stats_expressions_filtered(
+    table_schema: &StructType,
+    needed_columns_schema: &StructType,
+    prefix: &str,
+    column_to_field_id: &HashMap<String, i32>,
+    null_count_exprs: &mut Vec<ExpressionRef>,
+    min_values_exprs: &mut Vec<ExpressionRef>,
+    max_values_exprs: &mut Vec<ExpressionRef>,
+    null_count_fields: &mut Vec<StructField>,
+    min_max_fields: &mut Vec<StructField>,
+) -> DeltaResult<()> {
+    // Iterate through needed columns (from stats_schema) and find them in table_schema
+    for needed_field in needed_columns_schema.fields() {
+        let field_name = if prefix.is_empty() {
+            needed_field.name().to_string()
+        } else {
+            format!("{}.{}", prefix, needed_field.name())
+        };
+
+        // Find corresponding field in table_schema
+        let Some(table_field) = table_schema.field(needed_field.name()) else {
+            // Column in stats_schema but not in table_schema - skip it
+            continue;
+        };
+
+        match (table_field.data_type(), needed_field.data_type()) {
+            (DataType::Struct(table_nested), DataType::Struct(needed_nested)) => {
+                // Recurse into nested struct
+                let mut nested_null_count_exprs = Vec::new();
+                let mut nested_min_values_exprs = Vec::new();
+                let mut nested_max_values_exprs = Vec::new();
+                let mut nested_null_count_fields = Vec::new();
+                let mut nested_min_max_fields = Vec::new();
+
+                collect_stats_expressions_filtered(
+                    table_nested,
+                    needed_nested,
+                    &field_name,
+                    column_to_field_id,
+                    &mut nested_null_count_exprs,
+                    &mut nested_min_values_exprs,
+                    &mut nested_max_values_exprs,
+                    &mut nested_null_count_fields,
+                    &mut nested_min_max_fields,
+                )?;
+
+                // Only add struct if it has fields
+                if !nested_null_count_exprs.is_empty() {
+                    let nested_null_count_schema =
+                        StructType::new_unchecked(nested_null_count_fields);
+                    let nested_min_max_schema = StructType::new_unchecked(nested_min_max_fields);
+
+                    null_count_exprs.push(Arc::new(Expression::struct_from_with_schema(
+                        nested_null_count_exprs,
+                        nested_null_count_schema.clone(),
+                    )));
+                    null_count_fields.push(StructField::nullable(
+                        table_field.name(),
+                        DataType::Struct(Box::new(nested_null_count_schema)),
+                    ));
+
+                    min_values_exprs.push(Arc::new(Expression::struct_from_with_schema(
+                        nested_min_values_exprs,
+                        nested_min_max_schema.clone(),
+                    )));
+                    max_values_exprs.push(Arc::new(Expression::struct_from_with_schema(
+                        nested_max_values_exprs,
+                        nested_min_max_schema.clone(),
+                    )));
+                    min_max_fields.push(StructField::nullable(
+                        table_field.name(),
+                        DataType::Struct(Box::new(nested_min_max_schema)),
+                    ));
+                }
+            }
+            _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
+                // Primitive type - create stats expressions if field ID exists
+                if column_to_field_id.contains_key(&field_name) {
+                    // Build expression: content_stats.<field_name>.null_count
+                    let null_count_expr = Arc::new(Expression::Column(ColumnName::new([
+                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                        &field_name,
+                        crate::content_tree::NULL_COUNT_FIELD_NAME,
+                    ])));
+
+                    // Build expression: content_stats.<field_name>.lower_bound
+                    let lower_bound_expr = Arc::new(Expression::Column(ColumnName::new([
+                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                        &field_name,
+                        "lower_bound",
+                    ])));
+
+                    // Build expression: content_stats.<field_name>.upper_bound
+                    let upper_bound_expr = Arc::new(Expression::Column(ColumnName::new([
+                        crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                        &field_name,
+                        "upper_bound",
+                    ])));
+
+                    null_count_exprs.push(null_count_expr);
+                    null_count_fields
+                        .push(StructField::nullable(table_field.name(), DataType::LONG));
+
+                    min_values_exprs.push(lower_bound_expr);
+                    max_values_exprs.push(upper_bound_expr);
+                    min_max_fields.push(StructField::nullable(
+                        table_field.name(),
+                        table_field.data_type().clone(),
+                    ));
+                }
+            }
+            _ => {
+                // Skip non-primitive, non-struct types (arrays, maps, variants)
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1403,7 +1677,7 @@ mod tests {
     #[test]
     fn test_stats_schema_non_nullable_int() {
         // Non-nullable integer field: should have 4 stats fields
-        // (no null_value_count, no nan_value_count, no size stats)
+        // (no null_count, no nan_value_count, no size stats)
         let schema = StructType::new_unchecked([field_with_id("id", DataType::INTEGER, false, 1)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
@@ -1418,7 +1692,9 @@ mod tests {
         // Should have: value_count, lower_bound, upper_bound, exact_bounds
         assert_eq!(id_stats_struct.fields().count(), 4);
         assert!(id_stats_struct.field("value_count").is_some());
-        assert!(id_stats_struct.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats_struct
+            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+            .is_none()); // not nullable
         assert!(id_stats_struct.field("nan_value_count").is_none()); // not float/double
         assert!(id_stats_struct.field("avg_value_size").is_none()); // fixed-length
         assert!(id_stats_struct.field("max_value_size").is_none()); // fixed-length
@@ -1444,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_stats_schema_nullable_string() {
-        // Nullable string field: should have 7 stats fields (includes null_value_count)
+        // Nullable string field: should have 7 stats fields (includes null_count)
         let schema = StructType::new_unchecked([field_with_id("name", DataType::STRING, true, 2)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
@@ -1454,15 +1730,21 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
+        // Should have: value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
         assert_eq!(name_stats_struct.fields().count(), 7);
-        assert!(name_stats_struct.field("null_value_count").is_some()); // nullable
+        assert!(name_stats_struct
+            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+            .is_some()); // nullable
         assert!(name_stats_struct.field("nan_value_count").is_none()); // not float/double
 
         // Check field IDs: base is 10_400 (field_id 2 -> 10_000 + 200*2)
         let base_id = 10_400;
         assert_eq!(
-            get_field_id(name_stats_struct.field("null_value_count").unwrap()),
+            get_field_id(
+                name_stats_struct
+                    .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                    .unwrap()
+            ),
             Some(base_id + 2)
         );
     }
@@ -1470,7 +1752,7 @@ mod tests {
     #[test]
     fn test_stats_schema_nullable_double() {
         // Nullable double field: should have 6 stats fields
-        // (includes null_value_count and nan_value_count; no size stats)
+        // (includes null_count and nan_value_count; no size stats)
         let schema = StructType::new_unchecked([field_with_id("score", DataType::DOUBLE, true, 5)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
@@ -1481,7 +1763,9 @@ mod tests {
         };
 
         assert_eq!(score_stats_struct.fields().count(), 6);
-        assert!(score_stats_struct.field("null_value_count").is_some()); // nullable
+        assert!(score_stats_struct
+            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+            .is_some()); // nullable
         assert!(score_stats_struct.field("nan_value_count").is_some()); // double
         assert!(score_stats_struct.field("avg_value_size").is_none()); // fixed-length
         assert!(score_stats_struct.field("max_value_size").is_none()); // fixed-length
@@ -1497,7 +1781,7 @@ mod tests {
     #[test]
     fn test_stats_schema_non_nullable_float() {
         // Non-nullable float field: should have 5 stats fields
-        // (includes nan_value_count; no null_value_count; no size stats)
+        // (includes nan_value_count; no null_count; no size stats)
         let schema =
             StructType::new_unchecked([field_with_id("value", DataType::FLOAT, false, 100)]);
 
@@ -1509,7 +1793,9 @@ mod tests {
         };
 
         assert_eq!(value_stats_struct.fields().count(), 5);
-        assert!(value_stats_struct.field("null_value_count").is_none()); // not nullable
+        assert!(value_stats_struct
+            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+            .is_none()); // not nullable
         assert!(value_stats_struct.field("nan_value_count").is_some()); // float
         assert!(value_stats_struct.field("avg_value_size").is_none()); // fixed-length
         assert!(value_stats_struct.field("max_value_size").is_none()); // fixed-length
@@ -1532,7 +1818,7 @@ mod tests {
 
     #[test]
     fn test_stats_schema_missing_field_id() {
-        // Field without parquet.field.id should cause stats_schema to return an error
+        // Field without PARQUET:field_id should cause stats_schema to return an error
         let schema = StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)]);
 
         assert!(stats_schema(&schema).is_err());
@@ -1591,7 +1877,7 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected struct type for 'b'"),
         };
-        assert_eq!(b_stats_struct.fields().count(), 4); // no null_value_count, no nan_value_count, no size stats
+        assert_eq!(b_stats_struct.fields().count(), 4); // no null_count, no nan_value_count, no size stats
 
         // Check 'c' stats (nullable double)
         let c_stats = a_stats_struct.field("c").unwrap();
@@ -1599,7 +1885,7 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected struct type for 'c'"),
         };
-        assert_eq!(c_stats_struct.fields().count(), 6); // includes null_value_count and nan_value_count; no size stats
+        assert_eq!(c_stats_struct.fields().count(), 6); // includes null_count and nan_value_count; no size stats
     }
 
     #[test]
@@ -1710,7 +1996,7 @@ mod tests {
     }
 
     /// Helper function to get a column's stats field value in AMT format
-    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound, exact_bounds}}
+    /// AMT format: {col_name: {value_count, null_count?, lower_bound, upper_bound, exact_bounds}}
     fn get_column_stat<'a>(
         stats: &'a StructData,
         column: &str,
@@ -1745,7 +2031,7 @@ mod tests {
         // AMT format has one field per column: {id: {...}, name: {...}}
         assert_eq!(content_stats.fields().len(), 2);
 
-        // Check id column stats (non-nullable LONG, so no null_value_count)
+        // Check id column stats (non-nullable LONG, so no null_count)
         assert_eq!(
             get_column_stat(&content_stats, "id", "value_count"),
             Some(&Scalar::Long(100))
@@ -1763,13 +2049,17 @@ mod tests {
             Some(&Scalar::Boolean(true))
         );
 
-        // Check name column stats (nullable STRING, so has null_value_count)
+        // Check name column stats (nullable STRING, so has null_count)
         assert_eq!(
             get_column_stat(&content_stats, "name", "value_count"),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "name", "null_value_count"),
+            get_column_stat(
+                &content_stats,
+                "name",
+                crate::content_tree::NULL_COUNT_FIELD_NAME
+            ),
             Some(&Scalar::Long(5))
         );
         assert_eq!(
@@ -2071,7 +2361,7 @@ mod tests {
         // - id.lower_bound: min(1, 40) = 1
         // - id.upper_bound: max(50, 100) = 100
         // - name.value_count: 100 + 150 = 250
-        // - name.null_value_count: 5 + 10 = 15
+        // - name.null_count: 5 + 10 = 15
         // - name.lower_bound: min("alice", "bob") = "alice"
         // - name.upper_bound: max("mike", "zoe") = "zoe"
 
@@ -2093,7 +2383,11 @@ mod tests {
             Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "name", "null_value_count"),
+            get_column_stat(
+                &aggregated,
+                "name",
+                crate::content_tree::NULL_COUNT_FIELD_NAME
+            ),
             Some(&Scalar::Long(15))
         );
         assert_eq!(
@@ -2300,7 +2594,10 @@ mod tests {
                 get_struct_field(outer_stats, "nested_name")
             {
                 assert_eq!(
-                    get_struct_field(nested_name_stats, "null_value_count"),
+                    get_struct_field(
+                        nested_name_stats,
+                        crate::content_tree::NULL_COUNT_FIELD_NAME
+                    ),
                     Some(&Scalar::Long(15))
                 );
                 assert_eq!(

@@ -1156,6 +1156,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
+        None,  // No table schema for these tests
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1230,6 +1231,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
+        None,  // No table schema for these tests
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1299,6 +1301,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
         None,  // No data predicate for manifest-level skipping
         false, // Don't skip leaf manifests for tests
+        None,  // No table schema for these tests
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1390,6 +1393,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
         false,
+        None,
     )?;
 
     let mut iter = checkpoint_result.actions;

@@ -707,6 +707,7 @@ impl Scan {
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
                 self.snapshot.content_root(),
                 false, // Don't skip leaf manifests for incremental scans
+                Some(self.state_info.physical_schema.as_ref()), // Pass physical schema for AMT
             )?;
         let actions = action_with_checkpoint_info
             .actions
@@ -765,6 +766,7 @@ impl Scan {
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
                 self.snapshot.content_root(),
                 self.skip_leaf_manifests,
+                Some(self.state_info.physical_schema.as_ref()), // Pass physical schema for AMT
             )
     }
 

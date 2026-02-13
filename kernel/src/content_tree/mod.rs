@@ -1,5 +1,6 @@
 pub(crate) mod builder;
 pub(crate) mod bulk_processor;
+pub(crate) mod data_skipping;
 pub(crate) mod lazy_reader;
 pub(crate) mod reader;
 pub(crate) mod stats;
@@ -10,9 +11,7 @@ pub(crate) mod writer;
 use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
 use crate::content_tree::builder::MetadataBuilder;
 use crate::engine_data::{EngineData, FilteredEngineData};
-use crate::expressions::{ColumnName, Predicate, PredicateRef, Scalar, StructData};
-use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
-use crate::kernel_predicates::KernelPredicateEvaluator;
+use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -28,6 +27,14 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tracing::debug;
 use url::Url;
+
+/// Field name for the content_stats column in MetadataEntry schema.
+/// This field contains per-column statistics in AMT format.
+pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+
+/// Field name for the null_count field within content_stats.
+/// This field contains the count of null values for a column.
+pub(crate) const NULL_COUNT_FIELD_NAME: &str = "null_count";
 
 /// Type alias for the iterator returned by `open_stream`.
 type ParquetStreamResult = (
@@ -105,7 +112,7 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 /// content_stats: {
 ///   column_name: {
 ///     value_count: i64,
-///     null_value_count: i64,  // if nullable
+///     null_count: i64,  // if nullable
 ///     lower_bound: <column_type>,
 ///     upper_bound: <column_type>,
 ///     exact_bounds: bool
@@ -113,149 +120,6 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 ///   ...
 /// }
 /// ```
-struct ManifestStatsProvider<'a> {
-    /// The content_stats from a manifest entry
-    content_stats: &'a StructData,
-    /// Total record count from the manifest entry (used for rowcount stat)
-    record_count: i64,
-}
-
-impl<'a> ManifestStatsProvider<'a> {
-    /// Creates a new ManifestStatsProvider from a manifest entry's content_stats.
-    fn new(content_stats: &'a StructData, record_count: i64) -> Self {
-        Self {
-            content_stats,
-            record_count,
-        }
-    }
-
-    /// Looks up a nested scalar value in the content_stats structure.
-    ///
-    /// TODO: Fix nested fields
-    /// TODO: Lookup based on field-id
-    /// TODO: Explore option of pushing this to the engine
-    /// TODO: Add missing fields around sizes and nan's
-    ///
-    /// Given a column name like `["col1"]`, this navigates:
-    /// `content_stats.col1.<stat_field>` where stat_field is "lower_bound", "upper_bound", etc.
-    fn get_stat_value(&self, col: &ColumnName, stat_field: &str) -> Option<Scalar> {
-        let col_stats = self.get_column_stats(col)?;
-        col_stats
-            .fields()
-            .iter()
-            .zip(col_stats.values())
-            .find(|(field, _)| field.name() == stat_field)
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_null())
-            .cloned()
-    }
-
-    /// Gets the stats struct for a specific column from content_stats.
-    fn get_column_stats(&self, col: &ColumnName) -> Option<&StructData> {
-        col.iter()
-            .try_fold(self.content_stats, |current, field_name| {
-                current
-                    .fields()
-                    .iter()
-                    .zip(current.values())
-                    .find(|(field, _)| field.name() == field_name)
-                    .and_then(|(_, value)| match value {
-                        Scalar::Struct(nested) => Some(nested),
-                        _ => None,
-                    })
-            })
-    }
-}
-
-impl<'a> ParquetStatsProvider for ManifestStatsProvider<'a> {
-    fn get_parquet_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
-        self.get_stat_value(col, "lower_bound")
-    }
-
-    fn get_parquet_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
-        self.get_stat_value(col, "upper_bound")
-    }
-
-    fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
-        match self.get_stat_value(col, "null_value_count") {
-            Some(Scalar::Long(count)) => Some(count),
-            _ => None,
-        }
-    }
-
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        self.record_count
-    }
-}
-
-/// Evaluates whether an entry can be skipped based on its content_stats and a predicate.
-///
-/// This function works for any `MetadataEntry` type - data files, manifests, etc.
-/// It uses the entry's `content_stats` (min/max bounds) to determine if the predicate
-/// can possibly match any rows in the entry.
-///
-/// Returns `true` if the entry can definitely be skipped (no rows in the entry
-/// can possibly satisfy the predicate based on min/max stats).
-/// Returns `false` if the entry might contain matching rows and should be processed.
-///
-/// If content_stats is None or the predicate cannot be evaluated, returns `false` (cannot skip).
-fn can_skip_entry(entry: &MetadataEntry, predicate: &Predicate) -> bool {
-    let content_stats = match &entry.content_stats {
-        Some(stats) => stats,
-        None => return false, // No stats available, cannot skip
-    };
-
-    let provider = ManifestStatsProvider::new(content_stats, entry.record_count);
-
-    // Use the KernelPredicateEvaluator to evaluate the predicate against stats.
-    // The evaluator returns Some(true) if the predicate might match, Some(false) if it
-    // definitely cannot match, or None if it cannot be determined.
-    match provider.eval(predicate) {
-        Some(false) => {
-            // Predicate definitely cannot match any rows in this entry
-            debug!(
-                "Skipping entry {:?} - predicate cannot match based on stats",
-                entry.location
-            );
-            true
-        }
-        _ => {
-            // Predicate might match, or we couldn't determine - don't skip
-            false
-        }
-    }
-}
-
-/// Filters a vector of entries based on a predicate using content_stats.
-///
-/// Returns only entries that might contain matching data (cannot be skipped).
-/// Logs the number of entries skipped for debugging.
-fn filter_entries_by_predicate(
-    entries: Vec<MetadataEntry>,
-    predicate: Option<&PredicateRef>,
-    entry_type: &str,
-) -> Vec<MetadataEntry> {
-    let Some(pred) = predicate else {
-        return entries;
-    };
-
-    let total = entries.len();
-    let filtered: Vec<MetadataEntry> = entries
-        .into_iter()
-        .filter(|entry| !can_skip_entry(entry, pred))
-        .collect();
-
-    let skipped = total - filtered.len();
-    if skipped > 0 {
-        debug!(
-            "Data skipping: skipped {}/{} {} based on content_stats",
-            skipped, total, entry_type
-        );
-    }
-
-    filtered
-}
-
 /// Represents table metadata in Adaptive Metadata Tree (AMT) format.
 ///
 /// This structure contains metadata entries that describe the files in a Delta table
@@ -1744,9 +1608,91 @@ impl Metadata {
     pub(crate) fn manifest_references(
         &self,
         predicate: Option<&PredicateRef>,
+        evaluation_handler: Option<&Arc<dyn EvaluationHandler>>,
+        stats_schema: Option<&StructType>,
+        table_schema: Option<&StructType>,
+        manifest_batch_schema: Option<&SchemaRef>,
     ) -> DeltaResult<LeafReferences> {
-        // Get all metadata entries from the root manifest
-        let entries = self.entries()?;
+        // Try to create expression-based filter if all required params are provided
+        let skipping_filter = if let (
+            Some(pred),
+            Some(handler),
+            Some(stats),
+            Some(schema),
+            Some(batch_schema),
+        ) = (
+            predicate,
+            evaluation_handler,
+            stats_schema,
+            table_schema,
+            manifest_batch_schema,
+        ) {
+            let filter = data_skipping::ManifestDataSkippingFilter::new(
+                handler,
+                pred,
+                stats,
+                schema,
+                batch_schema,
+            );
+            if filter.is_some() {
+                debug!("Created expression-based manifest data skipping filter");
+            } else {
+                debug!("Failed to create expression-based filter");
+            }
+            filter
+        } else {
+            debug!("Manifest-level data skipping: missing required parameters (predicate={}, handler={}, stats_schema={}, table_schema={}, batch_schema={})",
+                predicate.is_some(), evaluation_handler.is_some(), stats_schema.is_some(), table_schema.is_some(), manifest_batch_schema.is_some());
+            None
+        };
+
+        // Get metadata entries, applying expression-based filtering if available
+        let entries = if let Some(ref filter) = skipping_filter {
+            // Apply expression-based filtering to batches, then materialize
+            let mut all_entries = Vec::new();
+            let mut total_before_filter = 0;
+            let mut total_after_filter = 0;
+            use crate::engine_data::RowVisitor;
+
+            for batch in self.data.iter() {
+                // Materialize all entries from the batch first
+                let mut visitor = reader::MetadataEntryVisitor::default();
+                visitor.visit_rows_of(batch.as_ref())?;
+                let batch_total = visitor.entries.len();
+                total_before_filter += batch_total;
+
+                // Apply the filter to get selection vector for this batch
+                let selection_vector = filter.apply(batch.as_ref())?;
+
+                // Filter entries based on selection vector
+                let batch_entries: Vec<_> = visitor
+                    .entries
+                    .into_iter()
+                    .zip(selection_vector.into_iter())
+                    .filter_map(|(entry, keep)| if keep { Some(entry) } else { None })
+                    .collect();
+
+                let batch_kept = batch_entries.len();
+                total_after_filter += batch_kept;
+
+                debug!(
+                    "Expression-based filter: batch had {} entries, kept {} entries, skipped {}",
+                    batch_total,
+                    batch_kept,
+                    batch_total - batch_kept
+                );
+
+                all_entries.extend(batch_entries);
+            }
+            let total_skipped = total_before_filter - total_after_filter;
+            debug!("Expression-based manifest filtering: total entries={}, kept={}, skipped={} ({:.1}%)",
+                total_before_filter, total_after_filter, total_skipped,
+                if total_before_filter > 0 { (total_skipped as f64 / total_before_filter as f64) * 100.0 } else { 0.0 });
+            all_entries
+        } else {
+            // No filtering - just materialize all entries
+            self.entries()?
+        };
 
         // Separate entries by type
         let mut data_manifest_entries = Vec::new();
@@ -1787,9 +1733,8 @@ impl Metadata {
             .map(FilteredManifest::new)
             .collect();
 
-        // Apply manifest-level data skipping if a predicate is provided
-        let data_manifest_entries =
-            filter_entries_by_predicate(data_manifest_entries, predicate, "child manifests");
+        // Expression-based filtering was already applied during entry materialization if skipping_filter was created
+        // data_manifest_entries already contains only the manifests that passed the filter
 
         // Create ManifestReferences for each data manifest
         let manifest_refs: Vec<DeltaResult<ManifestReference>> = data_manifest_entries
@@ -2188,11 +2133,12 @@ impl Metadata {
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
         path_in_log: String,
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<ParquetStreamResult> {
-        // Cached schema for reading MetadataEntry from parquet files.
+        // Cached schema for reading MetadataEntry from parquet files without content_stats.
         // Uses base_schema which excludes content_stats (requires table schema).
         // Includes _pos metadata column for tracking row positions within the manifest.
-        static READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+        static READ_SCHEMA_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
             use crate::schema::MetadataColumnSpec;
 
             let base_schema = MetadataEntry::base_schema();
@@ -2207,6 +2153,24 @@ impl Metadata {
             Arc::new(StructType::new_unchecked(fields))
         });
 
+        // Build read schema with content_stats if table schema is provided
+        let read_schema = if let Some(ts) = table_schema {
+            use crate::schema::MetadataColumnSpec;
+
+            let schema_with_stats = MetadataEntry::to_schema_with_content_stats(ts)?;
+            let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
+
+            // Add _pos metadata column to track row indices (needed for data_manifest_position)
+            fields.push(StructField::create_metadata_column(
+                "_pos",
+                MetadataColumnSpec::RowIndex,
+            ));
+
+            Arc::new(StructType::new_unchecked(fields))
+        } else {
+            READ_SCHEMA_BASE.clone()
+        };
+
         let file = FileMeta {
             location: path.clone(),
             last_modified: 0,
@@ -2216,8 +2180,7 @@ impl Metadata {
         let parsed =
             ParsedLogPath::try_from(file.clone())?.ok_or_else(|| Error::invalid_log_path(path))?;
 
-        let read_result_iter =
-            parquet_handler.read_parquet_files(&[file], READ_SCHEMA.clone(), None)?;
+        let read_result_iter = parquet_handler.read_parquet_files(&[file], read_schema, None)?;
 
         Ok((read_result_iter, parsed.version, path_in_log))
     }
@@ -2233,7 +2196,7 @@ impl Metadata {
         table_root: Url,
     ) -> DeltaResult<Self> {
         let (read_result_iter, version, path_in_log) =
-            Self::open_stream(parquet_handler, path, path_in_log)?;
+            Self::open_stream(parquet_handler, path, path_in_log, None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -2260,7 +2223,7 @@ impl Metadata {
     /// metadata entries to be added before building a new Metadata instance.
     ///
     /// # Arguments
-    /// * `table_schema` - The table's data schema with parquet.field.id metadata on each field.
+    /// * `table_schema` - The table's data schema with PARQUET:field_id metadata on each field.
     ///   This is used to convert Delta JSON stats to the content_stats StructData format.
     ///
     /// # Returns
@@ -2478,7 +2441,7 @@ pub(crate) fn metadata_entry_to_scalars(
             "sortOrderId" => Scalar::from(entry.sort_order_id),
             "recordCount" => Scalar::from(entry.record_count),
             "fileSizeInBytes" => Scalar::from(entry.file_size_in_bytes),
-            "contentStats" => match &entry.content_stats {
+            CONTENT_STATS_FIELD_NAME => match &entry.content_stats {
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
@@ -2864,7 +2827,7 @@ impl MetadataEntry {
         use crate::schema::derive_macro_utils::GetStructField as _;
 
         // Generate AMT-style stats schema format:
-        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
+        // {col: {value_count: LONG, null_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
         let stats_struct = stats::stats_schema(table_schema)?;
 
         Ok(StructType::new_unchecked([
@@ -2879,7 +2842,7 @@ impl MetadataEntry {
             Option::<i64>::get_struct_field("fileSizeInBytes"),
             // content_stats - dynamic based on table schema (AMT stats format)
             StructField::new(
-                "contentStats",
+                CONTENT_STATS_FIELD_NAME,
                 DataType::Struct(Box::new(stats_struct)),
                 true,
             ),
@@ -3038,20 +3001,20 @@ mod tests {
         // Generate schema with content_stats
         let schema_with_stats = MetadataEntry::to_schema_with_content_stats(&table_schema)?;
 
-        // Schema should have 13 top-level fields (12 base + 1 for contentStats)
+        // Schema should have 13 top-level fields (12 base + 1 for content_stats)
         assert_eq!(schema_with_stats.fields().len(), 13);
 
-        // Verify contentStats field exists
+        // Verify content_stats field exists
         let content_stats_field = schema_with_stats
-            .field("contentStats")
-            .expect("contentStats field should exist");
+            .field(CONTENT_STATS_FIELD_NAME)
+            .expect("content_stats field should exist");
         assert!(content_stats_field.nullable);
 
-        // Verify contentStats is a struct with AMT stats format:
-        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
+        // Verify content_stats is a struct with AMT stats format:
+        // {col_name: {value_count, null_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected contentStats to be a struct"),
+            _ => panic!("Expected content_stats to be a struct"),
         };
 
         // Should have 3 fields: id, name, value (one per column)
@@ -3067,7 +3030,7 @@ mod tests {
             _ => panic!("Expected id stats to be a struct"),
         };
         assert!(id_stats.field("value_count").is_some());
-        assert!(id_stats.field("null_value_count").is_none()); // not nullable
+        assert!(id_stats.field("null_count").is_none()); // not nullable
         assert!(id_stats.field("nan_value_count").is_none()); // not float/double
         assert!(id_stats.field("lower_bound").is_some());
         assert!(id_stats.field("upper_bound").is_some());
@@ -3077,13 +3040,13 @@ mod tests {
             &DataType::INTEGER
         );
 
-        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        // name: nullable STRING -> {value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
         let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
         };
         assert!(name_stats.field("value_count").is_some());
-        assert!(name_stats.field("null_value_count").is_some()); // nullable
+        assert!(name_stats.field("null_count").is_some()); // nullable
         assert!(name_stats.field("nan_value_count").is_none()); // not float/double
         assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
         assert!(name_stats.field("max_value_size").is_some()); // string has size stats
@@ -3095,13 +3058,13 @@ mod tests {
             &DataType::STRING
         );
 
-        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        // value: nullable DOUBLE -> {value_count, null_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
         let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
         };
         assert!(value_stats.field("value_count").is_some());
-        assert!(value_stats.field("null_value_count").is_some()); // nullable
+        assert!(value_stats.field("null_count").is_some()); // nullable
         assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
         assert!(value_stats.field("lower_bound").is_some());
         assert!(value_stats.field("upper_bound").is_some());
@@ -3146,9 +3109,9 @@ mod tests {
 
         // Create content_stats in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
+        //  value: {value_count, null_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
 
-        // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
+        // Build id stats struct (non-nullable INTEGER, so no null_count or nan_value_count)
         let id_stats = StructData::try_new(
             vec![
                 StructField::nullable("value_count", DataType::LONG),
@@ -3164,11 +3127,11 @@ mod tests {
             ],
         )?;
 
-        // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
+        // Build value stats struct (nullable DOUBLE, so has null_count and nan_value_count)
         let value_stats = StructData::try_new(
             vec![
                 StructField::nullable("value_count", DataType::LONG),
-                StructField::nullable("null_value_count", DataType::LONG),
+                StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
                 StructField::nullable("nan_value_count", DataType::LONG),
                 StructField::nullable("lower_bound", DataType::DOUBLE),
                 StructField::nullable("upper_bound", DataType::DOUBLE),
@@ -3200,7 +3163,7 @@ mod tests {
                     "value",
                     DataType::Struct(Box::new(StructType::new_unchecked([
                         StructField::nullable("value_count", DataType::LONG),
-                        StructField::nullable("null_value_count", DataType::LONG),
+                        StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
                         StructField::nullable("nan_value_count", DataType::LONG),
                         StructField::nullable("lower_bound", DataType::DOUBLE),
                         StructField::nullable("upper_bound", DataType::DOUBLE),
@@ -3363,9 +3326,9 @@ mod tests {
 
         // Create content_stats data in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
+        //  name: {value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
 
-        // Build id stats struct (non-nullable INTEGER, so no null_value_count)
+        // Build id stats struct (non-nullable INTEGER, so no null_count)
         let id_stats_fields = vec![
             StructField::nullable("value_count", DataType::LONG),
             StructField::nullable("lower_bound", DataType::INTEGER),
@@ -3382,10 +3345,10 @@ mod tests {
             ],
         )?;
 
-        // Build name stats struct (nullable STRING, so has null_value_count and size stats)
+        // Build name stats struct (nullable STRING, so has null_count and size stats)
         let name_stats_fields = vec![
             StructField::nullable("value_count", DataType::LONG),
-            StructField::nullable("null_value_count", DataType::LONG),
+            StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
             StructField::nullable("avg_value_size", DataType::LONG),
             StructField::nullable("max_value_size", DataType::LONG),
             StructField::nullable("lower_bound", DataType::STRING),
@@ -3819,7 +3782,7 @@ mod tests {
             let metadata = field.metadata();
             assert!(
                 metadata.contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
-                "{} field should have parquet.field.id in metadata",
+                "{} field should have PARQUET:field_id in metadata",
                 field_name
             );
             match metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()) {
@@ -3899,7 +3862,7 @@ mod tests {
             status_field
                 .metadata()
                 .contains_key(ColumnMetadataKey::ParquetFieldId.as_ref()),
-            "status field should have parquet.field.id in metadata"
+            "status field should have PARQUET:field_id in metadata"
         );
         assert_eq!(
             status_field
@@ -4932,7 +4895,7 @@ mod tests {
         };
 
         // Get manifest references (no manifest-level skipping for this test)
-        let root_state = metadata.manifest_references(None)?;
+        let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
         // Verify we got one manifest reference
         assert_eq!(root_state.manifest_references.len(), 1);
@@ -5022,7 +4985,7 @@ mod tests {
         };
 
         // Get manifest references (no manifest-level skipping for this test)
-        let root_state = metadata.manifest_references(None)?;
+        let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
         // Verify we got two manifest references
         assert_eq!(root_state.manifest_references.len(), 2);
@@ -5213,7 +5176,7 @@ mod tests {
         };
 
         // Get manifest references from the root (no manifest-level skipping for this test)
-        let root_state = root_metadata.manifest_references(None)?;
+        let root_state = root_metadata.manifest_references(None, None, None, None, None)?;
 
         // Process all manifests using the helper method
         let schema = crate::actions::get_log_add_schema().clone();
@@ -5243,462 +5206,10 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to create content_stats for testing data skipping.
-    /// Creates stats for a single integer column "id" with the given min/max bounds.
-    /// Includes column mapping annotations as required when metadata tree feature is enabled.
-    fn create_id_content_stats(min_value: i32, max_value: i32) -> DeltaResult<StructData> {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructType};
-
-        // Create schema for a single "id" column with column mapping annotations
-        // (required when metadata tree feature is enabled)
-        let table_schema =
-            StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)
-                .with_metadata([
-                    (
-                        ColumnMetadataKey::ParquetFieldId.as_ref(),
-                        MetadataValue::Number(1),
-                    ),
-                    (
-                        ColumnMetadataKey::ColumnMappingId.as_ref(),
-                        MetadataValue::Number(1),
-                    ),
-                    (
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        MetadataValue::String("col-id".to_string()),
-                    ),
-                ])]);
-
-        let content_stats_schema = crate::content_tree::stats::stats_schema(&table_schema)?;
-        let content_stats_fields: Vec<_> = content_stats_schema.into_fields().collect();
-
-        // Build the 'id' stats struct (4 fields for non-nullable int: value_count, lower_bound, upper_bound, exact_bounds)
-        let id_stats_schema = match content_stats_fields[0].data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            _ => panic!("Expected struct type"),
-        };
-        let id_stats_fields: Vec<_> = id_stats_schema.into_fields().collect();
-        let id_stats = StructData::try_new(
-            id_stats_fields,
-            vec![
-                Scalar::Long(100),          // value_count
-                Scalar::Integer(min_value), // lower_bound
-                Scalar::Integer(max_value), // upper_bound
-                Scalar::Boolean(true),      // exact_bounds
-            ],
-        )?;
-
-        // Build the content_stats struct containing the id stats
-        StructData::try_new(content_stats_fields, vec![Scalar::Struct(id_stats)])
-    }
-
-    /// Helper to create a MetadataEntry with content_stats for testing.
-    fn create_data_entry_with_stats(
-        location: &str,
-        min_id: i32,
-        max_id: i32,
-    ) -> DeltaResult<MetadataEntry> {
-        Ok(MetadataEntry {
-            content_type: DataContentType::Data,
-            location: Some(location.to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: Some(create_id_content_stats(min_id, max_id)?),
-            manifest_info: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        })
-    }
-
-    #[test]
-    fn test_can_skip_entry_with_content_stats() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression, Predicate};
-
-        // Create entries with different id ranges:
-        // Entry 1: id in [1, 100]
-        // Entry 2: id in [101, 200]
-        // Entry 3: id in [201, 300]
-        let entry1 = create_data_entry_with_stats("file1.parquet", 1, 100)?;
-        let entry2 = create_data_entry_with_stats("file2.parquet", 101, 200)?;
-        let entry3 = create_data_entry_with_stats("file3.parquet", 201, 300)?;
-
-        // Test 1: Predicate "id = 50" should NOT skip entry1, but SHOULD skip entry2 and entry3
-        let pred_eq_50: Predicate = column_expr!("id").eq(Expression::literal(50i32));
-        assert!(
-            !can_skip_entry(&entry1, &pred_eq_50),
-            "Entry with id [1,100] should NOT be skipped for id=50"
-        );
-        assert!(
-            can_skip_entry(&entry2, &pred_eq_50),
-            "Entry with id [101,200] SHOULD be skipped for id=50"
-        );
-        assert!(
-            can_skip_entry(&entry3, &pred_eq_50),
-            "Entry with id [201,300] SHOULD be skipped for id=50"
-        );
-
-        // Test 2: Predicate "id > 150" should skip entry1, NOT skip entry2 and entry3
-        let pred_gt_150: Predicate = column_expr!("id").gt(Expression::literal(150i32));
-        assert!(
-            can_skip_entry(&entry1, &pred_gt_150),
-            "Entry with id [1,100] SHOULD be skipped for id>150"
-        );
-        assert!(
-            !can_skip_entry(&entry2, &pred_gt_150),
-            "Entry with id [101,200] should NOT be skipped for id>150"
-        );
-        assert!(
-            !can_skip_entry(&entry3, &pred_gt_150),
-            "Entry with id [201,300] should NOT be skipped for id>150"
-        );
-
-        // Test 3: Predicate "id < 50" should NOT skip entry1, but SHOULD skip entry2 and entry3
-        let pred_lt_50: Predicate = column_expr!("id").lt(Expression::literal(50i32));
-        assert!(
-            !can_skip_entry(&entry1, &pred_lt_50),
-            "Entry with id [1,100] should NOT be skipped for id<50"
-        );
-        assert!(
-            can_skip_entry(&entry2, &pred_lt_50),
-            "Entry with id [101,200] SHOULD be skipped for id<50"
-        );
-        assert!(
-            can_skip_entry(&entry3, &pred_lt_50),
-            "Entry with id [201,300] SHOULD be skipped for id<50"
-        );
-
-        // Test 4: Predicate "id >= 1 AND id <= 300" should NOT skip any entry
-        let pred_range: Predicate = Predicate::and(
-            column_expr!("id").ge(Expression::literal(1i32)),
-            column_expr!("id").le(Expression::literal(300i32)),
-        );
-        assert!(
-            !can_skip_entry(&entry1, &pred_range),
-            "Entry with id [1,100] should NOT be skipped for 1<=id<=300"
-        );
-        assert!(
-            !can_skip_entry(&entry2, &pred_range),
-            "Entry with id [101,200] should NOT be skipped for 1<=id<=300"
-        );
-        assert!(
-            !can_skip_entry(&entry3, &pred_range),
-            "Entry with id [201,300] should NOT be skipped for 1<=id<=300"
-        );
-
-        // Test 5: Predicate "id > 500" should skip ALL entries
-        let pred_gt_500: Predicate = column_expr!("id").gt(Expression::literal(500i32));
-        assert!(
-            can_skip_entry(&entry1, &pred_gt_500),
-            "Entry with id [1,100] SHOULD be skipped for id>500"
-        );
-        assert!(
-            can_skip_entry(&entry2, &pred_gt_500),
-            "Entry with id [101,200] SHOULD be skipped for id>500"
-        );
-        assert!(
-            can_skip_entry(&entry3, &pred_gt_500),
-            "Entry with id [201,300] SHOULD be skipped for id>500"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_can_skip_entry_without_content_stats() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression, Predicate};
-
-        // Create an entry WITHOUT content_stats
-        let entry_no_stats = MetadataEntry {
-            content_type: DataContentType::Data,
-            location: Some("file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None, // No stats!
-            manifest_info: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        // Without content_stats, we can never skip (safe default)
-        let pred: Predicate = column_expr!("id").gt(Expression::literal(500i32));
-        assert!(
-            !can_skip_entry(&entry_no_stats, &pred),
-            "Entry without content_stats should NEVER be skipped"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_filter_entries_by_predicate_integration() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression, Predicate};
-
-        // Create 5 entries with different id ranges:
-        // Entry 1: id in [1, 100]
-        // Entry 2: id in [101, 200]
-        // Entry 3: id in [201, 300]
-        // Entry 4: id in [301, 400]
-        // Entry 5: id in [401, 500]
-        let entries = vec![
-            create_data_entry_with_stats("file1.parquet", 1, 100)?,
-            create_data_entry_with_stats("file2.parquet", 101, 200)?,
-            create_data_entry_with_stats("file3.parquet", 201, 300)?,
-            create_data_entry_with_stats("file4.parquet", 301, 400)?,
-            create_data_entry_with_stats("file5.parquet", 401, 500)?,
-        ];
-
-        // Test 1: No predicate - all entries should be returned
-        let filtered = filter_entries_by_predicate(entries.clone(), None, "test entries");
-        assert_eq!(filtered.len(), 5, "No predicate should return all entries");
-
-        // Test 2: Predicate "id = 150" - only entry2 should remain
-        let pred_eq_150: Predicate = column_expr!("id").eq(Expression::literal(150i32));
-        let pred_ref = Arc::new(pred_eq_150);
-        let filtered =
-            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
-        assert_eq!(
-            filtered.len(),
-            1,
-            "Predicate id=150 should return 1 entry (file2)"
-        );
-        assert_eq!(
-            filtered[0].location.as_ref().unwrap(),
-            "file2.parquet",
-            "Only file2 should match id=150"
-        );
-
-        // Test 3: Predicate "id > 250" - entries 3, 4, 5 should remain
-        let pred_gt_250: Predicate = column_expr!("id").gt(Expression::literal(250i32));
-        let pred_ref = Arc::new(pred_gt_250);
-        let filtered =
-            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
-        assert_eq!(
-            filtered.len(),
-            3,
-            "Predicate id>250 should return 3 entries"
-        );
-        let locations: Vec<_> = filtered
-            .iter()
-            .map(|e| e.location.as_ref().unwrap().as_str())
-            .collect();
-        assert!(locations.contains(&"file3.parquet"));
-        assert!(locations.contains(&"file4.parquet"));
-        assert!(locations.contains(&"file5.parquet"));
-
-        // Test 4: Predicate "id < 150" - entries 1 and 2 should remain
-        // Entry1 [1,100]: all values < 150, not skipped
-        // Entry2 [101,200]: some values < 150 (101-149), not skipped
-        // Entry3,4,5: min > 150, all skipped
-        let pred_lt_150: Predicate = column_expr!("id").lt(Expression::literal(150i32));
-        let pred_ref = Arc::new(pred_lt_150);
-        let filtered =
-            filter_entries_by_predicate(entries.clone(), Some(&pred_ref), "test entries");
-        assert_eq!(
-            filtered.len(),
-            2,
-            "Predicate id<150 should return 2 entries (file1 and file2)"
-        );
-        let locations: Vec<_> = filtered
-            .iter()
-            .map(|e| e.location.as_ref().unwrap().as_str())
-            .collect();
-        assert!(locations.contains(&"file1.parquet"));
-        assert!(locations.contains(&"file2.parquet"));
-
-        // Test 5: Predicate "id > 1000" - no entries should remain
-        let pred_gt_1000: Predicate = column_expr!("id").gt(Expression::literal(1000i32));
-        let pred_ref = Arc::new(pred_gt_1000);
-        let filtered = filter_entries_by_predicate(entries, Some(&pred_ref), "test entries");
-        assert_eq!(
-            filtered.len(),
-            0,
-            "Predicate id>1000 should skip all entries"
-        );
-
-        Ok(())
-    }
-
     /// Test manifest skipping using direct entry filtering (without serialization).
     ///
     /// This test demonstrates the data skipping behavior at the manifest level
     /// by directly testing `filter_entries_by_predicate` on DataManifest entries.
-    #[test]
-    fn test_manifest_skipping_with_predicate() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression, Predicate};
-
-        // Create DataManifest entries with content_stats representing different id ranges
-        // These represent child manifests in a hierarchical metadata tree
-        //
-        // Manifest 1: contains data files with id in [1, 100]
-        // Manifest 2: contains data files with id in [101, 200]
-        // Manifest 3: contains data files with id in [201, 300]
-
-        let manifest1 = MetadataEntry {
-            content_type: DataContentType::DataManifest,
-            location: Some("manifest1.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: Some(create_id_content_stats(1, 100)?),
-            manifest_info: Some(ManifestStats {
-                added_files_count: 10,
-                existing_files_count: 0,
-                deletes_files_count: 0,
-                added_rows_count: 100,
-                existing_rows_count: 0,
-                delete_rows_count: 0,
-                min_sequence_number: 100,
-            }),
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        let manifest2 = MetadataEntry {
-            location: Some("manifest2.parquet".to_string()),
-            content_stats: Some(create_id_content_stats(101, 200)?),
-            ..manifest1.clone()
-        };
-
-        let manifest3 = MetadataEntry {
-            location: Some("manifest3.parquet".to_string()),
-            content_stats: Some(create_id_content_stats(201, 300)?),
-            ..manifest1.clone()
-        };
-
-        let manifests = vec![manifest1, manifest2, manifest3];
-
-        // Test 1: No predicate - all 3 manifests should be returned
-        let filtered = filter_entries_by_predicate(manifests.clone(), None, "child manifests");
-        assert_eq!(
-            filtered.len(),
-            3,
-            "No predicate should return all 3 manifests"
-        );
-
-        // Test 2: Predicate "id = 50" - only manifest1 should be returned
-        let pred_eq_50: Predicate = column_expr!("id").eq(Expression::literal(50i32));
-        let pred_ref = Arc::new(pred_eq_50);
-        let filtered =
-            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
-        assert_eq!(
-            filtered.len(),
-            1,
-            "Predicate id=50 should return 1 manifest"
-        );
-        assert_eq!(
-            filtered[0].location.as_ref().unwrap(),
-            "manifest1.parquet",
-            "Only manifest1 should match id=50"
-        );
-
-        // Test 3: Predicate "id > 150" - manifests 2 and 3 should be returned
-        let pred_gt_150: Predicate = column_expr!("id").gt(Expression::literal(150i32));
-        let pred_ref = Arc::new(pred_gt_150);
-        let filtered =
-            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
-        assert_eq!(
-            filtered.len(),
-            2,
-            "Predicate id>150 should return 2 manifests"
-        );
-        let locations: Vec<_> = filtered
-            .iter()
-            .map(|e| e.location.as_ref().unwrap().as_str())
-            .collect();
-        assert!(locations.contains(&"manifest2.parquet"));
-        assert!(locations.contains(&"manifest3.parquet"));
-
-        // Test 4: Predicate "id > 500" - no manifests should be returned
-        let pred_gt_500: Predicate = column_expr!("id").gt(Expression::literal(500i32));
-        let pred_ref = Arc::new(pred_gt_500);
-        let filtered =
-            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
-        assert_eq!(
-            filtered.len(),
-            0,
-            "Predicate id>500 should skip all manifests"
-        );
-
-        // Test 5: Predicate "id < 250" - manifests 1 and 2 should be returned
-        // Manifest1 [1,100]: max=100 < 250, not skipped
-        // Manifest2 [101,200]: max=200 < 250, not skipped
-        // Manifest3 [201,300]: min=201 < 250 but max=300 > 250, some rows might match, not skipped
-        // Actually, for "id < 250", manifest3 has min=201 and max=300
-        // Since some values in [201,249] satisfy id < 250, manifest3 should NOT be skipped
-        let pred_lt_250: Predicate = column_expr!("id").lt(Expression::literal(250i32));
-        let pred_ref = Arc::new(pred_lt_250);
-        let filtered =
-            filter_entries_by_predicate(manifests.clone(), Some(&pred_ref), "child manifests");
-        assert_eq!(
-            filtered.len(),
-            3,
-            "Predicate id<250 should return all 3 manifests (all might have matching rows)"
-        );
-
-        // Test 6: Predicate "id < 100" - manifest1 might match, manifests 2 and 3 should be skipped
-        // Manifest1 [1,100]: max=100 >= 100, but some values < 100, not skipped
-        // Manifest2 [101,200]: min=101 > 100, cannot have id < 100, skipped
-        // Manifest3 [201,300]: min=201 > 100, cannot have id < 100, skipped
-        let pred_lt_100: Predicate = column_expr!("id").lt(Expression::literal(100i32));
-        let pred_ref = Arc::new(pred_lt_100);
-        let filtered = filter_entries_by_predicate(manifests, Some(&pred_ref), "child manifests");
-        assert_eq!(
-            filtered.len(),
-            1,
-            "Predicate id<100 should return 1 manifest (only manifest1)"
-        );
-        assert_eq!(
-            filtered[0].location.as_ref().unwrap(),
-            "manifest1.parquet",
-            "Only manifest1 should match id<100"
-        );
-
-        Ok(())
-    }
-
     /// End-to-end integration test for DV size conversion through the metadata tree.
     ///
     /// This test creates a table with deletion vectors using the Transaction API and bulk mode,
@@ -5744,7 +5255,7 @@ mod tests {
                     "type": "integer",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 1,
+                        "PARQUET:field_id": 1,
                         "delta.columnMapping.id": 1,
                         "delta.columnMapping.physicalName": "id"
                     }
@@ -5754,7 +5265,7 @@ mod tests {
                     "type": "string",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 2,
+                        "PARQUET:field_id": 2,
                         "delta.columnMapping.id": 2,
                         "delta.columnMapping.physicalName": "value"
                     }

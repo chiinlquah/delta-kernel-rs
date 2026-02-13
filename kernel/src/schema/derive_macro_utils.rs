@@ -149,16 +149,18 @@ mod tests {
         assert_eq!(field_valid_id.name(), "validId");
 
         let metadata = field_valid_id.metadata();
-        assert!(metadata.contains_key("parquet.field.id"));
+        assert!(metadata.contains_key(crate::schema::ColumnMetadataKey::ParquetFieldId.as_ref()));
 
-        match metadata.get("parquet.field.id") {
+        match metadata.get(crate::schema::ColumnMetadataKey::ParquetFieldId.as_ref()) {
             Some(crate::schema::MetadataValue::Number(n)) => assert_eq!(*n, 123),
-            _ => panic!("Expected number parquet.field.id"),
+            _ => panic!("Expected number PARQUET:field_id"),
         }
 
         // Test field without field_id
         let field_no_id = fields[1];
         assert_eq!(field_no_id.name(), "noFieldId");
-        assert!(!field_no_id.metadata().contains_key("parquet.field.id"));
+        assert!(!field_no_id
+            .metadata()
+            .contains_key(crate::schema::ColumnMetadataKey::ParquetFieldId.as_ref()));
     }
 }

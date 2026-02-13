@@ -14,7 +14,7 @@ use crate::{EngineData, Snapshot};
 use super::*;
 
 /// Helper function to create a minimal table schema for tests.
-/// This schema has the required parquet.field.id metadata for content_stats generation.
+/// This schema has the required PARQUET:field_id metadata for content_stats generation.
 fn test_table_schema() -> StructType {
     StructType::new_unchecked([
         StructField::new("value", DataType::INTEGER, true).with_metadata([

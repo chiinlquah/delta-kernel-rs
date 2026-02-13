@@ -660,7 +660,7 @@ impl Transaction {
                 .map(|cr| (cr.clone(), cr.version));
 
             let table_schema = self.read_snapshot.schema().as_ref().clone();
-            // Convert to physical schema with parquet.field.id metadata for stats mapping
+            // Convert to physical schema with PARQUET:field_id metadata for stats mapping
             let physical_table_schema = table_schema.make_physical(column_mapping_mode);
             let table_root = self.read_snapshot.table_root().clone();
             let current_version = self.read_snapshot.version();
@@ -1076,7 +1076,7 @@ impl Transaction {
             })
             .transpose()?;
 
-        // Get physical schema with parquet.field.id for adaptive metadata tree
+        // Get physical schema with PARQUET:field_id for adaptive metadata tree
         let column_mapping_mode = self
             .read_snapshot
             .table_configuration()
@@ -3433,7 +3433,7 @@ mod tests {
                     "type": "integer",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 1,
+                        "PARQUET:field_id": 1,
                         "delta.columnMapping.id": 1,
                         "delta.columnMapping.physicalName": "id"
                     }
@@ -3443,7 +3443,7 @@ mod tests {
                     "type": "string",
                     "nullable": true,
                     "metadata": {
-                        "parquet.field.id": 2,
+                        "PARQUET:field_id": 2,
                         "delta.columnMapping.id": 2,
                         "delta.columnMapping.physicalName": "value"
                     }
