@@ -938,6 +938,12 @@ impl ContentRoot {
         &self.path
     }
 
+    /// Get the version of the content root (for testing only)
+    #[doc(hidden)]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
     #[internal_api]
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<ContentRoot>> {
         let mut visitor = ContentRootVisitor::default();

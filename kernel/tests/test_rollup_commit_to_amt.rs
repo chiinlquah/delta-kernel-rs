@@ -2,10 +2,8 @@
 //! then doing a batch commit to convert those stats to content_stats.
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::Snapshot;
-use futures::StreamExt;
 use object_store::ObjectStore;
 use std::sync::Arc;
 use test_utils::{create_table, engine_store_setup};

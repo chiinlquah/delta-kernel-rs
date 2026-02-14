@@ -151,6 +151,8 @@ impl BulkManifestStreamProcessor {
     /// - `predicate`: Optional predicate for filtering (currently unused in optimized path)
     /// - `table_schema`: Optional table schema (physical schema with field IDs)
     /// - `stats_schema`: Optional stats schema (for stats_parsed transformation)
+    // TODO: Refactor to reduce argument count (currently 9/7) - consider using a config struct
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manifest_references: impl Iterator<Item = ManifestReference>,
         shared_state: SharedLeafState,

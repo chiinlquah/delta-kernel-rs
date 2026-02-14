@@ -420,39 +420,9 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     //
     // Note: file4 has stats_parsed but isn't being filtered out. This might be because
     // root files aren't going through the same data skipping filter as leaf files.
-    println!("Scanned files: {:?}", scanned_files);
-
-    assert_eq!(
-        scanned_files.len(),
-        2,
-        "File-level skipping works! Expected file1 and file4. Got {}. Files: {:?}",
-        scanned_files.len(),
-        scanned_files
-    );
-
-    // file1 should be included (overlaps with predicate)
-    assert!(
-        scanned_files.contains(file1),
-        "file1 should be included (IDs 1-100 overlap with <50)"
-    );
-
-    // file2 should be filtered out by file-level skipping!
-    assert!(
-        !scanned_files.contains(file2),
-        "file2 should be filtered out by file-level skipping (IDs 101-200, min > 50)"
-    );
-
-    // file3 should be filtered out at manifest level
-    assert!(
-        !scanned_files.contains(file3),
-        "file3 should be filtered out at manifest level (leaf2 filtered)"
-    );
-
-    // file4 is still included - root files need separate handling
-    assert!(
-        scanned_files.contains(file4),
-        "file4 currently included (root files need filtering - separate issue)"
-    );
+    let expected_files: std::collections::HashSet<_> =
+        [file1.to_string(), file4.to_string()].into_iter().collect();
+    assert_eq!(scanned_files, expected_files);
 
     // Verify using multi-phase scan planning counts
     // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase planning API
@@ -470,10 +440,6 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     let filtered_scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let (filtered_batches, filtered_files) =
         count_scan_metadata_and_files(filtered_scan, engine.as_ref())?;
-    println!(
-        "Filtered scan: {} batches, {} files",
-        filtered_batches, filtered_files
-    );
 
     // File-level data skipping is working!
     //
@@ -488,8 +454,5 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         "File-level data skipping works! leaf1 has 1 file (file1), root has 1 file (file4)"
     );
 
-    println!("✓✓✓ Manifest-level data skipping works (filters leaf2)!");
-    println!("✓✓✓ File-level data skipping works (filters file2 from leaf1)!");
-    println!("⚠ Root-level files (file4) need filtering via checkpoint data skipping");
     Ok(())
 }

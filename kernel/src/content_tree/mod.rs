@@ -1899,6 +1899,8 @@ impl Metadata {
     }
 
     /// Version of non_root_action_batches that takes handlers directly (for lazy streaming).
+    // TODO: Refactor to reduce argument count (currently 8/7) - consider using a config struct
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn non_root_action_batches_with_handlers(
         root_state: LeafReferences,
         parquet_handler: Arc<dyn ParquetHandler>,
