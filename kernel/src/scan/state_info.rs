@@ -189,7 +189,6 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we just add them as
                         // if they're normal physical columns
                         let physical_field = logical_field.make_physical(column_mapping_mode);
-                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
                         if !logical_field.is_metadata_column()

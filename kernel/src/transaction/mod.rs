@@ -685,11 +685,18 @@ impl Transaction {
                 .protocol()
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
 
-        if can_batch_commit
-            && (!self.add_files_metadata.is_empty()
-                || !self.remove_files_metadata.is_empty()
-                || !self.leaf_manifests.is_empty())
-        {
+        // Determine if there's work to do in batch commit mode:
+        // - Files/manifests explicitly added, OR
+        // - Delta log commits to replay (either no content root exists, or content root is behind current version)
+        let has_work_to_do = !self.add_files_metadata.is_empty()
+            || !self.remove_files_metadata.is_empty()
+            || !self.leaf_manifests.is_empty()
+            || self.read_snapshot.content_root().map_or(
+                self.read_snapshot.version() > 0,  // No content root: replay needed if version > 0
+                |cr| cr.version < self.read_snapshot.version()  // Content root behind: replay needed
+            );
+
+        if can_batch_commit && has_work_to_do {
             // Content metadata trees require column mapping mode to be ID for stable field IDs
             let column_mapping_mode = self
                 .read_snapshot

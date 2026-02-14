@@ -1563,6 +1563,7 @@ impl Metadata {
 
                 if add_selection.iter().any(|&b| b) {
                     let transformed = add_eval.evaluate(batch_ref)?;
+
                     let filtered_data = transformed.apply_selection_vector(add_selection)?;
                     result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
                 }
