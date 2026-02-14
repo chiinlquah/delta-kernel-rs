@@ -939,7 +939,9 @@ impl ContentRoot {
     }
 
     /// Get the version of the content root (for testing only)
-    #[doc(hidden)]
+    // TODO: Make this properly test-only without requiring #[allow] - consider using #[cfg(test)]
+    // or moving to a test-utilities module
+    #[allow(dead_code, unreachable_pub)]
     pub fn version(&self) -> Version {
         self.version
     }
