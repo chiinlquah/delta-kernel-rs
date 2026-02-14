@@ -692,8 +692,8 @@ impl Transaction {
             || !self.remove_files_metadata.is_empty()
             || !self.leaf_manifests.is_empty()
             || self.read_snapshot.content_root().map_or(
-                self.read_snapshot.version() > 0,  // No content root: replay needed if version > 0
-                |cr| cr.version < self.read_snapshot.version()  // Content root behind: replay needed
+                self.read_snapshot.version() > 0, // No content root: replay needed if version > 0
+                |cr| cr.version < self.read_snapshot.version(), // Content root behind: replay needed
             );
 
         if can_batch_commit && has_work_to_do {

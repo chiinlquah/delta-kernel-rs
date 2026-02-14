@@ -552,7 +552,8 @@ impl Iterator for BulkManifestStreamProcessor {
             };
 
             // Apply manifest DV to get FilteredEngineData
-            let filtered_batch = match state.manifest_dv_applicator.process_batch(batch_to_process) {
+            let filtered_batch = match state.manifest_dv_applicator.process_batch(batch_to_process)
+            {
                 Ok(fb) => fb,
                 Err(e) => return Some(Err(e)),
             };

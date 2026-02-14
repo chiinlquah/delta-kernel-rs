@@ -947,9 +947,9 @@ impl LogSegment {
             let content_root_has_stats = content_root.is_some() && need_file_actions;
 
             // Checkpoint/sidecars have stats_parsed if their schema is compatible
-            let checkpoint_has_stats = file_actions_schema
-                .as_ref()
-                .is_some_and(|file_schema| Self::schema_has_compatible_stats_parsed(file_schema, stats));
+            let checkpoint_has_stats = file_actions_schema.as_ref().is_some_and(|file_schema| {
+                Self::schema_has_compatible_stats_parsed(file_schema, stats)
+            });
 
             content_root_has_stats || checkpoint_has_stats
         });

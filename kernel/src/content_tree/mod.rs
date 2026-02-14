@@ -583,7 +583,12 @@ impl Metadata {
         path_in_log: &str,
         has_stats_parsed: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        Self::build_metadata_to_action_transform(remove_schema, "remove", path_in_log, has_stats_parsed)
+        Self::build_metadata_to_action_transform(
+            remove_schema,
+            "remove",
+            path_in_log,
+            has_stats_parsed,
+        )
     }
 
     /// Builds a Transform expression to convert joined MetadataEntry + DV fields → Add fields.
@@ -1252,8 +1257,8 @@ impl Metadata {
         // 1. stats_schema is provided
         // 2. content_stats field exists in metadata (meaning it was read with table_schema)
         if let Some(stats_sch) = stats_schema {
-            if let Some(content_stats_field) = metadata_schema
-                .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+            if let Some(content_stats_field) =
+                metadata_schema.field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
             {
                 let mut fields: Vec<StructField> = schema.fields().cloned().collect();
                 // Add content_stats so it can be read by the stats transformation
@@ -1285,7 +1290,11 @@ impl Metadata {
 
         let add_evaluator_opt = if has_add {
             let add_expr = if has_dvs {
-                Self::build_metadata_to_add_transform_with_dv(output_schema, path_in_log, has_stats_parsed)?
+                Self::build_metadata_to_add_transform_with_dv(
+                    output_schema,
+                    path_in_log,
+                    has_stats_parsed,
+                )?
             } else {
                 Self::build_metadata_to_add_transform(output_schema, path_in_log, has_stats_parsed)?
             };
@@ -1299,7 +1308,11 @@ impl Metadata {
         };
 
         let remove_evaluator_opt = if has_remove {
-            let remove_expr = Self::build_metadata_to_remove_transform(output_schema, path_in_log, has_stats_parsed)?;
+            let remove_expr = Self::build_metadata_to_remove_transform(
+                output_schema,
+                path_in_log,
+                has_stats_parsed,
+            )?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
                 remove_expr,
@@ -1507,11 +1520,8 @@ impl Metadata {
         let has_dvs = dv_joiner_opt.is_some();
 
         // Determine evaluator schema (includes parsed DV columns if present, and stats_parsed if needed)
-        let evaluator_schema = Self::get_evaluator_schema_with_stats(
-            has_dvs,
-            &metadata_schema,
-            stats_schema,
-        );
+        let evaluator_schema =
+            Self::get_evaluator_schema_with_stats(has_dvs, &metadata_schema, stats_schema);
 
         // Build evaluators for Add and/or Remove actions
         let evaluators = Self::build_action_evaluators(
