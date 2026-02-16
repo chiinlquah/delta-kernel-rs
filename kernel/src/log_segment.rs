@@ -941,12 +941,18 @@ impl LogSegment {
         };
 
         // Check if checkpoint has compatible stats_parsed and add it to the schema if so
-        let has_stats_parsed =
-            stats_schema
-                .zip(file_actions_schema.as_ref())
-                .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                });
+        // Also check if content root is present - it always outputs stats_parsed when stats_schema is Some
+        let has_stats_parsed = stats_schema.is_some_and(|stats| {
+            // Content root always outputs stats_parsed when stats_schema is provided
+            let content_root_has_stats = content_root.is_some() && need_file_actions;
+
+            // Checkpoint/sidecars have stats_parsed if their schema is compatible
+            let checkpoint_has_stats = file_actions_schema.as_ref().is_some_and(|file_schema| {
+                Self::schema_has_compatible_stats_parsed(file_schema, stats)
+            });
+
+            content_root_has_stats || checkpoint_has_stats
+        });
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
