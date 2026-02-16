@@ -412,16 +412,11 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     }
 
     // Verify filtering with id < 50:
-    // File-level data skipping is now working!
     // - file1 (IDs 1-100): INCLUDED (overlaps with <50)
-    // - file2 (IDs 101-200): FILTERED OUT by file-level skipping (min=101 > 50) ✓
+    // - file2 (IDs 101-200): FILTERED OUT by file-level skipping (min=101 > 50)
     // - file3 (IDs 201-300): FILTERED OUT by manifest-level skipping (leaf2 filtered)
-    // - file4 (IDs 301-400): INCLUDED (from root batch, stats_parsed populated)
-    //
-    // Note: file4 has stats_parsed but isn't being filtered out. This might be because
-    // root files aren't going through the same data skipping filter as leaf files.
-    let expected_files: std::collections::HashSet<_> =
-        [file1.to_string(), file4.to_string()].into_iter().collect();
+    // - file4 (IDs 301-400): FILTERED OUT by file-level skipping (min=301 > 50)
+    let expected_files: std::collections::HashSet<_> = [file1.to_string()].into_iter().collect();
     assert_eq!(scanned_files, expected_files);
 
     // Verify using multi-phase scan planning counts
@@ -441,17 +436,15 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     let (filtered_batches, filtered_files) =
         count_scan_metadata_and_files(filtered_scan, engine.as_ref())?;
 
-    // File-level data skipping is working!
-    //
-    // Current behavior:
-    // - 2 batches: leaf1 (only file1 after filtering) + root batch (file4)
-    // - leaf2 filtered at manifest level (min=201 > 50) ✓
-    // - file2 filtered at file level (min=101 > 50) ✓✓✓
-    // - file4 from root still included (needs separate handling for checkpoint-sourced files)
+    // With predicate id < 50:
+    // - 1 batch: leaf1 (only file1 after filtering)
+    // - leaf2 filtered at manifest level (min=201 > 50)
+    // - file2 filtered at file level (min=101 > 50)
+    // - file4 filtered at file level (min=301 > 50)
     assert_eq!(
         (filtered_batches, filtered_files),
-        (2, 2),
-        "File-level data skipping works! leaf1 has 1 file (file1), root has 1 file (file4)"
+        (1, 1),
+        "All data skipping works: only file1 (IDs 1-100) overlaps with id < 50"
     );
 
     Ok(())
