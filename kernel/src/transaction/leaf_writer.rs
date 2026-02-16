@@ -574,19 +574,8 @@ impl LeafNodeWriter {
             Some(c) => c.as_ref(),
             None => add_metadata.as_ref(),
         };
-        let mut visitor = crate::content_tree::builder::WriteMetadataWithStatsVisitor::default();
-        visitor.visit_rows_of(data)?;
-
-        // Tuple: (path, partition_values, size, modification_time, content_stats)
-        for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
-            self.data_builder.add_file_with_dedup(
-                path,
-                size,
-                content_stats,
-                self.version,
-                Some(self.snapshot_id),
-            )?;
-        }
+        self.data_builder
+            .add_from_engine_data_write(data, self.version, Some(self.snapshot_id))?;
 
         Ok(())
     }
@@ -878,7 +867,7 @@ mod tests {
     ///
     /// This mimics what the engine produces when writing parquet files: stats in Delta JSON
     /// format with numRecords, minValues, maxValues, nullCount, and tightBounds.
-    /// The WriteMetadataWithStatsVisitor will automatically convert these to AMT format.
+    /// The stats will be automatically converted to AMT format by the builder.
     ///
     /// Parameters for each file: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
     #[allow(clippy::type_complexity)]
@@ -1215,7 +1204,7 @@ mod tests {
         );
 
         // Add files with Delta JSON format stats (like the engine produces when writing parquet).
-        // The stats will be automatically converted to AMT format by WriteMetadataWithStatsVisitor.
+        // The stats will be automatically converted to AMT format by the builder.
         // Parameters: (path, size, mod_time, num_records, id_min, id_max, id_null_count, value_min, value_max, value_null_count)
         let metadata = create_test_add_metadata_with_delta_json_stats(vec![(
             "file1.parquet",
