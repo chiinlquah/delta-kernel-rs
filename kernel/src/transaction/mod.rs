@@ -775,7 +775,6 @@ impl Transaction {
             }
 
             for add_metadata_result in self.add_files_metadata.iter() {
-                // TODO: files might be re-added, they must be deduplicated here.
                 // Pre-convert stats from Delta JSON format to AMT struct format at batch level
                 let converted = crate::content_tree::stats::try_pre_convert_stats_column(
                     engine,
