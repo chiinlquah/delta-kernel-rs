@@ -466,3 +466,10 @@ if [ -f "${SUMMARY_TXT}" ]; then
     echo "=============="
     cat "${SUMMARY_TXT}"
 fi
+
+# Run analysis script
+echo ""
+echo "================================================"
+echo -e "${BLUE}Running benchmark analysis...${NC}"
+echo "================================================"
+bash "${SCRIPT_DIR}/analyze_benchmark_results.sh" "${RESULTS_DIR}" "run_${TIMESTAMP}"

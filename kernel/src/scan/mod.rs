@@ -495,6 +495,18 @@ impl Scan {
         }
     }
 
+    /// Returns the table schema only when we need to read content_stats from manifests.
+    /// Content_stats is needed when:
+    /// - There's a predicate (for manifest-level data skipping), OR
+    /// - Stats output is requested (physical_stats_schema is Some)
+    fn table_schema_for_content_stats(&self) -> Option<&StructType> {
+        if self.physical_predicate().is_some() || self.state_info.physical_stats_schema.is_some() {
+            Some(self.state_info.physical_schema.as_ref())
+        } else {
+            None
+        }
+    }
+
     /// Get the logical schema for file statistics.
     ///
     /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
@@ -705,7 +717,7 @@ impl Scan {
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
                 self.snapshot.content_root(),
                 false, // Don't skip leaf manifests for incremental scans
-                Some(self.state_info.physical_schema.as_ref()), // Pass physical schema for AMT
+                self.table_schema_for_content_stats(),
             )?;
         let actions = action_with_checkpoint_info
             .actions
@@ -764,7 +776,7 @@ impl Scan {
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
                 self.snapshot.content_root(),
                 self.skip_leaf_manifests,
-                Some(self.state_info.physical_schema.as_ref()), // Pass physical schema for AMT
+                self.table_schema_for_content_stats(),
             )
     }
 

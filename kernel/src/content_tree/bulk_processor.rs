@@ -65,6 +65,9 @@ struct ManifestProcessingState {
     /// Optional DV joiner for affiliated/unaffiliated DVs
     dv_joiner_opt: Option<Box<dyn crate::LookupJoiner>>,
 
+    /// Optional stats transformation evaluator (content_stats → stats_parsed)
+    stats_transform_opt: Option<Arc<dyn crate::ExpressionEvaluator>>,
+
     /// Optional Add evaluator
     add_evaluator_opt: Option<Arc<dyn crate::ExpressionEvaluator>>,
 
@@ -100,6 +103,12 @@ pub(crate) struct BulkManifestStreamProcessor {
 
     /// Table root URL
     table_root: Url,
+
+    /// Table schema (physical schema with field IDs for content_stats transformation)
+    table_schema: Option<Arc<StructType>>,
+
+    /// Stats schema (for stats_parsed transformation)
+    stats_schema: Option<Arc<StructType>>,
 
     /// Current manifest processing state (if any)
     current_manifest_state: Option<ManifestProcessingState>,
@@ -140,6 +149,10 @@ impl BulkManifestStreamProcessor {
     /// - `schema`: Action schema to use
     /// - `table_root`: Table root URL
     /// - `predicate`: Optional predicate for filtering (currently unused in optimized path)
+    /// - `table_schema`: Optional table schema (physical schema with field IDs)
+    /// - `stats_schema`: Optional stats schema (for stats_parsed transformation)
+    // TODO: Refactor to reduce argument count (currently 9/7) - consider using a config struct
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manifest_references: impl Iterator<Item = ManifestReference>,
         shared_state: SharedLeafState,
@@ -148,11 +161,18 @@ impl BulkManifestStreamProcessor {
         schema: SchemaRef,
         table_root: Url,
         _predicate: Option<PredicateRef>,
+        table_schema: Option<Arc<StructType>>,
+        stats_schema: Option<Arc<StructType>>,
     ) -> DeltaResult<Self> {
         let manifest_refs: Vec<ManifestReference> = manifest_references.collect();
 
         // Build read schema with _file metadata column for grouping
-        let base_schema = MetadataEntry::base_schema();
+        // Include content_stats if table_schema is provided (leaf manifests have content_stats for files)
+        let base_schema = if let Some(ref ts) = table_schema {
+            MetadataEntry::to_schema_with_content_stats(ts.as_ref())?
+        } else {
+            MetadataEntry::base_schema()
+        };
         let mut read_fields: Vec<StructField> = base_schema.fields().cloned().collect();
         read_fields.push(StructField::create_metadata_column(
             "_pos",
@@ -231,6 +251,8 @@ impl BulkManifestStreamProcessor {
             evaluation_handler,
             schema,
             table_root,
+            table_schema,
+            stats_schema,
             current_manifest_state: None,
             pending_actions: std::collections::VecDeque::new(),
         })
@@ -375,8 +397,11 @@ impl BulkManifestStreamProcessor {
             Vec::new()
         };
 
-        // Build DV joiner from pre-loaded metadata (both affiliated and unaffiliated)
-        let metadata_schema = Arc::new(super::MetadataEntry::base_schema());
+        // Build metadata schema that matches actual batches from parquet
+        // (includes _pos and content_stats if table_schema was provided)
+        let metadata_schema = super::MetadataEntry::processing_schema_with_pos(
+            self.table_schema.as_ref().map(|s| s.as_ref()),
+        )?;
         let dv_joiner_opt = Metadata::build_dv_joiner_for_leaf(
             self.evaluation_handler.clone(),
             metadata_schema.clone(),
@@ -397,7 +422,22 @@ impl BulkManifestStreamProcessor {
         let has_remove = self.schema.contains(REMOVE_NAME);
         let has_dvs = dv_joiner_opt.is_some();
 
-        let evaluator_schema = super::Metadata::get_evaluator_schema(has_dvs, &metadata_schema);
+        // Use get_evaluator_schema_with_stats to include stats_parsed if needed
+        let evaluator_schema = super::Metadata::get_evaluator_schema_with_stats(
+            has_dvs,
+            &metadata_schema,
+            self.stats_schema.as_ref().map(|s| s.as_ref()),
+        );
+
+        // Build stats transformation evaluator if needed
+        let stats_transform_opt = super::MetadataEntry::create_stats_transformation_evaluator(
+            self.evaluation_handler.as_ref(),
+            &metadata_schema,
+            &self.schema,
+            self.table_schema.as_ref().map(|s| s.as_ref()),
+            self.stats_schema.as_ref().map(|s| s.as_ref()),
+        )?;
+
         let manifest_location = manifest_ref
             .data_manifest
             .manifest
@@ -420,6 +460,7 @@ impl BulkManifestStreamProcessor {
             current_file_path,
             manifest_dv_applicator,
             dv_joiner_opt,
+            stats_transform_opt,
             add_evaluator_opt: evaluators.add_evaluator,
             remove_evaluator_opt: evaluators.remove_evaluator,
         });
@@ -502,8 +543,19 @@ impl Iterator for BulkManifestStreamProcessor {
                 None => unreachable!("Peeked batch should be available"),
             };
 
+            // Apply stats transformation if needed (before DV processing)
+            let batch_to_process = if let Some(ref stats_eval) = state.stats_transform_opt {
+                match stats_eval.evaluate(batch.as_ref()) {
+                    Ok(augmented) => augmented,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                batch
+            };
+
             // Apply manifest DV to get FilteredEngineData
-            let filtered_batch = match state.manifest_dv_applicator.process_batch(batch) {
+            let filtered_batch = match state.manifest_dv_applicator.process_batch(batch_to_process)
+            {
                 Ok(fb) => fb,
                 Err(e) => return Some(Err(e)),
             };

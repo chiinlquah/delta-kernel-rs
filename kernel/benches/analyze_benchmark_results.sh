@@ -55,7 +55,7 @@ extract_json() {
     sed -n '/{/,$ p' "$file" 2>/dev/null || echo "{}"
 }
 
-ANALYSIS_FILE="${RUN_DIR}/analysis.txt"
+ANALYSIS_FILE="${RUN_DIR%/}/analysis.txt"
 
 echo "Generating analysis..." > "${ANALYSIS_FILE}"
 echo "================================================" >> "${ANALYSIS_FILE}"
@@ -844,6 +844,11 @@ generate_dv_comparison_table() {
 # Run comparison table generation
 echo -e "${BLUE}Generating comparison tables...${NC}"
 generate_comparison_tables
+
+# Print comparison tables to STDOUT
+echo ""
+echo ""
+awk '/^=+$/ && getline && /^COMPARISON TABLES/ {found=1; print prev; print; next} {prev=$0} found {print}' "${ANALYSIS_FILE}"
 
 echo ""
 echo "Analysis saved to: ${ANALYSIS_FILE}"
