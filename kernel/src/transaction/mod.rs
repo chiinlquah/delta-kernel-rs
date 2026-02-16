@@ -782,12 +782,19 @@ impl Transaction {
             }
 
             for add_metadata_result in self.add_files_metadata.iter() {
-                // TODO: files might be re-added, they must be deduplicated here.
-                metadata_builder.add_from_engine_data_write(
+                // Pre-convert stats from Delta JSON format to AMT struct format at batch level
+                let converted = crate::content_tree::stats::try_pre_convert_stats_column(
+                    engine,
                     add_metadata_result.as_ref(),
-                    commit_version,
-                    snapshot_id,
+                    "stats",
+                    &physical_table_schema,
+                    &BASE_ADD_FILES_SCHEMA,
                 )?;
+                let data: &dyn EngineData = match &converted {
+                    Some(c) => c.as_ref(),
+                    None => add_metadata_result.as_ref(),
+                };
+                metadata_builder.add_from_engine_data_write(data, commit_version, snapshot_id)?;
             }
 
             // Add leaf manifests collected via add_leaf() to the ContentRoot

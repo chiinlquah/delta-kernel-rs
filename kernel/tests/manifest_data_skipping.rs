@@ -29,6 +29,15 @@ use test_utils::{create_table, engine_store_setup};
 
 mod common;
 
+/// Describes a test file with its metadata and stats for `create_add_files_with_stats`.
+struct TestFileStats<'a> {
+    path: &'a str,
+    size: i64,
+    num_records: i64,
+    min_id: i64,
+    max_id: i64,
+}
+
 /// Helper to create a field with column mapping metadata
 fn field_with_metadata(name: &str, data_type: DataType, field_id: i64) -> StructField {
     StructField::nullable(name, data_type).with_metadata([
@@ -88,28 +97,18 @@ fn build_stats_struct_field(
 /// Creates add file metadata with stats for testing
 fn create_add_files_with_stats(
     add_files_schema: &Arc<StructType>,
-    files: Vec<(&str, i64, i64, i64, i64, i64)>, // (path, size, mod_time, num_records, min_id, max_id)
+    files: Vec<TestFileStats<'_>>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let num_files = files.len();
 
     // Build basic arrays
-    let path_array = StringArray::from(files.iter().map(|(p, ..)| *p).collect::<Vec<_>>());
-    let size_array = Int64Array::from(files.iter().map(|(_, s, ..)| *s).collect::<Vec<_>>());
-    let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m, ..)| *m).collect::<Vec<_>>());
+    let path_array = StringArray::from(files.iter().map(|f| f.path).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|f| f.size).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(vec![0i64; num_files]);
     let num_records_array =
-        Int64Array::from(files.iter().map(|(_, _, _, n, ..)| *n).collect::<Vec<_>>());
-    let min_id_array = Int64Array::from(
-        files
-            .iter()
-            .map(|(_, _, _, _, min, _)| *min)
-            .collect::<Vec<_>>(),
-    );
-    let max_id_array = Int64Array::from(
-        files
-            .iter()
-            .map(|(_, _, _, _, _, max)| *max)
-            .collect::<Vec<_>>(),
-    );
+        Int64Array::from(files.iter().map(|f| f.num_records).collect::<Vec<_>>());
+    let min_id_array = Int64Array::from(files.iter().map(|f| f.min_id).collect::<Vec<_>>());
+    let max_id_array = Int64Array::from(files.iter().map(|f| f.max_id).collect::<Vec<_>>());
 
     // Create empty partition values map
     let partition_values_array = Arc::new(MapArray::new(
@@ -264,7 +263,7 @@ fn add_leaf_with_files(
     txn: &mut delta_kernel::transaction::Transaction,
     engine: &dyn delta_kernel::Engine,
     add_files_schema: &Arc<StructType>,
-    files: Vec<(&str, i64, i64, i64, i64, i64)>,
+    files: Vec<TestFileStats<'_>>,
 ) -> DeltaResult<()> {
     let mut leaf = txn.new_leaf_node_writer(engine)?;
     let data = create_add_files_with_stats(add_files_schema, files)?;
@@ -345,8 +344,20 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         engine.as_ref(),
         &add_files_schema,
         vec![
-            (file1, 100, 1, 100, 1, 100),     // IDs 1-100
-            (file2, 100, 101, 200, 101, 200), // IDs 101-200
+            TestFileStats {
+                path: file1,
+                size: 100,
+                num_records: 100,
+                min_id: 1,
+                max_id: 100,
+            },
+            TestFileStats {
+                path: file2,
+                size: 100,
+                num_records: 200,
+                min_id: 101,
+                max_id: 200,
+            },
         ],
     )?;
 
@@ -354,15 +365,33 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         &mut txn,
         engine.as_ref(),
         &add_files_schema,
-        vec![(file3, 100, 201, 300, 201, 300)], // IDs 201-300
+        vec![TestFileStats {
+            path: file3,
+            size: 100,
+            num_records: 100,
+            min_id: 201,
+            max_id: 300,
+        }],
     )?;
 
     // Verify stats in leaf data
     let leaf1_data = create_add_files_with_stats(
         &add_files_schema,
         vec![
-            (file1, 100, 1, 100, 1, 100),
-            (file2, 100, 101, 200, 101, 200),
+            TestFileStats {
+                path: file1,
+                size: 100,
+                num_records: 100,
+                min_id: 1,
+                max_id: 100,
+            },
+            TestFileStats {
+                path: file2,
+                size: 100,
+                num_records: 200,
+                min_id: 101,
+                max_id: 200,
+            },
         ],
     )?;
     verify_stats(
@@ -374,8 +403,16 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     )?;
 
     // Add file directly to root
-    let root_file_data =
-        create_add_files_with_stats(&add_files_schema, vec![(file4, 100, 301, 400, 301, 400)])?;
+    let root_file_data = create_add_files_with_stats(
+        &add_files_schema,
+        vec![TestFileStats {
+            path: file4,
+            size: 100,
+            num_records: 400,
+            min_id: 301,
+            max_id: 400,
+        }],
+    )?;
     verify_stats(
         root_file_data.as_ref(),
         &HashMap::from([(file4.to_string(), (400, 301, 400))]),
@@ -412,16 +449,11 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     }
 
     // Verify filtering with id < 50:
-    // File-level data skipping is now working!
     // - file1 (IDs 1-100): INCLUDED (overlaps with <50)
-    // - file2 (IDs 101-200): FILTERED OUT by file-level skipping (min=101 > 50) ✓
+    // - file2 (IDs 101-200): FILTERED OUT by file-level skipping (min=101 > 50)
     // - file3 (IDs 201-300): FILTERED OUT by manifest-level skipping (leaf2 filtered)
-    // - file4 (IDs 301-400): INCLUDED (from root batch, stats_parsed populated)
-    //
-    // Note: file4 has stats_parsed but isn't being filtered out. This might be because
-    // root files aren't going through the same data skipping filter as leaf files.
-    let expected_files: std::collections::HashSet<_> =
-        [file1.to_string(), file4.to_string()].into_iter().collect();
+    // - file4 (IDs 301-400): FILTERED OUT by file-level skipping (min=301 > 50)
+    let expected_files: std::collections::HashSet<_> = [file1.to_string()].into_iter().collect();
     assert_eq!(scanned_files, expected_files);
 
     // Verify using multi-phase scan planning counts
@@ -441,17 +473,15 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     let (filtered_batches, filtered_files) =
         count_scan_metadata_and_files(filtered_scan, engine.as_ref())?;
 
-    // File-level data skipping is working!
-    //
-    // Current behavior:
-    // - 2 batches: leaf1 (only file1 after filtering) + root batch (file4)
-    // - leaf2 filtered at manifest level (min=201 > 50) ✓
-    // - file2 filtered at file level (min=101 > 50) ✓✓✓
-    // - file4 from root still included (needs separate handling for checkpoint-sourced files)
+    // With predicate id < 50:
+    // - 1 batch: leaf1 (only file1 after filtering)
+    // - leaf2 filtered at manifest level (min=201 > 50)
+    // - file2 filtered at file level (min=101 > 50)
+    // - file4 filtered at file level (min=301 > 50)
     assert_eq!(
         (filtered_batches, filtered_files),
-        (2, 2),
-        "File-level data skipping works! leaf1 has 1 file (file1), root has 1 file (file4)"
+        (1, 1),
+        "All data skipping works: only file1 (IDs 1-100) overlaps with id < 50"
     );
 
     Ok(())

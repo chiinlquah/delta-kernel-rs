@@ -663,18 +663,17 @@ impl MetadataBuilder {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if there was an error visiting the engine data
-    #[allow(dead_code)]
     pub(crate) fn add_from_engine_data_write(
         &mut self,
         engine_data: &dyn EngineData,
         version: Version,
         snapshot_id: Option<i64>,
     ) -> Result<(), crate::Error> {
-        let mut visitor = WriteMetadataVisitor::default();
+        let mut visitor = WriteMetadataWithStatsVisitor::default();
         visitor.visit_rows_of(engine_data)?;
 
-        for add in visitor.adds {
-            self.add(add, version, snapshot_id)?;
+        for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
+            self.add_file_with_dedup(path, size, content_stats, version, snapshot_id)?;
         }
 
         Ok(())
@@ -1395,7 +1394,7 @@ impl MetadataBuilder {
 
 /// Entry extracted by WriteMetadataWithStatsVisitor:
 /// (path, partition_values, size, modification_time, content_stats)
-pub(crate) type WriteMetadataEntry = (
+type WriteMetadataEntry = (
     String,
     HashMap<String, String>,
     i64,
@@ -1411,9 +1410,9 @@ pub(crate) type WriteMetadataEntry = (
 /// level using [`crate::engine::arrow_utils::try_pre_convert_stats_column`] before
 /// visiting rows.
 #[derive(Default)]
-pub(crate) struct WriteMetadataWithStatsVisitor {
+struct WriteMetadataWithStatsVisitor {
     /// Entries: (path, partition_values, size, modification_time, content_stats)
-    pub entries: Vec<WriteMetadataEntry>,
+    entries: Vec<WriteMetadataEntry>,
 }
 
 impl RowVisitor for WriteMetadataWithStatsVisitor {
@@ -1473,15 +1472,6 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
     }
 }
 
-/// Visitor that extracts write metadata and converts to Add structs
-///
-/// This visitor reads the simpler write metadata format (path, partitionValues, size,
-/// modificationTime, stats) and constructs Add structs with minimal fields set.
-#[derive(Default)]
-struct WriteMetadataVisitor {
-    pub adds: Vec<Add>,
-}
-
 /// Visitor that extracts Add-like data from scan row schema.
 ///
 /// The scan row schema has a different structure than the log Add action schema:
@@ -1496,70 +1486,6 @@ struct WriteMetadataVisitor {
 #[derive(Default)]
 struct ScanRowToAddVisitor {
     pub adds: Vec<Add>,
-}
-
-impl RowVisitor for WriteMetadataVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType};
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("path"),
-                column_name!("partitionValues"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats.numRecords"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::LONG,
-                DataType::LONG,
-                DataType::LONG,
-            ];
-            (names, types).into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        for i in 0..row_count {
-            if let Some(path) = getters[0].get_opt(i, "path")? {
-                let partition_values: HashMap<String, String> =
-                    getters[1].get(i, "partitionValues")?;
-                let size: i64 = getters[2].get(i, "size")?;
-                let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-
-                // Extract stats.numRecords and create a stats JSON string
-                let stats: Option<String> = getters[4]
-                    .get_opt(i, "stats.numRecords")?
-                    .map(|num_records: i64| format!(r#"{{"numRecords":{}}}"#, num_records));
-
-                let add = Add {
-                    path,
-                    partition_values,
-                    size,
-                    modification_time,
-                    data_change: true, // will be overridden by transaction
-                    stats,
-                    tags: None,
-                    deletion_vector: None,
-                    base_row_id: None,
-                    default_row_commit_version: None,
-                    clustering_provider: None,
-                    data_manifest_path: None,
-                    data_manifest_position: None,
-                    delete_manifest_path: None,
-                    delete_manifest_position: None,
-                };
-                self.adds.push(add);
-            }
-        }
-        Ok(())
-    }
 }
 
 impl RowVisitor for ScanRowToAddVisitor {
