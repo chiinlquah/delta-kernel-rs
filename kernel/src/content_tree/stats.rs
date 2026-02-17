@@ -1692,7 +1692,8 @@ mod tests {
     fn test_stats_schema_non_nullable_int() {
         // Non-nullable integer field: should have 4 stats fields
         // (no null_count, no nan_value_count, no size stats)
-        let schema = StructType::new_unchecked([field_with_id("id", DataType::INTEGER, false, 1)]);
+        let field = field_with_id("id", DataType::INTEGER, false, 1);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         assert_eq!(stats.fields().count(), 1);
@@ -1717,25 +1718,14 @@ mod tests {
         assert!(id_stats_struct.field("exact_bounds").is_some());
 
         // Check field IDs: base is 10_200 (field_id 1 -> 10_000 + 200*1)
-        let base_id = 10_200;
-        assert_eq!(
-            get_field_id(id_stats_struct.field("value_count").unwrap()),
-            Some(base_id + 1)
-        );
-        assert_eq!(
-            get_field_id(id_stats_struct.field("lower_bound").unwrap()),
-            Some(base_id + 6)
-        );
-        assert_eq!(
-            get_field_id(id_stats_struct.field("upper_bound").unwrap()),
-            Some(base_id + 7)
-        );
+        assert_stats_field_ids(id_stats_struct, 10_200, &field)
     }
 
     #[test]
     fn test_stats_schema_nullable_string() {
         // Nullable string field: should have 7 stats fields (includes null_count)
-        let schema = StructType::new_unchecked([field_with_id("name", DataType::STRING, true, 2)]);
+        let field = field_with_id("name", DataType::STRING, true, 2);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let name_stats = stats.field("name").expect("name field should exist");
@@ -1751,15 +1741,56 @@ mod tests {
             .is_some()); // nullable
         assert!(name_stats_struct.field("nan_value_count").is_none()); // not float/double
 
-        // Check field IDs: base is 10_400 (field_id 2 -> 10_000 + 200*2)
-        let base_id = 10_400;
+        // Check field IDs: base is 10_400
+        assert_stats_field_ids(name_stats_struct, 10_400, &field)
+    }
+
+    fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         assert_eq!(
-            get_field_id(
-                name_stats_struct
-                    .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-                    .unwrap()
-            ),
-            Some(base_id + 2)
+            get_field_id(stats_struct.field("value_count").unwrap()),
+            Some(base_id + STATS_OFFSET_VALUE_COUNT)
+        );
+
+        if field.is_nullable() {
+            assert_eq!(
+                get_field_id(
+                    stats_struct
+                        .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                        .unwrap()
+                ),
+                Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
+            );
+        }
+
+        if field.data_type.eq(&DataType::FLOAT) || field.data_type.eq(&DataType::DOUBLE) {
+            assert_eq!(
+                get_field_id(stats_struct.field("nan_value_count").unwrap()),
+                Some(base_id + STATS_OFFSET_NAN_VALUE_COUNT)
+            );
+        }
+
+        if field.data_type.eq(&DataType::STRING) || field.data_type.eq(&DataType::BINARY) {
+            assert_eq!(
+                get_field_id(stats_struct.field("avg_value_size").unwrap()),
+                Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE)
+            );
+            assert_eq!(
+                get_field_id(stats_struct.field("max_value_size").unwrap()),
+                Some(base_id + STATS_OFFSET_MAX_VALUE_SIZE)
+            );
+        }
+
+        assert_eq!(
+            get_field_id(stats_struct.field("lower_bound").unwrap()),
+            Some(base_id + STATS_OFFSET_LOWER_BOUND)
+        );
+        assert_eq!(
+            get_field_id(stats_struct.field("upper_bound").unwrap()),
+            Some(base_id + STATS_OFFSET_UPPER_BOUND)
+        );
+        assert_eq!(
+            get_field_id(stats_struct.field("exact_bounds").unwrap()),
+            Some(base_id + STATS_OFFSET_EXACT_BOUNDS)
         );
     }
 
@@ -1767,7 +1798,8 @@ mod tests {
     fn test_stats_schema_nullable_double() {
         // Nullable double field: should have 6 stats fields
         // (includes null_count and nan_value_count; no size stats)
-        let schema = StructType::new_unchecked([field_with_id("score", DataType::DOUBLE, true, 5)]);
+        let field = field_with_id("score", DataType::DOUBLE, true, 5);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let score_stats = stats.field("score").expect("score field should exist");
@@ -1784,20 +1816,16 @@ mod tests {
         assert!(score_stats_struct.field("avg_value_size").is_none()); // fixed-length
         assert!(score_stats_struct.field("max_value_size").is_none()); // fixed-length
 
-        // Check field IDs: base is 11_000 (field_id 5 -> 10_000 + 200*5)
-        let base_id = 11_000;
-        assert_eq!(
-            get_field_id(score_stats_struct.field("nan_value_count").unwrap()),
-            Some(base_id + 3)
-        );
+        // Check field IDs: base is 11_000
+        assert_stats_field_ids(score_stats_struct, 11_000, &field)
     }
 
     #[test]
     fn test_stats_schema_non_nullable_float() {
         // Non-nullable float field: should have 5 stats fields
         // (includes nan_value_count; no null_count; no size stats)
-        let schema =
-            StructType::new_unchecked([field_with_id("value", DataType::FLOAT, false, 100)]);
+        let field = field_with_id("value", DataType::FLOAT, false, 100);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let value_stats = stats.field("value").expect("value field should exist");
@@ -1813,6 +1841,7 @@ mod tests {
         assert!(value_stats_struct.field("nan_value_count").is_some()); // float
         assert!(value_stats_struct.field("avg_value_size").is_none()); // fixed-length
         assert!(value_stats_struct.field("max_value_size").is_none()); // fixed-length
+        assert_stats_field_ids(value_stats_struct, 30_000, &field)
     }
 
     #[test]
@@ -1841,7 +1870,8 @@ mod tests {
     #[test]
     fn test_stats_schema_bounds_preserve_type() {
         // Verify that lower_bound and upper_bound have the same type as the original field
-        let schema = StructType::new_unchecked([field_with_id("amount", DataType::LONG, true, 42)]);
+        let field = field_with_id("amount", DataType::LONG, true, 42);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let amount_stats = stats.field("amount").expect("amount field should exist");
@@ -1854,15 +1884,15 @@ mod tests {
         let upper = amount_stats_struct.field("upper_bound").unwrap();
         assert_eq!(lower.data_type(), &DataType::LONG);
         assert_eq!(upper.data_type(), &DataType::LONG);
+        assert_stats_field_ids(amount_stats_struct, 18_400, &field)
     }
 
     #[test]
     fn test_stats_schema_nested_struct() {
         // Test nested struct: { a: struct { b: int, c: double } }
-        let inner_struct = StructType::new_unchecked([
-            field_with_id("b", DataType::INTEGER, false, 2),
-            field_with_id("c", DataType::DOUBLE, true, 3),
-        ]);
+        let field_b = field_with_id("b", DataType::INTEGER, false, 2);
+        let field_c = field_with_id("c", DataType::DOUBLE, true, 3);
+        let inner_struct = StructType::new_unchecked([field_b.clone(), field_c.clone()]);
         let schema = StructType::new_unchecked([field_with_id(
             "a",
             DataType::Struct(Box::new(inner_struct)),
@@ -1892,6 +1922,7 @@ mod tests {
             _ => panic!("Expected struct type for 'b'"),
         };
         assert_eq!(b_stats_struct.fields().count(), 4); // no null_count, no nan_value_count, no size stats
+        assert_stats_field_ids(b_stats_struct, 10_400, &field_b);
 
         // Check 'c' stats (nullable double)
         let c_stats = a_stats_struct.field("c").unwrap();
@@ -1900,6 +1931,7 @@ mod tests {
             _ => panic!("Expected struct type for 'c'"),
         };
         assert_eq!(c_stats_struct.fields().count(), 6); // includes null_count and nan_value_count; no size stats
+        assert_stats_field_ids(c_stats_struct, 10_600, &field_c);
     }
 
     #[test]
