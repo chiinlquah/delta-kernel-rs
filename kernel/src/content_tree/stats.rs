@@ -15,20 +15,20 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Number of stats slots reserved per column.
-const NUM_STATS_PER_COLUMN: i32 = 200;
+/// Number of supported stats per column.
+const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
 
 /// Number of reserved field IDs at the top of the i32 range.
-const RESERVED_FIELD_IDS: i32 = 200;
+const NUM_RESERVED_FIELD_IDS: i32 = 200;
 
-/// Starting field ID for the data space (regular column stats).
-const DATA_SPACE_FIELD_ID_START: i32 = 10_000;
+/// Starting field ID of the stats space for the data field IDs (regular column stats).
+const STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS: i32 = 10_000;
 
-/// Starting field ID for the metadata space (reserved field stats).
-const METADATA_SPACE_FIELD_ID_START: i32 = 2_147_000_000;
+/// Starting field ID of the stats space for the metadata field IDs (reserved field stats).
+const STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS: i32 = 2_147_000_000;
 
 /// Field ID where reserved field IDs begin.
-const RESERVED_FIELD_IDS_START: i32 = i32::MAX - RESERVED_FIELD_IDS;
+const RESERVED_FIELD_IDS_START: i32 = i32::MAX - NUM_RESERVED_FIELD_IDS;
 
 /// Computes the base field ID for a column's stats struct, given a parent struct field ID.
 ///
@@ -64,19 +64,21 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 
     let (id_space_start, id) = if field_id >= RESERVED_FIELD_IDS_START {
         // This is a reserved field ID, which uses a different calculation
-        let id = RESERVED_FIELD_IDS - (i32::MAX - field_id);
-        (METADATA_SPACE_FIELD_ID_START, id)
+        let id = NUM_RESERVED_FIELD_IDS - (i32::MAX - field_id);
+        (STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS, id)
     } else {
-        (DATA_SPACE_FIELD_ID_START, field_id)
+        (STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS, field_id)
     };
 
     // Calculate final_id, checking for overflow
-    let stats_offset = NUM_STATS_PER_COLUMN.checked_mul(id)?;
+    let stats_offset = NUM_SUPPORTED_STATS_PER_COLUMN.checked_mul(id)?;
     let final_id = id_space_start.checked_add(stats_offset)?;
 
     // Check for overlap with other ID ranges:
     // Data space IDs should not overlap into metadata space
-    if field_id < RESERVED_FIELD_IDS_START && final_id >= METADATA_SPACE_FIELD_ID_START {
+    if field_id < RESERVED_FIELD_IDS_START
+        && final_id >= STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS
+    {
         return None;
     }
 
@@ -111,22 +113,24 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 #[allow(dead_code)]
 pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
     // Invalid stats field ID: negative or not a multiple of NUM_STATS_PER_COLUMN
-    if stats_field_id < 0 || stats_field_id % NUM_STATS_PER_COLUMN != 0 {
+    if stats_field_id < 0 || stats_field_id % NUM_SUPPORTED_STATS_PER_COLUMN != 0 {
         return None;
     }
 
-    let final_id = if stats_field_id < METADATA_SPACE_FIELD_ID_START {
+    let final_id = if stats_field_id < STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS {
         // Data space: reverse the calculation
         // stats_field_id = DATA_SPACE_FIELD_ID_START + NUM_STATS_PER_COLUMN * field_id
         // => field_id = (stats_field_id - DATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
-        (stats_field_id - DATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
+        (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
+            / NUM_SUPPORTED_STATS_PER_COLUMN
     } else {
         // Metadata space (reserved field IDs): reverse the calculation
         // stats_field_id = METADATA_SPACE_FIELD_ID_START + NUM_STATS_PER_COLUMN * id
         // where id = RESERVED_FIELD_IDS - (i32::MAX - field_id)
         // => id = (stats_field_id - METADATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
         // => field_id = i32::MAX - (RESERVED_FIELD_IDS - id) = RESERVED_FIELD_IDS_START + id
-        let id = (stats_field_id - METADATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN;
+        let id = (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS)
+            / NUM_SUPPORTED_STATS_PER_COLUMN;
         RESERVED_FIELD_IDS_START + id
     };
 
@@ -259,8 +263,8 @@ impl SchemaVisitor for StatsSchemaVisitor {
 /// - offset 1: `value_count` (long)
 /// - offset 2: `null_count` (long) - only if the field is nullable
 /// - offset 3: `nan_value_count` (long) - only for float/double types
-/// - offset 4: `avg_value_size` (long) - only for variable-length types (e.g. string/binary)
-/// - offset 5: `max_value_size` (long) - only for variable-length types (e.g. string/binary)
+/// - offset 4: `avg_value_size` (int) - only for variable-length types (e.g. string/binary)
+/// - offset 5: `max_value_size` (int) - only for variable-length types (e.g. string/binary)
 /// - offset 6: `lower_bound` (same type as the field)
 /// - offset 7: `upper_bound` (same type as the field)
 /// - offset 8: `exact_bounds` (boolean)
@@ -318,14 +322,14 @@ fn build_primitive_stats_struct(
     if has_size_stats {
         fields.push(field_with_id(
             "avg_value_size",
-            DataType::LONG,
+            DataType::INTEGER,
             true,
             base_field_id + STATS_OFFSET_AVG_VALUE_SIZE,
         ));
 
         fields.push(field_with_id(
             "max_value_size",
-            DataType::LONG,
+            DataType::INTEGER,
             true,
             base_field_id + STATS_OFFSET_MAX_VALUE_SIZE,
         ));
@@ -369,8 +373,8 @@ fn build_primitive_stats_struct(
 /// - `value_count` (long): count of values
 /// - `null_count` (long): count of null values (only if field is nullable)
 /// - `nan_value_count` (long): count of NaN values (only for float/double types)
-/// - `avg_value_size` (long): average size of values (only for variable-length types)
-/// - `max_value_size` (long): maximum size of values (only for variable-length types)
+/// - `avg_value_size` (int): average size of values (only for variable-length types)
+/// - `max_value_size` (int): maximum size of values (only for variable-length types)
 /// - `lower_bound` (same type as field): minimum value
 /// - `upper_bound` (same type as field): maximum value
 /// - `exact_bounds` (boolean): whether bounds are exact
@@ -915,7 +919,7 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
                 sum_long_scalars(&field_scalars)
             }
             // Max fields
-            "max_value_size" => max_long_scalars(&field_scalars),
+            "max_value_size" => max_scalar(&field_scalars, &DataType::INTEGER),
             // Min bound
             "lower_bound" => min_scalar(&field_scalars, field.data_type()),
             // Max bound
@@ -954,6 +958,7 @@ fn sum_long_scalars(scalars: &[&Scalar]) -> Scalar {
 }
 
 /// Takes the maximum of Long scalars, ignoring nulls.
+#[allow(dead_code)]
 fn max_long_scalars(scalars: &[&Scalar]) -> Scalar {
     let mut max: Option<i64> = None;
 
@@ -1616,6 +1621,8 @@ mod tests {
             (2, Some(10_400)),
             (5, Some(11_000)),
             (100, Some(30_000)),
+            (-1, None),                     // negative
+            (1_000_000, Some(200_010_000)), // 1_000_000 = max data field id
             (2_147_483_447, Some(2_147_000_000)),
             (2_147_483_448, Some(2_147_000_200)),
             (2_147_483_541, Some(2_147_018_800)),
@@ -1641,15 +1648,22 @@ mod tests {
             (10_400, Some(2)),
             (11_000, Some(5)),
             (30_000, Some(100)),
+            (200_010_000, Some(1_000_000)), // 1_000_000 = max data field id
             (2_147_000_000, Some(2_147_483_447)),
             (2_147_000_200, Some(2_147_483_448)),
             (2_147_018_800, Some(2_147_483_541)),
             (2_147_039_600, Some(2_147_483_645)),
             (2_147_039_800, Some(2_147_483_646)),
             // Invalid cases
-            (-1, None),     // negative
-            (10_001, None), // not a multiple of 200
-            (0, None),      // below data space start (would give negative field_id)
+            (-1, None), // negative
+            // below data space start (would give negative field_id)
+            (0, None),
+            (5_000, None),
+            // not a multiple of 200
+            (10_001, None),
+            (10_201, None),
+            (10_500, None),
+            (10_900, None),
         ];
         for (stats_field_id, expected) in cases {
             assert_eq!(

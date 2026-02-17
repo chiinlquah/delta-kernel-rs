@@ -3556,8 +3556,8 @@ mod tests {
         let name_stats_fields = vec![
             StructField::nullable("value_count", DataType::LONG),
             StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
-            StructField::nullable("avg_value_size", DataType::LONG),
-            StructField::nullable("max_value_size", DataType::LONG),
+            StructField::nullable("avg_value_size", DataType::INTEGER),
+            StructField::nullable("max_value_size", DataType::INTEGER),
             StructField::nullable("lower_bound", DataType::STRING),
             StructField::nullable("upper_bound", DataType::STRING),
             StructField::nullable("exact_bounds", DataType::BOOLEAN),
@@ -3567,8 +3567,8 @@ mod tests {
             vec![
                 Scalar::Long(500),
                 Scalar::Long(10),
-                Scalar::Null(DataType::LONG),
-                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::INTEGER),
+                Scalar::Null(DataType::INTEGER),
                 Scalar::String("aardvark".to_string()),
                 Scalar::String("zebra".to_string()),
                 Scalar::Boolean(true),
