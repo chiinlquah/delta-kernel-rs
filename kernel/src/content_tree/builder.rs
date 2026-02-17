@@ -2229,7 +2229,7 @@ mod tests {
             Some(&Scalar::Long(100))
         );
 
-        // Check name stats: null_count=15, lower_bound="alice", upper_bound="zoe"
+        // Check name stats: null_value_count=15, lower_bound="alice", upper_bound="zoe"
         assert_eq!(
             get_column_stat(
                 aggregated_stats,

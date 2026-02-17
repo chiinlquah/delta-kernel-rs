@@ -261,7 +261,7 @@ impl SchemaVisitor for StatsSchemaVisitor {
 ///
 /// The stats struct contains the following fields (with field IDs as offsets from the base):
 /// - offset 1: `value_count` (long)
-/// - offset 2: `null_count` (long) - only if the field is nullable
+/// - offset 2: `null_value_count` (long) - only if the field is nullable
 /// - offset 3: `nan_value_count` (long) - only for float/double types
 /// - offset 4: `avg_value_size` (int) - only for variable-length types (e.g. string/binary)
 /// - offset 5: `max_value_size` (int) - only for variable-length types (e.g. string/binary)
@@ -275,7 +275,7 @@ fn build_primitive_stats_struct(
 ) -> StructType {
     // Base fields: value_count, lower_bound, upper_bound, exact_bounds.
     // Optional fields:
-    // - null_count (if nullable)
+    // - null_value_count (if nullable)
     // - nan_value_count (if float/double)
     // - avg_value_size/max_value_size (if variable-length: string/binary)
     let (has_nan_count, has_size_stats) = match &data_type {
@@ -298,7 +298,7 @@ fn build_primitive_stats_struct(
         base_field_id + STATS_OFFSET_VALUE_COUNT,
     ));
 
-    // null_count: only if the field is nullable
+    // null_value_count: only if the field is nullable
     if nullable {
         fields.push(field_with_id(
             crate::content_tree::NULL_COUNT_FIELD_NAME,
@@ -371,7 +371,7 @@ fn build_primitive_stats_struct(
 ///
 /// Each primitive field's stats struct contains:
 /// - `value_count` (long): count of values
-/// - `null_count` (long): count of null values (only if field is nullable)
+/// - `null_value_count` (long): count of null values (only if field is nullable)
 /// - `nan_value_count` (long): count of NaN values (only for float/double types)
 /// - `avg_value_size` (int): average size of values (only for variable-length types)
 /// - `max_value_size` (int): maximum size of values (only for variable-length types)
@@ -676,7 +676,7 @@ fn build_struct_stats(
 ///
 /// For AMT-style format (per-column stats with lower_bound, upper_bound, etc.):
 /// - `value_count`: sum of all value_counts
-/// - `null_count`: sum of all null_counts
+/// - `null_value_count`: sum of all null_value_counts
 /// - `nan_value_count`: sum of all nan_value_counts
 /// - `avg_value_size`: set to null (would require weighted average calculation)
 /// - `max_value_size`: max of all max_value_sizes
@@ -1207,7 +1207,7 @@ fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
 /// Builds per-column stats struct expression for a leaf (primitive) column.
 ///
 /// The field ordering matches the AMT stats schema from [`stats_schema`]:
-/// value_count, null_count, nan_value_count, avg_value_size,
+/// value_count, null_value_count, nan_value_count, avg_value_size,
 /// max_value_size, lower_bound, upper_bound, exact_bounds.
 ///
 /// When `known_stats_schema` is `Some`, column references are only created for fields
@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn test_stats_schema_non_nullable_int() {
         // Non-nullable integer field: should have 4 stats fields
-        // (no null_count, no nan_value_count, no size stats)
+        // (no null_value_count, no nan_value_count, no size stats)
         let field = field_with_id("id", DataType::INTEGER, false, 1);
         let schema = StructType::new_unchecked([field.clone()]);
 
@@ -1723,7 +1723,7 @@ mod tests {
 
     #[test]
     fn test_stats_schema_nullable_string() {
-        // Nullable string field: should have 7 stats fields (includes null_count)
+        // Nullable string field: should have 7 stats fields (includes null_value_count)
         let field = field_with_id("name", DataType::STRING, true, 2);
         let schema = StructType::new_unchecked([field.clone()]);
 
@@ -1734,7 +1734,7 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
+        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
         assert_eq!(name_stats_struct.fields().count(), 7);
         assert!(name_stats_struct
             .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
@@ -1797,7 +1797,7 @@ mod tests {
     #[test]
     fn test_stats_schema_nullable_double() {
         // Nullable double field: should have 6 stats fields
-        // (includes null_count and nan_value_count; no size stats)
+        // (includes null_value_count and nan_value_count; no size stats)
         let field = field_with_id("score", DataType::DOUBLE, true, 5);
         let schema = StructType::new_unchecked([field.clone()]);
 
@@ -1823,7 +1823,7 @@ mod tests {
     #[test]
     fn test_stats_schema_non_nullable_float() {
         // Non-nullable float field: should have 5 stats fields
-        // (includes nan_value_count; no null_count; no size stats)
+        // (includes nan_value_count; no null_value_count; no size stats)
         let field = field_with_id("value", DataType::FLOAT, false, 100);
         let schema = StructType::new_unchecked([field.clone()]);
 
@@ -1921,7 +1921,7 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected struct type for 'b'"),
         };
-        assert_eq!(b_stats_struct.fields().count(), 4); // no null_count, no nan_value_count, no size stats
+        assert_eq!(b_stats_struct.fields().count(), 4); // no null_value_count, no nan_value_count, no size stats
         assert_stats_field_ids(b_stats_struct, 10_400, &field_b);
 
         // Check 'c' stats (nullable double)
@@ -1930,7 +1930,7 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected struct type for 'c'"),
         };
-        assert_eq!(c_stats_struct.fields().count(), 6); // includes null_count and nan_value_count; no size stats
+        assert_eq!(c_stats_struct.fields().count(), 6); // includes null_value_count and nan_value_count; no size stats
         assert_stats_field_ids(c_stats_struct, 10_600, &field_c);
     }
 
@@ -2042,7 +2042,7 @@ mod tests {
     }
 
     /// Helper function to get a column's stats field value in AMT format
-    /// AMT format: {col_name: {value_count, null_count?, lower_bound, upper_bound, exact_bounds}}
+    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound, exact_bounds}}
     fn get_column_stat<'a>(
         stats: &'a StructData,
         column: &str,
@@ -2077,7 +2077,7 @@ mod tests {
         // AMT format has one field per column: {id: {...}, name: {...}}
         assert_eq!(content_stats.fields().len(), 2);
 
-        // Check id column stats (non-nullable LONG, so no null_count)
+        // Check id column stats (non-nullable LONG, so no null_value_count)
         assert_eq!(
             get_column_stat(&content_stats, "id", "value_count"),
             Some(&Scalar::Long(100))
@@ -2095,7 +2095,7 @@ mod tests {
             Some(&Scalar::Boolean(true))
         );
 
-        // Check name column stats (nullable STRING, so has null_count)
+        // Check name column stats (nullable STRING, so has null_value_count)
         assert_eq!(
             get_column_stat(&content_stats, "name", "value_count"),
             Some(&Scalar::Long(100))
@@ -2407,7 +2407,7 @@ mod tests {
         // - id.lower_bound: min(1, 40) = 1
         // - id.upper_bound: max(50, 100) = 100
         // - name.value_count: 100 + 150 = 250
-        // - name.null_count: 5 + 10 = 15
+        // - name.null_value_count: 5 + 10 = 15
         // - name.lower_bound: min("alice", "bob") = "alice"
         // - name.upper_bound: max("mike", "zoe") = "zoe"
 

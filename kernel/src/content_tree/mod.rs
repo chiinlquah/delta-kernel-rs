@@ -32,9 +32,9 @@ use url::Url;
 /// This field contains per-column statistics in AMT format.
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
 
-/// Field name for the null_count field within content_stats.
+/// Field name for the null_value_count field within content_stats.
 /// This field contains the count of null values for a column.
-pub(crate) const NULL_COUNT_FIELD_NAME: &str = "null_count";
+pub(crate) const NULL_COUNT_FIELD_NAME: &str = "null_value_count";
 
 /// Type alias for the iterator returned by `open_stream`.
 type ParquetStreamResult = (
@@ -112,7 +112,7 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 /// content_stats: {
 ///   column_name: {
 ///     value_count: i64,
-///     null_count: i64,  // if nullable
+///     null_value_count: i64,  // if nullable
 ///     lower_bound: <column_type>,
 ///     upper_bound: <column_type>,
 ///     exact_bounds: bool
@@ -3034,7 +3034,7 @@ impl MetadataEntry {
         use crate::schema::derive_macro_utils::GetStructField as _;
 
         // Generate AMT-style stats schema format:
-        // {col: {value_count: LONG, null_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
+        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
         let stats_struct = stats::stats_schema(table_schema)?;
 
         Ok(StructType::new_unchecked([
@@ -3218,7 +3218,7 @@ mod tests {
         assert!(content_stats_field.nullable);
 
         // Verify content_stats is a struct with AMT stats format:
-        // {col_name: {value_count, null_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
+        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected content_stats to be a struct"),
@@ -3237,7 +3237,7 @@ mod tests {
             _ => panic!("Expected id stats to be a struct"),
         };
         assert!(id_stats.field("value_count").is_some());
-        assert!(id_stats.field("null_count").is_none()); // not nullable
+        assert!(id_stats.field("null_value_count").is_none()); // not nullable
         assert!(id_stats.field("nan_value_count").is_none()); // not float/double
         assert!(id_stats.field("lower_bound").is_some());
         assert!(id_stats.field("upper_bound").is_some());
@@ -3247,13 +3247,13 @@ mod tests {
             &DataType::INTEGER
         );
 
-        // name: nullable STRING -> {value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
         let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
         };
         assert!(name_stats.field("value_count").is_some());
-        assert!(name_stats.field("null_count").is_some()); // nullable
+        assert!(name_stats.field("null_value_count").is_some()); // nullable
         assert!(name_stats.field("nan_value_count").is_none()); // not float/double
         assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
         assert!(name_stats.field("max_value_size").is_some()); // string has size stats
@@ -3265,13 +3265,13 @@ mod tests {
             &DataType::STRING
         );
 
-        // value: nullable DOUBLE -> {value_count, null_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
         let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
         };
         assert!(value_stats.field("value_count").is_some());
-        assert!(value_stats.field("null_count").is_some()); // nullable
+        assert!(value_stats.field("null_value_count").is_some()); // nullable
         assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
         assert!(value_stats.field("lower_bound").is_some());
         assert!(value_stats.field("upper_bound").is_some());
@@ -3316,9 +3316,9 @@ mod tests {
 
         // Create content_stats in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  value: {value_count, null_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
+        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
 
-        // Build id stats struct (non-nullable INTEGER, so no null_count or nan_value_count)
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
         let id_stats = StructData::try_new(
             vec![
                 StructField::nullable("value_count", DataType::LONG),
@@ -3334,7 +3334,7 @@ mod tests {
             ],
         )?;
 
-        // Build value stats struct (nullable DOUBLE, so has null_count and nan_value_count)
+        // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
         let value_stats = StructData::try_new(
             vec![
                 StructField::nullable("value_count", DataType::LONG),
@@ -3533,9 +3533,9 @@ mod tests {
 
         // Create content_stats data in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  name: {value_count, null_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
+        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
 
-        // Build id stats struct (non-nullable INTEGER, so no null_count)
+        // Build id stats struct (non-nullable INTEGER, so no null_value_count)
         let id_stats_fields = vec![
             StructField::nullable("value_count", DataType::LONG),
             StructField::nullable("lower_bound", DataType::INTEGER),
@@ -3552,7 +3552,7 @@ mod tests {
             ],
         )?;
 
-        // Build name stats struct (nullable STRING, so has null_count and size stats)
+        // Build name stats struct (nullable STRING, so has null_value_count and size stats)
         let name_stats_fields = vec![
             StructField::nullable("value_count", DataType::LONG),
             StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
