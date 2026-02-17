@@ -794,7 +794,12 @@ impl Transaction {
                     Some(c) => c.as_ref(),
                     None => add_metadata_result.as_ref(),
                 };
-                metadata_builder.add_from_engine_data_write(data, commit_version, snapshot_id)?;
+                metadata_builder.add_from_engine_data_write(
+                    engine,
+                    data,
+                    commit_version,
+                    snapshot_id,
+                )?;
             }
 
             // Add leaf manifests collected via add_leaf() to the ContentRoot

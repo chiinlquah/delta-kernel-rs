@@ -574,8 +574,12 @@ impl LeafNodeWriter {
             Some(c) => c.as_ref(),
             None => add_metadata.as_ref(),
         };
-        self.data_builder
-            .add_from_engine_data_write(data, self.version, Some(self.snapshot_id))?;
+        self.data_builder.add_from_engine_data_write(
+            engine,
+            data,
+            self.version,
+            Some(self.snapshot_id),
+        )?;
 
         Ok(())
     }

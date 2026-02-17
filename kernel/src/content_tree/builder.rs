@@ -230,6 +230,20 @@ pub(crate) struct MetadataBuilder {
     /// Combined cache for DV bitmaps (manifest_dv + changes_dv)
     /// Keyed by manifest location. Provides O(1) access and lazy deserialization.
     dv_cache: HashMap<String, DvCache>,
+    /// Pre-transformed EngineData batches already in MetadataEntry schema.
+    /// These bypass the row-by-row visitor path and are produced by the expression
+    /// evaluator in `add_from_engine_data_write`.
+    pre_built_data: Vec<Box<dyn EngineData>>,
+    /// Aggregate stats for each pre-built data batch, computed at add time.
+    pre_built_aggregates: Vec<BatchAggregates>,
+}
+
+/// Lightweight aggregate stats computed when adding pre-built columnar batches.
+/// All pre-built entries are `TrackingStatus::Added` at the builder's version.
+struct BatchAggregates {
+    file_count: i64,
+    total_record_count: i64,
+    total_file_size: i64,
 }
 
 impl std::fmt::Debug for MetadataBuilder {
@@ -237,6 +251,7 @@ impl std::fmt::Debug for MetadataBuilder {
         f.debug_struct("MetadataBuilder")
             .field("table_root", &self.table_root)
             .field("pending_entries", &self.pending_entries.len())
+            .field("pre_built_data", &self.pre_built_data.len())
             .field("dv_cache_count", &self.dv_cache.len())
             .field(
                 "dv_cache_dirty_count",
@@ -268,6 +283,8 @@ impl MetadataBuilder {
             values_seen: HashSet::new(),
             cached_schema: OnceLock::new(),
             dv_cache: HashMap::new(),
+            pre_built_data: Vec::new(),
+            pre_built_aggregates: Vec::new(),
         }
     }
 
@@ -649,34 +666,205 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    /// Adds write metadata from `EngineData` to the metadata.
+    /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
     ///
-    /// This method is designed for batch commit scenarios where the data contains simple
-    /// write metadata (path, partitionValues, size, modificationTime, stats) rather than
-    /// full Add actions.
+    /// This method transforms the input write metadata (path, partitionValues, size,
+    /// modificationTime, stats) directly into MetadataEntry schema using the engine's
+    /// expression evaluator, avoiding the row-by-row visitor pattern.
+    ///
+    /// When stats are in AMT format (after successful `try_pre_convert_stats_column`),
+    /// the full stats are passed through and record counts are extracted. When stats
+    /// are not in AMT format (e.g., empty or unconverted), content_stats is set to null
+    /// and record_count defaults to 0.
     ///
     /// # Arguments
+    /// * `engine` - The engine to use for expression evaluation
     /// * `engine_data` - The engine data containing write metadata records to extract and add
     /// * `version` - The version at which these files are being added
     /// * `snapshot_id` - Optional snapshot ID to use for tracking info
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if there was an error visiting the engine data
+    /// * `Err` if there was an error evaluating the expression
     pub(crate) fn add_from_engine_data_write(
         &mut self,
+        engine: &dyn crate::Engine,
         engine_data: &dyn EngineData,
         version: Version,
         snapshot_id: Option<i64>,
-    ) -> Result<(), crate::Error> {
-        let mut visitor = WriteMetadataWithStatsVisitor::default();
-        visitor.visit_rows_of(engine_data)?;
+    ) -> DeltaResult<()> {
+        use crate::content_tree::stats;
 
-        for (path, _partition_values, size, _modification_time, content_stats) in visitor.entries {
-            self.add_file_with_dedup(path, size, content_stats, version, snapshot_id)?;
+        if engine_data.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let output_schema = self.get_schema()?;
+        let stats_struct = stats::stats_schema(&self.table_schema)?;
+
+        // Try fast path: full AMT stats schema (works when stats were pre-converted)
+        let result = self.evaluate_write_transform(
+            engine,
+            engine_data,
+            version,
+            snapshot_id,
+            &output_schema,
+            Some(&stats_struct),
+        );
+
+        match result {
+            Ok((transformed, agg)) => {
+                self.pre_built_data.push(transformed);
+                self.pre_built_aggregates.push(agg);
+                Ok(())
+            }
+            Err(_) => {
+                // Fall back: empty stats schema (stats not in AMT format)
+                let (transformed, agg) = self.evaluate_write_transform(
+                    engine,
+                    engine_data,
+                    version,
+                    snapshot_id,
+                    &output_schema,
+                    None,
+                )?;
+                self.pre_built_data.push(transformed);
+                self.pre_built_aggregates.push(agg);
+                Ok(())
+            }
+        }
+    }
+
+    /// Build and evaluate a write metadata transformation expression.
+    ///
+    /// When `stats_struct` is `Some`, the input schema includes the AMT stats struct
+    /// and content_stats/recordCount are derived from it. When `None`, stats are treated
+    /// as an empty struct and content_stats is null with recordCount = 0.
+    fn evaluate_write_transform(
+        &self,
+        engine: &dyn crate::Engine,
+        engine_data: &dyn EngineData,
+        version: Version,
+        snapshot_id: Option<i64>,
+        output_schema: &SchemaRef,
+        stats_struct: Option<&crate::schema::StructType>,
+    ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
+        use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
+        use crate::expressions::{Expression, Scalar};
+        use crate::schema::{MapType, StructField, StructType};
+
+        let stats_type = match stats_struct {
+            Some(ss) => DataType::Struct(Box::new(ss.clone())),
+            None => DataType::Struct(Box::new(StructType::new_unchecked(vec![]))),
+        };
+
+        let input_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable("stats", stats_type),
+        ]));
+
+        let version_i64 = version as i64;
+
+        // Build recordCount and content_stats expressions based on stats availability
+        let (record_count_expr, content_stats_expr) = match stats_struct {
+            Some(ss) => {
+                let rc = if let Some(first_col) = ss.fields().next().map(|f| f.name().clone()) {
+                    Expression::coalesce([
+                        Expression::column(["stats", first_col.as_str(), "value_count"]),
+                        Expression::literal(Scalar::Long(0)),
+                    ])
+                } else {
+                    Expression::literal(Scalar::Long(0))
+                };
+                (rc, Expression::column(["stats"]))
+            }
+            None => {
+                let stats_null_type = output_schema
+                    .field(CONTENT_STATS_FIELD_NAME)
+                    .map(|f| f.data_type().clone())
+                    .unwrap_or(DataType::STRING);
+                (
+                    Expression::literal(Scalar::Long(0)),
+                    Expression::null_literal(stats_null_type),
+                )
+            }
+        };
+
+        // Build field expressions mapping input → output for each MetadataEntry field
+        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+        for field in output_schema.fields() {
+            let expr: Expression = match field.name().as_str() {
+                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+                "location" => Expression::column(["path"]),
+                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
+                "trackingInfo" => {
+                    let tracking_struct = match field.data_type() {
+                        DataType::Struct(s) => s.as_ref().clone(),
+                        _ => {
+                            return Err(crate::Error::generic(
+                                "trackingInfo field should be a struct type",
+                            ))
+                        }
+                    };
+                    let snapshot_id_expr = match snapshot_id {
+                        Some(id) => Expression::literal(Scalar::Long(id)),
+                        None => Expression::null_literal(DataType::LONG),
+                    };
+                    Expression::struct_from_with_schema(
+                        [
+                            Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
+                            snapshot_id_expr,
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::null_literal(DataType::LONG), // firstRowId
+                            Expression::null_literal(DataType::BINARY), // changesDv
+                        ],
+                        tracking_struct,
+                    )
+                }
+                "contentInfo" => Expression::null_literal(field.data_type().clone()),
+                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
+                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "recordCount" => record_count_expr.clone(),
+                "fileSizeInBytes" => Expression::column(["size"]),
+                CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
+                "manifestStats" => Expression::null_literal(field.data_type().clone()),
+                "referencedFile" => Expression::null_literal(DataType::STRING),
+                "manifestDv" => Expression::null_literal(DataType::BINARY),
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            field_exprs.push(Arc::new(expr));
+        }
+
+        // Create the struct transform expression
+        let transform_expr =
+            Expression::struct_from_with_schema(field_exprs, output_schema.as_ref().clone());
+
+        // Create evaluator and evaluate
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            input_schema,
+            Arc::new(transform_expr),
+            DataType::Struct(Box::new(output_schema.as_ref().clone())),
+        )?;
+        let transformed = evaluator.evaluate(engine_data)?;
+
+        // Compute lightweight aggregates from the transformed output (flat i64 columns)
+        let mut agg_visitor = TransformedAggregateVisitor::default();
+        agg_visitor.visit_rows_of(transformed.as_ref())?;
+
+        let aggregates = BatchAggregates {
+            file_count: engine_data.len() as i64,
+            total_record_count: agg_visitor.total_record_count,
+            total_file_size: agg_visitor.total_file_size,
+        };
+
+        Ok((transformed, aggregates))
     }
 
     /// Adds multiple `Add` records from an iterator of `EngineData` results to the metadata.
@@ -776,7 +964,7 @@ impl MetadataBuilder {
     /// Returns true if this builder has any pending entries.
     #[allow(dead_code)]
     pub(crate) fn has_entries(&self) -> bool {
-        !self.pending_entries.is_empty()
+        !self.pending_entries.is_empty() || !self.pre_built_data.is_empty()
     }
 
     /// Remove data file entries by path. Only used when moving values in the root
@@ -873,6 +1061,10 @@ impl MetadataBuilder {
         // Note: We keep the HashSet structure but clear it because we want to track
         // deduplication for entries added after this point
         self.values_seen.clear();
+
+        // Clear pre-built data (these are data file entries, not manifest references)
+        self.pre_built_data.clear();
+        self.pre_built_aggregates.clear();
     }
 
     /// Marks existing entries as DELETED based on a matching file path or deletion vector.
@@ -1076,8 +1268,8 @@ impl MetadataBuilder {
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
-        let record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
-        let file_size_in_bytes: i64 = self
+        let mut record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
+        let mut file_size_in_bytes: i64 = self
             .pending_entries
             .iter()
             .filter_map(|e| e.file_size_in_bytes)
@@ -1115,6 +1307,15 @@ impl MetadataBuilder {
             }
         }
 
+        // Include pre-built batch aggregates (all entries are Added at self.version)
+        for agg in &self.pre_built_aggregates {
+            record_count += agg.total_record_count;
+            file_size_in_bytes += agg.total_file_size;
+            added_files_count += agg.file_count;
+            added_rows_count += agg.total_record_count;
+            min_sequence_number = min_sequence_number.min(self.version as i64);
+        }
+
         // If no entries, set min_sequence_number to 0
         if min_sequence_number == i64::MAX {
             min_sequence_number = 0;
@@ -1140,10 +1341,12 @@ impl MetadataBuilder {
         // Determine content type based on what's in the manifest
         // If all entries are PositionDeletes, this is a DeleteManifest
         // Otherwise, it's a DataManifest
-        let content_type = if self
-            .pending_entries
-            .iter()
-            .all(|entry| entry.content_type == DataContentType::PositionDeletes)
+        // Pre-built data is always Data type, so if we have any, it's a DataManifest
+        let content_type = if self.pre_built_data.is_empty()
+            && self
+                .pending_entries
+                .iter()
+                .all(|entry| entry.content_type == DataContentType::PositionDeletes)
             && !self.pending_entries.is_empty()
         {
             DataContentType::DeleteManifest
@@ -1219,7 +1422,7 @@ impl MetadataBuilder {
         let schema = self.get_schema()?;
 
         // Handle empty case early
-        if self.pending_entries.is_empty() {
+        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
             return Ok(Metadata {
                 table_root: self.table_root.clone(),
                 data: vec![],
@@ -1229,26 +1432,24 @@ impl MetadataBuilder {
             });
         }
 
-        // Calculate fields per row
-        let fields_per_row = schema.fields().len();
+        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
 
-        // Pre-allocate one big vector for all scalars
-        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-
-        // Push all scalars into the single vector
-        for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema)?;
-            all_scalars.extend(scalars);
+        // Add scalar-built batch from pending_entries (existing path)
+        if !self.pending_entries.is_empty() {
+            let fields_per_row = schema.fields().len();
+            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+            for entry in &self.pending_entries {
+                let scalars = metadata_entry_to_scalars(entry, &schema)?;
+                all_scalars.extend(scalars);
+            }
+            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+            let evaluation_handler = engine.evaluation_handler();
+            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+            data.push(engine_data);
         }
 
-        // Divide into row slices using chunks
-        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-
-        // Create multi-row EngineData in one call
-        let evaluation_handler = engine.evaluation_handler();
-        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-
-        let data = vec![engine_data];
+        // Add pre-transformed columnar batches
+        data.append(&mut self.pre_built_data);
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1293,7 +1494,7 @@ impl MetadataBuilder {
         let schema = self.get_schema()?;
 
         // Handle empty case early
-        if self.pending_entries.is_empty() {
+        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
             return Ok(Metadata {
                 table_root: self.table_root.clone(),
                 data: vec![],
@@ -1303,26 +1504,24 @@ impl MetadataBuilder {
             });
         }
 
-        // Calculate fields per row
-        let fields_per_row = schema.fields().len();
+        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
 
-        // Pre-allocate one big vector for all scalars
-        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-
-        // Push all scalars into the single vector
-        for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema)?;
-            all_scalars.extend(scalars);
+        // Add scalar-built batch from pending_entries (existing path)
+        if !self.pending_entries.is_empty() {
+            let fields_per_row = schema.fields().len();
+            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+            for entry in &self.pending_entries {
+                let scalars = metadata_entry_to_scalars(entry, &schema)?;
+                all_scalars.extend(scalars);
+            }
+            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+            let evaluation_handler = engine.evaluation_handler();
+            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+            data.push(engine_data);
         }
 
-        // Divide into row slices using chunks
-        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-
-        // Create multi-row EngineData in one call
-        let evaluation_handler = engine.evaluation_handler();
-        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-
-        let data = vec![engine_data];
+        // Add pre-transformed columnar batches
+        data.append(&mut self.pre_built_data);
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1351,7 +1550,7 @@ impl MetadataBuilder {
         let schema = self.get_schema()?;
 
         // Handle empty case early
-        if self.pending_entries.is_empty() {
+        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
             return Ok(Metadata {
                 table_root: self.table_root.clone(),
                 data: vec![],
@@ -1361,26 +1560,24 @@ impl MetadataBuilder {
             });
         }
 
-        // Calculate fields per row
-        let fields_per_row = schema.fields().len();
+        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
 
-        // Pre-allocate one big vector for all scalars
-        let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-
-        // Push all scalars into the single vector
-        for entry in &self.pending_entries {
-            let scalars = metadata_entry_to_scalars(entry, &schema)?;
-            all_scalars.extend(scalars);
+        // Add scalar-built batch from pending_entries (existing path)
+        if !self.pending_entries.is_empty() {
+            let fields_per_row = schema.fields().len();
+            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
+            for entry in &self.pending_entries {
+                let scalars = metadata_entry_to_scalars(entry, &schema)?;
+                all_scalars.extend(scalars);
+            }
+            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+            let evaluation_handler = engine.evaluation_handler();
+            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
+            data.push(engine_data);
         }
 
-        // Divide into row slices using chunks
-        let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-
-        // Create multi-row EngineData in one call
-        let evaluation_handler = engine.evaluation_handler();
-        let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-
-        let data = vec![engine_data];
+        // Add pre-transformed columnar batches
+        data.append(&mut self.pre_built_data);
 
         Ok(Metadata {
             table_root: self.table_root.clone(),
@@ -1392,56 +1589,22 @@ impl MetadataBuilder {
     }
 }
 
-/// Entry extracted by WriteMetadataWithStatsVisitor:
-/// (path, partition_values, size, modification_time, content_stats)
-type WriteMetadataEntry = (
-    String,
-    HashMap<String, String>,
-    i64,
-    i64,
-    Option<StructData>,
-);
-
-/// Visitor that extracts write metadata including stats as StructData.
-///
-/// This visitor reads the write metadata format (path, partitionValues, size,
-/// modificationTime, stats) where stats is expected to already be in AMT format
-/// (per-column stats). Delta JSON format stats should be pre-converted at the batch
-/// level using [`crate::engine::arrow_utils::try_pre_convert_stats_column`] before
-/// visiting rows.
+/// Visitor that reads aggregate statistics from the transformed output.
+/// This reads flat `recordCount` and `fileSizeInBytes` columns that were already computed
+/// by the expression evaluator, avoiding the expensive `get_struct()` + `materialize()`
+/// per row that the old approach required.
 #[derive(Default)]
-struct WriteMetadataWithStatsVisitor {
-    /// Entries: (path, partition_values, size, modification_time, content_stats)
-    entries: Vec<WriteMetadataEntry>,
+struct TransformedAggregateVisitor {
+    total_file_size: i64,
+    total_record_count: i64,
 }
 
-impl RowVisitor for WriteMetadataWithStatsVisitor {
+impl RowVisitor for TransformedAggregateVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        use crate::schema::{column_name, MapType, StructType};
-        // Note: This returns a static reference with an empty struct type placeholder.
-        // The actual type checking happens during extraction. This is a limitation of the
-        // RowVisitor interface which requires static references. The stats schema is used
-        // at extraction time to properly interpret the data.
+        use crate::schema::column_name;
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![
-                column_name!("path"),
-                column_name!("partitionValues"),
-                column_name!("size"),
-                column_name!("modificationTime"),
-                column_name!("stats"),
-            ];
-            let types = vec![
-                DataType::STRING,
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
-                DataType::LONG,
-                DataType::LONG,
-                // Use an empty struct as a placeholder - the actual schema is determined at runtime
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![]))),
-            ];
+            let names = vec![column_name!("recordCount"), column_name!("fileSizeInBytes")];
+            let types = vec![DataType::LONG, DataType::LONG];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
@@ -1449,24 +1612,10 @@ impl RowVisitor for WriteMetadataWithStatsVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            if let Some(path) = getters[0].get_opt(i, "path")? {
-                let partition_values: HashMap<String, String> =
-                    getters[1].get(i, "partitionValues")?;
-                let size: i64 = getters[2].get(i, "size")?;
-                let modification_time: i64 = getters[3].get(i, "modificationTime")?;
-
-                // Extract stats as StructData. Stats are expected to already be in AMT
-                // format (pre-converted at the batch level if needed).
-                // Filter out empty structs (e.g. placeholder columns with no fields).
-                let stats: Option<StructData> = getters[4]
-                    .get_struct(i, "stats")?
-                    .map(|struct_item| struct_item.materialize())
-                    .transpose()?
-                    .filter(|s| !s.fields().is_empty());
-
-                self.entries
-                    .push((path, partition_values, size, modification_time, stats));
-            }
+            let record_count: i64 = getters[0].get(i, "recordCount")?;
+            self.total_record_count += record_count;
+            let file_size: i64 = getters[1].get(i, "fileSizeInBytes")?;
+            self.total_file_size += file_size;
         }
         Ok(())
     }
