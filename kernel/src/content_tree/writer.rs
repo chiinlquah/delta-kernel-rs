@@ -1,4 +1,4 @@
-use crate::content_tree::Metadata;
+use crate::content_tree::ContentTreeNode;
 use crate::path::ParsedLogPath;
 use crate::{DeltaResult, Engine};
 use url::Url;
@@ -6,14 +6,14 @@ use url::Url;
 /// Orchestrates the process of creating a V3 checkpoint for a table.
 ///
 #[allow(dead_code)]
-pub(crate) struct MetadataWriter {
-    pub(crate) metadata: Metadata,
+pub(crate) struct ContentTreeNodeWriter {
+    pub(crate) metadata: ContentTreeNode,
 }
 
 #[allow(dead_code)]
-impl MetadataWriter {
-    /// Creates a new [`MetadataWriter`] for given content root metadata.
-    pub(crate) fn try_new(metadata: Metadata) -> DeltaResult<Self> {
+impl ContentTreeNodeWriter {
+    /// Creates a new [`ContentTreeNodeWriter`] for given content root metadata.
+    pub(crate) fn try_new(metadata: ContentTreeNode) -> DeltaResult<Self> {
         Ok(Self { metadata })
     }
 

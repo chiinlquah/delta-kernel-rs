@@ -1,4 +1,4 @@
-//! Lazy iterator for reading content root (Adaptive Metadata Tree) files.
+//! Lazy iterator for reading content root (Adaptive ContentTreeNode Tree) files.
 //!
 //! This module provides a lazy evaluation approach to reading content root metadata:
 //! - Opens the parquet I/O stream immediately
@@ -14,7 +14,7 @@ use url::Url;
 /// Lazy iterator that defers content root metadata construction until data is requested.
 ///
 /// Opens the parquet I/O stream immediately but defers:
-/// 1. Collecting batches and constructing Metadata object
+/// 1. Collecting batches and constructing ContentTreeNode object
 /// 2. Getting root action batches
 /// 3. Getting leaf action batches (if not skipping)
 pub(crate) struct LazyContentRootIterator {
@@ -36,7 +36,7 @@ struct ContentRootContext {
 }
 
 enum LazyContentRootState {
-    /// Initial state - parquet stream is open but Metadata not yet constructed
+    /// Initial state - parquet stream is open but ContentTreeNode not yet constructed
     NotStarted {
         parquet_batches: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
         version: Version,
@@ -46,7 +46,7 @@ enum LazyContentRootState {
     /// Currently reading from root manifest batches
     ReadingRoot {
         root_iter: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-        metadata: Box<crate::content_tree::Metadata>,
+        metadata: Box<crate::content_tree::ContentTreeNode>,
         context: ContentRootContext,
     },
     /// Currently reading from leaf manifest batches
@@ -93,12 +93,13 @@ impl LazyContentRootIterator {
 
         // Open the parquet stream using the metadata helper
         // Pass table_schema so content_stats field is included in the read schema
-        let (parquet_batches, version, path_in_log) = crate::content_tree::Metadata::open_stream(
-            parquet_handler.clone(),
-            content_root_url,
-            path_in_log,
-            table_schema.as_ref(),
-        )?;
+        let (parquet_batches, version, path_in_log) =
+            crate::content_tree::ContentTreeNode::open_stream(
+                parquet_handler.clone(),
+                content_root_url,
+                path_in_log,
+                table_schema.as_ref(),
+            )?;
 
         let context = ContentRootContext {
             parquet_handler,
@@ -134,7 +135,7 @@ impl Iterator for LazyContentRootIterator {
                     path_in_log,
                     context,
                 } => {
-                    // Lazily construct the Metadata object on first access
+                    // Lazily construct the ContentTreeNode object on first access
                     let data: Vec<Box<dyn EngineData>> =
                         match parquet_batches.collect::<DeltaResult<Vec<_>>>() {
                             Ok(d) => d,
@@ -142,13 +143,14 @@ impl Iterator for LazyContentRootIterator {
                         };
 
                     // Construct metadata from collected batches with the parsed version
-                    let metadata =
-                        Box::new(crate::content_tree::Metadata::from_batches_with_version(
+                    let metadata = Box::new(
+                        crate::content_tree::ContentTreeNode::from_batches_with_version(
                             data,
                             version,
                             path_in_log,
                             context.table_root.clone(),
-                        ));
+                        ),
+                    );
 
                     // Get root batches using the handler-based method
                     let root_iter = match metadata.root_action_batches_with_handler(
@@ -195,7 +197,7 @@ impl Iterator for LazyContentRootIterator {
                     // Lazily read leaf manifests now that root is exhausted
                     // Construct manifest batch schema with content_stats for data skipping
                     let manifest_batch_schema = context.table_schema.as_ref().and_then(|ts| {
-                        crate::content_tree::MetadataEntry::to_schema_with_content_stats(ts)
+                        crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts)
                             .ok()
                             .map(Arc::new)
                     });
@@ -212,7 +214,7 @@ impl Iterator for LazyContentRootIterator {
                     };
 
                     let leaf_iter =
-                        match crate::content_tree::Metadata::non_root_action_batches_with_handlers(
+                        match crate::content_tree::ContentTreeNode::non_root_action_batches_with_handlers(
                             leaf_refs,
                             context.parquet_handler.clone(),
                             context.evaluation_handler.clone(),

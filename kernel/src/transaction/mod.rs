@@ -16,7 +16,7 @@ use crate::actions::{
     PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-use crate::content_tree::writer::MetadataWriter;
+use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
@@ -319,7 +319,7 @@ pub struct Transaction {
     // Aggregated root DV actions to remove from root DV manifest
     aggregated_root_dv_actions: HashSet<String>,
     // Leaf manifest entries to include in root
-    leaf_manifests: Vec<crate::content_tree::MetadataEntry>,
+    leaf_manifests: Vec<crate::content_tree::ContentTreeNodeEntry>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
     /// Whether the root has been released to the client via release_root_and_delta_actions().
@@ -727,7 +727,7 @@ impl Transaction {
                 if let Some((content_root_action, content_root_version)) = latest_content_root {
                     // Load metadata from content root (gets root manifest + leaf references)
                     let root_path = content_root_action.path.clone();
-                    let metadata = crate::content_tree::Metadata::new_from_content_root(
+                    let metadata = crate::content_tree::ContentTreeNode::new_from_content_root(
                         engine,
                         &content_root_action,
                         table_root.clone(),
@@ -740,7 +740,7 @@ impl Transaction {
                 } else {
                     // No content root found, start with empty metadata
                     // Use commit_version for the new metadata, not the current snapshot version
-                    let builder = crate::content_tree::builder::MetadataBuilder::new_for(
+                    let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                         table_root.clone(),
                         commit_version,
                         physical_table_schema.clone(),
@@ -972,7 +972,8 @@ impl Transaction {
             }
 
             let new_metadata = metadata_builder.build(engine, snapshot_id)?;
-            let content_metadata_path = MetadataWriter::try_new(new_metadata)?.write(engine)?;
+            let content_metadata_path =
+                ContentTreeNodeWriter::try_new(new_metadata)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
@@ -2587,7 +2588,7 @@ mod tests {
 
     /// Helper function to create a logical test table schema with column mapping metadata.
     /// This returns the logical schema (with delta.columnMapping.* metadata).
-    /// Use test_table_physical_schema() when creating MetadataBuilder instances.
+    /// Use test_table_physical_schema() when creating ContentTreeNodeBuilder instances.
     fn test_table_schema() -> StructType {
         StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, true).with_metadata([
@@ -2614,7 +2615,7 @@ mod tests {
     }
 
     /// Returns the physical schema for test tables with column mapping enabled.
-    /// Use this when creating MetadataBuilder instances in tests.
+    /// Use this when creating ContentTreeNodeBuilder instances in tests.
     fn test_table_physical_schema() -> StructType {
         test_table_schema().make_physical(crate::table_features::ColumnMappingMode::Id)
     }
@@ -3296,7 +3297,7 @@ mod tests {
     #[test]
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
-        use crate::content_tree::builder::MetadataBuilder;
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
@@ -3313,7 +3314,7 @@ mod tests {
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
         let mut leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
@@ -3322,7 +3323,7 @@ mod tests {
 
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
         let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_url = root_builder.write_root(&engine)?;
 
@@ -3424,9 +3425,9 @@ mod tests {
     #[test]
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
-        use crate::content_tree::builder::MetadataBuilder;
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::content_tree::{
-            ContentInfo, DataContentType, DataFileFormat, MetadataEntry, TrackingInfo,
+            ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
             TrackingStatus,
         };
         use crate::engine::sync::SyncEngine;
@@ -3449,7 +3450,7 @@ mod tests {
 
         // Create data leaf manifest with 5 data files
         let mut data_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
 
         // Files without DV
         data_leaf_builder.add(
@@ -3492,10 +3493,10 @@ mod tests {
 
         // Create delete leaf manifest with PositionDeletes entries for the DVs
         let mut delete_leaf_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
 
         // DV entry for file-2.parquet
-        let dv_entry_2 = MetadataEntry {
+        let dv_entry_2 = ContentTreeNodeEntry {
             content_type: DataContentType::PositionDeletes,
             location: Some("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3525,7 +3526,7 @@ mod tests {
         };
 
         // DV entry for file-3.parquet
-        let dv_entry_3 = MetadataEntry {
+        let dv_entry_3 = ContentTreeNodeEntry {
             content_type: DataContentType::PositionDeletes,
             location: Some(
                 "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
@@ -3563,7 +3564,7 @@ mod tests {
 
         // Create root manifest with both data and delete leaf manifests
         let mut root_builder =
-            MetadataBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
         root_builder.add_entry(delete_leaf_entry);
         let root_url = root_builder.write_root(&engine)?;
@@ -3637,8 +3638,8 @@ mod tests {
         // Step 7: Verify the ManifestDV for the delete manifest
         // When delete_from_leaf is used, it creates a ManifestDV entry that marks which
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
-        use crate::content_tree::reader::MetadataEntryVisitor;
-        use crate::content_tree::Metadata;
+        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+        use crate::content_tree::ContentTreeNode;
         use crate::RowVisitor;
 
         // Read the ContentRoot action from version 2 to get the new manifest path
@@ -3669,7 +3670,7 @@ mod tests {
         let root_manifest_url = table_root
             .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
-        let root_metadata = Metadata::read(
+        let root_metadata = ContentTreeNode::read(
             &engine,
             &root_manifest_url,
             content_root_path.clone(),
@@ -3677,7 +3678,7 @@ mod tests {
         )?;
 
         // Extract all entries from the root manifest
-        let mut root_visitor = MetadataEntryVisitor::default();
+        let mut root_visitor = ContentTreeNodeEntryVisitor::default();
         for engine_data in root_metadata.data() {
             root_visitor.visit_rows_of(engine_data.as_ref())?;
         }
@@ -3731,14 +3732,14 @@ mod tests {
         let delete_manifest_url = table_root
             .join(&delete_manifest_path)
             .map_err(|e| Error::generic(format!("Failed to parse delete manifest URL: {e}")))?;
-        let delete_manifest_metadata = Metadata::read(
+        let delete_manifest_metadata = ContentTreeNode::read(
             &engine,
             &delete_manifest_url,
             delete_manifest_path.clone(),
             table_root.clone(),
         )?;
 
-        let mut delete_visitor = MetadataEntryVisitor::default();
+        let mut delete_visitor = ContentTreeNodeEntryVisitor::default();
         for engine_data in delete_manifest_metadata.data() {
             delete_visitor.visit_rows_of(engine_data.as_ref())?;
         }

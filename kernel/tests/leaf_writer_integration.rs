@@ -1426,7 +1426,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
 
         // Read the root manifest (path is now relative, so join with table root)
         let root_manifest_url = table_url.join(content_root.path())?;
-        let root_metadata = delta_kernel::Metadata::read(
+        let root_metadata = delta_kernel::ContentTreeNode::read(
             &engine,
             &root_manifest_url,
             content_root.path().to_string(),
@@ -1434,9 +1434,9 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         )?;
 
         // Check that root manifest entries don't include fileA.parquet or fileB.parquet
-        use delta_kernel::{MetadataEntryVisitor, RowVisitor};
+        use delta_kernel::{ContentTreeNodeEntryVisitor, RowVisitor};
 
-        let mut visitor = MetadataEntryVisitor::default();
+        let mut visitor = ContentTreeNodeEntryVisitor::default();
         for engine_data in root_metadata.data() {
             visitor.visit_rows_of(engine_data.as_ref())?;
         }
@@ -1481,7 +1481,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
             .or_else(|_| table_url.join(leaf_manifest_location))?;
 
         // Read the leaf manifest
-        let leaf_metadata = delta_kernel::Metadata::read(
+        let leaf_metadata = delta_kernel::ContentTreeNode::read(
             &engine,
             &leaf_manifest_url,
             leaf_manifest_location.to_string(),
@@ -1489,7 +1489,7 @@ async fn test_move_files_from_root_to_leaf() -> Result<(), Box<dyn std::error::E
         )?;
 
         // Parse leaf manifest entries
-        let mut leaf_visitor = delta_kernel::MetadataEntryVisitor::default();
+        let mut leaf_visitor = delta_kernel::ContentTreeNodeEntryVisitor::default();
         for engine_data in leaf_metadata.data() {
             leaf_visitor.visit_rows_of(engine_data.as_ref())?;
         }
@@ -1574,15 +1574,15 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
 
             // Path is now relative, so join with table root
             let root_manifest_url = table_url.join(content_root.path())?;
-            let root_metadata = delta_kernel::Metadata::read(
+            let root_metadata = delta_kernel::ContentTreeNode::read(
                 &engine,
                 &root_manifest_url,
                 content_root.path().to_string(),
                 table_url.clone(),
             )?;
 
-            use delta_kernel::{MetadataEntryVisitor, RowVisitor};
-            let mut visitor = MetadataEntryVisitor::default();
+            use delta_kernel::{ContentTreeNodeEntryVisitor, RowVisitor};
+            let mut visitor = ContentTreeNodeEntryVisitor::default();
             for engine_data in root_metadata.data() {
                 visitor.visit_rows_of(engine_data.as_ref())?;
             }

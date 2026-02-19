@@ -6,26 +6,26 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use super::{
-    ContentInfo, DataContentType, DataFileFormat, ManifestStats, MetadataEntry, TrackingInfo,
-    TrackingStatus,
+    ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestStats,
+    TrackingInfo, TrackingStatus,
 };
 
-/// Visitor that extracts MetadataEntry structs from EngineData
+/// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
 #[allow(dead_code)]
-pub struct MetadataEntryVisitor {
-    pub entries: Vec<MetadataEntry>,
+pub struct ContentTreeNodeEntryVisitor {
+    pub entries: Vec<ContentTreeNodeEntry>,
 }
 
-impl RowVisitor for MetadataEntryVisitor {
+impl RowVisitor for ContentTreeNodeEntryVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| MetadataEntry::base_schema().leaves(None::<&str>));
+            LazyLock::new(|| ContentTreeNodeEntry::base_schema().leaves(None::<&str>));
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // The number of getters should match the number of leaf fields in MetadataEntry schema
+        // The number of getters should match the number of leaf fields in ContentTreeNodeEntry schema
         // We'll validate this implicitly by accessing each field
 
         for i in 0..row_count {
@@ -40,7 +40,7 @@ impl RowVisitor for MetadataEntryVisitor {
 fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<MetadataEntry> {
+) -> DeltaResult<ContentTreeNodeEntry> {
     // The getters are in order of flattened leaf fields (24 total):
     // 0: content_type
     // 1: location
@@ -171,7 +171,7 @@ fn visit_metadata_entry_at<'a>(
     // - split_offsets (array extraction not straightforward in visitor pattern)
     // - equality_ids (array extraction not straightforward in visitor pattern)
 
-    Ok(MetadataEntry {
+    Ok(ContentTreeNodeEntry {
         content_type,
         location,
         file_format,

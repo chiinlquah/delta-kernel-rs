@@ -17,8 +17,8 @@ use crate::schema::{ColumnName, DataType, MetadataColumnSpec, StructField, Struc
 use crate::{DeltaResult, Error, EvaluationHandler, FileMeta, ParquetHandler};
 
 use super::{
-    parse_or_join_url, FilteredManifest, ManifestReference, Metadata, MetadataEntry, SchemaRef,
-    SharedLeafState,
+    parse_or_join_url, ContentTreeNode, ContentTreeNodeEntry, FilteredManifest, ManifestReference,
+    SchemaRef, SharedLeafState,
 };
 
 /// Visitor that extracts the file path from the first row of a batch.
@@ -90,7 +90,7 @@ pub(crate) struct BulkManifestStreamProcessor {
     manifest_iter: std::vec::IntoIter<ManifestReference>,
 
     /// Pre-loaded unaffiliated DV metadata (shared across all data manifests)
-    unaffiliated_dv_metadata: Vec<Arc<super::Metadata>>,
+    unaffiliated_dv_metadata: Vec<Arc<super::ContentTreeNode>>,
 
     /// Filtered manifests for unaffiliated DVs (needed for processing)
     unaffiliated_dv_manifests: Vec<super::FilteredManifest>,
@@ -169,9 +169,9 @@ impl BulkManifestStreamProcessor {
         // Build read schema with _file metadata column for grouping
         // Include content_stats if table_schema is provided (leaf manifests have content_stats for files)
         let base_schema = if let Some(ref ts) = table_schema {
-            MetadataEntry::to_schema_with_content_stats(ts.as_ref())?
+            ContentTreeNodeEntry::to_schema_with_content_stats(ts.as_ref())?
         } else {
-            MetadataEntry::base_schema()
+            ContentTreeNodeEntry::base_schema()
         };
         let mut read_fields: Vec<StructField> = base_schema.fields().cloned().collect();
         read_fields.push(StructField::create_metadata_column(
@@ -226,7 +226,7 @@ impl BulkManifestStreamProcessor {
         let data_batch_iter =
             parquet_handler.read_parquet_files(&data_file_metas, read_schema, None)?;
 
-        // Consume unaffiliated DV batches immediately and create Metadata objects
+        // Consume unaffiliated DV batches immediately and create ContentTreeNode objects
         let unaffiliated_dv_metadata = if !unaffiliated_dv_manifests.is_empty() {
             Self::consume_batches_for_manifests(
                 &mut unaffiliated_dv_batch_iter.peekable(),
@@ -265,18 +265,18 @@ impl BulkManifestStreamProcessor {
         visitor.get_file_path()
     }
 
-    /// Helper to create Metadata from batches and manifest.
+    /// Helper to create ContentTreeNode from batches and manifest.
     fn create_metadata_from_batches(
         batches: Vec<Box<dyn EngineData>>,
         manifest: &FilteredManifest,
         table_root: &Url,
-    ) -> DeltaResult<super::Metadata> {
+    ) -> DeltaResult<super::ContentTreeNode> {
         let location = manifest
             .manifest
             .location
             .clone()
             .ok_or_else(|| Error::generic("Manifest must have a location"))?;
-        Ok(super::Metadata::from_batches(
+        Ok(super::ContentTreeNode::from_batches(
             batches,
             location,
             table_root.clone(),
@@ -381,7 +381,7 @@ impl BulkManifestStreamProcessor {
             .location
             .to_string();
 
-        // Consume affiliated DV batches and create Metadata objects directly
+        // Consume affiliated DV batches and create ContentTreeNode objects directly
         let affiliated_dv_metadata = if !manifest_ref.affiliated_dv_manifests.is_empty() {
             Self::consume_batches_for_manifests(
                 &mut self.dv_batch_iter,
@@ -399,10 +399,10 @@ impl BulkManifestStreamProcessor {
 
         // Build metadata schema that matches actual batches from parquet
         // (includes _pos and content_stats if table_schema was provided)
-        let metadata_schema = super::MetadataEntry::processing_schema_with_pos(
+        let metadata_schema = super::ContentTreeNodeEntry::processing_schema_with_pos(
             self.table_schema.as_ref().map(|s| s.as_ref()),
         )?;
-        let dv_joiner_opt = Metadata::build_dv_joiner_for_leaf(
+        let dv_joiner_opt = ContentTreeNode::build_dv_joiner_for_leaf(
             self.evaluation_handler.clone(),
             metadata_schema.clone(),
             &manifest_ref,
@@ -423,20 +423,21 @@ impl BulkManifestStreamProcessor {
         let has_dvs = dv_joiner_opt.is_some();
 
         // Use get_evaluator_schema_with_stats to include stats_parsed if needed
-        let evaluator_schema = super::Metadata::get_evaluator_schema_with_stats(
+        let evaluator_schema = super::ContentTreeNode::get_evaluator_schema_with_stats(
             has_dvs,
             &metadata_schema,
             self.stats_schema.as_ref().map(|s| s.as_ref()),
         );
 
         // Build stats transformation evaluator if needed
-        let stats_transform_opt = super::MetadataEntry::create_stats_transformation_evaluator(
-            self.evaluation_handler.as_ref(),
-            &metadata_schema,
-            &self.schema,
-            self.table_schema.as_ref().map(|s| s.as_ref()),
-            self.stats_schema.as_ref().map(|s| s.as_ref()),
-        )?;
+        let stats_transform_opt =
+            super::ContentTreeNodeEntry::create_stats_transformation_evaluator(
+                self.evaluation_handler.as_ref(),
+                &metadata_schema,
+                &self.schema,
+                self.table_schema.as_ref().map(|s| s.as_ref()),
+                self.stats_schema.as_ref().map(|s| s.as_ref()),
+            )?;
 
         let manifest_location = manifest_ref
             .data_manifest
@@ -445,7 +446,7 @@ impl BulkManifestStreamProcessor {
             .clone()
             .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
-        let evaluators = super::Metadata::build_action_evaluators(
+        let evaluators = super::ContentTreeNode::build_action_evaluators(
             self.evaluation_handler.as_ref(),
             evaluator_schema,
             &self.schema,
@@ -561,7 +562,7 @@ impl Iterator for BulkManifestStreamProcessor {
             };
 
             // Process the filtered batch to action batches
-            let action_batches = match super::Metadata::process_filtered_batch_to_actions(
+            let action_batches = match super::ContentTreeNode::process_filtered_batch_to_actions(
                 filtered_batch,
                 state.dv_joiner_opt.as_ref().map(|b| b.as_ref()),
                 state.add_evaluator_opt.as_ref(),

@@ -565,16 +565,17 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     let path0 = Path::from("_delta_log/00000000000000000000.json");
     block_on(async { store.put(&path0, commit0_content.into()).await }).unwrap();
 
-    // Create engine first so we can use it for MetadataWriter
+    // Create engine first so we can use it for ContentTreeNodeWriter
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
-    // Create metadata for content_root using MetadataBuilder
+    // Create metadata for content_root using ContentTreeNodeBuilder
     let content_root_url = {
         use crate::actions::Add;
-        use crate::content_tree::builder::MetadataBuilder;
-        use crate::content_tree::writer::MetadataWriter;
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::content_tree::writer::ContentTreeNodeWriter;
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 3, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 3, test_table_schema());
 
         // Add the action that should be in content_root
         let add = Add {
@@ -597,7 +598,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
         builder.add(add, 3, None)?;
 
         let metadata = builder.build(engine.as_ref(), None).unwrap();
-        let writer = MetadataWriter::try_new(metadata).unwrap();
+        let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap()
     };
 
@@ -966,13 +967,14 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     // Create engine
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
-    // Create metadata for content_root using MetadataBuilder
+    // Create metadata for content_root using ContentTreeNodeBuilder
     let content_root_url = {
         use crate::actions::Add;
-        use crate::content_tree::builder::MetadataBuilder;
-        use crate::content_tree::writer::MetadataWriter;
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::content_tree::writer::ContentTreeNodeWriter;
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 10, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 10, test_table_schema());
 
         // Add the action that should be in content_root
         let add = Add {
@@ -995,7 +997,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
         builder.add(add, 10, None)?;
 
         let metadata = builder.build(engine.as_ref(), None).unwrap();
-        let writer = MetadataWriter::try_new(metadata).unwrap();
+        let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap()
     };
 

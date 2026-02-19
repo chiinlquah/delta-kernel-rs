@@ -1,8 +1,8 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::content_tree::builder::MetadataBuilder;
+use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::stats::try_pre_convert_stats_column;
 use crate::content_tree::{
-    DataContentType, DataFileFormat, MetadataEntry, TrackingInfo, TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
@@ -63,10 +63,10 @@ pub struct LeafNodeWriterResult {
     pub(crate) manifest_dvs: HashMap<String, RoaringTreemap>,
 
     /// Written data file manifest (if any data files were added).
-    pub(crate) data_file_manifest_written: Option<MetadataEntry>,
+    pub(crate) data_file_manifest_written: Option<ContentTreeNodeEntry>,
 
     /// Written DV manifest (if any DVs were added).
-    pub(crate) dv_file_manifest_written: Option<MetadataEntry>,
+    pub(crate) dv_file_manifest_written: Option<ContentTreeNodeEntry>,
 
     /// Root entries to remove (file paths that should be removed from root)
     pub(crate) root_entries_to_remove: HashSet<String>,
@@ -77,13 +77,13 @@ pub struct LeafNodeWriterResult {
 
 /// Builder for creating leaf manifests.
 ///
-/// This wraps a MetadataBuilder and adds tracking for:
+/// This wraps a ContentTreeNodeBuilder and adds tracking for:
 /// - Manifest deletion vectors (for marking entries in other manifests as deleted)
 /// - Root entries to remove
 /// - Deletion vectors to write
 pub struct LeafNodeWriter {
-    /// Wrapped MetadataBuilder for file management
-    data_builder: MetadataBuilder,
+    /// Wrapped ContentTreeNodeBuilder for file management
+    data_builder: ContentTreeNodeBuilder,
 
     /// Table root URL
     table_root: Url,
@@ -474,7 +474,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 };
 
                 // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
-                // TODO: Version manipulation is a workaround. The MetadataBuilder API should
+                // TODO: Version manipulation is a workaround. The ContentTreeNodeBuilder API should
                 // support explicitly setting TrackingStatus without relying on version comparison.
                 let file_version = if self.leaf_writer.version > 0 {
                     self.leaf_writer.version - 1
@@ -525,7 +525,7 @@ impl LeafNodeWriter {
         root_manifest_path: Option<String>,
     ) -> Self {
         Self {
-            data_builder: MetadataBuilder::new_for(
+            data_builder: ContentTreeNodeBuilder::new_for(
                 table_root.clone(),
                 version,
                 table_schema.as_ref().clone(),
@@ -704,7 +704,7 @@ impl LeafNodeWriter {
     /// # Returns
     /// LeafNodeWriterResult with written manifests and tracking info
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
-        // Write data manifest using MetadataBuilder's write_leaf()
+        // Write data manifest using ContentTreeNodeBuilder's write_leaf()
         let data_manifest_entry = if self.data_builder.has_entries() {
             let entry = self
                 .data_builder
@@ -731,14 +731,14 @@ impl LeafNodeWriter {
         })
     }
 
-    /// Write DV manifest and return MetadataEntry.
+    /// Write DV manifest and return ContentTreeNodeEntry.
     fn write_dv_manifest(
         &self,
         engine: &dyn Engine,
-        data_manifest_entry: Option<&MetadataEntry>,
-    ) -> DeltaResult<MetadataEntry> {
-        // Create a separate MetadataBuilder for DVs
-        let mut dv_builder = MetadataBuilder::new_for(
+        data_manifest_entry: Option<&ContentTreeNodeEntry>,
+    ) -> DeltaResult<ContentTreeNodeEntry> {
+        // Create a separate ContentTreeNodeBuilder for DVs
+        let mut dv_builder = ContentTreeNodeBuilder::new_for(
             self.table_root.clone(),
             self.version,
             self.table_schema.as_ref().clone(),
@@ -777,7 +777,7 @@ impl LeafNodeWriter {
             None // Mixed sources = unaffiliated
         };
 
-        // Convert DV descriptors to MetadataEntry
+        // Convert DV descriptors to ContentTreeNodeEntry
         for (data_file_path, dv_descriptor, _) in self.deletion_vectors.values() {
             let (content_info, location) =
                 crate::content_tree::builder::extract_deletion_vector_content(dv_descriptor)?;
@@ -788,7 +788,7 @@ impl LeafNodeWriter {
             // TODO: Should this at least be offset + size_in_bytes.
             let file_size = content_info.size_in_bytes;
 
-            let dv_entry = MetadataEntry {
+            let dv_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::PositionDeletes,
                 location: Some(location),
                 file_format: DataFileFormat::Parquet,
@@ -1253,7 +1253,7 @@ mod tests {
         );
 
         // Read back the manifest parquet file directly to verify content_stats columns
-        // The MetadataEntryVisitor doesn't read content_stats (it's table-schema-dependent),
+        // The ContentTreeNodeEntryVisitor doesn't read content_stats (it's table-schema-dependent),
         // so we read the parquet file directly and check the columns are present.
         let manifest_location = manifest_entry.location.as_ref().unwrap();
         let manifest_url = table_root.join(manifest_location)?;
@@ -1273,9 +1273,10 @@ mod tests {
         let parquet_handler = engine.parquet_handler();
 
         // Use the production schema to ensure test matches actual behavior
-        // This generates the full MetadataEntry schema with content_stats based on table schema
-        let read_schema =
-            Arc::new(crate::content_tree::MetadataEntry::to_schema_with_content_stats(&schema)?);
+        // This generates the full ContentTreeNodeEntry schema with content_stats based on table schema
+        let read_schema = Arc::new(
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(&schema)?,
+        );
 
         let read_result_iter =
             parquet_handler.read_parquet_files(&[file_meta], read_schema, None)?;
@@ -1814,20 +1815,20 @@ mod tests {
             .expect("Manifest should have location");
 
         // Read back the manifest file to verify contents
-        use crate::content_tree::reader::MetadataEntryVisitor;
-        use crate::content_tree::Metadata;
+        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+        use crate::content_tree::ContentTreeNode;
 
         // manifest_location is now a relative path, join with table_root
         let manifest_url = table_root.join(manifest_location)?;
-        let manifest_metadata = Metadata::read(
+        let manifest_metadata = ContentTreeNode::read(
             engine.as_ref(),
             &manifest_url,
             manifest_location.to_string(),
             table_root.clone(),
         )?;
 
-        // Use MetadataEntryVisitor to extract all entries
-        let mut visitor = MetadataEntryVisitor::default();
+        // Use ContentTreeNodeEntryVisitor to extract all entries
+        let mut visitor = ContentTreeNodeEntryVisitor::default();
         for engine_data in manifest_metadata.data() {
             visitor.visit_rows_of(engine_data.as_ref())?;
         }

@@ -1,4 +1,4 @@
-//! Stats field ID calculation utilities for Adaptive Metadata Tree (AMT).
+//! Stats field ID calculation utilities for Adaptive ContentTreeNode Tree (AMT).
 //!
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
@@ -124,7 +124,7 @@ pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
         (stats_field_id - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
             / NUM_SUPPORTED_STATS_PER_COLUMN
     } else {
-        // Metadata space (reserved field IDs): reverse the calculation
+        // ContentTreeNode space (reserved field IDs): reverse the calculation
         // stats_field_id = METADATA_SPACE_FIELD_ID_START + NUM_STATS_PER_COLUMN * id
         // where id = RESERVED_FIELD_IDS - (i32::MAX - field_id)
         // => id = (stats_field_id - METADATA_SPACE_FIELD_ID_START) / NUM_STATS_PER_COLUMN
@@ -198,7 +198,7 @@ impl SchemaVisitor for StatsSchemaVisitor {
         // Get the field ID from metadata
         let field_id = get_field_id(field).ok_or_else(|| {
             crate::Error::generic(format!(
-                "Field '{}' is missing field ID! Metadata: {:#?}",
+                "Field '{}' is missing field ID! ContentTreeNode: {:#?}",
                 field.name(),
                 field.metadata()
             ))
@@ -1038,7 +1038,7 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 /// Converts Delta Protocol JSON stats to content_stats StructData format.
 ///
 /// This function takes the raw JSON stats string from a Delta Add action and converts
-/// it to the StructData format expected by the content_stats field in MetadataEntry.
+/// it to the StructData format expected by the content_stats field in ContentTreeNodeEntry.
 ///
 /// The output format is the Delta JSON stats format:
 /// - numRecords: LONG
