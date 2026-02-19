@@ -841,3 +841,108 @@ impl LoggingTest {
         String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
 }
+
+/// Helper to collect file paths from a scan.
+///
+/// Returns a HashSet of all file paths found in the scan results.
+/// Useful for verifying which files are visible at a particular table version.
+pub fn collect_file_paths(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> DeltaResult<std::collections::HashSet<String>> {
+    use delta_kernel::engine_data::TypedGetData;
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::schema::DataType;
+    use delta_kernel::RowVisitor;
+    use std::collections::HashSet;
+
+    struct PathCollector<'a> {
+        paths: HashSet<String>,
+        selection_vector: &'a [bool],
+    }
+
+    impl<'a> RowVisitor for PathCollector<'a> {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            use std::sync::LazyLock;
+            static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                LazyLock::new(|| (vec![ColumnName::new(["path"])], vec![DataType::STRING]));
+            (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+        }
+
+        fn visit<'b>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'b dyn delta_kernel::engine_data::GetData<'b>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                if i < self.selection_vector.len() && !self.selection_vector[i] {
+                    continue;
+                }
+                let path: String = getters[0].get(i, "path")?;
+                self.paths.insert(path);
+            }
+            Ok(())
+        }
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut all_paths = HashSet::new();
+
+    for scan_metadata_result in scan.scan_metadata(engine)? {
+        let scan_metadata = scan_metadata_result?;
+        let mut collector = PathCollector {
+            paths: HashSet::new(),
+            selection_vector: scan_metadata.scan_files.selection_vector(),
+        };
+        collector.visit_rows_of(scan_metadata.scan_files.data())?;
+        all_paths.extend(collector.paths);
+    }
+
+    Ok(all_paths)
+}
+
+/// Helper to remove files from a transaction with custom selection logic.
+///
+/// This function allows selective removal of files based on a custom predicate.
+/// The `modify_selection` closure receives the batch index and a mutable selection vector,
+/// allowing fine-grained control over which files to remove.
+///
+/// Returns the total number of files removed.
+///
+/// # Example
+/// ```ignore
+/// // Remove only the 2nd file
+/// let mut files_seen = 0;
+/// remove_scan_files_with_selection(&mut txn, scan, engine, |_batch_idx, selection| {
+///     for selected in selection.iter_mut() {
+///         if *selected {
+///             files_seen += 1;
+///             *selected = files_seen == 2; // Only keep selection true for 2nd file
+///         }
+///     }
+///     selection.iter().any(|&x| x)
+/// })?;
+/// ```
+pub fn remove_scan_files_with_selection<F>(
+    txn: &mut delta_kernel::transaction::Transaction,
+    scan: Scan,
+    engine: &dyn Engine,
+    mut modify_selection: F,
+) -> DeltaResult<usize>
+where
+    F: FnMut(usize, &mut Vec<bool>) -> bool,
+{
+    use delta_kernel::engine_data::FilteredEngineData;
+
+    let mut total_removed = 0;
+    for (batch_idx, scan_metadata_result) in scan.scan_metadata(engine)?.enumerate() {
+        let scan_metadata = scan_metadata_result?;
+        let (data, mut selection_vector) = scan_metadata.scan_files.into_parts();
+
+        if modify_selection(batch_idx, &mut selection_vector) {
+            total_removed += selection_vector.iter().filter(|&x| *x).count();
+            txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+        }
+    }
+    Ok(total_removed)
+}

@@ -40,7 +40,8 @@ use delta_kernel::schema::{
 
 use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata,
-    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
+    create_default_engine, create_table, engine_store_setup, remove_scan_files_with_selection,
+    setup_test_tables, test_read,
 };
 
 mod common;
@@ -214,30 +215,6 @@ fn remove_all_scan_files(
     Ok(total_file_count)
 }
 
-/// Helper function to remove files from a scan with custom selection logic.
-/// The `modify_selection` closure is called for each batch and can modify the selection vector.
-/// Returns the total count of files removed.
-fn remove_scan_files_with_selection<F>(
-    txn: &mut delta_kernel::transaction::Transaction,
-    scan: delta_kernel::scan::Scan,
-    engine: &dyn Engine,
-    mut modify_selection: F,
-) -> DeltaResult<usize>
-where
-    F: FnMut(usize, &mut Vec<bool>) -> bool, // (batch_idx, selection_vector) -> should_remove
-{
-    let mut total_removed = 0;
-    for (batch_idx, scan_metadata_result) in scan.scan_metadata(engine)?.enumerate() {
-        let scan_metadata = scan_metadata_result?;
-        let (data, mut selection_vector) = scan_metadata.scan_files.into_parts();
-
-        if modify_selection(batch_idx, &mut selection_vector) {
-            total_removed += selection_vector.iter().filter(|&x| *x).count();
-            txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
-        }
-    }
-    Ok(total_removed)
-}
 fn get_simple_int_schema() -> Arc<StructType> {
     Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
 }
