@@ -221,14 +221,30 @@ impl SchemaVisitor for StatsSchemaVisitor {
             _ => StructType::new_unchecked(type_result),
         };
 
+        // Build metadata with the base_stats_id as the field ID instead of the original field ID.
+        // The stats group struct should use the base stats field ID (e.g., 10200 for field_id=1),
+        // not the original column field ID.
+        let metadata: Vec<(&str, MetadataValue)> = field
+            .metadata
+            .iter()
+            .map(|(k, v)| {
+                let value = if k == ColumnMetadataKey::ParquetFieldId.as_ref()
+                    || k == ColumnMetadataKey::ColumnMappingId.as_ref()
+                {
+                    MetadataValue::Number(base_stats_id as i64)
+                } else {
+                    v.clone()
+                };
+                (k.as_str(), value)
+            })
+            .collect();
+
         Ok(vec![StructField::new(
             field.name(),
             DataType::Struct(Box::new(stats_struct)),
             true,
         )
-        .with_metadata(
-            field.metadata.iter().map(|(k, v)| (k.as_str(), v.clone())),
-        )])
+        .with_metadata(metadata)])
     }
 
     fn r#struct(&mut self, _struct: &StructType, results: Vec<Self::T>) -> DeltaResult<Self::T> {
@@ -1718,7 +1734,14 @@ mod tests {
         assert!(id_stats_struct.field("exact_bounds").is_some());
 
         // Check field IDs: base is 10_200 (field_id 1 -> 10_000 + 200*1)
-        assert_stats_field_ids(id_stats_struct, 10_200, &field)
+        assert_stats_field_ids(id_stats_struct, 10_200, &field);
+
+        // Verify the group-level field ID uses base_stats_id, not the original field ID
+        assert_eq!(
+            get_field_id(id_stats),
+            Some(10_200),
+            "Stats group field ID should be the base stats ID (10200), not the original field ID (1)"
+        );
     }
 
     #[test]
@@ -1742,7 +1765,14 @@ mod tests {
         assert!(name_stats_struct.field("nan_value_count").is_none()); // not float/double
 
         // Check field IDs: base is 10_400
-        assert_stats_field_ids(name_stats_struct, 10_400, &field)
+        assert_stats_field_ids(name_stats_struct, 10_400, &field);
+
+        // Verify the group-level field ID uses base_stats_id
+        assert_eq!(
+            get_field_id(name_stats),
+            Some(10_400),
+            "Stats group field ID should be the base stats ID (10400), not the original field ID (2)"
+        );
     }
 
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
