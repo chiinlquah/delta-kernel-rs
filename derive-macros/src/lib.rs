@@ -38,7 +38,10 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(ToSchema, attributes(allow_null_container_values, field_id))]
+#[proc_macro_derive(
+    ToSchema,
+    attributes(allow_null_container_values, field_id, skip_schema)
+)]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
@@ -169,6 +172,13 @@ fn gen_schema_field(field: &Field) -> TokenStream {
     }
 }
 
+fn has_skip_schema(field: &Field) -> bool {
+    field.attrs.iter().any(|attr| match &attr.meta {
+        Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "skip_schema"),
+        _ => false,
+    })
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -184,7 +194,10 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     };
 
-    let schema_fields = fields.iter().map(gen_schema_field);
+    let schema_fields = fields
+        .iter()
+        .filter(|f| !has_skip_schema(f))
+        .map(gen_schema_field);
 
     quote! { #(#schema_fields),* }
 }

@@ -808,7 +808,7 @@ impl LeafNodeWriter {
                 record_count: dv_descriptor.cardinality,
                 file_size_in_bytes: Some(file_size),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: Some(data_file_path.to_string()),
                 manifest_dv: None,
                 key_metadata: None,

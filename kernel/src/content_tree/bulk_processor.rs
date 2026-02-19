@@ -171,7 +171,10 @@ impl BulkManifestStreamProcessor {
         let base_schema = if let Some(ref ts) = table_schema {
             MetadataEntry::to_schema_with_content_stats(ts.as_ref())?
         } else {
-            MetadataEntry::base_schema()
+            {
+                use crate::schema::ToSchema as _;
+                MetadataEntry::to_schema()
+            }
         };
         let mut read_fields: Vec<StructField> = base_schema.fields().cloned().collect();
         read_fields.push(StructField::create_metadata_column(
