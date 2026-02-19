@@ -3517,7 +3517,7 @@ mod tests {
             record_count: 5, // cardinality from the DV descriptor
             file_size_in_bytes: Some(108),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: Some("data/file-2.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
@@ -3549,7 +3549,7 @@ mod tests {
             record_count: 5,
             file_size_in_bytes: Some(108),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: Some("data/file-3.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,

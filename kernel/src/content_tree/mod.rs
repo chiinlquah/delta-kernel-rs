@@ -2233,12 +2233,13 @@ impl ContentTreeNode {
         table_schema: Option<&StructType>,
     ) -> DeltaResult<ParquetStreamResult> {
         // Cached schema for reading ContentTreeNodeEntry from parquet files without content_stats.
-        // Uses base_schema which excludes content_stats (requires table schema).
+        // Uses ToSchema which excludes content_stats (requires table schema).
         // Includes _pos metadata column for tracking row positions within the manifest.
         static READ_SCHEMA_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
             use crate::schema::MetadataColumnSpec;
 
-            let base_schema = ContentTreeNodeEntry::base_schema();
+            use crate::schema::ToSchema as _;
+            let base_schema = ContentTreeNodeEntry::to_schema();
             let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
 
             // Add _pos metadata column to track row indices (needed for data_manifest_position)
@@ -2284,7 +2285,7 @@ impl ContentTreeNode {
 
     /// Read metadata using a parquet handler directly (for lazy streaming).
     ///
-    /// Uses `ContentTreeNodeEntry::base_schema()` for reading, which excludes content_stats.
+    /// Uses `ContentTreeNodeEntry::to_schema()` for reading, which excludes content_stats.
     /// The visitor extracts all fields except content_stats which requires table schema.
     fn read_with_handler(
         parquet_handler: Arc<dyn ParquetHandler>,
@@ -2542,7 +2543,7 @@ pub(crate) fn metadata_entry_to_scalars(
                 Some(struct_data) => Scalar::Struct(struct_data.clone()),
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "manifestStats" => match &entry.manifest_info {
+            "manifestStats" => match &entry.manifest_stats {
                 Some(ms) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
@@ -2785,62 +2786,86 @@ impl From<ManifestStats> for Scalar {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ToSchema)]
 pub struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
+    #[field_id = 134]
     pub content_type: DataContentType,
 
     /// Location of the file. Required for most content types.
+    #[field_id = 100]
     pub location: Option<String>,
 
     /// avro, orc, parquet or puffin
+    #[field_id = 101]
     pub(crate) file_format: DataFileFormat,
 
+    #[field_id = 147]
     pub tracking_info: Option<TrackingInfo>,
 
+    #[field_id = 148]
     pub(crate) content_info: Option<ContentInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
+    #[field_id = 149]
     pub(crate) partition_spec_id: i64,
 
     /// ID representing sort order for this file. Can only be set if content_type is Data.
+    #[field_id = 140]
     pub(crate) sort_order_id: Option<i64>,
 
     /// Number of records in this file, or the cardinality of a deletion vector
+    #[field_id = 103]
     pub(crate) record_count: i64,
 
     /// Total file size in bytes. Must be defined if location is defined
+    #[field_id = 104]
     pub(crate) file_size_in_bytes: Option<i64>,
 
     /// Column-level statistics for the data file.
     /// The schema of this struct is dynamically generated based on the table schema
     /// using [`stats::stats_schema`]. When `None`, no statistics are available.
     /// See: <https://docs.google.com/document/d/1uvbrwwAJW2TgsnoaIcwAFpjbhHkBUL5wY_24nKgtt9I/>
+    // Skip the schema since we don't know the type here, use to_schema_with_content_stats instead
+    #[skip_schema]
+    #[field_id = 146]
     pub(crate) content_stats: Option<StructData>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
-    pub(crate) manifest_info: Option<ManifestStats>,
+    #[field_id = 150]
+    pub(crate) manifest_stats: Option<ManifestStats>,
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
+    #[field_id = 143]
     pub referenced_file: Option<String>,
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
+    // TODO: Remove the skip, and make sure that this is included all the way though
+    #[skip_schema]
+    #[field_id = 131]
     pub(crate) key_metadata: Option<Bytes>,
 
     /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
+    // TODO: Remove the skip, and make sure that this is included all the way though
+    #[skip_schema]
+    #[field_id = 132]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Not used by Delta today
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
+    // TODO: Remove the skip, and make sure that this is included all the way though
+    #[skip_schema]
+    #[field_id = 135]
     pub(crate) equality_ids: Option<Vec<i32>>,
 
     /// DV that applies to the manifest linked to from this entry.
+    #[field_id = 151]
     pub(crate) manifest_dv: Option<Bytes>,
 }
 
@@ -2870,39 +2895,6 @@ impl ContentTreeNodeEntry {
         Ok(Arc::new(schema_with_tracking))
     }
 
-    /// Returns a base ContentTreeNodeEntry schema that excludes content_stats.
-    ///
-    /// This is used for reading metadata entries back from parquet files where
-    /// we don't need the table-schema-dependent content_stats field. The visitor
-    /// pattern requires static schema references, so we use this fixed schema
-    /// for reading rather than the dynamic `to_schema_with_content_stats`.
-    ///
-    /// Note: When reading metadata entries using this schema, content_stats will
-    /// always be None since it's not included in this schema.
-    pub(crate) fn base_schema() -> StructType {
-        use crate::schema::derive_macro_utils::GetStructField as _;
-
-        StructType::new_unchecked([
-            DataContentType::get_struct_field("contentType"),
-            Option::<String>::get_struct_field("location"),
-            DataFileFormat::get_struct_field("fileFormat"),
-            TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<ContentInfo>::get_struct_field("contentInfo"),
-            i64::get_struct_field("partitionSpecId"),
-            Option::<i64>::get_struct_field("sortOrderId"),
-            i64::get_struct_field("recordCount"),
-            Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats intentionally excluded - requires table schema
-            // Use `to_schema_with_content_stats(table_schema)` when writing
-            Option::<ManifestStats>::get_struct_field("manifestStats"),
-            Option::<String>::get_struct_field("referencedFile"),
-            Option::<Bytes>::get_struct_field("manifestDv"),
-            // key_metadata intentionally excluded - binary type not supported
-            // split_offsets intentionally excluded - not used by Delta today
-            // equality_ids intentionally excluded - not used by Delta today
-        ])
-    }
-
     /// Helper to create metadata schema for reading/processing manifest batches.
     ///
     /// This includes `_pos` metadata column and optionally `content_stats` based on table_schema.
@@ -2910,12 +2902,12 @@ impl ContentTreeNodeEntry {
     pub(crate) fn processing_schema_with_pos(
         table_schema: Option<&StructType>,
     ) -> DeltaResult<SchemaRef> {
-        use crate::schema::MetadataColumnSpec;
+        use crate::schema::{MetadataColumnSpec, ToSchema as _};
 
         let base_schema = if let Some(ts) = table_schema {
             Self::to_schema_with_content_stats(ts)?
         } else {
-            Self::base_schema()
+            Self::to_schema()
         };
 
         let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
@@ -3032,35 +3024,30 @@ impl ContentTreeNodeEntry {
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
     ) -> DeltaResult<StructType> {
-        use crate::schema::derive_macro_utils::GetStructField as _;
+        use crate::schema::{ColumnMetadataKey, ToSchema};
 
         // Generate AMT-style stats schema format:
         // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
         let stats_struct = stats::stats_schema(table_schema)?;
 
-        Ok(StructType::new_unchecked([
-            DataContentType::get_struct_field("contentType"),
-            Option::<String>::get_struct_field("location"),
-            DataFileFormat::get_struct_field("fileFormat"),
-            TrackingInfo::get_struct_field("trackingInfo"),
-            Option::<ContentInfo>::get_struct_field("contentInfo"),
-            i64::get_struct_field("partitionSpecId"),
-            Option::<i64>::get_struct_field("sortOrderId"),
-            i64::get_struct_field("recordCount"),
-            Option::<i64>::get_struct_field("fileSizeInBytes"),
-            // content_stats - dynamic based on table schema (AMT stats format)
-            StructField::new(
-                CONTENT_STATS_FIELD_NAME,
-                DataType::Struct(Box::new(stats_struct)),
-                true,
-            ),
-            Option::<ManifestStats>::get_struct_field("manifestStats"),
-            Option::<String>::get_struct_field("referencedFile"),
-            Option::<Bytes>::get_struct_field("manifestDv"),
-            // key_metadata intentionally excluded - binary type not supported
-            // split_offsets intentionally excluded - not used by Delta today
-            // equality_ids intentionally excluded - not used by Delta today
-        ]))
+        // Build on the derived base schema (which includes field_ids) and insert content_stats
+        let base = Self::to_schema();
+        let content_stats_field = StructField::nullable(
+            CONTENT_STATS_FIELD_NAME,
+            DataType::Struct(Box::new(stats_struct)),
+        )
+        .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 146i64)]);
+
+        // Insert content_stats after fileSizeInBytes
+        let mut fields = Vec::new();
+        for field in base.fields() {
+            fields.push(field.clone());
+            if field.name() == "fileSizeInBytes" {
+                fields.push(content_stats_field.clone());
+            }
+        }
+
+        Ok(StructType::new_unchecked(fields))
     }
 }
 
@@ -3111,7 +3098,7 @@ mod tests {
             record_count: 42,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3165,8 +3152,9 @@ mod tests {
 
     #[test]
     fn test_metadata_entry_base_schema_fields() {
+        use crate::schema::ToSchema as _;
         // Verify the base schema has the expected structure (excludes content_stats)
-        let schema = ContentTreeNodeEntry::base_schema();
+        let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
         // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
@@ -3402,7 +3390,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: Some(content_stats),
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3470,7 +3458,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None, // Explicitly None
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3614,7 +3602,7 @@ mod tests {
             record_count: 500,
             file_size_in_bytes: Some(2048),
             content_stats: Some(content_stats),
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3725,7 +3713,7 @@ mod tests {
             record_count: 42,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3754,7 +3742,7 @@ mod tests {
             record_count: 10,
             file_size_in_bytes: Some(512),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3786,7 +3774,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(2048),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: Some(Bytes::from(inline_data)),
             key_metadata: None,
@@ -3796,7 +3784,7 @@ mod tests {
     }
 
     // Helper function to create a ContentTreeNodeEntry with manifest stats
-    fn create_metadata_entry_with_manifest_info() -> ContentTreeNodeEntry {
+    fn create_metadata_entry_with_manifest_stats() -> ContentTreeNodeEntry {
         ContentTreeNodeEntry {
             content_type: DataContentType::DataManifest,
             location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
@@ -3815,7 +3803,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(10240),
             content_stats: None,
-            manifest_info: Some(ManifestStats {
+            manifest_stats: Some(ManifestStats {
                 added_files_count: 5,
                 existing_files_count: 10,
                 deletes_files_count: 2,
@@ -3900,40 +3888,40 @@ mod tests {
             "file_size_in_bytes mismatch"
         );
 
-        // Compare manifest_info
-        match (&expected.manifest_info, &actual.manifest_info) {
+        // Compare manifest_stats
+        match (&expected.manifest_stats, &actual.manifest_stats) {
             (Some(exp_ms), Some(act_ms)) => {
                 assert_eq!(
                     exp_ms.added_files_count, act_ms.added_files_count,
-                    "manifest_info.added_files_count mismatch"
+                    "manifest_stats.added_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_files_count, act_ms.existing_files_count,
-                    "manifest_info.existing_files_count mismatch"
+                    "manifest_stats.existing_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.deletes_files_count, act_ms.deletes_files_count,
-                    "manifest_info.deletes_files_count mismatch"
+                    "manifest_stats.deletes_files_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.added_rows_count, act_ms.added_rows_count,
-                    "manifest_info.added_rows_count mismatch"
+                    "manifest_stats.added_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.existing_rows_count, act_ms.existing_rows_count,
-                    "manifest_info.existing_rows_count mismatch"
+                    "manifest_stats.existing_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.delete_rows_count, act_ms.delete_rows_count,
-                    "manifest_info.delete_rows_count mismatch"
+                    "manifest_stats.delete_rows_count mismatch"
                 );
                 assert_eq!(
                     exp_ms.min_sequence_number, act_ms.min_sequence_number,
-                    "manifest_info.min_sequence_number mismatch"
+                    "manifest_stats.min_sequence_number mismatch"
                 );
             }
             (None, None) => {}
-            _ => panic!("manifest_info presence mismatch"),
+            _ => panic!("manifest_stats presence mismatch"),
         }
 
         assert_eq!(
@@ -4042,6 +4030,28 @@ mod tests {
         let content_info_schema = ContentInfo::to_schema();
         assert_field_id(&content_info_schema, "offset", 144);
         assert_field_id(&content_info_schema, "sizeInBytes", 145);
+
+        // Verify top-level MetadataEntry field IDs
+        let metadata_entry_schema = MetadataEntry::to_schema();
+        assert_field_id(&metadata_entry_schema, "contentType", 134);
+        assert_field_id(&metadata_entry_schema, "location", 100);
+        assert_field_id(&metadata_entry_schema, "fileFormat", 101);
+        assert_field_id(&metadata_entry_schema, "trackingInfo", 147);
+        assert_field_id(&metadata_entry_schema, "contentInfo", 148);
+        assert_field_id(&metadata_entry_schema, "partitionSpecId", 149);
+        assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
+        assert_field_id(&metadata_entry_schema, "recordCount", 103);
+        assert_field_id(&metadata_entry_schema, "fileSizeInBytes", 104);
+        assert_field_id(&metadata_entry_schema, "manifestStats", 150);
+        assert_field_id(&metadata_entry_schema, "referencedFile", 143);
+        assert_field_id(&metadata_entry_schema, "manifestDv", 151);
+
+        // Verify content_stats field_id in to_schema_with_content_stats
+        let table_schema =
+            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)
+                .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 1i64)])]);
+        let schema_with_stats = MetadataEntry::to_schema_with_content_stats(&table_schema)?;
+        assert_field_id(&schema_with_stats, CONTENT_STATS_FIELD_NAME, 146);
 
         Ok(())
     }
@@ -4159,13 +4169,13 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_metadata_entry_with_manifest_info() -> DeltaResult<()> {
+    fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create metadata with manifest stats
-        let original_entry = create_metadata_entry_with_manifest_info();
+        let original_entry = create_metadata_entry_with_manifest_stats();
         let metadata = ContentTreeNode {
             data: vec![original_entry
                 .clone()
@@ -4256,7 +4266,7 @@ mod tests {
         // Create multiple entries including one with inline DV
         let entry1 = create_simple_metadata_entry();
         let entry2 = create_metadata_entry_with_dv();
-        let entry3 = create_metadata_entry_with_manifest_info();
+        let entry3 = create_metadata_entry_with_manifest_stats();
         let entry4 = create_metadata_entry_with_inline_dv();
 
         let metadata = ContentTreeNode {
@@ -4336,7 +4346,7 @@ mod tests {
                 record_count: (i * 10) as i64,
                 file_size_in_bytes: Some((i * 512) as i64),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -4414,7 +4424,7 @@ mod tests {
                 record_count: 42,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -4483,7 +4493,7 @@ mod tests {
             record_count: 42,
             file_size_in_bytes: Some(1024),
             content_stats: None,   // None
-            manifest_info: None,   // None
+            manifest_stats: None,  // None
             referenced_file: None, // None
             manifest_dv: None,
             key_metadata: None,
@@ -4524,7 +4534,7 @@ mod tests {
         assert!(ti.first_row_id.is_none());
         assert!(ti.changes_dv.is_none());
         assert!(actual.manifest_dv.is_none());
-        assert!(actual.manifest_info.is_none());
+        assert!(actual.manifest_stats.is_none());
         assert!(actual.referenced_file.is_none());
 
         Ok(())
@@ -4555,7 +4565,7 @@ mod tests {
             record_count: 42,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -4611,7 +4621,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -4647,7 +4657,7 @@ mod tests {
             record_count: 10,
             file_size_in_bytes: Some(108),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: Some(referenced_file.to_string()),
             manifest_dv: None,
             key_metadata: None,
@@ -5010,7 +5020,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: Some(ManifestStats {
+            manifest_stats: Some(ManifestStats {
                 added_files_count: 10,
                 existing_files_count: 90,
                 deletes_files_count: 0,
@@ -5050,7 +5060,7 @@ mod tests {
             record_count: 10,
             file_size_in_bytes: Some(512),
             content_stats: None,
-            manifest_info: Some(ManifestStats {
+            manifest_stats: Some(ManifestStats {
                 added_files_count: 5,
                 existing_files_count: 5,
                 deletes_files_count: 0,

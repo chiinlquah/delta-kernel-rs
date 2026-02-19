@@ -165,7 +165,7 @@ struct DvCache {
     dirty: bool,
 
     /// Total number of entries in the manifest (for bounds checking)
-    /// Cached from manifest_info to avoid O(n) scans
+    /// Cached from manifest_stats to avoid O(n) scans
     total_entry_count: i64,
 }
 
@@ -340,9 +340,9 @@ impl ContentTreeNodeBuilder {
 
                 // Update tracking_info status based on DV cardinality
                 // If all active entries are deleted, mark manifest as Deleted
-                if let Some(ref manifest_info) = entry.manifest_info {
+                if let Some(ref manifest_stats) = entry.manifest_stats {
                     let active_entry_count =
-                        manifest_info.added_files_count + manifest_info.existing_files_count;
+                        manifest_stats.added_files_count + manifest_stats.existing_files_count;
                     let cardinality = manifest_dv.len() as i64;
 
                     if cardinality == active_entry_count {
@@ -508,7 +508,7 @@ impl ContentTreeNodeBuilder {
             // Content stats passed directly
             content_stats,
 
-            manifest_info: None,
+            manifest_stats: None,
 
             // Path to file where to apply the DV to
             referenced_file: None,
@@ -614,7 +614,7 @@ impl ContentTreeNodeBuilder {
             // Content stats converted from Delta JSON stats blob
             content_stats,
 
-            manifest_info: None,
+            manifest_stats: None,
 
             // Path to file where to apply the DV to
             referenced_file,
@@ -936,11 +936,11 @@ impl ContentTreeNodeBuilder {
             DataContentType::DataManifest | DataContentType::DeleteManifest
         ) {
             if let Some(ref location) = entry.location {
-                // Get total entry count from manifest_info for bounds checking
-                let total_entry_count = if let Some(ref manifest_info) = entry.manifest_info {
-                    manifest_info.added_files_count
-                        + manifest_info.existing_files_count
-                        + manifest_info.deletes_files_count
+                // Get total entry count from manifest_stats for bounds checking
+                let total_entry_count = if let Some(ref manifest_stats) = entry.manifest_stats {
+                    manifest_stats.added_files_count
+                        + manifest_stats.existing_files_count
+                        + manifest_stats.deletes_files_count
                 } else {
                     0
                 };
@@ -1128,7 +1128,7 @@ impl ContentTreeNodeBuilder {
     /// the specified index as deleted. The deleted entries are tracked in a roaring bitmap
     /// stored inline.
     ///
-    /// The method gets the entry count from the leaf manifest's `manifest_info` field,
+    /// The method gets the entry count from the leaf manifest's `manifest_stats` field,
     /// which tracks file counts by status. If all entries become deleted, the manifest
     /// entry is automatically marked as deleted.
     ///
@@ -1140,7 +1140,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
+    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
     ///
     /// Delete a single entry from a leaf manifest by marking it as deleted via ManifestDV.
     ///
@@ -1154,7 +1154,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_info, index is out of bounds, or serialization fails
+    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
     #[allow(dead_code)]
     pub(crate) fn delete_from_leaf(&mut self, leaf_file_path: &str, index: u64) -> DeltaResult<()> {
         use roaring::RoaringTreemap;
@@ -1176,7 +1176,7 @@ impl ContentTreeNodeBuilder {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_info, any index is out of bounds, or serialization fails
+    /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of bounds, or serialization fails
     #[allow(dead_code)]
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
@@ -1321,7 +1321,7 @@ impl ContentTreeNodeBuilder {
             min_sequence_number = 0;
         }
 
-        let manifest_info = Some(crate::content_tree::ManifestStats {
+        let manifest_stats = Some(crate::content_tree::ManifestStats {
             added_files_count,
             existing_files_count,
             deletes_files_count,
@@ -1387,7 +1387,7 @@ impl ContentTreeNodeBuilder {
             content_stats,
 
             // Manifest statistics tracking entry counts by status
-            manifest_info,
+            manifest_stats,
 
             // Path to file where to apply the DV to
             referenced_file: None,
@@ -2291,7 +2291,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: content_stats_1,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -2321,7 +2321,7 @@ mod tests {
             record_count: 150,
             file_size_in_bytes: Some(2048),
             content_stats: content_stats_2,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -2438,7 +2438,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None, // No stats
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -2623,7 +2623,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -2649,7 +2649,7 @@ mod tests {
             record_count: 200,
             file_size_in_bytes: Some(2048),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -2796,7 +2796,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -2896,7 +2896,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -2983,7 +2983,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -3062,7 +3062,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -3143,7 +3143,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -3204,7 +3204,7 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Create a manifest entry with manifest_info showing:
+        // Create a manifest entry with manifest_stats showing:
         // - 2 added files (indices 0, 1)
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
@@ -3227,7 +3227,7 @@ mod tests {
             record_count: 5, // Total entries in the leaf
             file_size_in_bytes: Some(2048),
             content_stats: None,
-            manifest_info: Some(ManifestStats {
+            manifest_stats: Some(ManifestStats {
                 added_files_count: 2,
                 existing_files_count: 1,
                 deletes_files_count: 2, // 2 entries are already deleted
@@ -3328,7 +3328,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -3542,7 +3542,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3623,7 +3623,7 @@ mod tests {
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
-                manifest_info: None,
+                manifest_stats: None,
                 referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
@@ -3710,7 +3710,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3728,7 +3728,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3746,7 +3746,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3809,7 +3809,7 @@ mod tests {
             record_count: 10,
             file_size_in_bytes: Some(128),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
@@ -3827,7 +3827,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3878,7 +3878,7 @@ mod tests {
             record_count: 10,
             file_size_in_bytes: Some(128),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
@@ -3896,7 +3896,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
@@ -3941,7 +3941,7 @@ mod tests {
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
-            manifest_info: None,
+            manifest_stats: None,
             referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
