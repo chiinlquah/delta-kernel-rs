@@ -551,9 +551,6 @@ impl LogSegment {
         // content_root is now passed in from caller (no I/O needed)
         let content_root_version = content_root.map(|cr| cr.version);
 
-        let commit_stream =
-            CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
-
         let actions_with_checkpoint_info = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
@@ -564,6 +561,9 @@ impl LogSegment {
             skip_leaf_manifests,
             table_schema,
         )?;
+
+        let commit_stream =
+            CommitReader::try_new(engine, self, commit_read_schema, content_root_version)?;
 
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(actions_with_checkpoint_info.actions),

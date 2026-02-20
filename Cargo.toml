@@ -4,6 +4,8 @@ members = [
     "derive-macros",
     "ffi",
     "kernel",
+    "kernel/benches/bench-utils",
+    "kernel/benches/uc-table-copy",
     "kernel/examples/*",
     "test-utils",
     "feature-tests",

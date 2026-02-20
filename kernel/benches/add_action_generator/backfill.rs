@@ -25,7 +25,9 @@ mod stats;
 #[path = "writer.rs"]
 mod writer;
 
-// UC support module
+// Shared benchmark utilities (using path-based modules to avoid cyclic dependencies)
+#[path = "../table_utils.rs"]
+mod table_utils;
 #[path = "../uc_support.rs"]
 mod uc_support;
 
@@ -82,6 +84,10 @@ struct Args {
     /// Number of add actions per incremental commit
     #[arg(long, default_value_t = 200)]
     actions_per_commit: usize,
+
+    /// Remove all existing files before backfilling the table
+    #[arg(long, default_value_t = false)]
+    clean_before_backfill: bool,
 }
 
 fn validate_percentage(s: &str) -> Result<f64, String> {
@@ -213,7 +219,47 @@ async fn main() {
 
     println!("Incremental commits: {}", args.num_incremental_commits);
     println!("Actions per commit: {}", args.actions_per_commit);
+    println!("Clean before backfill: {}", args.clean_before_backfill);
     println!();
+
+    // Clean existing files if requested
+    if args.clean_before_backfill {
+        println!("Cleaning existing table files before backfill...");
+        let store_for_cleanup = engine
+            .get_object_store_for_url(&setup.table_url)
+            .expect("Failed to get object store for URL");
+
+        let path_prefix_for_cleanup = if setup.table_url.scheme() == "file" {
+            String::new()
+        } else {
+            setup.path_prefix.clone()
+        };
+
+        match table_utils::remove_all_table_files(
+            &store_for_cleanup,
+            &setup.table_url,
+            &path_prefix_for_cleanup,
+        )
+        .await
+        {
+            Ok(stats) => {
+                println!("  ✓ Cleanup complete:");
+                println!("    Files deleted: {}", stats.files_deleted);
+                println!("    Bytes deleted: {}", stats.total_bytes_deleted);
+                if !stats.errors.is_empty() {
+                    println!(
+                        "    WARNING: {} errors occurred during cleanup",
+                        stats.errors.len()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("  WARNING: Cleanup failed: {}", e);
+                eprintln!("  Continuing with backfill anyway...");
+            }
+        }
+        println!();
+    }
 
     // Get the object store from the engine
     let mut store = engine

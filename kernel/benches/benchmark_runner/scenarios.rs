@@ -368,12 +368,9 @@ pub fn vacuum_delete(
     // Create scan without predicate to get all files
     let scan = snapshot.clone().scan_builder().build()?;
 
-    // Delete 10% of files (max 10000 files) to avoid deleting entire table
     let mut batches_to_delete = Vec::new();
     let mut files_collected = 0;
-    const MAX_FILES_TO_DELETE: usize = 50000;
 
-    // First, count total files to calculate 10%
     let mut total_files = 0;
     let mut all_batches = Vec::new();
     for result in scan.scan_metadata(engine.as_ref())? {
@@ -382,8 +379,7 @@ pub fn vacuum_delete(
         all_batches.push(metadata.scan_files);
     }
 
-    // Calculate how many files to delete (10% of total, max 10000)
-    let files_to_delete = std::cmp::min((total_files as f64 * 0.1) as usize, MAX_FILES_TO_DELETE);
+    let files_to_delete = (total_files as f64 * partition_threshold as f64 / 100.0) as usize;
 
     // Collect batches until we reach the target
     for batch in all_batches {

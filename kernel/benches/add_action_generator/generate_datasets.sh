@@ -15,6 +15,7 @@ UC_MODE=false
 UC_ENDPOINT="https://e2-dogfood.staging.cloud.databricks.com"
 UC_TOKEN=""
 TABLE_PREFIX=""
+CLEAN_BEFORE_BACKFILL=false
 
 # Parse command line arguments
 usage() {
@@ -29,6 +30,7 @@ OPTIONS:
     --uc-endpoint URL              Unity Catalog endpoint URL
                                    (default: https://e2-dogfood.staging.cloud.databricks.com)
     --uc-token TOKEN               Unity Catalog access token
+    --clean-before-backfill        Clean existing table files before backfilling (UC mode)
     --num-actions N                Number of actions per dataset (default: 50000)
     --seed N                       Random seed (default: 42)
     -h, --help                     Show this help message
@@ -40,8 +42,11 @@ EXAMPLES:
     # Local mode (default)
     $0 datasets
 
-    # Unity Catalog mode
-    $0 -t managed_iceberg_bugbash_pupr.micah --uc-token "dapi..."
+    # Unity Catalog mode - create new tables (or overwrite existing)
+    $0 -t catalog.schema --uc-token "dapi..." --clean-before-backfill
+
+    # Unity Catalog mode - fail if tables already exist
+    $0 -t catalog.schema --uc-token "dapi..."
 
 EOF
     exit 1
@@ -61,6 +66,10 @@ while [[ $# -gt 0 ]]; do
         --uc-token)
             UC_TOKEN="$2"
             shift 2
+            ;;
+        --clean-before-backfill)
+            CLEAN_BEFORE_BACKFILL=true
+            shift
             ;;
         --num-actions)
             NUM_ACTIONS="$2"
@@ -108,6 +117,7 @@ if [ "$UC_MODE" = true ]; then
     echo "Table prefix: ${TABLE_PREFIX}"
     echo "Actions per dataset: ${NUM_ACTIONS}"
     echo "Random seed: ${SEED}"
+    echo "Clean before backfill: ${CLEAN_BEFORE_BACKFILL}"
     echo ""
 else
     # Create datasets directory if it doesn't exist and convert to absolute path
@@ -126,6 +136,26 @@ fi
 # Array of DV percentages to generate
 DV_PERCENTAGES=(0 50 100)
 FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
+
+# Function to check if a table/directory has existing commits
+has_existing_commits() {
+    local table_path=$1
+
+    if [ "$UC_MODE" = true ]; then
+        # For UC mode: we can't easily check without calling UC, so we assume tables
+        # either don't exist (backfill will create them) or need to be cleaned
+        # The backfill tool itself will handle this with --clean-before-backfill
+        return 1  # No commits (or we'll clean them)
+    else
+        # For local mode: check if _delta_log directory has any .json files
+        if [ -d "${table_path}/_delta_log" ]; then
+            if ls "${table_path}/_delta_log"/*.json >/dev/null 2>&1; then
+                return 0  # Has commits
+            fi
+        fi
+        return 1  # No commits
+    fi
+}
 
 # Function to run backfill command
 run_backfill() {
@@ -147,10 +177,20 @@ run_backfill() {
             -a "${NUM_ACTIONS}"
             -s "${SEED}"
         )
+
+        # Add --clean-before-backfill flag if requested
+        [ "$CLEAN_BEFORE_BACKFILL" = true ] && cmd_args+=(--clean-before-backfill)
     else
         # Local mode
         local table_dir="${DATASETS_DIR}/dv_${dv_pct}_pct"
         [ "$with_content_root" = true ] && table_dir="${table_dir}_with_content_root"
+
+        # Check if table already has commits
+        if has_existing_commits "${table_dir}"; then
+            echo -e "${GREEN}${description} - Already exists, skipping${NC}"
+            echo ""
+            return 0
+        fi
 
         local cmd_args=(
             -t "${table_dir}"

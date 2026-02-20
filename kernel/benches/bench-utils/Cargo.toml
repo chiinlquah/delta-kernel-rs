@@ -1,0 +1,24 @@
+[package]
+name = "bench-utils"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+delta_kernel = { path = "../..", features = [
+  "arrow",
+  "default-engine-rustls",
+  "internal-api",
+] }
+futures = "0.3"
+object_store = "0.12.3"
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
+uc-client = { path = "../../../uc-client" }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# for cargo-release
+[package.metadata.release]
+release = false

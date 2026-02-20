@@ -19,6 +19,7 @@ use url::Url;
 /// 3. Getting leaf action batches (if not skipping)
 pub(crate) struct LazyContentRootIterator {
     state: LazyContentRootState,
+    leaf_state: Option<LazyContentRootState>,
 }
 
 /// Shared context used across multiple states in the lazy content root iterator
@@ -119,6 +120,7 @@ impl LazyContentRootIterator {
                 path_in_log,
                 context,
             },
+            leaf_state: None,
         })
     }
 }
@@ -151,7 +153,47 @@ impl Iterator for LazyContentRootIterator {
                             context.table_root.clone(),
                         ),
                     );
+                    // Root batches exhausted. If skipping leaves, we're done
+                    self.leaf_state = if context.skip_leaf_manifests {
+                        None
+                    } else {
+                        // Lazily read leaf manifests now that root is exhausted
+                        // Construct manifest batch schema with content_stats for data skipping
+                        let manifest_batch_schema = context.table_schema.as_ref().and_then(|ts| {
+                            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                                ts,
+                            )
+                            .ok()
+                            .map(Arc::new)
+                        });
 
+                        let leaf_refs = match metadata.manifest_references(
+                            context.data_predicate.as_ref(),
+                            Some(&context.evaluation_handler),
+                            context.stats_schema.as_ref(),
+                            context.table_schema.as_ref(),
+                            manifest_batch_schema.as_ref(),
+                        ) {
+                            Ok(refs) => refs,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                        let leaf_iter =
+                        match crate::content_tree::ContentTreeNode::non_root_action_batches_with_handlers(
+                            leaf_refs,
+                            context.parquet_handler.clone(),
+                            context.evaluation_handler.clone(),
+                            &context.checkpoint_read_schema,
+                            &context.table_root,
+                            context.data_predicate.as_ref(),
+                            context.table_schema.as_ref(),
+                            context.stats_schema.as_ref(),
+                        ) {
+                            Ok(iter) => iter,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        Some(LazyContentRootState::ReadingLeaves { leaf_iter })
+                    };
                     // Get root batches using the handler-based method
                     let root_iter = match metadata.root_action_batches_with_handler(
                         context.evaluation_handler.as_ref(),
@@ -188,48 +230,7 @@ impl Iterator for LazyContentRootIterator {
                         return Some(batch);
                     }
 
-                    // Root batches exhausted. If skipping leaves, we're done
-                    if context.skip_leaf_manifests {
-                        self.state = LazyContentRootState::Done;
-                        return None;
-                    }
-
-                    // Lazily read leaf manifests now that root is exhausted
-                    // Construct manifest batch schema with content_stats for data skipping
-                    let manifest_batch_schema = context.table_schema.as_ref().and_then(|ts| {
-                        crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts)
-                            .ok()
-                            .map(Arc::new)
-                    });
-
-                    let leaf_refs = match metadata.manifest_references(
-                        context.data_predicate.as_ref(),
-                        Some(&context.evaluation_handler),
-                        context.stats_schema.as_ref(),
-                        context.table_schema.as_ref(),
-                        manifest_batch_schema.as_ref(),
-                    ) {
-                        Ok(refs) => refs,
-                        Err(e) => return Some(Err(e)),
-                    };
-
-                    let leaf_iter =
-                        match crate::content_tree::ContentTreeNode::non_root_action_batches_with_handlers(
-                            leaf_refs,
-                            context.parquet_handler.clone(),
-                            context.evaluation_handler.clone(),
-                            &context.checkpoint_read_schema,
-                            &context.table_root,
-                            context.data_predicate.as_ref(),
-                            context.table_schema.as_ref(),
-                            context.stats_schema.as_ref(),
-                        ) {
-                            Ok(iter) => iter,
-                            Err(e) => return Some(Err(e)),
-                        };
-
-                    // Transition to ReadingLeaves state
-                    self.state = LazyContentRootState::ReadingLeaves { leaf_iter };
+                    self.state = self.leaf_state.take().unwrap_or(LazyContentRootState::Done);
                     continue;
                 }
                 LazyContentRootState::ReadingLeaves { mut leaf_iter } => {
