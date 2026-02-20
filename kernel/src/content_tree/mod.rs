@@ -4031,8 +4031,8 @@ mod tests {
         assert_field_id(&content_info_schema, "offset", 144);
         assert_field_id(&content_info_schema, "sizeInBytes", 145);
 
-        // Verify top-level MetadataEntry field IDs
-        let metadata_entry_schema = MetadataEntry::to_schema();
+        // Verify top-level ContentTreeNodeEntry field IDs
+        let metadata_entry_schema = ContentTreeNodeEntry::to_schema();
         assert_field_id(&metadata_entry_schema, "contentType", 134);
         assert_field_id(&metadata_entry_schema, "location", 100);
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
@@ -4050,7 +4050,7 @@ mod tests {
         let table_schema =
             StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)
                 .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 1i64)])]);
-        let schema_with_stats = MetadataEntry::to_schema_with_content_stats(&table_schema)?;
+        let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema)?;
         assert_field_id(&schema_with_stats, CONTENT_STATS_FIELD_NAME, 146);
 
         Ok(())
