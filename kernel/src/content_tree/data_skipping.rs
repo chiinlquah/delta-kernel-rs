@@ -1,7 +1,7 @@
-//! Manifest-level data skipping for Adaptive Metadata Tree (AMT).
+//! Manifest-level data skipping for Adaptive ContentTreeNode Tree (AMT).
 //!
 //! This module provides filtering capabilities that apply predicates to manifest entries
-//! during parquet reading phase, before MetadataEntry materialization.
+//! during parquet reading phase, before ContentTreeNodeEntry materialization.
 
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -21,7 +21,7 @@ use super::stats::create_content_stats_to_stats_parsed_expr;
 /// Filter that applies data skipping to manifest entries during parquet reading.
 ///
 /// Evaluates predicates against content_stats at the EngineData level,
-/// before materializing MetadataEntry objects. This allows skipping entire
+/// before materializing ContentTreeNodeEntry objects. This allows skipping entire
 /// rows/entries that don't match the predicate.
 ///
 /// Uses a three-stage evaluation pipeline:

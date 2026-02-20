@@ -2,10 +2,10 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
-use crate::content_tree::writer::MetadataWriter;
+use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentInfo, DataContentType, DataFileFormat, Metadata,
-    MetadataEntry, TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
+    DataFileFormat, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -211,11 +211,11 @@ impl DvCache {
     }
 }
 
-/// Builder for creating [`Metadata`] instances based on V4 Metadata
+/// Builder for creating [`ContentTreeNode`] instances based on V4 ContentTreeNode
 #[allow(dead_code)]
-pub(crate) struct MetadataBuilder {
+pub(crate) struct ContentTreeNodeBuilder {
     table_root: Url,
-    pending_entries: Vec<MetadataEntry>,
+    pending_entries: Vec<ContentTreeNodeEntry>,
     version: Version,
     /// Table schema for converting stats JSON to content_stats format.
     /// The builder will populate content_stats from the Delta JSON stats blob.
@@ -230,7 +230,7 @@ pub(crate) struct MetadataBuilder {
     /// Combined cache for DV bitmaps (manifest_dv + changes_dv)
     /// Keyed by manifest location. Provides O(1) access and lazy deserialization.
     dv_cache: HashMap<String, DvCache>,
-    /// Pre-transformed EngineData batches already in MetadataEntry schema.
+    /// Pre-transformed EngineData batches already in ContentTreeNodeEntry schema.
     /// These bypass the row-by-row visitor path and are produced by the expression
     /// evaluator in `add_from_engine_data_write`.
     pre_built_data: Vec<Box<dyn EngineData>>,
@@ -246,9 +246,9 @@ struct BatchAggregates {
     total_file_size: i64,
 }
 
-impl std::fmt::Debug for MetadataBuilder {
+impl std::fmt::Debug for ContentTreeNodeBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetadataBuilder")
+        f.debug_struct("ContentTreeNodeBuilder")
             .field("table_root", &self.table_root)
             .field("pending_entries", &self.pending_entries.len())
             .field("pre_built_data", &self.pre_built_data.len())
@@ -262,8 +262,8 @@ impl std::fmt::Debug for MetadataBuilder {
 }
 
 /// Builder that can be created from an empty state, or from existing metadata
-impl MetadataBuilder {
-    /// Creates a new MetadataBuilder for the given table root and version.
+impl ContentTreeNodeBuilder {
+    /// Creates a new ContentTreeNodeBuilder for the given table root and version.
     ///
     /// # Arguments
     /// * `table_root` - The root URL of the table
@@ -392,7 +392,7 @@ impl MetadataBuilder {
         }
 
         // Compute the schema
-        let schema = MetadataEntry::to_schema_with_content_stats(&self.table_schema)?;
+        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema)?;
         let schema_ref = Arc::new(schema);
 
         // Try to cache it (ignore if another thread beat us to it)
@@ -474,7 +474,7 @@ impl MetadataBuilder {
         // Extract record_count from the content_stats (from any column's value_count)
         let record_count = extract_record_count_from_stats(content_stats.as_ref());
 
-        let data_file_entry = MetadataEntry {
+        let data_file_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some(path),
             file_format: DataFileFormat::Parquet,
@@ -533,7 +533,7 @@ impl MetadataBuilder {
     /// Add an entry with deduplication.
     ///
     /// # Arguments
-    /// * `add` - The Add action to convert to a MetadataEntry
+    /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
     #[allow(unreachable_code)]
@@ -582,7 +582,7 @@ impl MetadataBuilder {
 
         let (content_info, referenced_file) = dv_content.unzip();
 
-        let data_file_entry = MetadataEntry {
+        let data_file_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some(add.path.clone()),
             file_format: DataFileFormat::Parquet,
@@ -669,7 +669,7 @@ impl MetadataBuilder {
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
     ///
     /// This method transforms the input write metadata (path, partitionValues, size,
-    /// modificationTime, stats) directly into MetadataEntry schema using the engine's
+    /// modificationTime, stats) directly into ContentTreeNodeEntry schema using the engine's
     /// expression evaluator, avoiding the row-by-row visitor pattern.
     ///
     /// When stats are in AMT format (after successful `try_pre_convert_stats_column`),
@@ -796,7 +796,7 @@ impl MetadataBuilder {
             }
         };
 
-        // Build field expressions mapping input → output for each MetadataEntry field
+        // Build field expressions mapping input → output for each ContentTreeNodeEntry field
         let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
         for field in output_schema.fields() {
             let expr: Expression = match field.name().as_str() {
@@ -925,11 +925,11 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    /// Adds a raw MetadataEntry to the builder.
+    /// Adds a raw ContentTreeNodeEntry to the builder.
     ///
     /// This is useful when copying entries from existing metadata.
     #[allow(dead_code)]
-    pub(crate) fn add_entry(&mut self, mut entry: MetadataEntry) {
+    pub(crate) fn add_entry(&mut self, mut entry: ContentTreeNodeEntry) {
         // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
@@ -1086,7 +1086,7 @@ impl MetadataBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
-        // TODO: we should make pending entries a HashMap<String, MetadataEntry> to make this faster
+        // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
         for entry in &mut self.pending_entries {
             // Check if this entry matches the file path or deletion vector path
             let matches = if let Some(path) = file_path {
@@ -1237,34 +1237,34 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    /// Writes the pending entries as a leaf manifest and returns a MetadataEntry referencing it.
+    /// Writes the pending entries as a leaf manifest and returns a ContentTreeNodeEntry referencing it.
     ///
     /// https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw/edit?tab=t.0#heading=h.unn922df0zzw
     ///
     /// This method:
-    /// 1. Builds a leaf Metadata with a unique UUID
-    /// 2. Writes it to a parquet file using MetadataWriter
-    /// 3. Returns a MetadataEntry (DataManifest type) that references the written leaf
+    /// 1. Builds a leaf ContentTreeNode with a unique UUID
+    /// 2. Writes it to a parquet file using ContentTreeNodeWriter
+    /// 3. Returns a ContentTreeNodeEntry (DataManifest type) that references the written leaf
     ///
-    /// The returned MetadataEntry can be added to a root manifest to reference this leaf.
+    /// The returned ContentTreeNodeEntry can be added to a root manifest to reference this leaf.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for writing the parquet file
     /// * `snapshot_id` - Optional snapshot ID for tracking info
     ///
     /// # Returns
-    /// * `Ok(MetadataEntry)` - A manifest entry referencing the written leaf file
+    /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
     #[allow(dead_code)]
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
-    ) -> DeltaResult<MetadataEntry> {
+    ) -> DeltaResult<ContentTreeNodeEntry> {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let content_metadata_path = MetadataWriter::try_new(leaf_metadata)?.write(engine)?;
+        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
@@ -1354,7 +1354,7 @@ impl MetadataBuilder {
             DataContentType::DataManifest
         };
 
-        Ok(MetadataEntry {
+        Ok(ContentTreeNodeEntry {
             content_type,
             location: Some(manifest_path),
             file_format: DataFileFormat::Parquet,
@@ -1406,12 +1406,12 @@ impl MetadataBuilder {
         })
     }
 
-    /// Builds a root Metadata instance (leaf is `None`).
+    /// Builds a root ContentTreeNode instance (leaf is `None`).
     pub(crate) fn build(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
-    ) -> DeltaResult<Metadata> {
+    ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
@@ -1423,7 +1423,7 @@ impl MetadataBuilder {
 
         // Handle empty case early
         if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(Metadata {
+            return Ok(ContentTreeNode {
                 table_root: self.table_root.clone(),
                 data: vec![],
                 version: self.version,
@@ -1451,7 +1451,7 @@ impl MetadataBuilder {
         // Add pre-transformed columnar batches
         data.append(&mut self.pre_built_data);
 
-        Ok(Metadata {
+        Ok(ContentTreeNode {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
@@ -1462,7 +1462,7 @@ impl MetadataBuilder {
 
     /// Writes the pending entries as a root manifest and returns the URL where it was written.
     ///
-    /// This method builds a root Metadata (no UUID) and writes it to a parquet file.
+    /// This method builds a root ContentTreeNode (no UUID) and writes it to a parquet file.
     /// The root manifest typically contains references to leaf manifests (DataManifest entries)
     /// rather than individual data files.
     ///
@@ -1475,15 +1475,15 @@ impl MetadataBuilder {
     #[allow(dead_code)]
     pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
         let root_metadata = self.build(engine, None)?;
-        MetadataWriter::try_new(root_metadata)?.write(engine)
+        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)
     }
 
-    /// Builds a leaf Metadata instance with a generated UUID.
+    /// Builds a leaf ContentTreeNode instance with a generated UUID.
     pub(crate) fn build_leaf(
         &mut self,
         engine: &dyn crate::Engine,
         snapshot_id: Option<i64>,
-    ) -> DeltaResult<Metadata> {
+    ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
@@ -1495,7 +1495,7 @@ impl MetadataBuilder {
 
         // Handle empty case early
         if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(Metadata {
+            return Ok(ContentTreeNode {
                 table_root: self.table_root.clone(),
                 data: vec![],
                 version: self.version,
@@ -1523,7 +1523,7 @@ impl MetadataBuilder {
         // Add pre-transformed columnar batches
         data.append(&mut self.pre_built_data);
 
-        Ok(Metadata {
+        Ok(ContentTreeNode {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
@@ -1532,14 +1532,14 @@ impl MetadataBuilder {
         })
     }
 
-    /// Builds a leaf Metadata instance with a specific UUID.
+    /// Builds a leaf ContentTreeNode instance with a specific UUID.
     #[allow(dead_code)]
     pub(crate) fn build_leaf_with_uuid(
         &mut self,
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
         snapshot_id: Option<i64>,
-    ) -> DeltaResult<Metadata> {
+    ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
 
@@ -1551,7 +1551,7 @@ impl MetadataBuilder {
 
         // Handle empty case early
         if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(Metadata {
+            return Ok(ContentTreeNode {
                 table_root: self.table_root.clone(),
                 data: vec![],
                 version: self.version,
@@ -1579,7 +1579,7 @@ impl MetadataBuilder {
         // Add pre-transformed columnar batches
         data.append(&mut self.pre_built_data);
 
-        Ok(Metadata {
+        Ok(ContentTreeNode {
             table_root: self.table_root.clone(),
             data,
             version: self.version,
@@ -1820,7 +1820,7 @@ mod tests {
     fn test_path_to_absolute_with_relative_path() -> Result<(), Box<dyn std::error::Error>> {
         // Test with s3:// URL as table root
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "part-00000-123.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1840,7 +1840,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_s3_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let absolute_path = "s3://another-bucket/external/data.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -1851,7 +1851,7 @@ mod tests {
     #[test]
     fn test_path_to_absolute_with_absolute_https_path() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let absolute_path = "https://example.com/data/file.parquet";
         let result = builder.path_to_absolute(absolute_path)?;
@@ -1863,7 +1863,7 @@ mod tests {
     fn test_path_to_absolute_with_gs_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Google Cloud Storage URL
         let table_root = Url::parse("gs://my-gcs-bucket/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "data/part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1883,7 +1883,7 @@ mod tests {
     fn test_path_to_absolute_with_azure_url() -> Result<(), Box<dyn std::error::Error>> {
         // Test with Azure Blob Storage URL
         let table_root = Url::parse("abfss://container@account.dfs.core.windows.net/delta-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1899,7 +1899,7 @@ mod tests {
         // Test with file:// URL - use a temp directory that exists
         let temp_dir = std::env::temp_dir();
         let table_root = Url::parse(&format!("file://{}/", temp_dir.to_str().unwrap()))?;
-        let builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         let relative_path = "part-00000.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1918,7 +1918,7 @@ mod tests {
     {
         // Test that special characters in paths are preserved
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let builder = MetadataBuilder::new_for(table_root, 1, test_table_schema());
+        let builder = ContentTreeNodeBuilder::new_for(table_root, 1, test_table_schema());
 
         let relative_path = "partition=value%20with%20spaces/file.parquet";
         let result = builder.path_to_absolute(relative_path)?;
@@ -1944,7 +1944,8 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify
@@ -1989,7 +1990,8 @@ mod tests {
 
         // Create builder and add from engine data iterator
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
 
         // Build metadata and verify
@@ -2027,7 +2029,8 @@ mod tests {
 
         // Create builder and add from engine data
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
         // Build metadata and verify record counts
@@ -2089,7 +2092,8 @@ mod tests {
         ]);
 
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
 
         // Add an entry with JSON stats
         let stats_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":5}}"#;
@@ -2192,7 +2196,8 @@ mod tests {
 
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         // Builder with test table schema (has one "id" column)
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         let add = Add {
             path: "part-00000.parquet".to_string(),
@@ -2261,13 +2266,14 @@ mod tests {
         ]);
 
         // Create a builder with the table schema
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, table_schema.clone());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, table_schema.clone());
 
         // Create content_stats for file 1: id=[1, 50], name=["alice", "mike"]
         let stats1_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":50,"name":"mike"},"nullCount":{"id":0,"name":5}}"#;
         let content_stats_1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)?;
 
-        let entry1 = MetadataEntry {
+        let entry1 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -2297,7 +2303,7 @@ mod tests {
         let stats2_json = r#"{"numRecords":150,"minValues":{"id":40,"name":"bob"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":10}}"#;
         let content_stats_2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)?;
 
-        let entry2 = MetadataEntry {
+        let entry2 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data/part-00001.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -2410,10 +2416,11 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a builder with empty schema
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Create entries without content_stats
-        let entry = MetadataEntry {
+        let entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -2585,7 +2592,7 @@ mod tests {
 
     #[test]
     fn test_write_root_with_leaf() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::content_tree::{DataContentType, Metadata};
+        use crate::content_tree::{ContentTreeNode, DataContentType};
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
@@ -2594,10 +2601,11 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf builder with data file entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add some data file entries to the leaf
-        let data_entry_1 = MetadataEntry {
+        let data_entry_1 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data/part-00000.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -2623,7 +2631,7 @@ mod tests {
             equality_ids: None,
         };
 
-        let data_entry_2 = MetadataEntry {
+        let data_entry_2 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data/part-00001.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -2652,7 +2660,7 @@ mod tests {
         leaf_builder.add_entry(data_entry_1);
         leaf_builder.add_entry(data_entry_2);
 
-        // Step 2: Write the leaf manifest and get a MetadataEntry (DataManifest) back
+        // Step 2: Write the leaf manifest and get a ContentTreeNodeEntry (DataManifest) back
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Verify the leaf manifest entry
@@ -2677,7 +2685,8 @@ mod tests {
         assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
 
         // Step 3: Create a root builder and add the leaf manifest entry
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
 
         // Step 4: Write the root manifest
@@ -2699,7 +2708,8 @@ mod tests {
         // Step 5: Read back the root and verify
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let read_root = Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
+        let read_root =
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = read_root.entries()?;
         assert_eq!(root_entries.len(), 1);
         assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
@@ -2708,7 +2718,7 @@ mod tests {
         // Step 6: Read back the leaf and verify
         let leaf_relative_path = leaf_manifest_entry.location.as_ref().unwrap();
         let leaf_url = table_root.join(leaf_relative_path)?;
-        let read_leaf = Metadata::read(
+        let read_leaf = ContentTreeNode::read(
             &engine,
             &leaf_url,
             leaf_relative_path.clone(),
@@ -2727,13 +2737,13 @@ mod tests {
     /// Manifest deletion vectors (ManifestDV, content_type = 5) can filter out entries
     /// from a manifest by ordinal position without rewriting the manifest file.
     fn apply_manifest_dv(
-        entries: Vec<MetadataEntry>,
+        entries: Vec<ContentTreeNodeEntry>,
         dv_bytes: &Bytes,
-    ) -> DeltaResult<Vec<MetadataEntry>> {
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
         let deleted_positions = crate::content_tree::parse_manifest_dv(dv_bytes)?;
 
         // Filter entries: keep only those whose ordinal position is NOT in the deletion vector
-        let filtered_entries: Vec<MetadataEntry> =
+        let filtered_entries: Vec<ContentTreeNodeEntry> =
             if let Some(deleted_positions) = deleted_positions {
                 entries
                     .into_iter()
@@ -2765,9 +2775,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf with 10 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
@@ -2800,7 +2811,8 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 5)?;
@@ -2812,7 +2824,7 @@ mod tests {
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata =
-            Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
 
         // Should have: 1 DataManifest (DV is now inline on this entry)
@@ -2841,7 +2853,7 @@ mod tests {
         // Step 5: Read the leaf and apply manifest DV to verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
         let leaf_metadata =
-            Metadata::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
+            ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
         let leaf_entries = leaf_metadata.entries()?;
         assert_eq!(leaf_entries.len(), 10); // Original 10 entries
 
@@ -2863,9 +2875,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 10 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
@@ -2897,7 +2910,8 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 5)?;
@@ -2910,7 +2924,7 @@ mod tests {
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let root_metadata =
-            Metadata::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
         assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
 
@@ -2929,7 +2943,8 @@ mod tests {
 
         // Apply manifest DV and verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
-        let leaf_metadata = Metadata::read(&engine, &leaf_url, leaf_path.clone(), table_root)?;
+        let leaf_metadata =
+            ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root)?;
         let leaf_entries = leaf_metadata.entries()?;
         let filtered_entries = apply_manifest_dv(leaf_entries, manifest_dv_bytes)?;
         assert_eq!(filtered_entries.len(), 7); // 3 deleted, 7 remaining
@@ -2947,9 +2962,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 3 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..3 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
@@ -2981,7 +2997,8 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         root_builder.delete_from_leaf(&leaf_path, 0)?;
@@ -2994,7 +3011,8 @@ mod tests {
         // Read back and verify the manifest is marked as deleted
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
+        let root_metadata =
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let leaf_manifest = root_entries
@@ -3023,9 +3041,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a leaf with 10 entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
@@ -3057,7 +3076,8 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
         let result = root_builder.delete_from_leaf(&leaf_path, 10);
@@ -3074,7 +3094,8 @@ mod tests {
         let temp_dir = tempdir()?;
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Try to delete from a non-existent leaf
         let result = root_builder.delete_from_leaf("nonexistent.parquet", 5);
@@ -3101,9 +3122,10 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Create a leaf
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..5 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("data/part-{:05}.parquet", i)),
                 file_format: DataFileFormat::Parquet,
@@ -3137,7 +3159,8 @@ mod tests {
         let relative_path = &leaf_path;
 
         // Create root and delete using relative path
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
         root_builder.delete_from_leaf(relative_path, 3)?;
 
@@ -3146,7 +3169,8 @@ mod tests {
         // Read back and verify manifest DV is stored inline
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
+        let root_metadata =
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let data_manifest = root_entries
@@ -3177,14 +3201,15 @@ mod tests {
 
         // Create a leaf manifest that already has some deleted entries
         // This simulates a manifest that has been updated over time
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Create a manifest entry with manifest_stats showing:
         // - 2 added files (indices 0, 1)
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
-        let manifest_entry = MetadataEntry {
+        let manifest_entry = ContentTreeNodeEntry {
             content_type: DataContentType::DataManifest,
             location: Some("leaf-manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3233,7 +3258,8 @@ mod tests {
         // Read back and verify the manifest is marked as deleted
         let root_path_in_log =
             crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata = Metadata::read(&engine, &root_url, root_path_in_log, table_root)?;
+        let root_metadata =
+            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
         let root_entries = root_metadata.entries()?;
 
         let leaf_manifest = root_entries
@@ -3281,9 +3307,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf with 10 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
                 file_format: DataFileFormat::Parquet,
@@ -3315,7 +3342,8 @@ mod tests {
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
         root_builder.delete_from_leaf(&leaf_path, 2)?;
         root_builder.delete_from_leaf(&leaf_path, 5)?;
@@ -3326,7 +3354,7 @@ mod tests {
         let root_path_v1 =
             crate::content_tree::absolute_to_relative_path(&root_url_v1, &table_root)?;
         let root_metadata_v1 =
-            Metadata::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
         let entries_v1 = root_metadata_v1.entries()?;
         let manifest_v1 = entries_v1
             .iter()
@@ -3359,7 +3387,7 @@ mod tests {
         // Step 4: Start a new commit (v2) by loading v1 entries
         // Note: changes_dv is automatically cleared when entries are added
         let mut root_builder_v2 =
-            MetadataBuilder::new_for(table_root.clone(), 2, test_table_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 2, test_table_schema());
         for entry in entries_v1 {
             root_builder_v2.add_entry(entry);
         }
@@ -3374,7 +3402,7 @@ mod tests {
         let root_path_v2 =
             crate::content_tree::absolute_to_relative_path(&root_url_v2, &table_root)?;
         let root_metadata_v2 =
-            Metadata::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
         let entries_v2 = root_metadata_v2.entries()?;
         let manifest_v2 = entries_v2
             .iter()
@@ -3421,7 +3449,7 @@ mod tests {
         // Step 8: Start a new commit (v3) by loading v2 entries
         // Note: changes_dv is automatically cleared when entries are added
         let mut root_builder_v3 =
-            MetadataBuilder::new_for(table_root.clone(), 3, test_table_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 3, test_table_schema());
         for entry in entries_v2 {
             root_builder_v3.add_entry(entry);
         }
@@ -3435,7 +3463,7 @@ mod tests {
         let root_path_v3 =
             crate::content_tree::absolute_to_relative_path(&root_url_v3, &table_root)?;
         let root_metadata_v3 =
-            Metadata::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
         let entries_v3 = root_metadata_v3.entries()?;
         let manifest_v3 = entries_v3
             .iter()
@@ -3490,13 +3518,13 @@ mod tests {
         // Step 11: Start a new commit (v4) by loading v3 entries
         // Note: changes_dv is automatically cleared when entries are added
         let mut root_builder_v4 =
-            MetadataBuilder::new_for(table_root.clone(), 4, test_table_schema());
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 4, test_table_schema());
         for entry in entries_v3 {
             root_builder_v4.add_entry(entry);
         }
 
         // Step 12: Make an unrelated change - add a new data entry (no deletions)
-        let new_data_entry = MetadataEntry {
+        let new_data_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some(format!("{}data/part-{:05}.parquet", table_root, 100)),
             file_format: DataFileFormat::Parquet,
@@ -3529,7 +3557,7 @@ mod tests {
         let root_path_v4 =
             crate::content_tree::absolute_to_relative_path(&root_url_v4, &table_root)?;
         let root_metadata_v4 =
-            Metadata::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
+            ContentTreeNode::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
         let entries_v4 = root_metadata_v4.entries()?;
         let manifest_v4 = entries_v4
             .iter()
@@ -3574,9 +3602,10 @@ mod tests {
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Step 1: Create a leaf with 5 data entries
-        let mut leaf_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..5 {
-            let data_entry = MetadataEntry {
+            let data_entry = ContentTreeNodeEntry {
                 content_type: DataContentType::Data,
                 location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
                 file_format: DataFileFormat::Parquet,
@@ -3609,7 +3638,8 @@ mod tests {
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
         // with set_changes_dv=false (simulating moving entries to a different leaf)
-        let mut root_builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
 
         let mut indices = RoaringTreemap::new();
@@ -3623,7 +3653,8 @@ mod tests {
 
         // Step 3: Read back and verify changes_dv is NOT set for leaf reorganization
         let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata = Metadata::read(&engine, &root_url, root_path, table_root.clone())?;
+        let root_metadata =
+            ContentTreeNode::read(&engine, &root_url, root_path, table_root.clone())?;
         let entries = root_metadata.entries()?;
         let manifest = entries
             .iter()
@@ -3664,10 +3695,11 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add three entries with different file paths
-        let entry1 = MetadataEntry {
+        let entry1 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3685,7 +3717,7 @@ mod tests {
             split_offsets: None,
             equality_ids: None,
         };
-        let entry2 = MetadataEntry {
+        let entry2 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("file2.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3703,7 +3735,7 @@ mod tests {
             split_offsets: None,
             equality_ids: None,
         };
-        let entry3 = MetadataEntry {
+        let entry3 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("file3.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3762,10 +3794,11 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add DV entry
-        let dv_entry = MetadataEntry {
+        let dv_entry = ContentTreeNodeEntry {
             content_type: DataContentType::PositionDeletes,
             location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3783,7 +3816,7 @@ mod tests {
             split_offsets: None,
             equality_ids: None,
         };
-        let data_entry = MetadataEntry {
+        let data_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3830,10 +3863,11 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add DV entry that references a data file
-        let dv_entry = MetadataEntry {
+        let dv_entry = ContentTreeNodeEntry {
             content_type: DataContentType::PositionDeletes,
             location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3851,7 +3885,7 @@ mod tests {
             split_offsets: None,
             equality_ids: None,
         };
-        let data_entry = MetadataEntry {
+        let data_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
@@ -3892,10 +3926,11 @@ mod tests {
         let temp_dir = tempdir()?;
         let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let mut builder = MetadataBuilder::new_for(table_root.clone(), 1, test_table_schema());
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add entry
-        let entry = MetadataEntry {
+        let entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
