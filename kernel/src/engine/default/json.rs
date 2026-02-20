@@ -4,7 +4,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
@@ -15,10 +15,10 @@ use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use url::Url;
 
 use super::executor::TaskExecutor;
-use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{
+    fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json, to_json_bytes,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
@@ -92,22 +92,34 @@ async fn read_json_files_impl(
         return Ok(Box::pin(stream::empty()));
     }
 
-    let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
+    // Build Arrow schema from only the real JSON columns, omitting any metadata columns
+    // (e.g. FilePath) that the JSON reader cannot populate from the file content.
+    let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
 
-    // an iterator of futures that open each file
+    // An iterator of futures that open each file, producing a stream tagged with metadata columns.
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
-        let schema = schema.clone();
-        async move { open_json_file(store, schema, batch_size, file).await }
+        let json_arrow_schema = json_arrow_schema.clone();
+        let physical_schema = physical_schema.clone();
+        async move {
+            let file_path = file.location.to_string();
+            let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
+            // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
+            let tagged: BoxStream<'static, DeltaResult<Box<dyn EngineData>>> = batch_stream
+                .map(move |result| -> DeltaResult<Box<dyn EngineData>> {
+                    let batch = result?;
+                    let batch = fixup_json_read(batch, &physical_schema, &file_path)?;
+                    Ok(Box::new(ArrowEngineData::new(batch)) as _)
+                })
+                .boxed();
+            Ok::<_, Error>(tagged)
+        }
     });
 
-    // create a stream from that iterator which buffers up to `buffer_size` futures at a time
+    // Create a stream from that iterator which buffers up to `buffer_size` futures at a time.
     let result_stream = stream::iter(file_futures)
         .buffered(buffer_size)
-        .try_flatten()
-        .map_ok(|record_batch| -> Box<dyn EngineData> {
-            Box::new(ArrowEngineData::new(record_batch))
-        });
+        .try_flatten();
 
     Ok(Box::pin(result_stream))
 }
