@@ -226,7 +226,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 object_store.clone(),
                 task_executor.clone(),
             )),
-            parquet: Arc::new(DefaultParquetHandler::new(object_store.clone(), task_executor)),
+            parquet: Arc::new(DefaultParquetHandler::new(
+                object_store.clone(),
+                task_executor,
+            )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
             metrics_reporter,
@@ -242,7 +245,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
-        write_config: &crate::ParquetWriterConfig,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
@@ -259,7 +261,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 partition_values,
                 Some(write_context.stats_columns()),
-                write_config,
             )
             .await
     }

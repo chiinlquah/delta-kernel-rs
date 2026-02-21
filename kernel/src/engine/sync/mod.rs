@@ -32,7 +32,7 @@ impl SyncEngine {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }

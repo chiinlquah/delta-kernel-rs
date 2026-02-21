@@ -1,6 +1,6 @@
 use crate::content_tree::ContentTreeNode;
 use crate::path::ParsedLogPath;
-use crate::{DeltaResult, Engine, ParquetCompression, ParquetWriterConfig};
+use crate::{DeltaResult, Engine};
 use url::Url;
 
 /// Orchestrates the process of creating a V3 checkpoint for a table.
@@ -45,12 +45,9 @@ impl ContentTreeNodeWriter {
         let path = self.checkpoint_path()?;
         let data_iter = self.metadata.data.into_iter().map(Ok);
 
-        let write_config = ParquetWriterConfig {
-            compression: ParquetCompression::Zstd,
-        };
         engine
             .parquet_handler()
-            .write_parquet_file(path.clone(), Box::new(data_iter), &write_config)?;
+            .write_parquet_file(path.clone(), Box::new(data_iter))?;
 
         Ok(path)
     }
