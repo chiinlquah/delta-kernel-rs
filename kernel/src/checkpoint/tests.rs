@@ -831,6 +831,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
             &ArrowEngineData::new(data),
             write_context.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
     txn.add_files(add_files_metadata);
