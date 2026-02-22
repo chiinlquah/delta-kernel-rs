@@ -164,6 +164,9 @@ pub use content_tree::{
 };
 // Export metadata reader for testing
 pub use content_tree::reader::ContentTreeNodeEntryVisitor;
+// Benchmarking infrastructure (only public for benchmarks and tests)
+#[cfg(any(test, feature = "internal-api"))]
+pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;

@@ -3,9 +3,13 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
-use crate::arrow::array::types::{Int32Type, Int64Type};
+use crate::arrow::array::types::{
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    TimestampMicrosecondType,
+};
 use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
+    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
+    StructArray,
 };
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
@@ -13,7 +17,7 @@ use crate::arrow::datatypes::{
 };
 use crate::engine_data::{EngineData, EngineList, EngineMap, EngineStruct, GetData, RowVisitor};
 use crate::expressions::{ArrayData, Scalar, StructData};
-use crate::schema::{ColumnName, DataType, SchemaRef, StructField};
+use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef, StructField};
 use crate::{DeltaResult, Error};
 
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
@@ -129,11 +133,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let mut result = vec![];
-        for i in 0..EngineList::len(self, row_index) {
-            result.push(self.get(row_index, i));
-        }
-        result
+        (0..EngineList::len(self, row_index))
+            .map(|i| self.get(row_index, i))
+            .collect()
     }
 }
 
@@ -391,6 +393,16 @@ impl ProvidesColumnsAndFields for StructArray {
     }
 }
 
+/// Tracks the state of a column during extraction
+enum ColumnState<'a> {
+    /// Parent path used for traversal into nested structs
+    Parent,
+    /// Leaf column awaiting a getter to be extracted
+    AwaitingGetter(&'a DataType),
+    /// Leaf column with getter successfully extracted
+    HasGetter(&'a dyn GetData<'a>),
+}
+
 impl EngineData for ArrowEngineData {
     fn len(&self) -> usize {
         self.data.num_rows()
@@ -412,32 +424,48 @@ impl EngineData for ArrowEngineData {
             .with_backtrace());
         }
 
-        // Build a map of column paths to their expected types.
-        // - For parent paths (non-leaf), the value is None (used for traversal into nested structs)
-        // - For leaf columns, the value is Some(&DataType) (used for type validation)
-        // This allows extract_columns to look up the expected type by column name instead of
-        // using positional indexing, which fixes bugs when columns are found in different order
-        // than they were requested.
+        // Build a map tracking the state of each column path:
+        // - Parent: used for traversal into nested structs
+        // - AwaitingGetter: leaf column that needs a getter extracted
+        // - HasGetter: leaf column with getter successfully extracted (set during extraction)
+        //
+        // This is used to guide our depth-first extraction. If the list contains any non-leaf,
+        // duplicate, or missing column references, the extracted column list will be too
+        // short (error out below).
         let mut column_map = HashMap::new();
 
-        // Add all parent paths with None (for traversal)
-        for column in leaf_columns {
-            for i in 0..(column.len()) {
-                column_map.entry(&column[..i + 1]).or_insert(None);
-            }
-        }
-
-        // Set leaf columns to Some(data_type)
         for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
-            column_map.insert(column.as_ref(), Some(data_type));
+            column_map.insert(column.clone(), ColumnState::AwaitingGetter(data_type));
+            let mut cur_parent = column.parent();
+            while let Some(parent) = cur_parent {
+                column_map
+                    .entry(parent.clone())
+                    .or_insert(ColumnState::Parent);
+                cur_parent = parent.parent();
+            }
         }
         debug!(
             "Column map for selected columns {leaf_columns:?} has {} entries",
             column_map.len()
         );
 
-        let mut getters = vec![];
-        Self::extract_columns(&mut vec![], &mut getters, &column_map, &self.data)?;
+        // Extract all columns, transitioning AwaitingGetter -> HasGetter
+        Self::extract_columns(&mut vec![], &mut column_map, &self.data)?;
+
+        // Extract getters in the requested column order, verifying state transitions
+        let mut getters = Vec::with_capacity(leaf_columns.len());
+        for column in leaf_columns {
+            match column_map.get(column.as_ref()) {
+                Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
+                _ => {
+                    return Err(Error::MissingColumn(format!(
+                        "Column {} not found in the data",
+                        column
+                    )));
+                }
+            }
+        }
+
         if getters.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
                 "Visitor expected {} leaf columns, but only {} were found in the data",
@@ -501,147 +529,44 @@ impl EngineData for ArrowEngineData {
     }
 }
 
-/// Implement GetData for RunArray directly, so we can return it as a trait object
-/// without needing a wrapper struct or Box::leak.
-///
-/// This implementation supports multiple value types (strings, integers, booleans, etc.)
-/// by runtime downcasting of the values array.
-impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
-    fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        // Downcast values to StringArray
-        let values = self
-            .values()
-            .as_any()
-            .downcast_ref::<crate::arrow::array::StringArray>()
-            .ok_or_else(|| Error::generic("Expected StringArray values in RunArray"))?;
-
-        if values.is_null(physical_idx) {
-            Ok(None)
-        } else {
-            Ok(Some(values.value(physical_idx)))
-        }
-    }
-
-    fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        // Downcast values to Int32Array
-        let values = self
-            .values()
-            .as_primitive_opt::<Int32Type>()
-            .ok_or_else(|| Error::generic("Expected Int32Array values in RunArray"))?;
-
-        if values.is_null(physical_idx) {
-            Ok(None)
-        } else {
-            Ok(Some(values.value(physical_idx)))
-        }
-    }
-
-    fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        // Downcast values to Int64Array
-        let values = self
-            .values()
-            .as_primitive_opt::<Int64Type>()
-            .ok_or_else(|| Error::generic("Expected Int64Array values in RunArray"))?;
-
-        if values.is_null(physical_idx) {
-            Ok(None)
-        } else {
-            Ok(Some(values.value(physical_idx)))
-        }
-    }
-
-    fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        // Downcast values to BooleanArray
-        let values = self
-            .values()
-            .as_boolean_opt()
-            .ok_or_else(|| Error::generic("Expected BooleanArray values in RunArray"))?;
-
-        if values.is_null(physical_idx) {
-            Ok(None)
-        } else {
-            Ok(Some(values.value(physical_idx)))
-        }
-    }
-}
-
-/// Helper function to validate row index and get physical index for RunArray.
-///
-/// Returns:
-/// - `Ok(Some(physical_idx))` if the row is valid and not null
-/// - `Ok(None)` if the row is null
-/// - `Err(...)` if the row index is out of bounds
-fn validate_and_get_physical_index(
-    run_array: &crate::arrow::array::RunArray<Int64Type>,
-    row_index: usize,
-    field_name: &str,
-) -> DeltaResult<Option<usize>> {
-    if row_index >= run_array.len() {
-        return Err(Error::generic(format!(
-            "Row index {} out of bounds for field '{}'",
-            row_index, field_name
-        )));
-    }
-
-    if !run_array.is_valid(row_index) {
-        return Ok(None);
-    }
-
-    // Map logical index to physical index through run ends
-    let physical_idx = run_array.run_ends().get_physical_index(row_index);
-    Ok(Some(physical_idx))
-}
-
 impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
-        getters: &mut Vec<&'a dyn GetData<'a>>,
-        column_map: &HashMap<&[String], Option<&DataType>>,
+        column_map: &mut HashMap<ColumnName, ColumnState<'a>>,
         data: &'a dyn ProvidesColumnsAndFields,
     ) -> DeltaResult<()> {
         for (column, field) in data.columns().iter().zip(data.fields()) {
             path.push(field.name().to_string());
-            if let Some(type_option) = column_map.get(&path[..]) {
-                if let Some(struct_array) = column.as_struct_opt() {
-                    // Check if the expected type is Struct - if so, extract the struct as a whole
-                    // Otherwise, recurse into the struct to extract nested fields
-                    if matches!(type_option, Some(DataType::Struct(_))) {
-                        debug!("Pushing struct array for {}", ColumnName::new(path.iter()));
-                        getters.push(struct_array);
-                    } else {
-                        debug!(
-                            "Recurse into a struct array for {}",
-                            ColumnName::new(path.iter())
-                        );
-                        Self::extract_columns(path, getters, column_map, struct_array)?;
+
+            // Check if this path is in our column map and mutate state if needed
+            if let Some(state) = column_map.get_mut(path.as_slice()) {
+                match state {
+                    ColumnState::Parent => {
+                        // Parent path - recurse if it's a struct
+                        if let Some(struct_array) = column.as_struct_opt() {
+                            debug!(
+                                "Recurse into a struct array for {}",
+                                ColumnName::new(path.iter())
+                            );
+                            Self::extract_columns(path, column_map, struct_array)?;
+                        }
                     }
-                } else if column.data_type() == &ArrowDataType::Null {
-                    debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
-                    getters.push(&());
-                } else if let Some(data_type) = type_option {
-                    // Leaf column with expected type - look up type by name instead of position
-                    let getter = Self::extract_leaf_column(path, data_type, column)?;
-                    getters.push(getter);
+                    ColumnState::AwaitingGetter(data_type) => {
+                        // Leaf column - extract and transition to HasGetter
+                        let getter = if column.data_type() == &ArrowDataType::Null {
+                            debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
+                            &() as &'a dyn GetData<'a>
+                        } else {
+                            Self::extract_leaf_column(path, data_type, column)?
+                        };
+                        *state = ColumnState::HasGetter(getter);
+                    }
+                    ColumnState::HasGetter(_) => {
+                        return Err(Error::internal_error(format!(
+                            "Column {} already has a getter - duplicate column?",
+                            ColumnName::new(path.iter())
+                        )));
+                    }
                 }
                 // If type_option is None, it's a parent path with no leaf to extract - skip
             } else {
@@ -650,6 +575,19 @@ impl ArrowEngineData {
             path.pop();
         }
         Ok(())
+    }
+
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
+    /// This reduces boilerplate by handling the common pattern of trying direct access first,
+    /// then falling back to RunArray if the column is REE-encoded.
+    fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
+        match col.data_type() {
+            ArrowDataType::RunEndEncoded(_, _) => col
+                .as_any()
+                .downcast_ref::<RunArray<Int64Type>>()
+                .map(|run_array| run_array as &'a dyn GetData<'a>),
+            _ => None,
+        }
     }
 
     fn extract_leaf_column<'a>(
@@ -675,50 +613,68 @@ impl ArrowEngineData {
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
-                col.as_boolean_opt().map(|a| a as _).ok_or("bool")
+                col.as_boolean_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("bool")
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                // Try as direct string array first
-                if let Some(array) = col.as_string_opt() {
-                    Ok(array as _)
-                } else {
-                    // Check if it's RLE-encoded (RunEndEncoded with Utf8 values)
-                    use crate::arrow::array::RunArray;
-                    use crate::arrow::datatypes::DataType as ArrowDataType;
-
-                    match col.data_type() {
-                        ArrowDataType::RunEndEncoded(_, _) => {
-                            // RunArray implements GetData directly, so we can return it as a trait object
-                            // Just like StringArray - no wrapper struct or Box::leak needed!
-                            if let Some(run_array) =
-                                col.as_any().downcast_ref::<RunArray<Int64Type>>()
-                            {
-                                Ok(run_array as &'a dyn GetData<'a>)
-                            } else {
-                                // Error will be formatted by map_err to include column path and actual type
-                                Err("string (RLE-encoded)")
-                            }
-                        }
-                        _ => Err("string"),
-                    }
-                }
+                col.as_string_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("string")
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
-                col.as_binary_opt().map(|a| a as _).ok_or("binary")
+                col.as_binary_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("binary")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
+            }
+            &DataType::FLOAT => {
+                debug!("Pushing float array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Float32Type>()
+                    .map(|a| a as _)
+                    .ok_or("float")
+            }
+            &DataType::DOUBLE => {
+                debug!("Pushing double array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Float64Type>()
+                    .map(|a| a as _)
+                    .ok_or("double")
+            }
+            &DataType::DATE => {
+                debug!("Pushing date array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Date32Type>()
+                    .map(|a| a as _)
+                    .ok_or("date")
+            }
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
+                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<TimestampMicrosecondType>()
+                    .map(|a| a as _)
+                    .ok_or("timestamp")
+            }
+            DataType::Primitive(PrimitiveType::Decimal(_)) => {
+                debug!("Pushing decimal array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Decimal128Type>()
+                    .map(|a| a as _)
+                    .ok_or("decimal")
             }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
@@ -751,16 +707,17 @@ mod tests {
     use std::sync::Arc;
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
-    use crate::arrow::array::types::Int32Type;
+    use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
-        Array, AsArray, Int32Array, MapArray, RecordBatch, StringArray, StructArray,
+        Array, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch,
+        RunArray, StringArray, StructArray,
     };
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::EngineMap;
+    use crate::engine_data::{EngineMap, GetData};
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
@@ -1271,77 +1228,62 @@ mod tests {
     }
 
     #[test]
-    fn test_struct_extraction_via_get_data() -> DeltaResult<()> {
+    fn test_column_ordering_independence() -> DeltaResult<()> {
         use crate::arrow::array::StructArray;
-        use crate::engine_data::{GetData, RowVisitor, TypedGetData};
-        use crate::expressions::{ColumnName, StructData};
-        use std::sync::LazyLock;
+        use crate::engine_data::{GetData, TypedGetData};
+        use crate::schema::ColumnName;
 
-        // Create a struct array with nested data
-        let inner_fields = vec![
-            ArrowField::new("num_records", ArrowDataType::Int64, true),
-            ArrowField::new("flag", ArrowDataType::Boolean, true),
+        // Schema: field_a, field_b, nested.x, nested.y
+        let nested_fields = vec![
+            ArrowField::new("x", ArrowDataType::Int32, false),
+            ArrowField::new("y", ArrowDataType::Int32, false),
         ];
-        let inner_struct_type = ArrowDataType::Struct(inner_fields.clone().into());
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new("stats", inner_struct_type.clone(), true),
-        ]));
-
-        // Create the inner struct array
-        let num_records_array = crate::arrow::array::Int64Array::from(vec![
-            Some(100i64),
-            Some(200i64),
-            None, // null value
-        ]);
-        let flag_array =
-            crate::arrow::array::BooleanArray::from(vec![Some(true), Some(false), Some(true)]);
-
-        let stats_struct = StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("num_records", ArrowDataType::Int64, true)),
-                Arc::new(num_records_array) as crate::arrow::array::ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new("flag", ArrowDataType::Boolean, true)),
-                Arc::new(flag_array) as crate::arrow::array::ArrayRef,
-            ),
-        ]);
-
-        let path_array = StringArray::from(vec!["file1.parquet", "file2.parquet", "file3.parquet"]);
-
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("field_a", ArrowDataType::Int32, false),
+                ArrowField::new("field_b", ArrowDataType::Int32, false),
+                ArrowField::new(
+                    "nested",
+                    ArrowDataType::Struct(nested_fields.clone().into()),
+                    false,
+                ),
+            ])),
             vec![
-                Arc::new(path_array) as crate::arrow::array::ArrayRef,
-                Arc::new(stats_struct) as crate::arrow::array::ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(StructArray::try_new(
+                    nested_fields.into(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![100, 200])),
+                        Arc::new(Int32Array::from(vec![1000, 2000])),
+                    ],
+                    None,
+                )?),
             ],
         )?;
 
-        let arrow_data = ArrowEngineData::new(batch);
+        // Column names requested in reverse order (not schema order)
+        use std::sync::LazyLock;
+        static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+            vec![
+                ColumnName::new(["nested", "y"]),
+                ColumnName::new(["field_b"]),
+                ColumnName::new(["nested", "x"]),
+                ColumnName::new(["field_a"]),
+            ]
+        });
 
-        // Create a visitor that extracts struct data
-        struct StructVisitor {
-            entries: Vec<(String, Option<StructData>)>,
+        struct Visitor {
+            values: Vec<(i32, i32, i32, i32)>,
         }
-
-        impl RowVisitor for StructVisitor {
+        impl crate::engine_data::RowVisitor for Visitor {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
-                static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["path"]), ColumnName::new(["stats"])]);
-                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
-                    vec![
-                        DataType::STRING,
-                        DataType::Struct(Box::new(StructType::new_unchecked(vec![
-                            StructField::nullable("num_records", DataType::LONG),
-                            StructField::nullable("flag", DataType::BOOLEAN),
-                        ]))),
-                    ]
-                });
-                (&NAMES, &TYPES)
+                use std::sync::LazyLock;
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![DataType::INTEGER; 4]);
+                (&REQUESTED_COLUMNS, &TYPES)
             }
 
             fn visit<'a>(
@@ -1349,51 +1291,23 @@ mod tests {
                 row_count: usize,
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
-                assert_eq!(getters.len(), 2);
                 for i in 0..row_count {
-                    let path: String = getters[0].get(i, "path")?;
-                    let stats: Option<StructData> = getters[1].get_opt(i, "stats")?;
-                    self.entries.push((path, stats));
+                    self.values.push((
+                        getters[0].get(i, "nested.y")?,
+                        getters[1].get(i, "field_b")?,
+                        getters[2].get(i, "nested.x")?,
+                        getters[3].get(i, "field_a")?,
+                    ));
                 }
                 Ok(())
             }
         }
 
-        let mut visitor = StructVisitor { entries: vec![] };
-        arrow_data.visit_rows(
-            &[ColumnName::new(["path"]), ColumnName::new(["stats"])],
-            &mut visitor,
-        )?;
+        let mut visitor = Visitor { values: vec![] };
+        ArrowEngineData::new(batch).visit_rows(&REQUESTED_COLUMNS, &mut visitor)?;
 
-        // Verify the extracted data
-        assert_eq!(visitor.entries.len(), 3);
-
-        // First row: file1.parquet with stats {num_records: 100, flag: true}
-        assert_eq!(visitor.entries[0].0, "file1.parquet");
-        let stats0 = visitor.entries[0]
-            .1
-            .as_ref()
-            .expect("stats should be present");
-        assert_eq!(stats0.fields().len(), 2);
-        assert_eq!(stats0.fields()[0].name(), "num_records");
-        assert_eq!(stats0.fields()[1].name(), "flag");
-
-        // Second row: file2.parquet with stats {num_records: 200, flag: false}
-        assert_eq!(visitor.entries[1].0, "file2.parquet");
-        let stats1 = visitor.entries[1]
-            .1
-            .as_ref()
-            .expect("stats should be present");
-        assert_eq!(stats1.fields().len(), 2);
-
-        // Third row: file3.parquet with stats {num_records: null, flag: true}
-        assert_eq!(visitor.entries[2].0, "file3.parquet");
-        let stats2 = visitor.entries[2]
-            .1
-            .as_ref()
-            .expect("stats should be present");
-        assert_eq!(stats2.fields().len(), 2);
-
+        // Verify values match requested order, not schema order
+        assert_eq!(visitor.values, vec![(1000, 10, 100, 1), (2000, 20, 200, 2)]);
         Ok(())
     }
 
@@ -1543,6 +1457,55 @@ mod tests {
     }
 
     #[test]
+    fn test_visit_duplicate_column_error() -> DeltaResult<()> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create batch with simple columns
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("field_a", ArrowDataType::Int32, false),
+                ArrowField::new("field_a", ArrowDataType::Int32, false), // Duplicate column name
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+
+        // Request the duplicate column
+        static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> =
+            LazyLock::new(|| vec![ColumnName::new(["field_a"])]);
+
+        struct DummyVisitor;
+        impl RowVisitor for DummyVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::INTEGER]);
+                (&REQUESTED_COLUMNS, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                _row_count: usize,
+                _getters: &[&'a dyn crate::engine_data::GetData<'a>],
+            ) -> DeltaResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut visitor = DummyVisitor;
+        let result = ArrowEngineData::new(batch).visit_rows(&REQUESTED_COLUMNS, &mut visitor);
+
+        assert_result_error_with_message(
+            result,
+            "Column field_a already has a getter - duplicate column?",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_run_array_out_of_bounds_errors() -> DeltaResult<()> {
         use crate::arrow::array::types::Int64Type;
         use crate::arrow::array::{RunArray, StringArray};
@@ -1570,6 +1533,49 @@ mod tests {
         let err_msg = err.to_string();
         assert!(err_msg.contains("out of bounds"));
         assert!(err_msg.contains("another_field"));
+
+        // Test that out of bounds errors include field name for all types
+        let run_ends = Int64Array::from(vec![2]);
+
+        // Test str
+        let str_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &StringArray::from(vec!["test"]))?;
+        let err_msg = str_array.get_str(2, "str_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("str_field"));
+
+        // Test int
+        let int_array = RunArray::<Int64Type>::try_new(&run_ends, &Int32Array::from(vec![42]))?;
+        let err_msg = int_array.get_int(5, "int_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("int_field"));
+
+        // Test long
+        let long_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &Int64Array::from(vec![100i64]))?;
+        let err_msg = long_array
+            .get_long(3, "long_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("long_field"));
+
+        // Test bool
+        let bool_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &BooleanArray::from(vec![true]))?;
+        let err_msg = bool_array
+            .get_bool(2, "bool_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("bool_field"));
+
+        // Test binary
+        let binary_array = RunArray::<Int64Type>::try_new(
+            &run_ends,
+            &BinaryArray::from(vec![Some(b"data".as_ref())]),
+        )?;
+        let err_msg = binary_array
+            .get_binary(4, "binary_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("binary_field"));
 
         Ok(())
     }
@@ -1599,6 +1605,146 @@ mod tests {
         // Verify the RLE efficiency: 1000 logical rows, only 2 physical values
         assert_eq!(run_array.len(), 1000);
         assert_eq!(run_array.values().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_extraction_via_visitor() -> DeltaResult<()> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create RunArray columns with pattern: [val1, val1, null, null, val2]
+        // Per Arrow spec: nulls are encoded as runs in the values child array
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
+        let mk_field = |name, dt| {
+            ArrowField::new(
+                name,
+                ArrowDataType::RunEndEncoded(
+                    Arc::new(ArrowField::new("run_ends", ArrowDataType::Int64, false)),
+                    Arc::new(ArrowField::new("values", dt, true)),
+                ),
+                true,
+            )
+        };
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &StringArray::from(vec![Some("a"), None, Some("b")]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &Int32Array::from(vec![Some(1), None, Some(2)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &Int64Array::from(vec![Some(10i64), None, Some(20)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BooleanArray::from(vec![Some(true), None, Some(false)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BinaryArray::from(vec![Some(b"x".as_ref()), None, Some(b"y".as_ref())]),
+            )?),
+        ];
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            mk_field("s", ArrowDataType::Utf8),
+            mk_field("i", ArrowDataType::Int32),
+            mk_field("l", ArrowDataType::Int64),
+            mk_field("b", ArrowDataType::Boolean),
+            mk_field("bin", ArrowDataType::Binary),
+        ]));
+
+        let arrow_data = ArrowEngineData::new(RecordBatch::try_new(schema, columns)?);
+
+        type Row = (
+            Option<String>,
+            Option<i32>,
+            Option<i64>,
+            Option<bool>,
+            Option<Vec<u8>>,
+        );
+
+        struct TestVisitor {
+            data: Vec<Row>,
+        }
+
+        impl RowVisitor for TestVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static COLUMNS: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
+                    [
+                        ColumnName::new(["s"]),
+                        ColumnName::new(["i"]),
+                        ColumnName::new(["l"]),
+                        ColumnName::new(["b"]),
+                        ColumnName::new(["bin"]),
+                    ]
+                });
+                static TYPES: &[DataType] = &[
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                    DataType::BOOLEAN,
+                    DataType::BINARY,
+                ];
+                (&*COLUMNS, TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.data.push((
+                        getters[0].get_str(i, "s")?.map(|s| s.to_string()),
+                        getters[1].get_int(i, "i")?,
+                        getters[2].get_long(i, "l")?,
+                        getters[3].get_bool(i, "b")?,
+                        getters[4].get_binary(i, "bin")?.map(|b| b.to_vec()),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = TestVisitor { data: vec![] };
+        visitor.visit_rows_of(&arrow_data)?;
+
+        // Verify decompression including nulls: [val1, val1, null, null, val2]
+        let expected = vec![
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (None, None, None, None, None),
+            (None, None, None, None, None),
+            (
+                Some("b".into()),
+                Some(2),
+                Some(20),
+                Some(false),
+                Some(b"y".to_vec()),
+            ),
+        ];
+        assert_eq!(visitor.data, expected);
 
         Ok(())
     }

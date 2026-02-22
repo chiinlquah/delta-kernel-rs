@@ -161,6 +161,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
         checkpoint_info,
+        false,
     )
     .unwrap();
     let mut batch_count = 0;

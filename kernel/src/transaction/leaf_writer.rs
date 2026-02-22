@@ -1639,7 +1639,6 @@ mod tests {
                     StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             ),
-            StructField::nullable("stats_parsed", DataType::struct_type_unchecked(vec![])),
         ]));
 
         // Create arrays
@@ -1774,9 +1773,6 @@ mod tests {
             ),
         ]);
 
-        // Create an empty stats_parsed struct array (no fields, all null)
-        let stats_parsed_struct = StructArray::new_empty_fields(num_files, None);
-
         let batch = RecordBatch::try_new(
             Arc::new(TryFromKernel::try_from_kernel(scan_schema.as_ref())?),
             vec![
@@ -1786,7 +1782,6 @@ mod tests {
                 Arc::new(stats_array) as ArrayRef,
                 Arc::new(deletion_vector_struct) as ArrayRef,
                 Arc::new(file_constant_values_struct) as ArrayRef,
-                Arc::new(stats_parsed_struct) as ArrayRef,
             ],
         )?;
 
