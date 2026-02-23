@@ -2670,7 +2670,11 @@ impl From<TrackingStatus> for Scalar {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct ContentInfo {
+pub(crate) struct DvInfo {
+    /// Path to location that DV is stored in.
+    #[field_id = 152]
+    pub(crate) location: String 
+
     /// The offset in the file where the content starts.
     #[field_id = 144]
     pub(crate) offset: i64,
@@ -2679,6 +2683,9 @@ pub(crate) struct ContentInfo {
     /// required if content_offset is present.
     #[field_id = 145]
     pub(crate) size_in_bytes: i64,
+
+    #[field_id = 153]
+    pub(crate) cardinality: i64
 }
 
 #[allow(dead_code)]
@@ -2804,8 +2811,9 @@ pub struct ContentTreeNodeEntry {
     #[field_id = 147]
     pub tracking_info: Option<TrackingInfo>,
 
+    
     #[field_id = 148]
-    pub(crate) content_info: Option<ContentInfo>,
+    pub(crate) dv_info: Option<DvInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     #[field_id = 149]
@@ -2838,8 +2846,9 @@ pub struct ContentTreeNodeEntry {
 
     /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
-    #[field_id = 143]
-    pub referenced_file: Option<String>,
+    /// TODO: place holder for referenced file which is no longer necessary.
+    /// #[field_id = 143]
+    /// pub referenced_file: Option<String>,
 
     /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
@@ -2868,6 +2877,7 @@ pub struct ContentTreeNodeEntry {
     #[field_id = 151]
     pub(crate) manifest_dv: Option<Bytes>,
 }
+
 
 impl ContentTreeNodeEntry {
     /// Returns ContentTreeNodeEntry schema augmented with metadata columns for tracking.
