@@ -1,7 +1,7 @@
 //! Builder for creating new Delta tables.
 //!
 //! This module contains [`CreateTableTransactionBuilder`], which validates and constructs a
-//! [`CreateTableTransaction`] from user-provided schema, properties, and data layout options.
+//! [`CreateTableTransaction`](super::super::create_table::CreateTableTransaction) from user-provided schema, properties, and data layout options.
 //!
 //! Use [`create_table()`](super::super::create_table::create_table) as the entry point rather
 //! than constructing the builder directly.
@@ -384,7 +384,7 @@ fn validate_extract_table_features_and_properties(
 
 /// Builder for configuring a new Delta table.
 ///
-/// Use this to configure table properties before building a [`CreateTableTransaction`].
+/// Use this to configure table properties before building a [`CreateTableTransaction`](super::super::create_table::CreateTableTransaction).
 /// If the table build fails, no transaction will be created.
 ///
 /// Created via [`create_table()`](super::super::create_table::create_table).
@@ -482,9 +482,9 @@ impl CreateTableTransactionBuilder {
         self
     }
 
-    /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
+    /// Builds a [`CreateTableTransaction`](super::super::create_table::CreateTableTransaction) that can be committed to create the table.
     ///
-    /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
+    /// The returned [`CreateTableTransaction`](super::super::create_table::CreateTableTransaction) only exposes operations that are valid for
     /// table creation. Operations like removing files, removing domain metadata, or updating
     /// deletion vectors are not available, preventing misuse at compile time.
     ///
