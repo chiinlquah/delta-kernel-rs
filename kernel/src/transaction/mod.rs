@@ -3482,7 +3482,7 @@ mod tests {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::content_tree::{
-            ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, TrackingInfo,
+            ContentTreeNodeEntry, DataContentType, DataFileFormat, ContentInfo, TrackingInfo,
             TrackingStatus,
         };
         use crate::engine::sync::SyncEngine;

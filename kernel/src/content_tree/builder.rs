@@ -5,7 +5,7 @@ use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_co
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
-    DataFileFormat, DvInfo, TrackingInfo, TrackingStatus,
+    DataFileFormat, ContentInfo, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -77,14 +77,14 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// - `size_in_bytes` represents the total blob size including all framing
 /// - This includes the size prefix + bitmap data + CRC checksum
 ///
-/// Therefore, when converting from Delta to Iceberg's [`DvInfo`], we add 8 bytes
+/// Therefore, when converting from Delta to Iceberg's [`ContentInfo`], we add 8 bytes
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
 /// # Returns
-/// A [`DvInfo`] containing the DV location and size information.
+/// A [`ContentInfo`] containing the DV location and size information.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<DvInfo> {
+) -> DeltaResult<ContentInfo> {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
@@ -105,7 +105,7 @@ pub(crate) fn extract_deletion_vector_content(
     // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
     // - 4 bytes: size prefix
     // - 4 bytes: CRC checksum
-    Ok(DvInfo {
+    Ok(ContentInfo {
         location,
         offset: dv.offset.map(|v| v as i64).unwrap_or(0),
         size_in_bytes: dv.size_in_bytes as i64 + 8,
@@ -459,7 +459,7 @@ impl ContentTreeNodeBuilder {
         content_stats: Option<StructData>,
         version: Version,
         snapshot_id: Option<i64>,
-        dv_info: Option<DvInfo>,
+        content_info: Option<ContentInfo>,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(path.clone()) {
@@ -495,7 +495,7 @@ impl ContentTreeNodeBuilder {
             }),
 
             // DV info inline (from deletion vector if present)
-            dv_info,
+            content_info,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -594,7 +594,7 @@ impl ContentTreeNodeBuilder {
             }),
 
             // DV info inline (from deletion vector if present)
-            dv_info: dv_content,
+            content_info: dv_content,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -1349,7 +1349,7 @@ impl ContentTreeNodeBuilder {
             }),
 
             // DV info is inline on data entries inside the manifest, not on the manifest entry itself
-            dv_info: None,
+            content_info: None,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -2258,7 +2258,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -2287,7 +2287,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 150,
@@ -2403,7 +2403,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -2447,18 +2447,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path
         assert_eq!(
-            dv_info.location,
+            content_info.location,
             "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(dv_info.offset, 4);
-        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(dv_info.cardinality, 6);
+        assert_eq!(content_info.offset, 4);
+        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(content_info.cardinality, 6);
 
         Ok(())
     }
@@ -2478,18 +2478,18 @@ mod tests {
             cardinality: 2,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path (no prefix directory)
         assert_eq!(
-            dv_info.location,
+            content_info.location,
             "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(dv_info.offset, 1);
-        assert_eq!(dv_info.size_in_bytes, 44); // 36 + 8
-        assert_eq!(dv_info.cardinality, 2);
+        assert_eq!(content_info.offset, 1);
+        assert_eq!(content_info.size_in_bytes, 44); // 36 + 8
+        assert_eq!(content_info.cardinality, 2);
 
         Ok(())
     }
@@ -2508,18 +2508,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let dv_info = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
-            dv_info.location,
+            content_info.location,
             "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8)
-        assert_eq!(dv_info.offset, 4);
-        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(dv_info.cardinality, 6);
+        assert_eq!(content_info.offset, 4);
+        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(content_info.cardinality, 6);
 
         Ok(())
     }
@@ -2590,7 +2590,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -2615,7 +2615,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 200,
@@ -2761,7 +2761,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -2860,7 +2860,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -2946,7 +2946,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -3024,7 +3024,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -3104,7 +3104,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -3187,7 +3187,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 5, // Total entries in the leaf
@@ -3287,7 +3287,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -3500,7 +3500,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -3580,7 +3580,7 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                dv_info: None,
+                content_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
@@ -3666,7 +3666,7 @@ mod tests {
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -3683,7 +3683,7 @@ mod tests {
             location: Some("file2.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -3700,7 +3700,7 @@ mod tests {
             location: Some("file3.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -3762,7 +3762,7 @@ mod tests {
             location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 10,
@@ -3779,7 +3779,7 @@ mod tests {
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
@@ -3829,7 +3829,7 @@ mod tests {
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: Some(DvInfo {
+            content_info: Some(ContentInfo {
                 location: "dv1.bin".to_string(),
                 offset: 0,
                 size_in_bytes: 48,
@@ -3851,7 +3851,7 @@ mod tests {
             location: Some("data2.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 50,
@@ -3898,7 +3898,7 @@ mod tests {
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            dv_info: None,
+            content_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,

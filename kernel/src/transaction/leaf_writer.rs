@@ -457,8 +457,8 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 None
             };
 
-            // Convert DV descriptor to inline DvInfo for storage on the data entry
-            let dv_info = deletion_vector
+            // Convert DV descriptor to inline ContentInfo for storage on the data entry
+            let content_info = deletion_vector
                 .as_ref()
                 .map(crate::content_tree::builder::extract_deletion_vector_content)
                 .transpose()?;
@@ -487,7 +487,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     content_stats,
                     file_version,
                     Some(self.leaf_writer.snapshot_id),
-                    dv_info,
+                    content_info,
                 )?;
             }
         }
@@ -648,7 +648,7 @@ impl LeafNodeWriter {
 
             // In the CombinedManifest model, DV info is stored inline on data entries.
             // DV updates for existing leaf files require re-writing the data entry with
-            // updated dv_info. This is tracked via the dv_id but the actual re-writing
+            // updated content_info. This is tracked via the dv_id but the actual re-writing
             // is not yet implemented (TODO: implement inline DV update for existing entries).
             let _ = dv_id;
 
