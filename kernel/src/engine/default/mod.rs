@@ -265,6 +265,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
+        write_config: &crate::ParquetWriterConfig,
     ) -> DeltaResult<Box<dyn EngineData>> {
         // Validate partition columns exist in the schema and translate logical names to physical names.
         let physical_partition_values: HashMap<String, String> = partition_values
@@ -300,6 +301,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 physical_partition_values,
                 Some(write_context.stats_columns()),
+                write_config,
             )
             .await
     }

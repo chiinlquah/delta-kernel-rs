@@ -452,6 +452,7 @@ async fn write_data_and_check_result_and_stats(
                     data.as_ref().unwrap(),
                     write_context.as_ref(),
                     HashMap::new(),
+                    &Default::default(),
                 )
                 .await
         })
@@ -509,6 +510,7 @@ async fn append_data_and_check_result_and_stats(
                     data.as_ref().unwrap(),
                     write_context.as_ref(),
                     HashMap::new(),
+                    &Default::default(),
                 )
                 .await
         })
@@ -807,6 +809,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
                             HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
+                            &Default::default(),
                         )
                         .await
                 })
@@ -953,6 +956,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                         data.as_ref().unwrap(),
                         write_context.as_ref(),
                         HashMap::new(),
+                        &Default::default(),
                     )
                     .await
             })
@@ -1156,6 +1160,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
 
@@ -1352,6 +1357,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            &Default::default(),
         )
         .await?;
 
@@ -1526,6 +1532,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            &Default::default(),
         )
         .await?;
 
@@ -2002,6 +2009,7 @@ async fn generate_and_add_data_file(
             &ArrowEngineData::new(data),
             write_context.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
     txn.add_files(file_meta);
@@ -2205,6 +2213,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
                         data.as_ref().unwrap(),
                         write_context.as_ref(),
                         HashMap::new(),
+                        &Default::default(),
                     )
                     .await
             })
@@ -3265,6 +3274,7 @@ async fn add_files_to_transaction(
             &ArrowEngineData::new(data),
             write_context.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
     txn.add_files(add_files_metadata);

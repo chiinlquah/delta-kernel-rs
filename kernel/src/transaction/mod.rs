@@ -429,11 +429,24 @@ impl<S> Transaction<S> {
         let commit_version = self.get_commit_version();
 
         // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
+        // TODO: In batch commit mode, DV updates should be recorded in the content tree rather
+        // than written to the delta log (same issue as removes). This requires:
+        // 1. Processing dv_matched_files in the batch commit block of generate_log_actions
+        //    to update the content tree with new DV descriptors.
+        // 2. Suppressing dv_update_actions from the log (similar to how remove_actions are
+        //    suppressed when batch_commit is active).
+        // 3. Including !self.dv_matched_files.is_empty() in is_batch_commit_active()'s
+        //    has_work_to_do check.
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 5: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions =
-            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+        // Step 5: Generate remove actions for the delta log (skipped in batch commit mode, where
+        // removes are recorded in the content tree instead).
+        let batch_commit = self.is_batch_commit_active();
+        let remove_actions = if batch_commit {
+            None
+        } else {
+            Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
+        };
 
         // Step 6: Generate all log actions (commit info, protocol, metadata for create-table,
         // set transactions, domain metadata, add actions)
@@ -447,7 +460,7 @@ impl<S> Transaction<S> {
 
         let filtered_actions = actions
             .into_iter()
-            .chain(remove_actions)
+            .chain(remove_actions.into_iter().flatten())
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
@@ -541,26 +554,7 @@ impl<S> Transaction<S> {
         );
 
         // Handle batch commit - either write to metadata tree or include in JSON log
-        // Batch commit requires the MetadataTreeExperimental writer feature
-        let can_batch_commit = self.batch_commit
-            && self
-                .read_snapshot
-                .table_configuration()
-                .protocol()
-                .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
-
-        // Determine if there's work to do in batch commit mode:
-        // - Files/manifests explicitly added, OR
-        // - Delta log commits to replay (either no content root exists, or content root is behind current version)
-        let has_work_to_do = !self.add_files_metadata.is_empty()
-            || !self.remove_files_metadata.is_empty()
-            || !self.leaf_manifests.is_empty()
-            || self.read_snapshot.content_root().map_or(
-                self.read_snapshot.version() > 0, // No content root: replay needed if version > 0
-                |cr| cr.version < self.read_snapshot.version(), // Content root behind: replay needed
-            );
-
-        if can_batch_commit && has_work_to_do {
+        if self.is_batch_commit_active() {
             // Content metadata trees require column mapping mode to be ID for stable field IDs
             let column_mapping_mode = self
                 .read_snapshot
@@ -746,6 +740,10 @@ impl<S> Transaction<S> {
                     }
                 }
 
+                // Accumulate leaf deletions per manifest path to batch into a single
+                // delete_multiple_from_leaf call per leaf (avoids repeated bitmap |= per file).
+                let mut leaf_deletions: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+
                 // Process each remove batch and mark all files as deleted in the ContentRoot
                 for remove_action_result in
                     self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?
@@ -783,14 +781,16 @@ impl<S> Transaction<S> {
                             .is_some()
                             && remove.delete_manifest_position.is_some();
 
-                        // Use delete_from_leaf for entries in leaf manifests
+                        // Accumulate leaf manifest deletions to batch later
                         if data_in_leaf {
                             if let (Some(manifest_path), Some(position)) = (
                                 remove.data_manifest_path.as_ref(),
                                 remove.data_manifest_position,
                             ) {
-                                metadata_builder
-                                    .delete_from_leaf(manifest_path, position as u64)?;
+                                leaf_deletions
+                                    .entry(manifest_path.clone())
+                                    .or_default()
+                                    .insert(position as u64);
                             }
                         }
 
@@ -799,8 +799,10 @@ impl<S> Transaction<S> {
                                 remove.delete_manifest_path.as_ref(),
                                 remove.delete_manifest_position,
                             ) {
-                                metadata_builder
-                                    .delete_from_leaf(dv_manifest_path, dv_position as u64)?;
+                                leaf_deletions
+                                    .entry(dv_manifest_path.clone())
+                                    .or_default()
+                                    .insert(dv_position as u64);
                             }
                         }
 
@@ -832,6 +834,11 @@ impl<S> Transaction<S> {
                             )?;
                         }
                     }
+                }
+
+                // Flush accumulated leaf deletions: one bulk call per leaf instead of one per file
+                for (manifest_path, indices) in &leaf_deletions {
+                    metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
                 }
             }
 
@@ -1217,6 +1224,27 @@ impl<S> Transaction<S> {
     fn get_commit_version(&self) -> Version {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
+    }
+
+    /// Returns true if this commit will be handled as a batch commit (content tree update).
+    /// When true, add/remove actions are recorded in the content tree rather than the delta log.
+    fn is_batch_commit_active(&self) -> bool {
+        let can_batch_commit = self.batch_commit
+            && self
+                .read_snapshot
+                .table_configuration()
+                .protocol()
+                .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
+        let has_work_to_do = !self.add_files_metadata.is_empty()
+            || !self.remove_files_metadata.is_empty()
+            || !self.leaf_manifests.is_empty()
+            || self
+                .read_snapshot
+                .content_root()
+                .map_or(self.read_snapshot.version() > 0, |cr| {
+                    cr.version < self.read_snapshot.version()
+                });
+        can_batch_commit && has_work_to_do
     }
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
@@ -2950,6 +2978,84 @@ mod tests {
             .filter(|f| !final_files.contains(f))
             .count();
         assert_eq!(removed_count, 1, "Expected exactly 1 file to be removed");
+
+        Ok(())
+    }
+
+    /// Regression test: remove actions must NOT appear in the delta log when using batch commit.
+    /// In batch commit mode, removes are recorded in the content tree (manifest DV), so writing
+    /// them to the log as well would cause double-counting on replay.
+    #[test]
+    fn test_batch_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::committer::FileSystemCommitter;
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Step 1: Create initial table (v0)
+        create_initial_table(&table_root, true)?;
+
+        // Step 2: Build a leaf manifest with 5 data files and write a content root (v1)
+        let mut leaf_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+        let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
+        for path in &data_files {
+            leaf_builder.add(make_add_action(path.clone()), 1, Some(1))?;
+        }
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let mut root_builder =
+            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
+        root_builder.add_entry(leaf_manifest_entry);
+        let root_url = root_builder.write_root(&engine)?;
+        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+
+        // Step 3: Batch-commit a remove (v2)
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let scan = snapshot.clone().scan_builder().build()?;
+
+        let committer = Box::new(FileSystemCommitter::new());
+        let mut txn = snapshot
+            .transaction(committer, &engine)?
+            .with_batch_commit()
+            .with_operation("DELETE".to_string());
+
+        let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
+        if let Some(res) = scan_metadata_iter.next() {
+            let scan_data = res?;
+            let num_rows = scan_data.scan_files.data().len();
+            let mut selection_vector = vec![false; num_rows];
+            if num_rows > 2 {
+                selection_vector[2] = true;
+                let (data, _) = scan_data.scan_files.into_parts();
+                txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+            }
+        }
+
+        match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(_) => {}
+            _ => panic!("Transaction should succeed"),
+        };
+
+        // Step 4: Read the committed log file (v2) and assert no "remove" action is present.
+        // Each line in a Delta log file is a JSON object; a remove action has a top-level "remove" key.
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        let v2_log = std::fs::read_to_string(delta_log_path.join("00000000000000000002.json"))?;
+
+        for line in v2_log.lines() {
+            let json: serde_json::Value = serde_json::from_str(line)?;
+            assert!(
+                json.get("remove").is_none(),
+                "batch commit should not write remove actions to the delta log, but found: {line}"
+            );
+        }
 
         Ok(())
     }
