@@ -6,8 +6,8 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use super::{
-    ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestStats,
-    TrackingInfo, TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestStats, TrackingInfo,
+    TrackingStatus,
 };
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
@@ -43,20 +43,19 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (24 total):
-    // 0: content_type
-    // 1: location
-    // 2: file_format
+    // The getters are in order of flattened leaf fields (25 total):
+    // 0:  content_type
+    // 1:  location
+    // 2:  file_format
     // 3-8: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
-    // 9-10: content_info fields (offset, size_in_bytes)
-    // 11: partition_spec_id
-    // 12: sort_order_id
-    // 13: record_count
-    // 14: file_size_in_bytes
+    // 9-12: dv_info fields (location, offset, size_in_bytes, cardinality)
+    // 13: partition_spec_id
+    // 14: sort_order_id
+    // 15: record_count
+    // 16: file_size_in_bytes
     // (content_stats excluded from schema)
-    // 15-21: manifest_stats fields (7 fields)
-    // 22: referenced_file
-    // 23: manifest_dv
+    // 17-23: manifest_stats fields (7 fields)
+    // 24: manifest_dv
     // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
 
     // Extract content_type
@@ -67,6 +66,7 @@ fn visit_metadata_entry_at<'a>(
         2 => DataContentType::EqualityDeletes,
         3 => DataContentType::DataManifest,
         4 => DataContentType::DeleteManifest,
+        5 => DataContentType::CombinedManifest,
         _ => {
             return Err(Error::generic(format!(
                 "Invalid content_type value: {}",
@@ -117,39 +117,38 @@ fn visit_metadata_entry_at<'a>(
         changes_dv: tracking_changes_dv_bytes,
     });
 
-    // Extract content_info fields
-    let ci_offset: Option<i64> = getters[9].get_opt(row_index, "content_info.offset")?;
-    let ci_size_in_bytes: Option<i64> =
-        getters[10].get_opt(row_index, "content_info.size_in_bytes")?;
-
-    let content_info = ci_offset.map(|offset| ContentInfo {
-        offset,
-        size_in_bytes: ci_size_in_bytes.unwrap_or(0),
-    });
+    // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
+    let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;
+    let dv_info = dv_location.map(|location| -> DeltaResult<DvInfo> {
+        let offset: i64 = getters[10].get(row_index, "dv_info.offset")?;
+        let size_in_bytes: i64 = getters[11].get(row_index, "dv_info.size_in_bytes")?;
+        let cardinality: i64 = getters[12].get(row_index, "dv_info.cardinality")?;
+        Ok(DvInfo { location, offset, size_in_bytes, cardinality })
+    }).transpose()?;
 
     // Extract scalar fields
-    let partition_spec_id: i64 = getters[11].get(row_index, "partition_spec_id")?;
-    let sort_order_id: Option<i64> = getters[12].get_opt(row_index, "sort_order_id")?;
-    let record_count: i64 = getters[13].get(row_index, "record_count")?;
-    let file_size_in_bytes: Option<i64> = getters[14].get_opt(row_index, "file_size_in_bytes")?;
+    let partition_spec_id: i64 = getters[13].get(row_index, "partition_spec_id")?;
+    let sort_order_id: Option<i64> = getters[14].get_opt(row_index, "sort_order_id")?;
+    let record_count: i64 = getters[15].get(row_index, "record_count")?;
+    let file_size_in_bytes: Option<i64> = getters[16].get_opt(row_index, "file_size_in_bytes")?;
 
     // content_stats has no fields, so no getters
 
     // Extract manifest_stats fields
     let ms_added_files_count: Option<i64> =
-        getters[15].get_opt(row_index, "manifest_stats.added_files_count")?;
+        getters[17].get_opt(row_index, "manifest_stats.added_files_count")?;
     let ms_existing_files_count: Option<i64> =
-        getters[16].get_opt(row_index, "manifest_stats.existing_files_count")?;
+        getters[18].get_opt(row_index, "manifest_stats.existing_files_count")?;
     let ms_deletes_files_count: Option<i64> =
-        getters[17].get_opt(row_index, "manifest_stats.deletes_files_count")?;
+        getters[19].get_opt(row_index, "manifest_stats.deletes_files_count")?;
     let ms_added_rows_count: Option<i64> =
-        getters[18].get_opt(row_index, "manifest_stats.added_rows_count")?;
+        getters[20].get_opt(row_index, "manifest_stats.added_rows_count")?;
     let ms_existing_rows_count: Option<i64> =
-        getters[19].get_opt(row_index, "manifest_stats.existing_rows_count")?;
+        getters[21].get_opt(row_index, "manifest_stats.existing_rows_count")?;
     let ms_delete_rows_count: Option<i64> =
-        getters[20].get_opt(row_index, "manifest_stats.delete_rows_count")?;
+        getters[22].get_opt(row_index, "manifest_stats.delete_rows_count")?;
     let ms_min_sequence_number: Option<i64> =
-        getters[21].get_opt(row_index, "manifest_stats.min_sequence_number")?;
+        getters[23].get_opt(row_index, "manifest_stats.min_sequence_number")?;
 
     let manifest_stats = ms_added_files_count.map(|added_files_count| ManifestStats {
         added_files_count,
@@ -161,11 +160,8 @@ fn visit_metadata_entry_at<'a>(
         min_sequence_number: ms_min_sequence_number.unwrap_or(0),
     });
 
-    // Extract referenced_file
-    let referenced_file: Option<String> = getters[22].get_opt(row_index, "referenced_file")?;
-
     // Extract manifest_dv
-    let manifest_dv: Option<&[u8]> = getters[23].get_opt(row_index, "manifest_dv")?;
+    let manifest_dv: Option<&[u8]> = getters[24].get_opt(row_index, "manifest_dv")?;
     let manifest_dv_bytes = manifest_dv.map(Bytes::copy_from_slice);
 
     // Note: The following fields are not currently used by Delta and are not extracted:
@@ -178,14 +174,13 @@ fn visit_metadata_entry_at<'a>(
         location,
         file_format,
         tracking_info,
-        content_info,
+        dv_info,
         partition_spec_id,
         sort_order_id,
         record_count,
         file_size_in_bytes,
         content_stats: None, // Requires table schema to read - not included in base schema
         manifest_stats,
-        referenced_file,
         manifest_dv: manifest_dv_bytes,
         key_metadata: None,  // Not currently used by Delta
         split_offsets: None, // Not currently used by Delta

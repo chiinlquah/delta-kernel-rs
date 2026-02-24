@@ -1,9 +1,7 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::stats::try_pre_convert_stats_column;
-use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
-};
+use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
 use crate::schema::{DataType, StructField, StructType};
@@ -107,15 +105,6 @@ pub struct LeafNodeWriter {
 
     /// Snapshot ID for tracking info
     snapshot_id: i64,
-
-    /// Temporary tracking for DV writes. Value is (data_file_path, dv_descriptor, data_manifest_url).
-    /// data_manifest_url is used to determine affiliation (all DVs reference same manifest = affiliated).
-    /// HashMap of DVUniqueId -> (data_file_path, dv_descriptor, data_manifest_path)
-    /// data_manifest_path is the relative path to the manifest containing the data file
-    deletion_vectors: HashMap<DVUniqueId, (String, DeletionVectorDescriptor, Option<String>)>,
-
-    /// Track if any DVs were added via DvOnly mode. If true, forces unaffiliated DV manifest.
-    has_dv_only_entries: bool,
 
     /// Optional root manifest relative path for validation
     /// Used to prevent updating DVs for files still in the root manifest
@@ -347,7 +336,10 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
             self.add_type,
             AddType::DataFileOnly | AddType::DataFileAndDV
         );
-        let should_extract_dv = matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
+        // Always extract DVs when adding data files; DVOnly mode is no longer supported
+        // in the new CombinedManifest model (DVs are inline on data entries).
+        let should_extract_dv = should_add_data_file
+            || matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
 
         // Check if stats_parsed column is present (getters includes it when include_stats_columns was called)
         let has_stats_parsed = getters.len() > STATS_PARSED_IDX;
@@ -438,7 +430,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 (None, None, None, None, None, None, None)
             };
 
-            // Extract deletion vector if needed
+            // Extract deletion vector info (always, when we're extracting DV data)
             let deletion_vector = if should_extract_dv {
                 // Extract delete manifest metadata (for tracking old DV manifest entries)
                 let delete_manifest_path: Option<String> = getters[DELETE_MANIFEST_PATH_IDX]
@@ -465,7 +457,13 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 None
             };
 
-            // Add data file if needed
+            // Convert DV descriptor to inline DvInfo for storage on the data entry
+            let dv_info = deletion_vector
+                .as_ref()
+                .map(crate::content_tree::builder::extract_deletion_vector_content)
+                .transpose()?;
+
+            // Add data file if needed (with inline DV info)
             if should_add_data_file {
                 // Safety: When should_add_data_file is true, these values are guaranteed to be Some
                 let (Some(_pv), Some(sz), Some(_mt)) = (partition_values, size, modification_time)
@@ -482,24 +480,15 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                     0
                 };
 
-                // Use add_file_with_dedup which takes content_stats directly.
-                // If content_stats is None, the stats from checkpoint JSON will be parsed
-                // by the builder if available.
+                // Use add_file_with_dedup which takes content_stats and inline DV info.
                 self.leaf_writer.data_builder.add_file_with_dedup(
                     path.clone(),
                     sz,
                     content_stats,
                     file_version,
                     Some(self.leaf_writer.snapshot_id),
+                    dv_info,
                 )?;
-            }
-
-            // Track deletion vector if present
-            if let Some(dv) = deletion_vector {
-                let dv_id = create_dv_unique_id(&path, &dv);
-                self.leaf_writer
-                    .deletion_vectors
-                    .insert(dv_id, (path, dv, None));
             }
         }
         Ok(())
@@ -537,8 +526,6 @@ impl LeafNodeWriter {
             root_entries_to_remove: HashSet::new(),
             root_dv_entries_to_remove: HashSet::new(),
             snapshot_id,
-            deletion_vectors: HashMap::new(),
-            has_dv_only_entries: false,
             root_manifest_path,
             track_root_removals,
         }
@@ -634,13 +621,6 @@ impl LeafNodeWriter {
 
         visitor.visit_rows_of(data)?;
 
-        // If we're adding DVOnly, mark that we have DV-only entries
-        // This forces the DV manifest to be unaffiliated since we can't guarantee
-        // that all DVs reference files in the same manifest
-        if add_type == AddType::DVOnly {
-            self.has_dv_only_entries = true;
-        }
-
         Ok(())
     }
 
@@ -666,24 +646,16 @@ impl LeafNodeWriter {
 
             let dv_id = create_dv_unique_id(&dv_update.data_file_path, &dv_update.dv_descriptor);
 
-            // Store the DV along with the manifest URL of where its data file lives
-            // This allows us to determine affiliation correctly in write_dv_manifest()
-            let data_manifest_url = Some(dv_update.data_file_location.manifest_path.clone());
-            self.deletion_vectors.insert(
-                dv_id,
-                (
-                    dv_update.data_file_path.clone(),
-                    dv_update.dv_descriptor,
-                    data_manifest_url,
-                ),
-            );
+            // In the CombinedManifest model, DV info is stored inline on data entries.
+            // DV updates for existing leaf files require re-writing the data entry with
+            // updated dv_info. This is tracked via the dv_id but the actual re-writing
+            // is not yet implemented (TODO: implement inline DV update for existing entries).
+            let _ = dv_id;
 
-            // Note: data_file_location tells us where the data file IS, but we're not marking it as deleted!
-            // We're just adding DV information. The data file should remain in its manifest.
-            // manifest_dvs is ONLY for marking entries as deleted (e.g., when moving files between leaves),
-            // which happens in add_existing_actions(), not here.
+            // Note: data_file_location tells us where the data file IS.
+            // manifest_dvs is ONLY for marking entries as deleted (e.g., when moving files between leaves).
 
-            // Enhancement #1: If there was a previous DV in a different DELETE manifest (including root),
+            // Enhancement #1: If there was a previous DV in a DELETE manifest (including root),
             // mark that DV entry as deleted
             if let Some(prev_dv_loc) = dv_update.previous_delete_file_location {
                 let prev_entry = self
@@ -705,18 +677,12 @@ impl LeafNodeWriter {
     /// LeafNodeWriterResult with written manifests and tracking info
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
+        // In the new CombinedManifest model, DV info is inline on data entries,
+        // so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
             let entry = self
                 .data_builder
                 .write_leaf(engine, Some(self.snapshot_id))?;
-            Some(entry)
-        } else {
-            None
-        };
-
-        // Write DV manifest if we have deletion vectors
-        let dv_manifest_entry = if !self.deletion_vectors.is_empty() {
-            let entry = self.write_dv_manifest(engine, data_manifest_entry.as_ref())?;
             Some(entry)
         } else {
             None
@@ -727,108 +693,10 @@ impl LeafNodeWriter {
             root_entries_to_remove: self.root_entries_to_remove,
             root_dv_entries_to_remove: self.root_dv_entries_to_remove,
             data_file_manifest_written: data_manifest_entry,
-            dv_file_manifest_written: dv_manifest_entry,
+            dv_file_manifest_written: None,
         })
     }
 
-    /// Write DV manifest and return ContentTreeNodeEntry.
-    fn write_dv_manifest(
-        &self,
-        engine: &dyn Engine,
-        data_manifest_entry: Option<&ContentTreeNodeEntry>,
-    ) -> DeltaResult<ContentTreeNodeEntry> {
-        // Create a separate ContentTreeNodeBuilder for DVs
-        let mut dv_builder = ContentTreeNodeBuilder::new_for(
-            self.table_root.clone(),
-            self.version,
-            self.table_schema.as_ref().clone(),
-        );
-
-        // Determine affiliation by checking if all DVs reference files in the SAME manifest
-        let this_leaf_data_manifest_url = data_manifest_entry
-            .and_then(|e| e.location.as_ref())
-            .cloned();
-
-        // Collect all unique manifest URLs that our DVs' data files are in
-        let mut manifest_urls: std::collections::HashSet<Option<String>> =
-            std::collections::HashSet::new();
-        for (_, _, data_manifest_url) in self.deletion_vectors.values() {
-            manifest_urls.insert(data_manifest_url.as_ref().map(|u| u.to_string()));
-        }
-
-        // Determine affiliated manifest URL:
-        // - If any DVs were added via DVOnly mode, force unaffiliated (can't guarantee affiliation)
-        // - If all DVs have None (files in THIS leaf), use this_leaf_data_manifest_url
-        // - If all DVs have the same external URL, use that URL
-        // - Otherwise (mixed sources), set to None (unaffiliated)
-        let affiliated_manifest_url = if self.has_dv_only_entries {
-            None // DVOnly entries force unaffiliated manifest
-        } else if manifest_urls.len() == 1 {
-            // Safety: We know there's exactly one element
-            if let Some(single_url) = manifest_urls.iter().next() {
-                match single_url {
-                    None => this_leaf_data_manifest_url,
-                    Some(url) => Some(url.clone()),
-                }
-            } else {
-                None
-            }
-        } else {
-            None // Mixed sources = unaffiliated
-        };
-
-        // Convert DV descriptors to ContentTreeNodeEntry
-        for (data_file_path, dv_descriptor, _) in self.deletion_vectors.values() {
-            let (content_info, location) =
-                crate::content_tree::builder::extract_deletion_vector_content(dv_descriptor)?;
-
-            // Use relative path for referenced_file to match data file paths in manifests
-            // Data file paths are stored as relative, so DV references must also be relative
-            // content_info already has the +8 conversion applied by extract_deletion_vector_content
-            // TODO: Should this at least be offset + size_in_bytes.
-            let file_size = content_info.size_in_bytes;
-
-            let dv_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::PositionDeletes,
-                location: Some(location),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(self.snapshot_id),
-                    // TODO: For newly added DVs, sequence_number and file_sequence_number should be None
-                    // to inherit from the manifest's tracking_info. Only needed for existing DVs.
-                    sequence_number: Some(self.version as i64),
-                    file_sequence_number: Some(self.version as i64),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: Some(content_info),
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: dv_descriptor.cardinality,
-                file_size_in_bytes: Some(file_size),
-                content_stats: None,
-                manifest_stats: None,
-                referenced_file: Some(data_file_path.to_string()),
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
-
-            dv_builder.add_entry(dv_entry);
-        }
-
-        // Write the DV manifest
-        let mut dv_manifest = dv_builder.write_leaf(engine, Some(self.snapshot_id))?;
-
-        // Set referenced_file to indicate if this DV manifest is affiliated with a data manifest.
-        // Affiliated: All DVs reference files in a single data manifest (enables efficient loading)
-        // Unaffiliated: DVs reference files from multiple sources (None)
-        dv_manifest.referenced_file = affiliated_manifest_url;
-
-        Ok(dv_manifest)
-    }
 }
 
 #[cfg(test)]
@@ -1517,7 +1385,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dv_only_forces_unaffiliated() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_no_separate_dv_manifest_in_combined_model() -> Result<(), Box<dyn std::error::Error>> {
+        // In the new CombinedManifest model, DVs are inline on data entries.
+        // No separate DV manifest is written — dv_file_manifest_written is always None.
         let (engine, table_root, schema) = test_setup();
         let version = 1;
         let snapshot_id = 12345;
@@ -1531,45 +1401,21 @@ mod tests {
             None,
         );
 
-        // Verify initially has_dv_only_entries is false
-        assert!(
-            !writer.has_dv_only_entries,
-            "Initially should not have DV-only entries"
+        // Finish an empty writer — dv_file_manifest_written should be None
+        let _ = writer;
+        let writer2 = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
         );
+        let result = writer2.finish(engine.as_ref())?;
 
-        // Simulate DVOnly mode by setting the flag directly
-        // In real usage, this would be set by add_existing_actions with AddType::DVOnly
-        writer.has_dv_only_entries = true;
-
-        // Add a deletion vector (UUID must be at least 20 characters)
-        let dv_descriptor = DeletionVectorDescriptor {
-            storage_type:
-                crate::actions::deletion_vector::DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: "12345678901234567890".to_string(), // 20 chars minimum
-            offset: Some(0),
-            size_in_bytes: 10,
-            cardinality: 5,
-        };
-        let dv_id = create_dv_unique_id("test.parquet", &dv_descriptor);
-        writer
-            .deletion_vectors
-            .insert(dv_id, ("test.parquet".to_string(), dv_descriptor, None));
-
-        // Finish and verify the DV manifest is unaffiliated
-        let result = writer.finish(engine.as_ref())?;
-
-        // VERIFY: DV manifest was written
         assert!(
-            result.dv_file_manifest_written.is_some(),
-            "DV manifest should be written"
-        );
-
-        // VERIFY: DV manifest is unaffiliated (referenced_file is None)
-        let dv_manifest = result.dv_file_manifest_written.unwrap();
-        assert!(
-            dv_manifest.referenced_file.is_none(),
-            "DVOnly mode should create unaffiliated DV manifest (referenced_file should be None), but got: {:?}",
-            dv_manifest.referenced_file
+            result.dv_file_manifest_written.is_none(),
+            "CombinedManifest model does not write separate DV manifests"
         );
 
         Ok(())

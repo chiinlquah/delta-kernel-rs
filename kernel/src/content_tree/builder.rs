@@ -4,8 +4,8 @@ use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
-    DataFileFormat, TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
+    DataFileFormat, DvInfo, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -77,23 +77,15 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// - `size_in_bytes` represents the total blob size including all framing
 /// - This includes the size prefix + bitmap data + CRC checksum
 ///
-/// Therefore, when converting from Delta to Iceberg's [`ContentInfo`], we add 8 bytes
+/// Therefore, when converting from Delta to Iceberg's [`DvInfo`], we add 8 bytes
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
 /// # Returns
-/// A tuple of `(ContentInfo, String)` where the String is the DV file path.
+/// A [`DvInfo`] containing the DV location and size information.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<(ContentInfo, String)> {
+) -> DeltaResult<DvInfo> {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
-    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
-    // - 4 bytes: size prefix
-    // - 4 bytes: CRC checksum
-    let content_info = ContentInfo {
-        offset: dv.offset.map(|v| v as i64).unwrap_or(0),
-        size_in_bytes: dv.size_in_bytes as i64 + 8,
-    };
-
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -110,8 +102,15 @@ pub(crate) fn extract_deletion_vector_content(
             ));
         }
     };
-
-    Ok((content_info, location))
+    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
+    // - 4 bytes: size prefix
+    // - 4 bytes: CRC checksum
+    Ok(DvInfo {
+        location,
+        offset: dv.offset.map(|v| v as i64).unwrap_or(0),
+        size_in_bytes: dv.size_in_bytes as i64 + 8,
+        cardinality: dv.cardinality,
+    })
 }
 
 /// Extracts record_count from content_stats by finding the first column's value_count.
@@ -315,7 +314,9 @@ impl ContentTreeNodeBuilder {
             // Only process manifest entries
             if !matches!(
                 entry.content_type,
-                DataContentType::DataManifest | DataContentType::DeleteManifest
+                DataContentType::DataManifest
+                    | DataContentType::DeleteManifest
+                    | DataContentType::CombinedManifest
             ) {
                 continue;
             }
@@ -458,6 +459,7 @@ impl ContentTreeNodeBuilder {
         content_stats: Option<StructData>,
         version: Version,
         snapshot_id: Option<i64>,
+        dv_info: Option<DvInfo>,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(path.clone()) {
@@ -492,10 +494,8 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
-            content_info: None,
+            // DV info inline (from deletion vector if present)
+            dv_info,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -509,9 +509,6 @@ impl ContentTreeNodeBuilder {
             content_stats,
 
             manifest_stats: None,
-
-            // Path to file where to apply the DV to
-            referenced_file: None,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -580,8 +577,6 @@ impl ContentTreeNodeBuilder {
         let content_stats =
             delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
 
-        let (content_info, referenced_file) = dv_content.unzip();
-
         let data_file_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some(add.path.clone()),
@@ -598,10 +593,8 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
-            content_info,
+            // DV info inline (from deletion vector if present)
+            dv_info: dv_content,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -615,9 +608,6 @@ impl ContentTreeNodeBuilder {
             content_stats,
 
             manifest_stats: None,
-
-            // Path to file where to apply the DV to
-            referenced_file,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -933,7 +923,9 @@ impl ContentTreeNodeBuilder {
         // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
-            DataContentType::DataManifest | DataContentType::DeleteManifest
+            DataContentType::DataManifest
+                | DataContentType::DeleteManifest
+                | DataContentType::CombinedManifest
         ) {
             if let Some(ref location) = entry.location {
                 // Get total entry count from manifest_stats for bounds checking
@@ -977,9 +969,9 @@ impl ContentTreeNodeBuilder {
     /// * `file_path` - The file path to match against entry locations
     pub(crate) fn remove_data_file(&mut self, file_path: &str) -> DeltaResult<()> {
         self.pending_entries.retain(|entry| {
-            // Only match data files (location matches, no referenced_file)
-            let is_data_file =
-                entry.location.as_deref() == Some(file_path) && entry.referenced_file.is_none();
+            // Only match data files (location matches, content type is Data)
+            let is_data_file = entry.location.as_deref() == Some(file_path)
+                && entry.content_type == DataContentType::Data;
             !is_data_file
         });
 
@@ -999,9 +991,8 @@ impl ContentTreeNodeBuilder {
     /// * `dv_identifier` - The DV path to match (can be location or referenced file)
     pub(crate) fn remove_dv(&mut self, dv_identifier: &str) -> DeltaResult<()> {
         self.pending_entries.retain(|entry| {
-            // Match DVs by location OR referenced_file
-            let is_dv = entry.location.as_deref() == Some(dv_identifier)
-                || entry.referenced_file.as_deref() == Some(dv_identifier);
+            // Match DVs by location (DV info is now inline on data entries)
+            let is_dv = entry.location.as_deref() == Some(dv_identifier);
             !is_dv
         });
 
@@ -1037,7 +1028,9 @@ impl ContentTreeNodeBuilder {
             .filter(|entry| {
                 !matches!(
                     entry.content_type,
-                    DataContentType::DataManifest | DataContentType::DeleteManifest
+                    DataContentType::DataManifest
+                        | DataContentType::DeleteManifest
+                        | DataContentType::CombinedManifest
                 )
             })
             .filter_map(|entry| entry.location.clone())
@@ -1048,7 +1041,9 @@ impl ContentTreeNodeBuilder {
             // Remove actual data/DV entries from root
             matches!(
                 entry.content_type,
-                DataContentType::DataManifest | DataContentType::DeleteManifest
+                DataContentType::DataManifest
+                    | DataContentType::DeleteManifest
+                    | DataContentType::CombinedManifest
             )
         });
 
@@ -1091,7 +1086,6 @@ impl ContentTreeNodeBuilder {
             // Check if this entry matches the file path or deletion vector path
             let matches = if let Some(path) = file_path {
                 entry.location.as_deref() == Some(path)
-                    || entry.referenced_file.as_deref() == Some(path)
             } else if let Some(dv) = dv_path {
                 entry.location.as_deref() == Some(dv)
             } else {
@@ -1338,24 +1332,8 @@ impl ContentTreeNodeBuilder {
                 .map(|e| e.content_stats.as_ref()),
         );
 
-        // Determine content type based on what's in the manifest
-        // If all entries are PositionDeletes, this is a DeleteManifest
-        // Otherwise, it's a DataManifest
-        // Pre-built data is always Data type, so if we have any, it's a DataManifest
-        let content_type = if self.pre_built_data.is_empty()
-            && self
-                .pending_entries
-                .iter()
-                .all(|entry| entry.content_type == DataContentType::PositionDeletes)
-            && !self.pending_entries.is_empty()
-        {
-            DataContentType::DeleteManifest
-        } else {
-            DataContentType::DataManifest
-        };
-
         Ok(ContentTreeNodeEntry {
-            content_type,
+            content_type: DataContentType::CombinedManifest,
             location: Some(manifest_path),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
@@ -1370,10 +1348,8 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
-            content_info: None,
+            // DV info is inline on data entries inside the manifest, not on the manifest entry itself
+            dv_info: None,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -1388,9 +1364,6 @@ impl ContentTreeNodeBuilder {
 
             // Manifest statistics tracking entry counts by status
             manifest_stats,
-
-            // Path to file where to apply the DV to
-            referenced_file: None,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -2285,14 +2258,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: content_stats_1,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2315,14 +2287,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 150,
             file_size_in_bytes: Some(2048),
             content_stats: content_stats_2,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2432,14 +2403,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None, // No stats
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2477,17 +2447,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path
         assert_eq!(
-            location,
+            dv_info.location,
             "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
-        // Should have content_info with offset and size (+8 for size field and CRC)
-        assert_eq!(content_info.offset, 4);
-        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        // Should have offset and size (+8 for size field and CRC)
+        assert_eq!(dv_info.offset, 4);
+        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(dv_info.cardinality, 6);
 
         Ok(())
     }
@@ -2507,17 +2478,18 @@ mod tests {
             cardinality: 2,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path (no prefix directory)
         assert_eq!(
-            location,
+            dv_info.location,
             "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
-        // Should have content_info with offset and size (+8 for size field and CRC)
-        assert_eq!(content_info.offset, 1);
-        assert_eq!(content_info.size_in_bytes, 44); // 36 + 8
+        // Should have offset and size (+8 for size field and CRC)
+        assert_eq!(dv_info.offset, 1);
+        assert_eq!(dv_info.size_in_bytes, 44); // 36 + 8
+        assert_eq!(dv_info.cardinality, 2);
 
         Ok(())
     }
@@ -2536,17 +2508,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
-            location,
+            dv_info.location,
             "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
-        // Should have content_info with offset and size (+8)
-        assert_eq!(content_info.offset, 4);
-        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        // Should have offset and size (+8)
+        assert_eq!(dv_info.offset, 4);
+        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(dv_info.cardinality, 6);
 
         Ok(())
     }
@@ -2617,14 +2590,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2643,14 +2615,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 200,
             file_size_in_bytes: Some(2048),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2660,13 +2631,13 @@ mod tests {
         leaf_builder.add_entry(data_entry_1);
         leaf_builder.add_entry(data_entry_2);
 
-        // Step 2: Write the leaf manifest and get a ContentTreeNodeEntry (DataManifest) back
+        // Step 2: Write the leaf manifest and get a ContentTreeNodeEntry (CombinedManifest) back
         let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
 
         // Verify the leaf manifest entry
         assert_eq!(
             leaf_manifest_entry.content_type,
-            DataContentType::DataManifest
+            DataContentType::CombinedManifest
         );
         assert!(leaf_manifest_entry.location.is_some());
         let leaf_location = leaf_manifest_entry.location.as_ref().unwrap();
@@ -2712,7 +2683,7 @@ mod tests {
             ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = read_root.entries()?;
         assert_eq!(root_entries.len(), 1);
-        assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
+        assert_eq!(root_entries[0].content_type, DataContentType::CombinedManifest);
         assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
 
         // Step 6: Read back the leaf and verify
@@ -2790,15 +2761,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2827,13 +2797,13 @@ mod tests {
             ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
 
-        // Should have: 1 DataManifest (DV is now inline on this entry)
+        // Should have: 1 CombinedManifest (DV is now inline on this entry)
         assert_eq!(root_entries.len(), 1);
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
@@ -2890,15 +2860,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2926,11 +2895,11 @@ mod tests {
         let root_metadata =
             ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = root_metadata.entries()?;
-        assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
+        assert_eq!(root_entries.len(), 1); // CombinedManifest (DV is inline)
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
             .unwrap();
 
         // Verify all deleted indices in manifest_dv field
@@ -2977,15 +2946,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3018,7 +2986,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::DataManifest
+                e.content_type == DataContentType::CombinedManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3056,15 +3024,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3137,15 +3104,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3175,7 +3141,7 @@ mod tests {
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
             .unwrap();
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
@@ -3210,7 +3176,7 @@ mod tests {
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
         let manifest_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::DataManifest,
+            content_type: DataContentType::CombinedManifest,
             location: Some("leaf-manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
@@ -3221,7 +3187,7 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 5, // Total entries in the leaf
@@ -3236,7 +3202,6 @@ mod tests {
                 delete_rows_count: 200,
                 min_sequence_number: 1,
             }),
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3265,7 +3230,7 @@ mod tests {
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::DataManifest
+                e.content_type == DataContentType::CombinedManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3322,15 +3287,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3358,8 +3322,8 @@ mod tests {
         let entries_v1 = root_metadata_v1.entries()?;
         let manifest_v1 = entries_v1
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains both deletions (2 and 5)
         let manifest_dv_v1 = manifest_v1
@@ -3406,8 +3370,8 @@ mod tests {
         let entries_v2 = root_metadata_v2.entries()?;
         let manifest_v2 = entries_v2
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
         let manifest_dv_v2 = manifest_v2
@@ -3467,8 +3431,8 @@ mod tests {
         let entries_v3 = root_metadata_v3.entries()?;
         let manifest_v3 = entries_v3
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
         let manifest_dv_v3 = manifest_v3
@@ -3536,14 +3500,13 @@ mod tests {
                 first_row_id: None,
                 changes_dv: None,
             }),
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3561,8 +3524,8 @@ mod tests {
         let entries_v4 = root_metadata_v4.entries()?;
         let manifest_v4 = entries_v4
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
         let manifest_dv_v4 = manifest_v4
@@ -3617,15 +3580,14 @@ mod tests {
                     first_row_id: None,
                     changes_dv: None,
                 }),
-                content_info: None,
+                dv_info: None,
                 partition_spec_id: 0,
                 sort_order_id: None,
                 record_count: 100,
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
-                manifest_dv: None,
+                    manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3658,8 +3620,8 @@ mod tests {
         let entries = root_metadata.entries()?;
         let manifest = entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains the deletions (for internal tracking)
         let manifest_dv = manifest
@@ -3704,14 +3666,13 @@ mod tests {
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3722,14 +3683,13 @@ mod tests {
             location: Some("file2.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3740,14 +3700,13 @@ mod tests {
             location: Some("file3.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3797,20 +3756,19 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Add DV entry
-        let dv_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
+        // Add a Data entry with inline DV info
+        let data_entry_with_dv = ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
             location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 10,
             file_size_in_bytes: Some(128),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3821,26 +3779,25 @@ mod tests {
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         };
 
-        builder.add_entry(dv_entry);
+        builder.add_entry(data_entry_with_dv);
         builder.add_entry(data_entry);
 
         assert_eq!(builder.pending_entries.len(), 2);
 
-        // Remove by DV path
+        // Remove by location path
         builder.remove_dv("dv1.bin")?;
 
         // Should have 1 entry remaining (the data entry)
@@ -3854,7 +3811,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_entries_by_referenced_file() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_remove_data_file_keeps_other_entries() -> Result<(), Box<dyn std::error::Error>> {
         use tempfile::tempdir;
 
         let temp_dir = tempdir()?;
@@ -3866,55 +3823,61 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Add DV entry that references a data file
-        let dv_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
-            location: Some("dv1.bin".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 10,
-            file_size_in_bytes: Some(128),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: Some("data1.parquet".to_string()),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let data_entry = ContentTreeNodeEntry {
+        // Add two data entries; data1 has inline DV info, data2 doesn't
+        let data_entry1 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: Some(DvInfo {
+                location: "dv1.bin".to_string(),
+                offset: 0,
+                size_in_bytes: 48,
+                cardinality: 6,
+            }),
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
+            manifest_dv: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let data_entry2 = ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
+            location: Some("data2.parquet".to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            dv_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 50,
+            file_size_in_bytes: Some(512),
+            content_stats: None,
+            manifest_stats: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         };
 
-        builder.add_entry(dv_entry);
-        builder.add_entry(data_entry);
+        builder.add_entry(data_entry1);
+        builder.add_entry(data_entry2);
 
         assert_eq!(builder.pending_entries.len(), 2);
 
-        // Remove by data file path - should remove both the DV (which references it) and the data file itself
-        builder.remove_dv("data1.parquet")?; // Removes DV entry with referenced_file = data1.parquet
-        builder.remove_data_file("data1.parquet")?; // Removes data file entry
+        // Remove only the first data file (also removes its inline DV)
+        builder.remove_data_file("data1.parquet")?;
 
-        // Should have 0 entries remaining
-        assert_eq!(builder.pending_entries.len(), 0);
+        // Should have 1 entry remaining (data2 without DV)
+        assert_eq!(builder.pending_entries.len(), 1);
+        assert_eq!(
+            builder.pending_entries[0].location.as_deref(),
+            Some("data2.parquet")
+        );
 
         Ok(())
     }
@@ -3935,14 +3898,13 @@ mod tests {
             location: Some("file1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
