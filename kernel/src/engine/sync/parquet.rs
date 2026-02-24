@@ -146,10 +146,24 @@ impl ParquetHandler for SyncParquetHandler {
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
         let file = File::open(path)?;
         let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let row_group_offsets: Vec<i64> = metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .filter_map(|rg| {
+                rg.columns().first().map(|col| {
+                    col.dictionary_page_offset()
+                        .unwrap_or(col.data_page_offset())
+                })
+            })
+            .collect();
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;
-        Ok(ParquetFooter { schema })
+        Ok(ParquetFooter {
+            schema,
+            row_group_offsets,
+        })
     }
 }
 

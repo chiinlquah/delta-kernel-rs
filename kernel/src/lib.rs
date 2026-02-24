@@ -801,6 +801,8 @@ pub mod reserved_field_ids {
 pub struct ParquetFooter {
     /// The schema of the Parquet file, converted to Delta Kernel's schema format.
     pub schema: SchemaRef,
+    /// Byte offsets of each row group in the Parquet file, sorted ascending.
+    pub row_group_offsets: Vec<i64>,
 }
 
 /// Provides Parquet file related functionalities to Delta Kernel.

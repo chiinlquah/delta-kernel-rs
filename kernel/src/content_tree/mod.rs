@@ -2567,6 +2567,9 @@ pub(crate) fn metadata_entry_to_scalars(
                 None => Scalar::Null(field.data_type().clone()),
             },
             "referencedFile" => Scalar::from(entry.referenced_file.clone()),
+            "keyMetadata" => Scalar::from(entry.key_metadata.clone()),
+            "splitOffsets" => entry.split_offsets.clone().try_into()?,
+            "equalityIds" => entry.equality_ids.clone().try_into()?,
             "manifestDv" => Scalar::from(entry.manifest_dv.clone()),
             _ => Scalar::Null(field.data_type().clone()),
         };
@@ -2841,26 +2844,17 @@ pub struct ContentTreeNodeEntry {
     #[field_id = 143]
     pub referenced_file: Option<String>,
 
-    /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 131]
     pub(crate) key_metadata: Option<Bytes>,
 
-    /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 132]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
-    /// Not used by Delta today
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 135]
     pub(crate) equality_ids: Option<Vec<i32>>,
 
@@ -3156,18 +3150,17 @@ mod tests {
         // Verify the base schema has the expected structure (excludes content_stats)
         let schema = ContentTreeNodeEntry::to_schema();
 
-        // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
+        // Schema should have all the top-level fields (excluding content_stats)
         // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
-        // recordCount, fileSizeInBytes, manifestStats, referencedFile, manifestDv
-        assert_eq!(schema.fields().len(), 12);
+        // recordCount, fileSizeInBytes, manifestStats, referencedFile, keyMetadata, splitOffsets, equalityIds, manifestDv
+        assert_eq!(schema.fields().len(), 15);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // Schema should have all the leaf fields (24 = flattened count, excluding key_metadata, split_offsets, equality_ids)
-        // Added 2 fields (manifestDv, manifestDeltaDv), removed 1 (inlineContent), so 23 + 1 = 24
-        assert_eq!(leaf_names.len(), 24);
+        // 27 leaf fields: 24 original + keyMetadata + splitOffsets + equalityIds
+        assert_eq!(leaf_names.len(), 27);
     }
 
     #[test]
@@ -3197,8 +3190,8 @@ mod tests {
         // Generate schema with content_stats
         let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema)?;
 
-        // Schema should have 13 top-level fields (12 base + 1 for content_stats)
-        assert_eq!(schema_with_stats.fields().len(), 13);
+        // Schema should have 16 top-level fields (15 base + 1 for content_stats)
+        assert_eq!(schema_with_stats.fields().len(), 16);
 
         // Verify content_stats field exists
         let content_stats_field = schema_with_stats
@@ -3928,7 +3921,11 @@ mod tests {
             expected.referenced_file, actual.referenced_file,
             "referenced_file mismatch"
         );
-        // Note: key_metadata, split_offsets, equality_ids are not yet fully supported
+        assert_eq!(
+            expected.key_metadata, actual.key_metadata,
+            "key_metadata mismatch"
+        );
+        // Note: split_offsets and equality_ids are array types not extracted by the visitor
     }
 
     #[test]

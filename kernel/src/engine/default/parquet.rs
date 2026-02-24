@@ -420,14 +420,31 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load(&bytes, Default::default())?
             } else {
                 let path = Path::from_url_path(location.path())?;
-                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+                let mut reader = ParquetObjectReader::new(store, path);
+                if file_size > 0 {
+                    reader = reader.with_file_size(file_size);
+                }
                 ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?
             };
 
+            let row_group_offsets: Vec<i64> = metadata
+                .metadata()
+                .row_groups()
+                .iter()
+                .filter_map(|rg| {
+                    rg.columns().first().map(|col| {
+                        col.dictionary_page_offset()
+                            .unwrap_or(col.data_page_offset())
+                    })
+                })
+                .collect();
             let schema = StructType::try_from_arrow(metadata.schema().as_ref())
                 .map(Arc::new)
                 .map_err(Error::Arrow)?;
-            Ok(ParquetFooter { schema })
+            Ok(ParquetFooter {
+                schema,
+                row_group_offsets,
+            })
         })
     }
 }
