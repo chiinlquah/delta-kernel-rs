@@ -6,7 +6,7 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
 use crate::schema::{DataType, StructField, StructType};
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
+    DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version,
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -38,18 +38,6 @@ static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(||
 /// Format: "{data_file_path}#{dv_unique_id}"
 pub(crate) type DVUniqueId = String;
 
-/// Creates a DVUniqueId from a data file path and DV descriptor.
-pub(crate) fn create_dv_unique_id(
-    data_file_path: &str,
-    dv_descriptor: &DeletionVectorDescriptor,
-) -> DVUniqueId {
-    // Use the storage_type and path_or_inline_dv as the unique ID component
-    format!(
-        "{}#{:?}:{}",
-        data_file_path, dv_descriptor.storage_type, dv_descriptor.path_or_inline_dv
-    )
-}
-
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
 ///
@@ -62,9 +50,6 @@ pub struct LeafNodeWriterResult {
 
     /// Written data file manifest (if any data files were added).
     pub(crate) data_file_manifest_written: Option<ContentTreeNodeEntry>,
-
-    /// Written DV manifest (if any DVs were added).
-    pub(crate) dv_file_manifest_written: Option<ContentTreeNodeEntry>,
 
     /// Root entries to remove (file paths that should be removed from root)
     pub(crate) root_entries_to_remove: HashSet<String>,
@@ -115,33 +100,6 @@ pub struct LeafNodeWriter {
     track_root_removals: bool,
 }
 
-/// Type of action to add to the leaf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddType {
-    /// Add action contains only data file information (no deletion vector)
-    DataFileOnly,
-    /// Add action contains only deletion vector information (no new data file)
-    DVOnly,
-    /// Add action contains both data file and deletion vector information
-    DataFileAndDV,
-}
-
-/// Location of a file in a manifest.
-#[derive(Debug, Clone)]
-pub struct ManifestLocation {
-    /// Relative path to the manifest file (e.g., "_metadata_root/...")
-    pub manifest_path: String,
-    pub index: i64,
-}
-
-/// DV update information for a file.
-#[derive(Debug, Clone)]
-pub struct DvUpdate {
-    pub data_file_path: String,
-    pub dv_descriptor: DeletionVectorDescriptor,
-    pub data_file_location: ManifestLocation,
-    pub previous_delete_file_location: Option<ManifestLocation>,
-}
 
 /// Helper function to extract a deletion vector from a slice of getters starting at DV fields.
 /// The slice should contain exactly 5 getters corresponding to the DV fields in order:
@@ -218,7 +176,6 @@ fn track_manifest_entry_for_removal(
 /// Helper visitor to extract Add actions from scan rows and add them to a leaf
 struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
-    add_type: AddType,
     selection_vector: Vec<bool>,
     /// Whether to request the stats_parsed column. Starts as true and is set to false
     /// by visit_rows_of if the data doesn't have the column.
@@ -312,7 +269,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
-        // Fixed getter indices for all columns (same layout for all AddTypes)
+        // Fixed getter indices for all columns:
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
         //         deleteManifestPath, deleteManifestPosition, stats_parsed (optional)
@@ -320,31 +277,14 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
         const SIZE_IDX: usize = 1;
-        const MODIFICATION_TIME_IDX: usize = 2;
-        const STATS_IDX: usize = 3;
         const DV_START_IDX: usize = 4; // indices 4-8 are DV fields
-        const PARTITION_VALUES_IDX: usize = 9;
-        const BASE_ROW_ID_IDX: usize = 10;
-        const DEFAULT_ROW_COMMIT_VERSION_IDX: usize = 11;
         const DATA_MANIFEST_PATH_IDX: usize = 12;
         const DATA_MANIFEST_POSITION_IDX: usize = 13;
         const DELETE_MANIFEST_PATH_IDX: usize = 14;
         const DELETE_MANIFEST_POSITION_IDX: usize = 15;
         const STATS_PARSED_IDX: usize = 16; // Optional - only present if include_stats_columns was called
 
-        let should_add_data_file = matches!(
-            self.add_type,
-            AddType::DataFileOnly | AddType::DataFileAndDV
-        );
-        // Always extract DVs when adding data files; DVOnly mode is no longer supported
-        // in the new CombinedManifest model (DVs are inline on data entries).
-        let should_extract_dv = should_add_data_file
-            || matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
-
-        // Check if stats_parsed column is present (getters includes it when include_stats_columns was called)
         let has_stats_parsed = getters.len() > STATS_PARSED_IDX;
-
-        // Use the pre-computed root manifest path passed from the transaction
         let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
 
         for i in 0..row_count {
@@ -354,108 +294,64 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 continue;
             }
 
-            // Path is always needed
             let path_opt: Option<String> = getters[PATH_IDX].get_opt(i, "path")?;
             let Some(path) = path_opt else {
                 continue;
             };
 
-            // Extract data file fields if needed
-            #[allow(unused_variables)]
-            let (
-                size,
-                modification_time,
-                stats,
-                partition_values,
-                base_row_id,
-                default_row_commit_version,
-                content_stats,
-            ) = if should_add_data_file {
-                // Extract manifest metadata (always needed for tracking)
-                let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
-                    .get_opt(i, "fileConstantValues.dataManifestPath")?;
-                let data_manifest_position: Option<i64> = getters[DATA_MANIFEST_POSITION_IDX]
-                    .get_opt(i, "fileConstantValues.dataManifestPosition")?;
-
-                // Track data file manifest entry for removal
-                let mut ctx = ManifestRemovalContext {
-                    root_manifest_path: root_manifest_path.clone(),
-                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
-                    root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
-                    track_root_removals: self.leaf_writer.track_root_removals,
-                };
-                track_manifest_entry_for_removal(
-                    data_manifest_path,
-                    data_manifest_position,
-                    path.clone(),
-                    &mut ctx,
-                )?;
-
-                let size: i64 = getters[SIZE_IDX].get(i, "size")?;
-                let modification_time: i64 =
-                    getters[MODIFICATION_TIME_IDX].get(i, "modificationTime")?;
-                let stats: Option<String> = getters[STATS_IDX].get_opt(i, "stats")?;
-                let partition_values: HashMap<String, String> = getters[PARTITION_VALUES_IDX]
-                    .get_opt(i, "fileConstantValues.partitionValues")?
-                    .unwrap_or_default();
-                let base_row_id: Option<i64> =
-                    getters[BASE_ROW_ID_IDX].get_opt(i, "fileConstantValues.baseRowId")?;
-                let default_row_commit_version: Option<i64> = getters
-                    [DEFAULT_ROW_COMMIT_VERSION_IDX]
-                    .get_opt(i, "fileConstantValues.defaultRowCommitVersion")?;
-
-                // Extract stats_parsed as content_stats (already in AMT format after
-                // batch-level pre-conversion). Preferred over JSON stats string when available.
-                // Filter out empty structs (e.g. placeholder columns with no fields).
-                let content_stats = if has_stats_parsed {
-                    getters[STATS_PARSED_IDX]
-                        .get_struct(i, "stats_parsed")?
-                        .map(|struct_item| struct_item.materialize())
-                        .transpose()?
-                        .filter(|s| !s.fields().is_empty())
-                } else {
-                    None
-                };
-
-                (
-                    Some(size),
-                    Some(modification_time),
-                    stats,
-                    Some(partition_values),
-                    base_row_id,
-                    default_row_commit_version,
-                    content_stats,
-                )
-            } else {
-                (None, None, None, None, None, None, None)
+            // Track data file manifest entry for removal
+            let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
+                .get_opt(i, "fileConstantValues.dataManifestPath")?;
+            let data_manifest_position: Option<i64> = getters[DATA_MANIFEST_POSITION_IDX]
+                .get_opt(i, "fileConstantValues.dataManifestPosition")?;
+            let mut ctx = ManifestRemovalContext {
+                root_manifest_path: root_manifest_path.clone(),
+                manifest_dvs: &mut self.leaf_writer.manifest_dvs,
+                root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
+                track_root_removals: self.leaf_writer.track_root_removals,
             };
+            track_manifest_entry_for_removal(
+                data_manifest_path,
+                data_manifest_position,
+                path.clone(),
+                &mut ctx,
+            )?;
 
-            // Extract deletion vector info (always, when we're extracting DV data)
-            let deletion_vector = if should_extract_dv {
-                // Extract delete manifest metadata (for tracking old DV manifest entries)
-                let delete_manifest_path: Option<String> = getters[DELETE_MANIFEST_PATH_IDX]
-                    .get_opt(i, "fileConstantValues.deleteManifestPath")?;
-                let delete_manifest_position: Option<i64> =
-                    getters[DELETE_MANIFEST_POSITION_IDX]
-                        .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
-                // Track old DV manifest entry for removal
-                let mut ctx = ManifestRemovalContext {
-                    root_manifest_path: root_manifest_path.clone(),
-                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
-                    root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
-                    track_root_removals: self.leaf_writer.track_root_removals,
-                };
-                track_manifest_entry_for_removal(
-                    delete_manifest_path,
-                    delete_manifest_position,
-                    path.clone(),
-                    &mut ctx,
-                )?;
+            let size: i64 = getters[SIZE_IDX].get(i, "size")?;
 
-                extract_deletion_vector_at(i, &getters[DV_START_IDX..])?
+            // Extract stats_parsed as content_stats (already in AMT format after
+            // batch-level pre-conversion). Preferred over JSON stats string when available.
+            // Filter out empty structs (e.g. placeholder columns with no fields).
+            let content_stats = if has_stats_parsed {
+                getters[STATS_PARSED_IDX]
+                    .get_struct(i, "stats_parsed")?
+                    .map(|struct_item| struct_item.materialize())
+                    .transpose()?
+                    .filter(|s| !s.fields().is_empty())
             } else {
                 None
             };
+
+            // Track old DV manifest entry for removal (backward compat with separate DV manifests)
+            let delete_manifest_path: Option<String> = getters[DELETE_MANIFEST_PATH_IDX]
+                .get_opt(i, "fileConstantValues.deleteManifestPath")?;
+            let delete_manifest_position: Option<i64> =
+                getters[DELETE_MANIFEST_POSITION_IDX]
+                    .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
+            let mut ctx = ManifestRemovalContext {
+                root_manifest_path: root_manifest_path.clone(),
+                manifest_dvs: &mut self.leaf_writer.manifest_dvs,
+                root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
+                track_root_removals: self.leaf_writer.track_root_removals,
+            };
+            track_manifest_entry_for_removal(
+                delete_manifest_path,
+                delete_manifest_position,
+                path.clone(),
+                &mut ctx,
+            )?;
+
+            let deletion_vector = extract_deletion_vector_at(i, &getters[DV_START_IDX..])?;
 
             // Convert DV descriptor to inline ContentInfo for storage on the data entry
             let content_info = deletion_vector
@@ -463,33 +359,23 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 .map(crate::content_tree::builder::extract_deletion_vector_content)
                 .transpose()?;
 
-            // Add data file if needed (with inline DV info)
-            if should_add_data_file {
-                // Safety: When should_add_data_file is true, these values are guaranteed to be Some
-                let (Some(_pv), Some(sz), Some(_mt)) = (partition_values, size, modification_time)
-                else {
-                    return Err(Error::generic("Missing required fields for data file"));
-                };
+            // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
+            // TODO: Version manipulation is a workaround. The ContentTreeNodeBuilder API should
+            // support explicitly setting TrackingStatus without relying on version comparison.
+            let file_version = if self.leaf_writer.version > 0 {
+                self.leaf_writer.version - 1
+            } else {
+                0
+            };
 
-                // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
-                // TODO: Version manipulation is a workaround. The ContentTreeNodeBuilder API should
-                // support explicitly setting TrackingStatus without relying on version comparison.
-                let file_version = if self.leaf_writer.version > 0 {
-                    self.leaf_writer.version - 1
-                } else {
-                    0
-                };
-
-                // Use add_file_with_dedup which takes content_stats and inline DV info.
-                self.leaf_writer.data_builder.add_file_with_dedup(
-                    path.clone(),
-                    sz,
-                    content_stats,
-                    file_version,
-                    Some(self.leaf_writer.snapshot_id),
-                    content_info,
-                )?;
-            }
+            self.leaf_writer.data_builder.add_file_with_dedup(
+                path.clone(),
+                size,
+                content_stats,
+                file_version,
+                Some(self.leaf_writer.snapshot_id),
+                content_info,
+            )?;
         }
         Ok(())
     }
@@ -577,23 +463,10 @@ impl LeafNodeWriter {
     ///
     /// # Arguments
     /// * `scan_metadata` - FilteredEngineData with scan row schema including metadata columns
-    /// * `add_type` - Type of action to add (DataFileOnly, DVOnly, or DataFileAndDV). Note that
-    ///   DataFileAndDv is the only safe option that should always leave the tree in a good state.
-    ///   For DataFileOnly and DvOnly, callers must ensure that if DataFileOnly is called
-    ///   that either:
-    ///   1. The data files have no associated DV.
-    ///   2. The data files are either in the delta log OR the root.
-    ///   3. The DV is in an unaffiliated manifest.
-    ///   4. The DV is moved to a different leaf.
-    ///
-    ///   DvOnly calls must ensure either:
-    ///   1.  The data file is in a leaf already (leaf DV manifests are not applied to the root).
-    ///   2.  the data file in the root root is also moved to a leaf manifest separately with DataFileOnly.
     pub fn add_existing_actions(
         &mut self,
         engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
-        add_type: AddType,
     ) -> DeltaResult<()> {
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
@@ -614,57 +487,12 @@ impl LeafNodeWriter {
         // Process the scan data with the visitor
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
-            add_type,
             selection_vector,
             request_stats_parsed: true,
         };
 
         visitor.visit_rows_of(data)?;
 
-        Ok(())
-    }
-
-    /// Record DV updates for files.
-    ///
-    /// Tracks cross-leaf updates via manifest DVs and handles DV replacement.
-    ///
-    /// # Arguments
-    /// * `new_dv_updates` - Vec of DV updates for files
-    pub fn update_deletion_vectors(&mut self, new_dv_updates: Vec<DvUpdate>) -> DeltaResult<()> {
-        for dv_update in new_dv_updates {
-            // Enhancement #2: Error if trying to update DVs for files still in the root manifest
-            // Leaf writers should only manage DVs for files that have been moved to leaves
-            if let Some(root_path) = &self.root_manifest_path {
-                if &dv_update.data_file_location.manifest_path == root_path {
-                    return Err(crate::Error::generic(format!(
-                        "Cannot update deletion vector for file '{}' that is still in the root manifest. \
-                        Files must be moved to a leaf manifest before their DVs can be managed by a leaf writer.",
-                        dv_update.data_file_path
-                    )));
-                }
-            }
-
-            let dv_id = create_dv_unique_id(&dv_update.data_file_path, &dv_update.dv_descriptor);
-
-            // In the CombinedManifest model, DV info is stored inline on data entries.
-            // DV updates for existing leaf files require re-writing the data entry with
-            // updated content_info. This is tracked via the dv_id but the actual re-writing
-            // is not yet implemented (TODO: implement inline DV update for existing entries).
-            let _ = dv_id;
-
-            // Note: data_file_location tells us where the data file IS.
-            // manifest_dvs is ONLY for marking entries as deleted (e.g., when moving files between leaves).
-
-            // Enhancement #1: If there was a previous DV in a DELETE manifest (including root),
-            // mark that DV entry as deleted
-            if let Some(prev_dv_loc) = dv_update.previous_delete_file_location {
-                let prev_entry = self
-                    .manifest_dvs
-                    .entry(prev_dv_loc.manifest_path.to_string())
-                    .or_default();
-                prev_entry.insert(prev_dv_loc.index as u64);
-            }
-        }
         Ok(())
     }
 
@@ -693,7 +521,6 @@ impl LeafNodeWriter {
             root_entries_to_remove: self.root_entries_to_remove,
             root_dv_entries_to_remove: self.root_dv_entries_to_remove,
             data_file_manifest_written: data_manifest_entry,
-            dv_file_manifest_written: None,
         })
     }
 
@@ -1101,10 +928,6 @@ mod tests {
             "Data manifest should be written"
         );
         assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-        assert!(
             result.manifest_dvs.is_empty(),
             "Manifest DVs should be empty"
         );
@@ -1343,11 +1166,6 @@ mod tests {
             result.data_file_manifest_written.is_some(),
             "Data manifest should be written"
         );
-        assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-
         Ok(())
     }
 
@@ -1369,53 +1187,12 @@ mod tests {
             "Data manifest should not be written"
         );
         assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-        assert!(
             result.manifest_dvs.is_empty(),
             "Manifest DVs should be empty"
         );
         assert!(
             result.root_entries_to_remove.is_empty(),
             "Root entries to remove should be empty"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_no_separate_dv_manifest_in_combined_model() -> Result<(), Box<dyn std::error::Error>> {
-        // In the new CombinedManifest model, DVs are inline on data entries.
-        // No separate DV manifest is written — dv_file_manifest_written is always None.
-        let (engine, table_root, schema) = test_setup();
-        let version = 1;
-        let snapshot_id = 12345;
-
-        let mut writer = LeafNodeWriter::new(
-            table_root.clone(),
-            version,
-            snapshot_id,
-            schema.clone(),
-            true,
-            None,
-        );
-
-        // Finish an empty writer — dv_file_manifest_written should be None
-        let _ = writer;
-        let writer2 = LeafNodeWriter::new(
-            table_root.clone(),
-            version,
-            snapshot_id,
-            schema.clone(),
-            true,
-            None,
-        );
-        let result = writer2.finish(engine.as_ref())?;
-
-        assert!(
-            result.dv_file_manifest_written.is_none(),
-            "CombinedManifest model does not write separate DV manifests"
         );
 
         Ok(())
@@ -1638,7 +1415,7 @@ mod tests {
         let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
 
         // Add the existing actions with the filtered data
-        writer.add_existing_actions(engine.as_ref(), filtered_data, AddType::DataFileOnly)?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data)?;
 
         // Finish and check the result
         let result = writer.finish(engine.as_ref())?;

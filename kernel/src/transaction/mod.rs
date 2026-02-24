@@ -49,7 +49,7 @@ use delta_kernel_derive::internal_api;
 pub mod leaf_writer;
 
 // Re-export types needed for public API
-pub use leaf_writer::{AddType, DvUpdate, LeafNodeWriterResult, ManifestLocation};
+pub use leaf_writer::LeafNodeWriterResult;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -1040,7 +1040,7 @@ impl<S> Transaction<S> {
     ///     // Write to leaf manifests
     ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
     ///     for action in actions {
-    ///         leaf.add_existing_actions(engine, action, AddType::DataFileAndDV)?;
+    ///         leaf.add_existing_actions(engine, action)?;
     ///     }
     ///     let leaf_result = leaf.finish(engine)?;
     ///     txn.add_leaf(leaf_result)?;
@@ -1198,10 +1198,6 @@ impl<S> Transaction<S> {
         if let Some(data_manifest) = leaf_result.data_file_manifest_written {
             self.leaf_manifests.push(data_manifest);
         }
-        if let Some(dv_manifest) = leaf_result.dv_file_manifest_written {
-            self.leaf_manifests.push(dv_manifest);
-        }
-
         Ok(())
     }
 
