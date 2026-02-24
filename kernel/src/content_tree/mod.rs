@@ -690,74 +690,6 @@ impl ContentTreeNode {
         Ok(Arc::new(top_level_expr))
     }
 
-    /// Builds a selection vector that excludes deleted and manifest entries from a metadata batch.
-    ///
-    /// Returns a vector of booleans where `true` means the row should be included.
-    ///
-    /// Excludes:
-    /// - Deleted entries: `trackingInfo.status == TrackingStatus::Deleted`
-    /// - Manifest entries: `contentType == DataManifest` or `DeleteManifest`
-    ///
-    /// Processes a single metadata batch: applies filtering and transformation.
-    ///
-    /// # Parameters
-    /// - `batch`: The metadata batch to process
-    /// - `transform_evaluator`: The evaluator that transforms metadata to Add format
-    ///
-    /// # Returns
-    /// The transformed and filtered EngineData ready to be wrapped in ActionsBatch
-    fn has_deletion_vectors(&self) -> DeltaResult<bool> {
-        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-
-        struct DvCheckVisitor {
-            has_dv: bool,
-        }
-
-        impl RowVisitor for DvCheckVisitor {
-            fn selected_column_names_and_types(
-                &self,
-            ) -> (&'static [ColumnName], &'static [DataType]) {
-                static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
-                    vec![
-                        ColumnName::new(["contentType"]),
-                        ColumnName::new(["trackingInfo", "status"]),
-                        ColumnName::new(["contentInfo", "location"]),
-                    ]
-                });
-                static TYPES: &[DataType] =
-                    &[DataType::INTEGER, DataType::INTEGER, DataType::STRING];
-                (NAMES.as_slice(), TYPES)
-            }
-
-            fn visit<'a>(
-                &mut self,
-                row_count: usize,
-                getters: &[&'a dyn GetData<'a>],
-            ) -> DeltaResult<()> {
-                for i in 0..row_count {
-                    let content_type: i32 = getters[0].get(i, "contentType")?;
-                    let status_opt: Option<i32> =
-                        getters[1].get_opt(i, "trackingInfo.status")?;
-                    let dv_location: Option<&str> =
-                        getters[2].get_opt(i, "contentInfo.location")?;
-                    let is_active = status_opt.map(|s| s == 0 || s == 1).unwrap_or(false);
-                    if is_active && content_type == 0 && dv_location.is_some() {
-                        self.has_dv = true;
-                    }
-                }
-                Ok(())
-            }
-        }
-
-        for batch in self.data.iter() {
-            let mut visitor = DvCheckVisitor { has_dv: false };
-            visitor.visit_rows_of(batch.as_ref())?;
-            if visitor.has_dv {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 
     /// Creates a lookup joiner for DV entries from metadata batches.
     ///
@@ -1252,12 +1184,7 @@ impl ContentTreeNode {
         &self,
         evaluation_handler: &dyn EvaluationHandler,
         metadata_schema: SchemaRef,
-        has_dvs: bool,
     ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
-        if !has_dvs {
-            return Ok(Vec::new());
-        }
-
         debug!("Appending parsed DV columns to metadata batches");
         let mut processed = Vec::new();
         for batch in self.data.iter() {
@@ -1393,21 +1320,27 @@ impl ContentTreeNode {
         evaluation_handler: &dyn EvaluationHandler,
         metadata_schema: SchemaRef,
     ) -> DeltaResult<Option<Box<dyn LookupJoiner>>> {
-        // Check if we have deletion vectors
-        let has_dvs = self.has_deletion_vectors()?;
+        // Prepare batches by appending parsed DV columns (MUST be done before checking for DVs)
+        let batches_with_dv_columns = self.prepare_batches_with_dv_columns(
+            evaluation_handler,
+            metadata_schema.clone(),
+        )?;
+
+        // Check if any entries have deletion vectors (detected via dv_storageType after parsing)
+        let mut has_dvs = false;
+        for batch in &batches_with_dv_columns {
+            let (_, dv_selection) = Self::build_data_and_dv_selection_vectors(batch.as_ref())?;
+            if dv_selection.iter().any(|&b| b) {
+                has_dvs = true;
+                break;
+            }
+        }
 
         if !has_dvs {
             return Ok(None);
         }
 
         debug!("Building DV joiner for optimized path");
-
-        // Prepare batches by appending parsed DV columns (MUST be done before building joiner!)
-        let batches_with_dv_columns = self.prepare_batches_with_dv_columns(
-            evaluation_handler,
-            metadata_schema.clone(),
-            has_dvs,
-        )?;
 
         // Build DV joiner using the processed batches with parsed DV columns
         Ok(Some(Self::build_dv_joiner_from_metadata(
@@ -1436,7 +1369,6 @@ impl ContentTreeNode {
         let prepared = dv_metadata.prepare_batches_with_dv_columns(
             evaluation_handler,
             metadata_schema,
-            true,
         )?;
 
         // Apply manifest DV if present (filters out deleted DV entries)
