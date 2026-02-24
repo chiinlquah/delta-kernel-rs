@@ -171,7 +171,12 @@ async fn try_main() -> DeltaResult<()> {
     // Write the data using the engine (which internally collects statistics)
     let write_context = Arc::new(txn.get_write_context());
     let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
+        .write_parquet(
+            &sample_data,
+            write_context.as_ref(),
+            HashMap::new(),
+            &Default::default(),
+        )
         .await?;
 
     // Add the file metadata to the transaction
