@@ -676,7 +676,7 @@ impl TableConfiguration {
     #[allow(dead_code)]
     fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
         match info.feature_type {
-            FeatureType::Writer => {
+            FeatureType::WriterOnly => {
                 if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
                     self.protocol.min_writer_version() >= info.min_writer_version
@@ -941,9 +941,9 @@ mod test {
                 ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // Column mapping for writes is now supported
+            // Column mapping is now supported for writes.
             (
-                // Should succeed with change data feed and column mapping features both present
+                // CDF + column mapping: both supported, should succeed
                 create_mock_table_config(
                     &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
@@ -951,7 +951,7 @@ mod test {
                 Ok(()),
             ),
             (
-                // Should succeed with column mapping enabled
+                // Column mapping + AppendOnly, no CDF enabled: should succeed
                 create_mock_table_config(
                     &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
@@ -1342,15 +1342,15 @@ mod test {
 
     #[test]
     fn test_is_feature_info_supported_writer() {
-        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as Writer type
+        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as WriterOnly type
         let feature = TableFeature::ColumnMapping;
 
-        // Custom FeatureInfo that treats ColumnMapping as Writer-only with min_writer_version = 2
+        // Custom FeatureInfo that treats ColumnMapping as WriterOnly with min_writer_version = 2
         let custom_feature_info = FeatureInfo {
             name: "columnMapping",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1365,14 +1365,14 @@ mod test {
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
 
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
-        // For this to work with a Writer-only FeatureInfo, we need a real Writer-only feature
+        // For this to work with a WriterOnly FeatureInfo, we need a real WriterOnly feature
         // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
         let writer_only_feature = TableFeature::AppendOnly;
         let writer_only_info = FeatureInfo {
             name: "appendOnly",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1384,7 +1384,7 @@ mod test {
         assert!(config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
-        // Use ChangeDataFeed which is also a Writer-only feature
+        // Use ChangeDataFeed which is also a WriterOnly feature
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
         assert!(!config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
@@ -1431,7 +1431,7 @@ mod test {
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
         // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
         // But we still need to test that the code correctly identifies them as NOT supported
-        // Create a table with only Writer-only features (e.g., AppendOnly)
+        // Create a table with only WriterOnly features (e.g., AppendOnly)
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
         // ColumnMapping (ReaderWriter) should NOT be supported because:
@@ -1458,7 +1458,7 @@ mod test {
             name: "customPropertyFeature",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -1484,7 +1484,7 @@ mod test {
             name: "alwaysEnabledFeature",
             min_reader_version: 1,
             min_writer_version: 3,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,

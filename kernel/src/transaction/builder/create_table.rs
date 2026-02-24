@@ -15,6 +15,7 @@ use url::Url;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
@@ -50,6 +51,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // specifying clustering columns via `with_data_layout()`.
     // As features are supported, add them here:
     // TableFeature::DeletionVectors,
+    TableFeature::V2Checkpoint,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -147,7 +149,7 @@ fn add_feature_to_lists(
                 writer_features.push(feature);
             }
         }
-        FeatureType::Writer | FeatureType::Unknown => {
+        FeatureType::WriterOnly | FeatureType::Unknown => {
             if !writer_features.contains(&feature) {
                 writer_features.push(feature);
             }
@@ -563,8 +565,12 @@ impl CreateTableTransactionBuilder {
             TableConfiguration::try_new(metadata, protocol, None, table_url, PRE_COMMIT_VERSION)?;
 
         // Create Transaction<CreateTable> with pre-commit snapshot
-        CreateTableTransaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration)),
+        Transaction::try_new_create_table(
+            Arc::new(Snapshot::new(
+                log_segment,
+                table_configuration,
+                Arc::new(LazyCrc::new(None)),
+            )),
             self.engine_info,
             committer,
             system_domain_metadata,
