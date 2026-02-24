@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::crc::LazyCrc;
+
 use tracing::instrument;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -356,14 +358,8 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
-<<<<<<< HEAD
-        // TODO: Implement CRC
-        // // Create lazy CRC loader for P&M optimization
-        // let lazy_crc = LazyCrc::new(log_segment.latest_crc_file.clone());
-=======
         // Create lazy CRC loader for P&M optimization
         let lazy_crc = Arc::new(LazyCrc::new(log_segment.latest_crc_file.clone()));
->>>>>>> 7b1612f74fe173ee076af3009ba8e554a211b787
 
         // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();

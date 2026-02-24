@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -9,15 +9,14 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, generate_snapshot_id,
-    get_commit_schema, get_log_add_schema, get_log_commit_info_schema, get_log_content_root_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    ContentRoot, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME,
-    PROTOCOL_NAME,
+    as_log_add_schema, generate_snapshot_id, get_commit_schema, get_log_commit_info_schema,
+    get_log_content_root_schema, get_log_domain_metadata_schema, get_log_remove_schema,
+    get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata, SetTransaction,
+    INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::ContentTreeNodeWriter;
-use crate::engine_data::FilteredEngineData;
+use crate::engine_data::{FilteredEngineData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -32,8 +31,8 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::utils::require;
+use crate::table_features::{ColumnMappingMode, Operation, TableFeature};
+use crate::utils::{current_time_ms, require};
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -80,18 +79,6 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
-/// The static instance referenced by [`add_files_schema`].
-pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let stats = StructField::nullable(
-        "stats",
-        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
-    );
-
-    StructTypeBuilder::from_schema(mandatory_add_file_schema())
-        .add_field(stats)
-        .build_arc_unchecked()
-});
-
 /// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
@@ -136,10 +123,6 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
-
-/// Column name for temporary column used during deletion vector updates.
-/// This column holds new DV descriptors appended to scan file metadata before transforming to final add actions.
-static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// Extend a schema with the dataChange column and return a new SchemaRef.
 ///

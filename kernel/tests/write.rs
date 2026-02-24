@@ -49,8 +49,9 @@ use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
     copy_directory, create_add_files_metadata, create_default_engine, create_table,
     create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
-    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, setup_test_tables,
-    test_read, test_table_setup, write_batch_to_table, remove_scan_files_with_selection
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions,
+    remove_scan_files_with_selection, setup_test_tables, test_read, test_table_setup,
+    write_batch_to_table,
 };
 
 mod common;

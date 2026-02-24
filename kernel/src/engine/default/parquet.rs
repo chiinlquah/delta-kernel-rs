@@ -606,7 +606,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use crate::schema::{DataType, StructField, StructType, ColumnMetadataKey};
+    use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
     use crate::EngineData;
 
     use itertools::Itertools;

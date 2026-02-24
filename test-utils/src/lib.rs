@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array,
-    MapArray, RecordBatch, StringArray, StructArray,
+    new_null_array, Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -920,11 +920,6 @@ pub fn create_add_files_with_dvs(
         None,
         false,
     ));
-
-    let stats_struct = StructArray::from(vec![(
-        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-        Arc::new(num_records_array) as ArrayRef,
-    )]);
 
     // Build stats struct with all fields: numRecords, nullCount, minValues, maxValues, tightBounds
     // nullCount, minValues, maxValues are empty structs (structure depends on data schema)
