@@ -1380,4 +1380,218 @@ mod tests {
     // more complex setup with scan data and deletion vector descriptors.
     // These will be better tested in the Level 2 (transaction) tests where we can
     // use the full table infrastructure.
+
+    #[test]
+    fn test_existing_actions_stats_preserved() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, MapArray, StringArray, StructArray};
+        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::engine::arrow_conversion::TryFromKernel;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::schema::{DataType, MapType, StructField, StructType};
+        use crate::transaction::FilteredEngineData;
+
+        let (engine, table_root, schema) = test_setup();
+        let version = 1;
+        let snapshot_id = 12345;
+
+        let mut writer =
+            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema.clone(), true, None);
+
+        // Build scan row schema (matches SCAN_ROW_SCHEMA from log_replay)
+        let scan_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable(
+                "deletionVector",
+                DataType::struct_type_unchecked(vec![
+                    StructField::nullable("storageType", DataType::STRING),
+                    StructField::nullable("pathOrInlineDv", DataType::STRING),
+                    StructField::nullable("offset", DataType::INTEGER),
+                    StructField::nullable("sizeInBytes", DataType::INTEGER),
+                    StructField::nullable("cardinality", DataType::LONG),
+                ]),
+            ),
+            StructField::not_null(
+                "fileConstantValues",
+                DataType::struct_type_unchecked(vec![
+                    StructField::not_null(
+                        "partitionValues",
+                        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::STRING, true))),
+                    ),
+                    StructField::nullable("baseRowId", DataType::LONG),
+                    StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                    StructField::nullable("dataManifestPath", DataType::STRING),
+                    StructField::nullable("dataManifestPosition", DataType::LONG),
+                    StructField::nullable("deleteManifestPath", DataType::STRING),
+                    StructField::nullable("deleteManifestPosition", DataType::LONG),
+                ]),
+            ),
+        ]));
+
+        let path_array = StringArray::from(vec!["file0.parquet"]);
+        let size_array = Int64Array::from(vec![1024i64]);
+        let mod_time_array = Int64Array::from(vec![1000000i64]);
+
+        // Delta JSON stats string — matches what the scan produces from add.stats
+        let stats_json = r#"{"numRecords":100,"minValues":{"id":1,"value":"alice"},"maxValues":{"id":100,"value":"zoe"},"nullCount":{"id":0,"value":5},"tightBounds":true}"#;
+        let stats_array = StringArray::from(vec![Some(stats_json)]);
+
+        let dv_storage_type = StringArray::from(vec![None::<&str>]);
+        let dv_path = StringArray::from(vec![None::<&str>]);
+        let dv_offset = Int32Array::from(vec![None::<i32>]);
+        let dv_size = Int32Array::from(vec![None::<i32>]);
+        let dv_cardinality = Int64Array::from(vec![None::<i64>]);
+        let deletion_vector_struct = StructArray::from(vec![
+            (Arc::new(Field::new("storageType", ArrowDataType::Utf8, true)), Arc::new(dv_storage_type) as ArrayRef),
+            (Arc::new(Field::new("pathOrInlineDv", ArrowDataType::Utf8, true)), Arc::new(dv_path) as ArrayRef),
+            (Arc::new(Field::new("offset", ArrowDataType::Int32, true)), Arc::new(dv_offset) as ArrayRef),
+            (Arc::new(Field::new("sizeInBytes", ArrowDataType::Int32, true)), Arc::new(dv_size) as ArrayRef),
+            (Arc::new(Field::new("cardinality", ArrowDataType::Int64, true)), Arc::new(dv_cardinality) as ArrayRef),
+        ]);
+
+        let entries_field = Arc::new(Field::new(
+            "key_value",
+            ArrowDataType::Struct(vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ].into()),
+            false,
+        ));
+        let empty_entries = StructArray::from(vec![
+            (Arc::new(Field::new("key", ArrowDataType::Utf8, false)), Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef),
+            (Arc::new(Field::new("value", ArrowDataType::Utf8, true)), Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as ArrayRef),
+        ]);
+        let partition_values_array = MapArray::new(entries_field, OffsetBuffer::from_lengths(vec![0usize; 1]), empty_entries, None, false);
+
+        let file_constant_values_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("partitionValues", ArrowDataType::Map(Arc::new(Field::new("key_value", ArrowDataType::Struct(vec![Arc::new(Field::new("key", ArrowDataType::Utf8, false)), Arc::new(Field::new("value", ArrowDataType::Utf8, true))].into()), false)), false), false)),
+                Arc::new(partition_values_array) as ArrayRef,
+            ),
+            (Arc::new(Field::new("baseRowId", ArrowDataType::Int64, true)), Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef),
+            (Arc::new(Field::new("defaultRowCommitVersion", ArrowDataType::Int64, true)), Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef),
+            (Arc::new(Field::new("dataManifestPath", ArrowDataType::Utf8, true)), Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef),
+            (Arc::new(Field::new("dataManifestPosition", ArrowDataType::Int64, true)), Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef),
+            (Arc::new(Field::new("deleteManifestPath", ArrowDataType::Utf8, true)), Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef),
+            (Arc::new(Field::new("deleteManifestPosition", ArrowDataType::Int64, true)), Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(TryFromKernel::try_from_kernel(scan_schema.as_ref())?),
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                Arc::new(size_array) as ArrayRef,
+                Arc::new(mod_time_array) as ArrayRef,
+                Arc::new(stats_array) as ArrayRef,
+                Arc::new(deletion_vector_struct) as ArrayRef,
+                Arc::new(file_constant_values_struct) as ArrayRef,
+            ],
+        )?;
+
+        let engine_data = Box::new(ArrowEngineData::new(batch));
+        let selection_vector = vec![true];
+        let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
+
+        writer.add_existing_actions(engine.as_ref(), filtered_data)?;
+        let result = writer.finish(engine.as_ref())?;
+
+        assert!(result.data_file_manifest_written.is_some(), "Data manifest should be written");
+
+        let manifest_entry = result.data_file_manifest_written.unwrap();
+        let manifest_location = manifest_entry.location.as_ref().expect("Manifest should have location");
+        let manifest_url = table_root.join(manifest_location)?;
+
+        // Read back with full schema including content_stats to verify stats were preserved
+        use crate::arrow::array::Array;
+        use crate::engine::arrow_data::ArrowEngineData as ArrowEngineData2;
+        use crate::FileMeta;
+
+        let file_meta = FileMeta {
+            location: manifest_url.clone(),
+            last_modified: 0,
+            size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
+        };
+        let read_schema = Arc::new(
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(&schema)?,
+        );
+        let read_result_iter = engine.parquet_handler().read_parquet_files(&[file_meta], read_schema, None)?;
+
+        let mut found = false;
+        for batch_result in read_result_iter {
+            let batch = batch_result?;
+            let arrow_data = batch
+                .any_ref()
+                .downcast_ref::<ArrowEngineData2>()
+                .expect("Expected ArrowEngineData");
+            let record_batch = arrow_data.record_batch();
+
+            // Verify recordCount column (derived from numRecords in the stats JSON)
+            let record_count_col = record_batch.column_by_name("recordCount")
+                .expect("recordCount column should exist");
+            let rc_array = record_count_col.as_any()
+                .downcast_ref::<crate::arrow::array::Int64Array>()
+                .expect("recordCount should be Int64");
+            assert_eq!(rc_array.value(0), 100, "recordCount should be 100 (from numRecords in stats JSON)");
+
+            // Verify content_stats column exists and is not null
+            let content_stats_col = record_batch
+                .column_by_name(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+                .expect("content_stats column should exist");
+            assert!(content_stats_col.is_valid(0), "content_stats should not be null");
+
+            let stats_struct = content_stats_col.as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("content_stats should be a struct array");
+
+            // Verify id column stats
+            let id_stats = stats_struct.column_by_name("id").expect("id stats should exist");
+            let id_struct = id_stats.as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("id stats should be a struct");
+            let id_lb = id_struct.column_by_name("lower_bound").expect("id.lower_bound should exist");
+            assert_eq!(
+                id_lb.as_any().downcast_ref::<crate::arrow::array::Int32Array>().expect("Int32").value(0),
+                1,
+                "id.lower_bound should be 1"
+            );
+            let id_ub = id_struct.column_by_name("upper_bound").expect("id.upper_bound should exist");
+            assert_eq!(
+                id_ub.as_any().downcast_ref::<crate::arrow::array::Int32Array>().expect("Int32").value(0),
+                100,
+                "id.upper_bound should be 100"
+            );
+
+            // Verify value column stats
+            let value_stats = stats_struct.column_by_name("value").expect("value stats should exist");
+            let value_struct = value_stats.as_any()
+                .downcast_ref::<crate::arrow::array::StructArray>()
+                .expect("value stats should be a struct");
+            let value_lb = value_struct.column_by_name("lower_bound").expect("value.lower_bound");
+            assert_eq!(
+                value_lb.as_any().downcast_ref::<crate::arrow::array::StringArray>().expect("String").value(0),
+                "alice",
+                "value.lower_bound should be 'alice'"
+            );
+            let value_ub = value_struct.column_by_name("upper_bound").expect("value.upper_bound");
+            assert_eq!(
+                value_ub.as_any().downcast_ref::<crate::arrow::array::StringArray>().expect("String").value(0),
+                "zoe",
+                "value.upper_bound should be 'zoe'"
+            );
+            let value_nc = value_struct.column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME).expect("value.null_value_count");
+            assert_eq!(
+                value_nc.as_any().downcast_ref::<crate::arrow::array::Int64Array>().expect("Int64").value(0),
+                5,
+                "value.null_value_count should be 5"
+            );
+
+            found = true;
+        }
+        assert!(found, "Should have read the manifest");
+        Ok(())
+    }
 }

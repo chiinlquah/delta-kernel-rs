@@ -1570,8 +1570,9 @@ impl ContentTreeNodeBuilder {
     /// Build and evaluate a scan-row transformation expression.
     ///
     /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
-    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (AMT format),
-    /// which is projected directly into `content_stats`.
+    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON format:
+    /// `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is converted to AMT
+    /// format for `content_stats` using [`build_content_stats_from_delta_stats_parsed`].
     ///
     /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
     /// `add_from_existing_scan_rows`), `contentInfo` is projected from those columns with a
@@ -1596,20 +1597,14 @@ impl ContentTreeNodeBuilder {
         // Detect whether flat decoded DV columns are present in the input schema.
         let has_decoded_dv = scan_row_input_schema.field("_dv_location").is_some();
 
-        // stats_parsed is always present (added by step 1 in add_from_existing_scan_rows).
-        let (record_count_expr, content_stats_expr) = {
-            let rc = if let Some(first_col) =
-                stats_struct.fields().next().map(|f| f.name().clone())
-            {
-                Expression::coalesce([
-                    Expression::column(["stats_parsed", first_col.as_str(), "value_count"]),
-                    Expression::literal(Scalar::Long(0)),
-                ])
-            } else {
-                Expression::literal(Scalar::Long(0))
-            };
-            (rc, Expression::column(["stats_parsed"]))
-        };
+        // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta format).
+        // record_count reads numRecords directly; content_stats converts Delta→AMT via expressions.
+        let record_count_expr = Expression::coalesce([
+            Expression::column(["stats_parsed", "numRecords"]),
+            Expression::literal(Scalar::Long(0)),
+        ]);
+        let content_stats_expr =
+            build_content_stats_from_delta_stats_parsed(&self.table_schema, &stats_struct)?;
 
         // Build field expressions mapping scan_row input → ContentTreeNodeEntry output
         let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
@@ -1727,7 +1722,6 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
-        use crate::content_tree::stats;
         use crate::expressions::{ArrayData, Expression};
         use crate::schema::{ArrayType, StructField, StructType};
 
@@ -1740,11 +1734,12 @@ impl ContentTreeNodeBuilder {
         let mut dv_visitor = DecodedDvVisitor::with_capacity(engine_data.len());
         dv_visitor.visit_rows_of(engine_data)?;
 
-        // Step 2: Parse stats via expression evaluator on original engine_data.
+        // Step 2: Parse stats JSON into Delta format via expression evaluator.
         // Use a minimal input schema (path, size, stats) to avoid coupling to optional
-        // scan-row fields (e.g. fileConstantValues) that callers may not provide.
-        let stats_struct = stats::stats_schema(&self.table_schema)?;
-        let stats_schema_ref = Arc::new(stats_struct);
+        // scan-row fields (e.g. fileConstantValues, deletionVector) that callers may not provide.
+        // parse_json uses the Delta JSON stats schema ({numRecords, minValues, maxValues, nullCount,
+        // tightBounds}), so stats_parsed holds Delta format data for the final transform.
+        let delta_stats_schema = Arc::new(build_delta_stats_schema(&self.table_schema));
         let step2_input_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
@@ -1755,14 +1750,14 @@ impl ContentTreeNodeBuilder {
             StructField::nullable("size", DataType::LONG),
             StructField::nullable(
                 "stats_parsed",
-                DataType::Struct(Box::new(stats_schema_ref.as_ref().clone())),
+                DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
             ),
         ]));
         let parse_stats_expr = Expression::struct_from_with_schema(
             [
                 Expression::column(["path"]),
                 Expression::column(["size"]),
-                Expression::parse_json(Expression::column(["stats"]), stats_schema_ref),
+                Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
             ],
             stats_augmented_schema.as_ref().clone(),
         );
@@ -1865,6 +1860,110 @@ impl RowVisitor for TransformedAggregateVisitor {
         }
         Ok(())
     }
+}
+
+/// Builds the Delta JSON stats schema for a given table schema.
+///
+/// The Delta JSON stats format is:
+/// ```json
+/// { "numRecords": 100, "minValues": {"col": val, ...}, "maxValues": {"col": val, ...},
+///   "nullCount": {"col": 0, ...}, "tightBounds": true }
+/// ```
+///
+/// This schema is used with `Expression::parse_json` to parse the `stats` JSON string
+/// from scan rows into a typed struct. Field names match the table schema's field names
+/// (physical names when column mapping is enabled).
+fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::schema::StructType {
+    use crate::schema::{StructField, StructType};
+    let value_fields: Vec<StructField> = table_schema
+        .fields()
+        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+        .collect();
+    let null_count_fields: Vec<StructField> = table_schema
+        .fields()
+        .map(|f| StructField::nullable(f.name(), DataType::LONG))
+        .collect();
+    StructType::new_unchecked(vec![
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            DataType::Struct(Box::new(StructType::new_unchecked(value_fields.clone()))),
+        ),
+        StructField::nullable(
+            "maxValues",
+            DataType::Struct(Box::new(StructType::new_unchecked(value_fields))),
+        ),
+        StructField::nullable(
+            "nullCount",
+            DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
+        ),
+        StructField::nullable("tightBounds", DataType::BOOLEAN),
+    ])
+}
+
+/// Builds a content_stats expression (AMT format) from a `stats_parsed` column in Delta format.
+///
+/// Converts `stats_parsed: {numRecords, minValues, maxValues, nullCount, tightBounds}` (Delta JSON
+/// format) to `content_stats: {col: {value_count, [null_value_count], lower_bound, upper_bound,
+/// exact_bounds}}` (AMT format) using struct expressions.
+///
+/// Column names used for field access come from `table_schema` field names (physical names when
+/// column mapping is enabled, which must match the JSON keys in the Delta stats).
+fn build_content_stats_from_delta_stats_parsed(
+    table_schema: &crate::schema::StructType,
+    amt_schema: &crate::schema::StructType,
+) -> DeltaResult<crate::expressions::Expression> {
+    use crate::expressions::{Expression, Scalar};
+    let col_exprs: Vec<Arc<Expression>> = table_schema
+        .fields()
+        .zip(amt_schema.fields())
+        .map(|(table_field, amt_field)| {
+            let col_name = table_field.name();
+            let col_stats_type = match amt_field.data_type() {
+                DataType::Struct(s) => s.as_ref().clone(),
+                _ => {
+                    return Err(crate::Error::generic(format!(
+                        "Expected AMT stats field '{}' to be a struct, got {:?}",
+                        col_name,
+                        amt_field.data_type()
+                    )))
+                }
+            };
+            let field_exprs: Vec<Arc<Expression>> = col_stats_type
+                .fields()
+                .map(|f| {
+                    Arc::new(match f.name().as_str() {
+                        "value_count" => Expression::column(["stats_parsed", "numRecords"]),
+                        crate::content_tree::NULL_COUNT_FIELD_NAME => {
+                            Expression::column(["stats_parsed", "nullCount", col_name.as_str()])
+                        }
+                        "nan_value_count" => Expression::null_literal(DataType::LONG),
+                        "avg_value_size" => Expression::null_literal(DataType::INTEGER),
+                        "max_value_size" => Expression::null_literal(DataType::INTEGER),
+                        "lower_bound" => {
+                            Expression::column(["stats_parsed", "minValues", col_name.as_str()])
+                        }
+                        "upper_bound" => {
+                            Expression::column(["stats_parsed", "maxValues", col_name.as_str()])
+                        }
+                        "exact_bounds" => Expression::coalesce([
+                            Expression::column(["stats_parsed", "tightBounds"]),
+                            Expression::literal(Scalar::Boolean(true)),
+                        ]),
+                        _ => Expression::null_literal(f.data_type().clone()),
+                    })
+                })
+                .collect();
+            Ok(Arc::new(Expression::struct_from_with_schema(
+                field_exprs,
+                col_stats_type,
+            )))
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(Expression::struct_from_with_schema(
+        col_exprs,
+        amt_schema.clone(),
+    ))
 }
 
 /// Schema for the 4 flat DV columns appended to scan-row data before the final transform.
