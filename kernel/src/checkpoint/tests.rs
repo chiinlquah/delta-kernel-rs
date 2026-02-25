@@ -6,7 +6,7 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::datatypes::DataType;
 use crate::arrow::{
-    array::{create_array, RecordBatch},
+    array::{create_array, Int32Array, RecordBatch},
     datatypes::{Field, Schema},
 };
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
@@ -18,6 +18,8 @@ use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::utils::test_utils::Action;
+use crate::engine::arrow_conversion::TryIntoArrow;
+use crate::transaction::CommitResult;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use object_store::local::LocalFileSystem;

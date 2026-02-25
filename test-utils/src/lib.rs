@@ -593,7 +593,7 @@ pub async fn insert_data<E: TaskExecutor>(
 
     let write_context = txn.get_write_context();
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new(), &Default::default())
         .await?;
     txn.add_files(add_files_metadata);
 
@@ -1042,6 +1042,7 @@ pub async fn write_batch_to_table(
             &ArrowEngineData::new(data),
             &write_context,
             partition_values,
+            &Default::default(),
         )
         .await?;
     txn.add_files(add_meta);
