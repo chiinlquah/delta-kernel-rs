@@ -1266,19 +1266,6 @@ impl ContentTreeNodeBuilder {
 
         let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
 
-        // Read back footer to get row group offsets for split_offsets
-        let file_meta = crate::FileMeta {
-            location: content_metadata_path.clone(),
-            last_modified: 0,
-            size: 0,
-        };
-        let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
-        let split_offsets = if footer.row_group_offsets.is_empty() {
-            None
-        } else {
-            Some(footer.row_group_offsets)
-        };
-
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
@@ -1412,8 +1399,8 @@ impl ContentTreeNodeBuilder {
             // Encryption is not supported
             key_metadata: None,
 
-            // Row group offsets from written Parquet file
-            split_offsets,
+            // Not tracked by the current Kernel implementation
+            split_offsets: None,
 
             // Equality deletes are not supported, passing in null
             equality_ids: None,
