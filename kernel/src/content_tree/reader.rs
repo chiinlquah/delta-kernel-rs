@@ -21,7 +21,16 @@ impl RowVisitor for ContentTreeNodeEntryVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             use crate::schema::ToSchema as _;
-            ContentTreeNodeEntry::to_schema().leaves(None::<&str>)
+            let all_leaves = ContentTreeNodeEntry::to_schema().leaves(None::<&str>);
+            let (names, types) = all_leaves.as_ref();
+            // Filter out array types (splitOffsets, equalityIds) that GetData doesn't support
+            let (filtered_names, filtered_types): (Vec<_>, Vec<_>) = names
+                .iter()
+                .zip(types.iter())
+                .filter(|(_, dt)| !matches!(dt, DataType::Array(_)))
+                .map(|(n, t)| (n.clone(), t.clone()))
+                .unzip();
+            (filtered_names, filtered_types).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
@@ -43,7 +52,7 @@ fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<ContentTreeNodeEntry> {
-    // The getters are in order of flattened leaf fields (24 total):
+    // The getters are in order of flattened leaf fields (25 total, excluding array types):
     // 0: content_type
     // 1: location
     // 2: file_format
@@ -56,8 +65,10 @@ fn visit_metadata_entry_at<'a>(
     // (content_stats excluded from schema)
     // 15-21: manifest_stats fields (7 fields)
     // 22: referenced_file
-    // 23: manifest_dv
-    // (key_metadata, split_offsets, equality_ids excluded from schema - not used by Delta today)
+    // 23: key_metadata
+    // (split_offsets excluded - array type not supported by GetData)
+    // (equality_ids excluded - array type not supported by GetData)
+    // 24: manifest_dv
 
     // Extract content_type
     let content_type_int: i32 = getters[0].get(row_index, "content_type")?;
@@ -164,14 +175,15 @@ fn visit_metadata_entry_at<'a>(
     // Extract referenced_file
     let referenced_file: Option<String> = getters[22].get_opt(row_index, "referenced_file")?;
 
-    // Extract manifest_dv
-    let manifest_dv: Option<&[u8]> = getters[23].get_opt(row_index, "manifest_dv")?;
-    let manifest_dv_bytes = manifest_dv.map(Bytes::copy_from_slice);
+    // Extract key_metadata
+    let key_metadata: Option<&[u8]> = getters[23].get_opt(row_index, "key_metadata")?;
+    let key_metadata_bytes = key_metadata.map(Bytes::copy_from_slice);
 
-    // Note: The following fields are not currently used by Delta and are not extracted:
-    // - key_metadata (binary data not supported in visitor pattern)
-    // - split_offsets (array extraction not straightforward in visitor pattern)
-    // - equality_ids (array extraction not straightforward in visitor pattern)
+    // Note: split_offsets and equality_ids are array types not supported by GetData
+
+    // Extract manifest_dv
+    let manifest_dv: Option<&[u8]> = getters[24].get_opt(row_index, "manifest_dv")?;
+    let manifest_dv_bytes = manifest_dv.map(Bytes::copy_from_slice);
 
     Ok(ContentTreeNodeEntry {
         content_type,
@@ -186,9 +198,9 @@ fn visit_metadata_entry_at<'a>(
         content_stats: None, // Requires table schema to read - not included in base schema
         manifest_stats,
         referenced_file,
+        key_metadata: key_metadata_bytes,
+        split_offsets: None, // Array type not supported by GetData
+        equality_ids: None,  // Array type not supported by GetData
         manifest_dv: manifest_dv_bytes,
-        key_metadata: None,  // Not currently used by Delta
-        split_offsets: None, // Not currently used by Delta
-        equality_ids: None,  // Not currently used by Delta
     })
 }
