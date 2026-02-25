@@ -11,15 +11,15 @@ use crate::arrow::{
 };
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
 use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
-use crate::utils::test_utils::Action;
-use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::transaction::CommitResult;
+use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use object_store::local::LocalFileSystem;
