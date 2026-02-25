@@ -416,7 +416,24 @@ impl ContentTreeNode {
                 DataType::STRING,
                 true,
             )))),
-            "deletionVector" => Expression::null_literal(field_type.clone()),
+            "deletionVector" => {
+                use crate::actions::deletion_vector::DeletionVectorDescriptor;
+                use crate::schema::ToSchema;
+                let dv_schema = <DeletionVectorDescriptor as ToSchema>::to_schema();
+                Expression::Struct(
+                    vec![
+                        Arc::new(Expression::column(["dv_storageType"])),
+                        Arc::new(Expression::column(["dv_pathOrInlineDv"])),
+                        Arc::new(Expression::column(["dv_offset"])),
+                        Arc::new(Expression::column(["dv_sizeInBytes"])),
+                        Arc::new(Expression::column(["dv_cardinality"])),
+                    ],
+                    Some(Box::new(dv_schema)),
+                    Some(Arc::new(Expression::Predicate(Box::new(
+                        Expression::column(["dv_storageType"]).is_not_null(),
+                    )))),
+                )
+            }
 
             // Add-specific fields
             "modificationTime" if action_name == "add" => Expression::literal(i64::MIN),
@@ -516,100 +533,6 @@ impl ContentTreeNode {
         Expression::struct_from_with_schema([action_expr], top_level_schema)
     }
 
-    /// Builds a Transform expression to convert ContentTreeNodeEntry → Remove fields.
-    fn build_metadata_to_remove_transform(
-        remove_schema: &SchemaRef,
-        path_in_log: &str,
-        has_stats_parsed: bool,
-    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        Self::build_metadata_to_action_transform(
-            remove_schema,
-            "remove",
-            path_in_log,
-            has_stats_parsed,
-        )
-    }
-
-    /// Builds a Transform expression to convert ContentTreeNodeEntry + inline DV fields → Add fields.
-    ///
-    /// Reads the `deletionVector` struct from the flat DV columns (`dv_storageType`,
-    /// `dv_pathOrInlineDv`, `dv_offset`, `dv_sizeInBytes`, `dv_cardinality`) appended by
-    /// `append_inline_dv_columns`.
-    fn build_metadata_to_add_transform(
-        add_schema: &SchemaRef,
-        path_in_log: &str,
-        has_stats_parsed: bool,
-    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        use crate::expressions::Expression;
-        use crate::schema::DataType;
-
-        // Get the Add struct type from the schema
-        let add_field = add_schema
-            .field("add")
-            .ok_or_else(|| Error::generic("Schema missing 'add' field"))?;
-        let add_struct_type = match add_field.data_type() {
-            DataType::Struct(s) => s,
-            _ => return Err(Error::generic("'add' field is not a struct")),
-        };
-
-        // Get the deletionVector field type for building the DV struct
-        let _dv_field = add_struct_type
-            .field("deletionVector")
-            .ok_or_else(|| Error::generic("Add schema missing 'deletionVector' field"))?;
-
-        // Build expressions for each Add field
-        let mut add_field_exprs: Vec<Arc<Expression>> = Vec::new();
-
-        for field in add_struct_type.fields() {
-            let expr: Expression = match field.name().as_str() {
-                // DV-specific fields that differ from base transform
-                "deletionVector" => {
-                    // Combine flat DV columns into a struct
-                    // Use nullability predicate: struct is null when storageType is null (no DV match)
-                    use crate::actions::deletion_vector::DeletionVectorDescriptor;
-                    use crate::schema::ToSchema;
-                    let dv_schema = <DeletionVectorDescriptor as ToSchema>::to_schema();
-
-                    // Create struct with nullability predicate
-                    // When dv_storageType IS NOT NULL, the struct is non-null
-                    // When dv_storageType IS NULL (no join match), the entire struct becomes null
-                    Expression::Struct(
-                        vec![
-                            Arc::new(Expression::column(["dv_storageType"])),
-                            Arc::new(Expression::column(["dv_pathOrInlineDv"])),
-                            Arc::new(Expression::column(["dv_offset"])),
-                            Arc::new(Expression::column(["dv_sizeInBytes"])),
-                            Arc::new(Expression::column(["dv_cardinality"])),
-                        ],
-                        Some(Box::new(dv_schema)),
-                        Some(Arc::new(Expression::Predicate(Box::new(
-                            Expression::column(["dv_storageType"]).is_not_null(),
-                        )))),
-                    )
-                }
-                // All other fields: delegate to base function
-                _ => Self::build_action_field_expression(
-                    field.name(),
-                    field.data_type(),
-                    "add",
-                    path_in_log,
-                    has_stats_parsed,
-                )?,
-            };
-
-            add_field_exprs.push(Arc::new(expr));
-        }
-
-        // Create a struct expression with all Add fields
-        let add_struct_expr =
-            Expression::struct_from_with_schema(add_field_exprs, (**add_struct_type).clone());
-
-        // Wrap in outer struct for the top-level "add" field
-        let top_level_expr =
-            Self::wrap_action_in_top_level("add", add_struct_expr, add_struct_type);
-
-        Ok(Arc::new(top_level_expr))
-    }
 
 
     /// Appends 5 flat DV columns extracted directly from `contentInfo.*` on each Data entry.
@@ -927,8 +850,9 @@ impl ContentTreeNode {
         let has_stats_parsed = evaluator_schema.field("stats_parsed").is_some();
 
         let add_evaluator_opt = if has_add {
-            let add_expr = Self::build_metadata_to_add_transform(
+            let add_expr = Self::build_metadata_to_action_transform(
                 output_schema,
+                "add",
                 path_in_log,
                 has_stats_parsed,
             )?;
@@ -942,8 +866,9 @@ impl ContentTreeNode {
         };
 
         let remove_evaluator_opt = if has_remove {
-            let remove_expr = Self::build_metadata_to_remove_transform(
+            let remove_expr = Self::build_metadata_to_action_transform(
                 output_schema,
+                "remove",
                 path_in_log,
                 has_stats_parsed,
             )?;
