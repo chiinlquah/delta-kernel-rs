@@ -1,16 +1,15 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::content_tree::builder::ContentTreeNodeBuilder;
-use crate::content_tree::stats::try_pre_convert_stats_column;
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
-use crate::schema::{DataType, StructField, StructType};
+use crate::schema::DataType;
 use crate::{
     DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version,
 };
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use url::Url;
 
 
@@ -350,47 +349,14 @@ impl LeafNodeWriter {
         engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
     ) -> DeltaResult<()> {
-        use crate::content_tree::stats::stats_schema;
-        use crate::scan::log_replay::SCAN_ROW_SCHEMA;
-        // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
-
-        // Build the input schema hint for try_pre_convert_stats_column using the actual AMT stats
-        // schema. Scan rows always carry stats_parsed in AMT format (produced by log replay's
-        // ParseJson transform or content_tree's create_stats_transformation_evaluator). The AMT
-        // schema has per-column stat structs with no top-level numRecords field, so
-        // is_delta_json_stats_schema returns false and try_pre_convert_stats_column is a no-op.
-        // For any external checkpoints that do use a Delta-JSON-style stats_parsed
-        // (numRecords at top level), is_delta_json_stats_schema returns true and conversion runs.
-        let scan_row_schema_with_stats = {
-            let amt_stats = stats_schema(&self.table_schema)?;
-            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-            fields.push(StructField::nullable(
-                "stats_parsed",
-                DataType::Struct(Box::new(amt_stats)),
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        };
-
-        // Pre-convert stats_parsed if it is Delta JSON format.
-        // When stats_parsed is already AMT format the call is a no-op (returns Ok(None)).
-        let converted = try_pre_convert_stats_column(
-            engine,
-            scan_metadata.data(),
-            "stats_parsed",
-            &self.table_schema,
-            &scan_row_schema_with_stats,
-        )?;
-        let data: &dyn EngineData = match &converted {
-            Some(c) => c.as_ref(),
-            None => scan_metadata.data(),
-        };
+        let data = scan_metadata.data();
 
         // Write files to new leaf using expression-based transform (scan rows → manifest entries).
+        // Stats handling (stats_parsed vs parse_json fallback) is managed inside this method.
         self.data_builder.add_from_existing_scan_rows(
             engine,
             data,
-            &scan_row_schema_with_stats,
             &selection_vector,
             self.version,
             Some(self.snapshot_id),

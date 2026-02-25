@@ -1569,12 +1569,13 @@ impl ContentTreeNodeBuilder {
 
     /// Build and evaluate a scan-row transformation expression.
     ///
-    /// Transforms scan rows (SCAN_ROW_SCHEMA + stats_parsed) into ContentTreeNodeEntry schema,
-    /// using `TrackingStatus::Existed` for all rows. The `stats_parsed` column (already in AMT
-    /// format after `try_pre_convert_stats_column`) is projected directly into `content_stats`.
+    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
+    /// for all rows. If `scan_row_input_schema` includes a `stats_parsed` field (AMT format),
+    /// it is projected directly into `content_stats`. Otherwise, `parse_json(stats)` is used
+    /// as a fallback to parse the raw Delta JSON stats string into AMT format.
     ///
-    /// This is analogous to `evaluate_write_transform` but for scan row input rather than
-    /// write metadata input. DV rows must be handled separately (contentInfo is set to null here).
+    /// This is analogous to `evaluate_write_transform` but for scan row input. DV rows are
+    /// handled via the visitor path in `add_from_existing_scan_rows` (contentInfo is null here).
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,
@@ -1582,31 +1583,38 @@ impl ContentTreeNodeBuilder {
         scan_row_input_schema: &SchemaRef,
         version: Version,
         snapshot_id: Option<i64>,
-        output_schema: &SchemaRef,
-        stats_struct: &crate::schema::StructType,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
+        use crate::content_tree::stats;
         use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
         use crate::expressions::{Expression, Scalar};
         use crate::schema::DataType;
 
+        let output_schema = self.get_schema()?;
+        let stats_struct = stats::stats_schema(&self.table_schema)?;
         let version_i64 = version as i64;
 
-        // Build recordCount and content_stats expressions using stats_parsed (already AMT format)
+        // Build recordCount and content_stats expressions.
+        // If stats_parsed is in the input schema (set by scan pipeline's ParseJson transform),
+        // use it directly. Otherwise fall back to parse_json on the raw stats JSON string.
         let (record_count_expr, content_stats_expr) =
-            if let Some(first_col) = stats_struct.fields().next().map(|f| f.name().clone()) {
-                let rc = Expression::coalesce([
-                    Expression::column(["stats_parsed", first_col.as_str(), "value_count"]),
-                    Expression::literal(Scalar::Long(0)),
-                ]);
+            if scan_row_input_schema.field("stats_parsed").is_some() {
+                let rc = if let Some(first_col) =
+                    stats_struct.fields().next().map(|f| f.name().clone())
+                {
+                    Expression::coalesce([
+                        Expression::column(["stats_parsed", first_col.as_str(), "value_count"]),
+                        Expression::literal(Scalar::Long(0)),
+                    ])
+                } else {
+                    Expression::literal(Scalar::Long(0))
+                };
                 (rc, Expression::column(["stats_parsed"]))
             } else {
-                let stats_null_type = output_schema
-                    .field(CONTENT_STATS_FIELD_NAME)
-                    .map(|f| f.data_type().clone())
-                    .unwrap_or(DataType::STRING);
+                // parse_json parses the Delta JSON stats string into the AMT struct schema.
+                let stats_schema_ref = Arc::new(stats_struct);
                 (
                     Expression::literal(Scalar::Long(0)),
-                    Expression::null_literal(stats_null_type),
+                    Expression::parse_json(Expression::column(["stats"]), stats_schema_ref),
                 )
             };
 
@@ -1686,30 +1694,35 @@ impl ContentTreeNodeBuilder {
     /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
     /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
     ///
-    /// Non-DV rows are transformed in bulk via expression evaluation (`evaluate_scan_row_transform`),
-    /// with `stats_parsed` (already in AMT format) projected directly to `content_stats`.
+    /// Non-DV rows are transformed in bulk via expression evaluation (`evaluate_scan_row_transform`).
+    /// Stats are handled internally: if `stats_parsed` is present in the scan data, it is used
+    /// directly; otherwise `parse_json(stats)` is used as a fallback.
     ///
     /// DV rows are processed through the visitor path since DV info requires special decoding
-    /// (base62 UUID → relative path, size +8 bytes for Iceberg framing).
+    /// (base62 UUID → relative path, size +8 bytes for Iceberg framing). The decoded entries
+    /// are converted to EngineData and pushed to `pre_built_data`.
     pub(crate) fn add_from_existing_scan_rows(
         &mut self,
         engine: &dyn Engine,
         engine_data: &dyn EngineData,
-        scan_row_input_schema: &SchemaRef,
         selection_vector: &[bool],
         version: Version,
         snapshot_id: Option<i64>,
     ) -> DeltaResult<()> {
+        use crate::content_tree::stats;
+        use crate::scan::log_replay::SCAN_ROW_SCHEMA;
+        use crate::schema::{StructField, StructType};
+
         if engine_data.is_empty() {
             return Ok(());
         }
 
-        // 5a: Detect which rows have a deletion vector
+        // Detect which rows have a deletion vector (requires separate decoding path)
         let mut dv_visitor = DvCheckVisitor { has_dv: Vec::new() };
         dv_visitor.visit_rows_of(engine_data)?;
         let has_dv = dv_visitor.has_dv;
 
-        // 5b: Expression path for non-DV rows
+        // Expression path for non-DV rows
         let no_dv_sv: Vec<bool> = (0..engine_data.len())
             .map(|i| {
                 let selected = i >= selection_vector.len() || selection_vector[i];
@@ -1718,32 +1731,35 @@ impl ContentTreeNodeBuilder {
             .collect();
 
         if no_dv_sv.iter().any(|&b| b) {
-            let stats_struct = crate::content_tree::stats::stats_schema(&self.table_schema)?;
-            let output_schema = self.get_schema()?;
+            // Try with extended schema (SCAN_ROW_SCHEMA + stats_parsed) first.
+            // If stats_parsed is present in the data, evaluate_scan_row_transform will use it.
+            // If not, fall back to SCAN_ROW_SCHEMA where parse_json(stats) handles stats.
+            let amt_stats = stats::stats_schema(&self.table_schema)?;
+            let extended_schema = {
+                let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+                fields.push(StructField::nullable(
+                    "stats_parsed",
+                    DataType::Struct(Box::new(amt_stats)),
+                ));
+                Arc::new(StructType::new_unchecked(fields))
+            };
 
-            // Try with stats_parsed (already AMT format after try_pre_convert_stats_column).
-            // Fall back to null stats if schema doesn't match (e.g., data without stats_parsed).
-            let result = self.evaluate_scan_row_transform(
+            let all_entries = match self.evaluate_scan_row_transform(
                 engine,
                 engine_data,
-                scan_row_input_schema,
+                &extended_schema,
                 version,
                 snapshot_id,
-                &output_schema,
-                &stats_struct,
-            );
-            let all_entries = match result {
+            ) {
                 Ok((data, _)) => data,
                 Err(_) => {
-                    use crate::scan::log_replay::SCAN_ROW_SCHEMA;
+                    // stats_parsed not in data; fall back to parse_json(stats)
                     let (data, _) = self.evaluate_scan_row_transform(
                         engine,
                         engine_data,
                         &SCAN_ROW_SCHEMA,
                         version,
                         snapshot_id,
-                        &output_schema,
-                        &crate::schema::StructType::new_unchecked(vec![]),
                     )?;
                     data
                 }
@@ -1766,7 +1782,9 @@ impl ContentTreeNodeBuilder {
             self.pre_built_aggregates.push(aggregates);
         }
 
-        // 5c: Visitor path for DV rows (requires DV decoding: base62 UUID → path, size +8)
+        // Visitor path for DV rows: DV decoding (base62 UUID → path, size +8 for Iceberg framing)
+        // cannot be done via expression evaluator, so we build ContentTreeNodeEntry objects
+        // and convert them to EngineData (FilteredEngineData → pre_built_data).
         let dv_sv: Vec<bool> = (0..engine_data.len())
             .map(|i| {
                 let selected = i >= selection_vector.len() || selection_vector[i];
@@ -1782,24 +1800,71 @@ impl ContentTreeNodeBuilder {
             };
             dv_add_visitor.visit_rows_of(engine_data)?;
 
+            let schema = self.get_schema()?;
+            let mut entries: Vec<ContentTreeNodeEntry> = Vec::new();
             for add in dv_add_visitor.adds {
                 let dv_content = add
                     .deletion_vector
                     .as_ref()
                     .map(extract_deletion_vector_content)
                     .transpose()?;
-                // stats_parsed is already pre-converted; avoid re-parsing JSON stats.
-                // TODO: extract content_stats from stats_parsed AMT struct column instead.
-                // version - 1 ensures version != self.version → TrackingStatus::Existed
-                // TODO: fix TrackingStatus via a proper version API
-                self.add_file_with_dedup(
-                    add.path,
-                    add.size,
-                    None,
-                    version - 1,
-                    snapshot_id,
-                    dv_content,
-                )?;
+                let content_stats =
+                    delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
+                let record_count = extract_record_count_from_stats(content_stats.as_ref());
+                entries.push(ContentTreeNodeEntry {
+                    content_type: DataContentType::Data,
+                    location: Some(add.path),
+                    file_format: DataFileFormat::Parquet,
+                    tracking_info: Some(TrackingInfo {
+                        status: TrackingStatus::Existed,
+                        snapshot_id,
+                        sequence_number: Some(version as i64),
+                        file_sequence_number: Some(version as i64),
+                        first_row_id: None,
+                        changes_dv: None,
+                    }),
+                    content_info: dv_content,
+                    partition_spec_id: 0,
+                    sort_order_id: None,
+                    record_count,
+                    file_size_in_bytes: Some(add.size),
+                    content_stats,
+                    manifest_stats: None,
+                    manifest_dv: None,
+                    key_metadata: None,
+                    split_offsets: None,
+                    equality_ids: None,
+                });
+            }
+
+            if !entries.is_empty() {
+                use crate::content_tree::metadata_entry_to_scalars;
+                use crate::expressions::Scalar;
+
+                let fields_per_row = schema.fields().len();
+                let mut all_scalars = Vec::with_capacity(entries.len() * fields_per_row);
+                for entry in &entries {
+                    let scalars = metadata_entry_to_scalars(entry, &schema)?;
+                    all_scalars.extend(scalars);
+                }
+                let scalar_row_refs: Vec<&[Scalar]> =
+                    all_scalars.chunks(fields_per_row).collect();
+                let engine_data_out = engine
+                    .evaluation_handler()
+                    .create_many(schema.clone(), &scalar_row_refs)?;
+
+                let mut agg_visitor = TransformedAggregateVisitor::default();
+                agg_visitor.visit_rows_of(engine_data_out.as_ref())?;
+
+                let aggregates = BatchAggregates {
+                    added_file_count: 0,
+                    existing_file_count: entries.len() as i64,
+                    total_record_count: agg_visitor.total_record_count,
+                    total_file_size: agg_visitor.total_file_size,
+                };
+
+                self.pre_built_data.push(engine_data_out);
+                self.pre_built_aggregates.push(aggregates);
             }
         }
 
