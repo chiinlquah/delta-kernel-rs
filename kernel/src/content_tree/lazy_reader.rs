@@ -144,14 +144,18 @@ impl Iterator for LazyContentRootIterator {
                             Err(e) => return Some(Err(e)),
                         };
 
-                    // Construct metadata from collected batches with the parsed version
+                    // Construct metadata from collected batches with the parsed version.
+                    // This also validates that the root only contains supported entry types.
                     let metadata = Box::new(
-                        crate::content_tree::ContentTreeNode::from_batches_with_version(
+                        match crate::content_tree::ContentTreeNode::from_batches_with_version(
                             data,
                             version,
                             path_in_log,
                             context.table_root.clone(),
-                        ),
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => return Some(Err(e)),
+                        },
                     );
                     // Root batches exhausted. If skipping leaves, we're done
                     self.leaf_state = if context.skip_leaf_manifests {
