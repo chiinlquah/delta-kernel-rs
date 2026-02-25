@@ -1753,7 +1753,22 @@ impl RowVisitor for ScanRowToAddVisitor {
 mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::content_tree::ContentTreeNode;
     use serde_json::json;
+
+    /// Helper: builds a root manifest, writes it to disk, and reads it back.
+    fn build_and_read_root(
+        builder: &mut ContentTreeNodeBuilder,
+        engine: &dyn crate::Engine,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let root_metadata = builder.build(engine, snapshot_id)?;
+        let table_root = root_metadata.table_root.clone();
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
+        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root = ContentTreeNode::read(engine, &root_url, root_path, table_root)?;
+        root.entries()
+    }
 
     // TODO: Add tests for all tracking_info columns (status, snapshot_id, sequence_number,
     // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
@@ -2657,9 +2672,8 @@ mod tests {
 
         root_builder.delete_from_leaf(&leaf_path, 5)?;
 
-        // Step 3: Build the root in memory and verify manifest DV is stored inline
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let root_entries = root_metadata.entries()?;
+        // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         // Should have: 1 DataManifest (DV is now inline on this entry)
         assert_eq!(root_entries.len(), 1);
@@ -2752,9 +2766,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 7)?;
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        // Build the root in memory and verify
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
 
         let data_manifest = root_entries
@@ -2835,9 +2848,8 @@ mod tests {
         // The third deletion should automatically mark the manifest as deleted
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        // Build the root in memory and verify the manifest is marked as deleted
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -2988,9 +3000,8 @@ mod tests {
         root_builder.add_entry(leaf_manifest_entry);
         root_builder.delete_from_leaf(relative_path, 3)?;
 
-        // Build the root in memory and verify manifest DV is stored inline
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let data_manifest = root_entries
             .iter()
@@ -3072,9 +3083,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 1)?;
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        // Build the root in memory and verify the manifest is marked as deleted
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -3162,9 +3172,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 2)?;
         root_builder.delete_from_leaf(&leaf_path, 5)?;
 
-        // Step 3: Build the root in memory and verify changes_dv from first commit
-        let root_metadata_v1 = root_builder.build(&engine, Some(1))?;
-        let entries_v1 = root_metadata_v1.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv from first commit
+        let entries_v1 = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         let manifest_v1 = entries_v1
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3205,9 +3214,8 @@ mod tests {
         root_builder_v2.delete_from_leaf(&leaf_path, 3)?;
         root_builder_v2.delete_from_leaf(&leaf_path, 7)?;
 
-        // Build the root in memory and verify changes_dv only contains NEW deletions
-        let root_metadata_v2 = root_builder_v2.build(&engine, Some(2))?;
-        let entries_v2 = root_metadata_v2.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletions
+        let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, Some(2))?;
         let manifest_v2 = entries_v2
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3261,9 +3269,8 @@ mod tests {
         // Step 9: Delete one additional record (entry 8) in the third commit
         root_builder_v3.delete_from_leaf(&leaf_path, 8)?;
 
-        // Build the root in memory and verify changes_dv only contains NEW deletion
-        let root_metadata_v3 = root_builder_v3.build(&engine, Some(3))?;
-        let entries_v3 = root_metadata_v3.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletion
+        let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, Some(3))?;
         let manifest_v3 = entries_v3
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3350,9 +3357,8 @@ mod tests {
         };
         root_builder_v4.add_entry(new_data_entry);
 
-        // Build the root in memory and verify changes_dv is None (no deletions)
-        let root_metadata_v4 = root_builder_v4.build(&engine, Some(4))?;
-        let entries_v4 = root_metadata_v4.entries()?;
+        // Build, write, and read back the root to verify changes_dv is None (no deletions)
+        let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, Some(4))?;
         let manifest_v4 = entries_v4
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3443,9 +3449,8 @@ mod tests {
         // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
-        // Step 3: Build the root in memory and verify changes_dv is NOT set for leaf reorganization
-        let root_metadata = root_builder.build(&engine, Some(1))?;
-        let entries = root_metadata.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf reorganization
+        let entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         let manifest = entries
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
