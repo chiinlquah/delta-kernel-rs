@@ -1750,14 +1750,6 @@ impl RowVisitor for ScanRowToAddVisitor {
 }
 
 #[cfg(test)]
-impl ContentTreeNodeBuilder {
-    pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
-        let root_metadata = self.build(engine, None)?;
-        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
