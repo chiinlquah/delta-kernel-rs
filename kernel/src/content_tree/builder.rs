@@ -15,7 +15,7 @@ use crate::expressions::StructData;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::try_parse_uri;
-use crate::{DeltaResult, EngineData, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -238,9 +238,9 @@ pub(crate) struct ContentTreeNodeBuilder {
 }
 
 /// Lightweight aggregate stats computed when adding pre-built columnar batches.
-/// All pre-built entries are `TrackingStatus::Added` at the builder's version.
 struct BatchAggregates {
-    file_count: i64,
+    added_file_count: i64,
+    existing_file_count: i64,
     total_record_count: i64,
     total_file_size: i64,
 }
@@ -849,7 +849,8 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            file_count: engine_data.len() as i64,
+            added_file_count: engine_data.len() as i64,
+            existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
             total_file_size: agg_visitor.total_file_size,
         };
@@ -905,7 +906,11 @@ impl ContentTreeNodeBuilder {
         version: Version,
         snapshot_id: Option<i64>,
     ) -> Result<(), crate::Error> {
-        let mut visitor = ScanRowToAddVisitor::default();
+        let mut visitor = ScanRowToAddVisitor {
+            adds: vec![],
+            selection_vector: vec![],
+            row_offset: 0,
+        };
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
@@ -1301,11 +1306,12 @@ impl ContentTreeNodeBuilder {
             }
         }
 
-        // Include pre-built batch aggregates (all entries are Added at self.version)
+        // Include pre-built batch aggregates
         for agg in &self.pre_built_aggregates {
             record_count += agg.total_record_count;
             file_size_in_bytes += agg.total_file_size;
-            added_files_count += agg.file_count;
+            added_files_count += agg.added_file_count;
+            existing_files_count += agg.existing_file_count;
             added_rows_count += agg.total_record_count;
             min_sequence_number = min_sequence_number.min(self.version as i64);
         }
@@ -1560,6 +1566,245 @@ impl ContentTreeNodeBuilder {
             leaf: Some(leaf_uuid),
         })
     }
+
+    /// Build and evaluate a scan-row transformation expression.
+    ///
+    /// Transforms scan rows (SCAN_ROW_SCHEMA + stats_parsed) into ContentTreeNodeEntry schema,
+    /// using `TrackingStatus::Existed` for all rows. The `stats_parsed` column (already in AMT
+    /// format after `try_pre_convert_stats_column`) is projected directly into `content_stats`.
+    ///
+    /// This is analogous to `evaluate_write_transform` but for scan row input rather than
+    /// write metadata input. DV rows must be handled separately (contentInfo is set to null here).
+    fn evaluate_scan_row_transform(
+        &self,
+        engine: &dyn Engine,
+        engine_data: &dyn EngineData,
+        scan_row_input_schema: &SchemaRef,
+        version: Version,
+        snapshot_id: Option<i64>,
+        output_schema: &SchemaRef,
+        stats_struct: &crate::schema::StructType,
+    ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
+        use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
+        use crate::expressions::{Expression, Scalar};
+        use crate::schema::DataType;
+
+        let version_i64 = version as i64;
+
+        // Build recordCount and content_stats expressions using stats_parsed (already AMT format)
+        let (record_count_expr, content_stats_expr) =
+            if let Some(first_col) = stats_struct.fields().next().map(|f| f.name().clone()) {
+                let rc = Expression::coalesce([
+                    Expression::column(["stats_parsed", first_col.as_str(), "value_count"]),
+                    Expression::literal(Scalar::Long(0)),
+                ]);
+                (rc, Expression::column(["stats_parsed"]))
+            } else {
+                let stats_null_type = output_schema
+                    .field(CONTENT_STATS_FIELD_NAME)
+                    .map(|f| f.data_type().clone())
+                    .unwrap_or(DataType::STRING);
+                (
+                    Expression::literal(Scalar::Long(0)),
+                    Expression::null_literal(stats_null_type),
+                )
+            };
+
+        // Build field expressions mapping scan_row input → ContentTreeNodeEntry output
+        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+        for field in output_schema.fields() {
+            let expr: Expression = match field.name().as_str() {
+                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+                "location" => Expression::column(["path"]),
+                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
+                "trackingInfo" => {
+                    let tracking_struct = match field.data_type() {
+                        DataType::Struct(s) => s.as_ref().clone(),
+                        _ => {
+                            return Err(crate::Error::generic(
+                                "trackingInfo field should be a struct type",
+                            ))
+                        }
+                    };
+                    let snapshot_id_expr = match snapshot_id {
+                        Some(id) => Expression::literal(Scalar::Long(id)),
+                        None => Expression::null_literal(DataType::LONG),
+                    };
+                    Expression::struct_from_with_schema(
+                        [
+                            Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                            snapshot_id_expr,
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::null_literal(DataType::LONG), // firstRowId
+                            Expression::null_literal(DataType::BINARY), // changesDv
+                        ],
+                        tracking_struct,
+                    )
+                }
+                // contentInfo is null here; DV rows are handled separately in add_from_existing_scan_rows
+                "contentInfo" => Expression::null_literal(field.data_type().clone()),
+                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
+                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "recordCount" => record_count_expr.clone(),
+                "fileSizeInBytes" => Expression::column(["size"]),
+                CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
+                "manifestStats" => Expression::null_literal(field.data_type().clone()),
+                "referencedFile" => Expression::null_literal(DataType::STRING),
+                "manifestDv" => Expression::null_literal(DataType::BINARY),
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            field_exprs.push(Arc::new(expr));
+        }
+
+        let transform_expr =
+            Expression::struct_from_with_schema(field_exprs, output_schema.as_ref().clone());
+
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            scan_row_input_schema.clone(),
+            Arc::new(transform_expr),
+            DataType::Struct(Box::new(output_schema.as_ref().clone())),
+        )?;
+        let transformed = evaluator.evaluate(engine_data)?;
+
+        // Compute aggregates from the transformed output
+        let mut agg_visitor = TransformedAggregateVisitor::default();
+        agg_visitor.visit_rows_of(transformed.as_ref())?;
+
+        let aggregates = BatchAggregates {
+            added_file_count: 0,
+            existing_file_count: engine_data.len() as i64,
+            total_record_count: agg_visitor.total_record_count,
+            total_file_size: agg_visitor.total_file_size,
+        };
+
+        Ok((transformed, aggregates))
+    }
+
+    /// Adds file metadata from existing scan rows to the leaf manifest.
+    ///
+    /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
+    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
+    ///
+    /// Non-DV rows are transformed in bulk via expression evaluation (`evaluate_scan_row_transform`),
+    /// with `stats_parsed` (already in AMT format) projected directly to `content_stats`.
+    ///
+    /// DV rows are processed through the visitor path since DV info requires special decoding
+    /// (base62 UUID → relative path, size +8 bytes for Iceberg framing).
+    pub(crate) fn add_from_existing_scan_rows(
+        &mut self,
+        engine: &dyn Engine,
+        engine_data: &dyn EngineData,
+        scan_row_input_schema: &SchemaRef,
+        selection_vector: &[bool],
+        version: Version,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<()> {
+        if engine_data.is_empty() {
+            return Ok(());
+        }
+
+        // 5a: Detect which rows have a deletion vector
+        let mut dv_visitor = DvCheckVisitor { has_dv: Vec::new() };
+        dv_visitor.visit_rows_of(engine_data)?;
+        let has_dv = dv_visitor.has_dv;
+
+        // 5b: Expression path for non-DV rows
+        let no_dv_sv: Vec<bool> = (0..engine_data.len())
+            .map(|i| {
+                let selected = i >= selection_vector.len() || selection_vector[i];
+                selected && !has_dv.get(i).copied().unwrap_or(false)
+            })
+            .collect();
+
+        if no_dv_sv.iter().any(|&b| b) {
+            let stats_struct = crate::content_tree::stats::stats_schema(&self.table_schema)?;
+            let output_schema = self.get_schema()?;
+
+            // Try with stats_parsed (already AMT format after try_pre_convert_stats_column).
+            // Fall back to null stats if schema doesn't match (e.g., data without stats_parsed).
+            let result = self.evaluate_scan_row_transform(
+                engine,
+                engine_data,
+                scan_row_input_schema,
+                version,
+                snapshot_id,
+                &output_schema,
+                &stats_struct,
+            );
+            let all_entries = match result {
+                Ok((data, _)) => data,
+                Err(_) => {
+                    use crate::scan::log_replay::SCAN_ROW_SCHEMA;
+                    let (data, _) = self.evaluate_scan_row_transform(
+                        engine,
+                        engine_data,
+                        &SCAN_ROW_SCHEMA,
+                        version,
+                        snapshot_id,
+                        &output_schema,
+                        &crate::schema::StructType::new_unchecked(vec![]),
+                    )?;
+                    data
+                }
+            };
+
+            let filtered = FilteredEngineData::try_new(all_entries, no_dv_sv)?
+                .apply_selection_vector()?;
+
+            let mut agg_visitor = TransformedAggregateVisitor::default();
+            agg_visitor.visit_rows_of(filtered.as_ref())?;
+
+            let aggregates = BatchAggregates {
+                added_file_count: 0,
+                existing_file_count: filtered.len() as i64,
+                total_record_count: agg_visitor.total_record_count,
+                total_file_size: agg_visitor.total_file_size,
+            };
+
+            self.pre_built_data.push(filtered);
+            self.pre_built_aggregates.push(aggregates);
+        }
+
+        // 5c: Visitor path for DV rows (requires DV decoding: base62 UUID → path, size +8)
+        let dv_sv: Vec<bool> = (0..engine_data.len())
+            .map(|i| {
+                let selected = i >= selection_vector.len() || selection_vector[i];
+                selected && has_dv.get(i).copied().unwrap_or(false)
+            })
+            .collect();
+
+        if dv_sv.iter().any(|&b| b) {
+            let mut dv_add_visitor = ScanRowToAddVisitor {
+                adds: vec![],
+                selection_vector: dv_sv,
+                row_offset: 0,
+            };
+            dv_add_visitor.visit_rows_of(engine_data)?;
+
+            for add in dv_add_visitor.adds {
+                let dv_content = add
+                    .deletion_vector
+                    .as_ref()
+                    .map(extract_deletion_vector_content)
+                    .transpose()?;
+                // stats_parsed is already pre-converted; avoid re-parsing JSON stats.
+                // TODO: extract content_stats from stats_parsed AMT struct column instead.
+                // version - 1 ensures version != self.version → TrackingStatus::Existed
+                // TODO: fix TrackingStatus via a proper version API
+                self.add_file_with_dedup(
+                    add.path,
+                    add.size,
+                    None,
+                    version - 1,
+                    snapshot_id,
+                    dv_content,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Visitor that reads aggregate statistics from the transformed output.
@@ -1605,9 +1850,22 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// - deletionVector (nested)
 ///
 /// This visitor extracts these fields and constructs Add structs.
-#[derive(Default)]
 struct ScanRowToAddVisitor {
     pub adds: Vec<Add>,
+    /// Selection vector controlling which rows to process. Empty means all rows selected.
+    selection_vector: Vec<bool>,
+    /// Running row offset across multiple `visit()` calls (for multi-batch inputs).
+    row_offset: usize,
+}
+
+impl Default for ScanRowToAddVisitor {
+    fn default() -> Self {
+        Self {
+            adds: Vec::new(),
+            selection_vector: Vec::new(),
+            row_offset: 0,
+        }
+    }
 }
 
 impl RowVisitor for ScanRowToAddVisitor {
@@ -1672,6 +1930,11 @@ impl RowVisitor for ScanRowToAddVisitor {
         };
 
         for i in 0..row_count {
+            let global_i = self.row_offset + i;
+            if global_i < self.selection_vector.len() && !self.selection_vector[global_i] {
+                continue;
+            }
+
             if let Some(path) = getters[0].get_opt(i, "scanRow.path")? {
                 let size: i64 = getters[1].get(i, "scanRow.size")?;
                 let modification_time: i64 = getters[2].get(i, "scanRow.modificationTime")?;
@@ -1735,6 +1998,33 @@ impl RowVisitor for ScanRowToAddVisitor {
                 };
                 self.adds.push(add);
             }
+        }
+        self.row_offset += row_count;
+        Ok(())
+    }
+}
+
+/// Visitor that detects which rows have a deletion vector by reading `deletionVector.storageType`.
+struct DvCheckVisitor {
+    has_dv: Vec<bool>,
+}
+
+impl RowVisitor for DvCheckVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::column_name;
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![column_name!("deletionVector.storageType")];
+            let types = vec![DataType::STRING];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            let storage_type: Option<String> =
+                getters[0].get_opt(i, "deletionVector.storageType")?;
+            self.has_dv.push(storage_type.is_some());
         }
         Ok(())
     }

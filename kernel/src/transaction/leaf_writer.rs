@@ -157,14 +157,11 @@ fn track_manifest_entry_for_removal(
 struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
     selection_vector: Vec<bool>,
-    /// Whether to request the stats_parsed column. Starts as true and is set to false
-    /// by visit_rows_of if the data doesn't have the column.
-    request_stats_parsed: bool,
 }
 
 type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
 
-/// Base scan columns without stats_parsed.
+/// Scan columns (all primitive leaf values — no struct columns needed).
 static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     use crate::schema::{column_name, MapType};
     let names = vec![
@@ -210,49 +207,17 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     (names, types)
 });
 
-/// Extended scan columns including stats_parsed.
-static SCAN_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-    use crate::schema::{column_name, StructType};
-    let mut names = BASE_SCAN_COLUMNS.0.clone();
-    names.push(column_name!("stats_parsed"));
-    let mut types = BASE_SCAN_COLUMNS.1.clone();
-    // Use an empty struct type: extract_columns only checks
-    // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
-    // as a single getter, so the exact fields don't matter here.
-    types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
-    (names, types)
-});
-
 impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        if self.request_stats_parsed {
-            (
-                &SCAN_COLUMNS_WITH_STATS_PARSED.0,
-                &SCAN_COLUMNS_WITH_STATS_PARSED.1,
-            )
-        } else {
-            (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
-        }
-    }
-
-    fn visit_rows_of(&mut self, data: &dyn EngineData) -> DeltaResult<()> {
-        // Try with stats_parsed first. If the data doesn't have the column,
-        // fall back to requesting without it.
-        match data.visit_rows(self.selected_column_names_and_types().0, self) {
-            Ok(()) => Ok(()),
-            Err(crate::Error::MissingColumn(_)) => {
-                self.request_stats_parsed = false;
-                data.visit_rows(self.selected_column_names_and_types().0, self)
-            }
-            Err(e) => Err(e),
-        }
+        (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
-        // Fixed getter indices for all columns:
+        // Fixed getter indices for all columns (all primitive leaf values):
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
-        //         deleteManifestPath, deleteManifestPosition, stats_parsed (optional)
+        //         deleteManifestPath, deleteManifestPosition
+        // Note: stats_parsed is pre-extracted into self.stats_per_row before visit() is called.
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
@@ -260,11 +225,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
         const DV_START_IDX: usize = 4; // indices 4-8 are DV fields
         const DATA_MANIFEST_PATH_IDX: usize = 12;
         const DATA_MANIFEST_POSITION_IDX: usize = 13;
-        const DELETE_MANIFEST_PATH_IDX: usize = 14;
-        const DELETE_MANIFEST_POSITION_IDX: usize = 15;
-        const STATS_PARSED_IDX: usize = 16; // Optional - only present if include_stats_columns was called
 
-        let has_stats_parsed = getters.len() > STATS_PARSED_IDX;
         let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
 
         for i in 0..row_count {
@@ -297,65 +258,6 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 &mut ctx,
             )?;
 
-            let size: i64 = getters[SIZE_IDX].get(i, "size")?;
-
-            // Extract stats_parsed as content_stats (already in AMT format after
-            // batch-level pre-conversion). Preferred over JSON stats string when available.
-            // Filter out empty structs (e.g. placeholder columns with no fields).
-            let content_stats = if has_stats_parsed {
-                getters[STATS_PARSED_IDX]
-                    .get_struct(i, "stats_parsed")?
-                    .map(|struct_item| struct_item.materialize())
-                    .transpose()?
-                    .filter(|s| !s.fields().is_empty())
-            } else {
-                None
-            };
-
-            // Track old DV manifest entry for removal (backward compat with separate DV manifests)
-            let delete_manifest_path: Option<String> = getters[DELETE_MANIFEST_PATH_IDX]
-                .get_opt(i, "fileConstantValues.deleteManifestPath")?;
-            let delete_manifest_position: Option<i64> =
-                getters[DELETE_MANIFEST_POSITION_IDX]
-                    .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
-            let mut ctx = ManifestRemovalContext {
-                root_manifest_path: root_manifest_path.clone(),
-                manifest_dvs: &mut self.leaf_writer.manifest_dvs,
-                root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
-                track_root_removals: self.leaf_writer.track_root_removals,
-            };
-            track_manifest_entry_for_removal(
-                delete_manifest_path,
-                delete_manifest_position,
-                path.clone(),
-                &mut ctx,
-            )?;
-
-            let deletion_vector = extract_deletion_vector_at(i, &getters[DV_START_IDX..])?;
-
-            // Convert DV descriptor to inline ContentInfo for storage on the data entry
-            let content_info = deletion_vector
-                .as_ref()
-                .map(crate::content_tree::builder::extract_deletion_vector_content)
-                .transpose()?;
-
-            // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
-            // TODO: Version manipulation is a workaround. The ContentTreeNodeBuilder API should
-            // support explicitly setting TrackingStatus without relying on version comparison.
-            let file_version = if self.leaf_writer.version > 0 {
-                self.leaf_writer.version - 1
-            } else {
-                0
-            };
-
-            self.leaf_writer.data_builder.add_file_with_dedup(
-                path.clone(),
-                size,
-                content_stats,
-                file_version,
-                Some(self.leaf_writer.snapshot_id),
-                content_info,
-            )?;
         }
         Ok(())
     }
@@ -484,13 +386,21 @@ impl LeafNodeWriter {
             None => scan_metadata.data(),
         };
 
-        // Process the scan data with the visitor
+        // Write files to new leaf using expression-based transform (scan rows → manifest entries).
+        self.data_builder.add_from_existing_scan_rows(
+            engine,
+            data,
+            &scan_row_schema_with_stats,
+            &selection_vector,
+            self.version,
+            Some(self.snapshot_id),
+        )?;
+
+        // Track manifest entry removals (mark source manifest entries as deleted via DVs).
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
             selection_vector,
-            request_stats_parsed: true,
         };
-
         visitor.visit_rows_of(data)?;
 
         Ok(())

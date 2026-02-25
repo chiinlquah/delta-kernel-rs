@@ -556,21 +556,6 @@ impl ArrowEngineData {
                         let getter = if column.data_type() == &ArrowDataType::Null {
                             debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                             &() as &'a dyn GetData<'a>
-                        } else if matches!(data_type, DataType::Struct(_)) {
-                            // Whole-struct extraction: push the StructArray directly as a getter.
-                            // extract_leaf_column handles primitive/string/list/map leaves;
-                            // struct columns requested as a whole belong at this level.
-                            debug!("Pushing struct array for {}", ColumnName::new(path.iter()));
-                            column
-                                .as_struct_opt()
-                                .map(|a| a as &'a dyn GetData<'a>)
-                                .ok_or_else(|| {
-                                    Error::unexpected_column_type(format!(
-                                        "On {}: expected struct, got {:?}",
-                                        ColumnName::new(path.iter()),
-                                        column.data_type()
-                                    ))
-                                })?
                         } else {
                             Self::extract_leaf_column(path, data_type, column)?
                         };
