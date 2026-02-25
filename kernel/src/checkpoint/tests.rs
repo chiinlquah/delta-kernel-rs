@@ -4,10 +4,9 @@ use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::Int32Array;
 use crate::arrow::datatypes::DataType;
 use crate::arrow::{
-    array::{create_array, RecordBatch},
+    array::{create_array, Int32Array, RecordBatch},
     datatypes::{Field, Schema},
 };
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
