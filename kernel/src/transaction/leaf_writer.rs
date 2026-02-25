@@ -13,26 +13,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-/// Schema for scan row data that includes stats_parsed with Delta JSON format marker.
-/// Used as the `input_schema` hint for [`crate::content_tree::stats::try_pre_convert_stats_column`]
-/// when converting stats_parsed in `add_existing_actions()`.
-///
-/// Built by extending SCAN_ROW_SCHEMA with a placeholder stats_parsed field.
-/// The actual stats_parsed structure will be determined by the checkpoint data.
-static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::SCAN_ROW_SCHEMA;
-
-    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-
-    // Add a placeholder stats_parsed field with minimal structure (just numRecords).
-    // This signals that stats_parsed is expected and should be converted from Delta JSON format.
-    fields.push(StructField::nullable(
-        "stats_parsed",
-        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
-    ));
-
-    Arc::new(StructType::new_unchecked(fields))
-});
 
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
@@ -468,16 +448,36 @@ impl LeafNodeWriter {
         engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
     ) -> DeltaResult<()> {
+        use crate::content_tree::stats::stats_schema;
+        use crate::scan::log_replay::SCAN_ROW_SCHEMA;
         // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
 
-        // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
+        // Build the input schema hint for try_pre_convert_stats_column using the actual AMT stats
+        // schema. Scan rows always carry stats_parsed in AMT format (produced by log replay's
+        // ParseJson transform or content_tree's create_stats_transformation_evaluator). The AMT
+        // schema has per-column stat structs with no top-level numRecords field, so
+        // is_delta_json_stats_schema returns false and try_pre_convert_stats_column is a no-op.
+        // For any external checkpoints that do use a Delta-JSON-style stats_parsed
+        // (numRecords at top level), is_delta_json_stats_schema returns true and conversion runs.
+        let scan_row_schema_with_stats = {
+            let amt_stats = stats_schema(&self.table_schema)?;
+            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+            fields.push(StructField::nullable(
+                "stats_parsed",
+                DataType::Struct(Box::new(amt_stats)),
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        };
+
+        // Pre-convert stats_parsed if it is Delta JSON format.
+        // When stats_parsed is already AMT format the call is a no-op (returns Ok(None)).
         let converted = try_pre_convert_stats_column(
             engine,
             scan_metadata.data(),
             "stats_parsed",
             &self.table_schema,
-            &SCAN_ROW_SCHEMA_WITH_STATS_PARSED,
+            &scan_row_schema_with_stats,
         )?;
         let data: &dyn EngineData = match &converted {
             Some(c) => c.as_ref(),

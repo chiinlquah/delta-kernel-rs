@@ -5,11 +5,11 @@ use crate::arrow::array::{
         Int32Type, Int64Type, TimestampMicrosecondType,
     },
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
-    PrimitiveArray, RunArray,
+    PrimitiveArray, RunArray, StructArray,
 };
 
 use crate::{
-    engine_data::{GetData, ListItem, MapItem},
+    engine_data::{EngineStruct, GetData, ListItem, MapItem, StructItem},
     DeltaResult, Error,
 };
 
@@ -197,6 +197,16 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
             })?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+}
+
+impl<'a> GetData<'a> for StructArray {
+    fn get_struct(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<StructItem<'a>>> {
+        if self.is_null(row_index) {
+            Ok(None)
+        } else {
+            Ok(Some(StructItem::new(self as &'a dyn EngineStruct, row_index)))
+        }
     }
 }
 
