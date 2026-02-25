@@ -1567,6 +1567,28 @@ impl ContentTreeNodeBuilder {
         })
     }
 
+    /// Builds an intermediate scan-row-like schema for DV rows with decoded DV fields (LONG types)
+    /// and pre-parsed AMT stats. Used to build EngineData after path decoding and sizeInBytes+8
+    /// adjustment before running `evaluate_scan_row_transform`.
+    fn dv_intermediate_schema(&self) -> DeltaResult<SchemaRef> {
+        use crate::content_tree::stats;
+        use crate::schema::{StructField, StructType};
+
+        let stats_struct = stats::stats_schema(&self.table_schema)?;
+        let dv_inner = StructType::new_unchecked(vec![
+            StructField::nullable("pathOrInlineDv", DataType::STRING),
+            StructField::nullable("offset", DataType::LONG),
+            StructField::not_null("sizeInBytes", DataType::LONG),
+            StructField::not_null("cardinality", DataType::LONG),
+        ]);
+        Ok(Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::nullable("stats_parsed", DataType::Struct(Box::new(stats_struct))),
+            StructField::nullable("deletionVector", DataType::Struct(Box::new(dv_inner))),
+        ])))
+    }
+
     /// Build and evaluate a scan-row transformation expression.
     ///
     /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
@@ -1574,8 +1596,9 @@ impl ContentTreeNodeBuilder {
     /// it is projected directly into `content_stats`. Otherwise, `parse_json(stats)` is used
     /// as a fallback to parse the raw Delta JSON stats string into AMT format.
     ///
-    /// This is analogous to `evaluate_write_transform` but for scan row input. DV rows are
-    /// handled via the visitor path in `add_from_existing_scan_rows` (contentInfo is null here).
+    /// If `scan_row_input_schema` has `deletionVector.offset` typed as LONG (decoded DV
+    /// intermediate schema), `contentInfo` is projected from the decoded DV columns with a
+    /// nullability predicate so non-DV rows produce a null struct. Otherwise `contentInfo` is null.
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,
@@ -1586,12 +1609,23 @@ impl ContentTreeNodeBuilder {
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
         use crate::content_tree::stats;
         use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
-        use crate::expressions::{Expression, Scalar};
+        use crate::expressions::{Expression, Predicate, Scalar};
         use crate::schema::DataType;
 
         let output_schema = self.get_schema()?;
         let stats_struct = stats::stats_schema(&self.table_schema)?;
         let version_i64 = version as i64;
+
+        // Detect whether DV fields have been decoded (LONG types) vs raw scan rows (INTEGER types).
+        // Decoded DV intermediate schema uses LONG for offset/sizeInBytes, enabling contentInfo projection.
+        let has_decoded_dv = scan_row_input_schema
+            .field("deletionVector")
+            .and_then(|f| match f.data_type() {
+                DataType::Struct(st) => st.field("offset"),
+                _ => None,
+            })
+            .map(|f| f.data_type() == &DataType::LONG)
+            .unwrap_or(false);
 
         // Build recordCount and content_stats expressions.
         // If stats_parsed is in the input schema (set by scan pipeline's ParseJson transform),
@@ -1650,8 +1684,35 @@ impl ContentTreeNodeBuilder {
                         tracking_struct,
                     )
                 }
-                // contentInfo is null here; DV rows are handled separately in add_from_existing_scan_rows
-                "contentInfo" => Expression::null_literal(field.data_type().clone()),
+                "contentInfo" => {
+                    if has_decoded_dv {
+                        // DV intermediate schema: project decoded DV columns into contentInfo.
+                        // Nullability predicate: null struct for rows where pathOrInlineDv is null.
+                        let content_info_type = match field.data_type() {
+                            DataType::Struct(s) => s.as_ref().clone(),
+                            _ => {
+                                return Err(crate::Error::generic(
+                                    "contentInfo field should be a struct type",
+                                ))
+                            }
+                        };
+                        let nullability = Expression::from_pred(Predicate::is_not_null(
+                            Expression::column(["deletionVector.pathOrInlineDv"]),
+                        ));
+                        Expression::struct_from_with_nullability(
+                            [
+                                Expression::column(["deletionVector.pathOrInlineDv"]),
+                                Expression::column(["deletionVector.offset"]),
+                                Expression::column(["deletionVector.sizeInBytes"]),
+                                Expression::column(["deletionVector.cardinality"]),
+                            ],
+                            content_info_type,
+                            nullability,
+                        )
+                    } else {
+                        Expression::null_literal(field.data_type().clone())
+                    }
+                }
                 "partitionSpecId" => Expression::literal(Scalar::Long(0)),
                 "sortOrderId" => Expression::null_literal(DataType::LONG),
                 "recordCount" => record_count_expr.clone(),
@@ -1782,9 +1843,10 @@ impl ContentTreeNodeBuilder {
             self.pre_built_aggregates.push(aggregates);
         }
 
-        // Visitor path for DV rows: DV decoding (base62 UUID → path, size +8 for Iceberg framing)
-        // cannot be done via expression evaluator, so we build ContentTreeNodeEntry objects
-        // and convert them to EngineData (FilteredEngineData → pre_built_data).
+        // DV rows: path decoding (base62 UUID → relative path) and sizeInBytes+8 adjustment
+        // cannot be done via expression evaluator. Extract via visitor, build an intermediate
+        // scan-row-like EngineData with decoded LONG-typed DV fields and pre-parsed stats, then
+        // run evaluate_scan_row_transform to produce the final ContentTreeNodeEntry output.
         let dv_sv: Vec<bool> = (0..engine_data.len())
             .map(|i| {
                 let selected = i >= selection_vector.len() || selection_vector[i];
@@ -1800,70 +1862,83 @@ impl ContentTreeNodeBuilder {
             };
             dv_add_visitor.visit_rows_of(engine_data)?;
 
-            let schema = self.get_schema()?;
-            let mut entries: Vec<ContentTreeNodeEntry> = Vec::new();
-            for add in dv_add_visitor.adds {
-                let dv_content = add
-                    .deletion_vector
-                    .as_ref()
-                    .map(extract_deletion_vector_content)
-                    .transpose()?;
-                let content_stats =
-                    delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
-                let record_count = extract_record_count_from_stats(content_stats.as_ref());
-                entries.push(ContentTreeNodeEntry {
-                    content_type: DataContentType::Data,
-                    location: Some(add.path),
-                    file_format: DataFileFormat::Parquet,
-                    tracking_info: Some(TrackingInfo {
-                        status: TrackingStatus::Existed,
-                        snapshot_id,
-                        sequence_number: Some(version as i64),
-                        file_sequence_number: Some(version as i64),
-                        first_row_id: None,
-                        changes_dv: None,
-                    }),
-                    content_info: dv_content,
-                    partition_spec_id: 0,
-                    sort_order_id: None,
-                    record_count,
-                    file_size_in_bytes: Some(add.size),
-                    content_stats,
-                    manifest_stats: None,
-                    manifest_dv: None,
-                    key_metadata: None,
-                    split_offsets: None,
-                    equality_ids: None,
-                });
-            }
-
-            if !entries.is_empty() {
-                use crate::content_tree::metadata_entry_to_scalars;
+            if !dv_add_visitor.adds.is_empty() {
                 use crate::expressions::Scalar;
 
-                let fields_per_row = schema.fields().len();
-                let mut all_scalars = Vec::with_capacity(entries.len() * fields_per_row);
-                for entry in &entries {
-                    let scalars = metadata_entry_to_scalars(entry, &schema)?;
-                    all_scalars.extend(scalars);
-                }
-                let scalar_row_refs: Vec<&[Scalar]> =
-                    all_scalars.chunks(fields_per_row).collect();
-                let engine_data_out = engine
-                    .evaluation_handler()
-                    .create_many(schema.clone(), &scalar_row_refs)?;
-
-                let mut agg_visitor = TransformedAggregateVisitor::default();
-                agg_visitor.visit_rows_of(engine_data_out.as_ref())?;
-
-                let aggregates = BatchAggregates {
-                    added_file_count: 0,
-                    existing_file_count: entries.len() as i64,
-                    total_record_count: agg_visitor.total_record_count,
-                    total_file_size: agg_visitor.total_file_size,
+                // Build intermediate scan-row-like EngineData with:
+                //   path (STRING), size (LONG), stats_parsed (Struct, AMT format), deletionVector (decoded, LONG types)
+                let dv_schema = self.dv_intermediate_schema()?;
+                let dv_inner_fields: Vec<_> = match dv_schema.field("deletionVector") {
+                    Some(f) => match f.data_type() {
+                        DataType::Struct(st) => st.fields().cloned().collect(),
+                        _ => {
+                            return Err(crate::Error::generic(
+                                "deletionVector should be struct in dv_schema",
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err(crate::Error::generic(
+                            "missing deletionVector field in dv_schema",
+                        ))
+                    }
                 };
+                let stats_parsed_null = Scalar::Null(
+                    dv_schema
+                        .field("stats_parsed")
+                        .ok_or_else(|| {
+                            crate::Error::generic("missing stats_parsed field in dv_schema")
+                        })?
+                        .data_type()
+                        .clone(),
+                );
+                let fields_per_row = dv_schema.fields().len(); // 4: path, size, stats_parsed, deletionVector
+                let mut all_scalars =
+                    Vec::with_capacity(dv_add_visitor.adds.len() * fields_per_row);
+                for add in &dv_add_visitor.adds {
+                    let content_info = add
+                        .deletion_vector
+                        .as_ref()
+                        .map(extract_deletion_vector_content)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            crate::Error::generic("DV row missing deletion vector")
+                        })?;
+                    let content_stats = delta_json_stats_to_content_stats(
+                        add.stats.as_deref(),
+                        &self.table_schema,
+                    )?;
+                    let dv_scalar = Scalar::Struct(StructData::new_unchecked(
+                        dv_inner_fields.clone(),
+                        vec![
+                            Scalar::String(content_info.location.into()),
+                            Scalar::Long(content_info.offset),
+                            Scalar::Long(content_info.size_in_bytes),
+                            Scalar::Long(content_info.cardinality),
+                        ],
+                    ));
+                    all_scalars.extend([
+                        Scalar::String(add.path.clone().into()),
+                        Scalar::Long(add.size),
+                        content_stats
+                            .map(Scalar::Struct)
+                            .unwrap_or_else(|| stats_parsed_null.clone()),
+                        dv_scalar,
+                    ]);
+                }
+                let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
+                let dv_engine_data = engine
+                    .evaluation_handler()
+                    .create_many(dv_schema.clone(), &scalar_row_refs)?;
 
-                self.pre_built_data.push(engine_data_out);
+                let (transformed, aggregates) = self.evaluate_scan_row_transform(
+                    engine,
+                    dv_engine_data.as_ref(),
+                    &dv_schema,
+                    version,
+                    snapshot_id,
+                )?;
+                self.pre_built_data.push(transformed);
                 self.pre_built_aggregates.push(aggregates);
             }
         }
