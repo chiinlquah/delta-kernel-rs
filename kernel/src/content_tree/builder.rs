@@ -1265,7 +1265,6 @@ impl ContentTreeNodeBuilder {
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
         let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
-
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
