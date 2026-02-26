@@ -273,7 +273,7 @@ impl ContentTreeNode {
                     // }
                     let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     match content_type_int {
-                        0 | 1 | 2 | 3 | 4 | 5 => {} // Data or CombinedManifest — supported
+                        0..=5 => {} // Data or CombinedManifest — supported
                         other => {
                             return Err(Error::unsupported(format!(
                                 "Unknown content type {other} in content tree root"
