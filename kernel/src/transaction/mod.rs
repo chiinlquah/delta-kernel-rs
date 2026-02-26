@@ -2886,6 +2886,7 @@ mod tests {
     fn test_remove_with_data_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::content_tree::writer::ContentTreeNodeWriter;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
@@ -2913,7 +2914,8 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_url = root_builder.write_root(&engine)?;
+        let root_metadata = root_builder.build(&engine, None)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
@@ -2985,6 +2987,7 @@ mod tests {
     fn test_batch_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::content_tree::writer::ContentTreeNodeWriter;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
@@ -3007,7 +3010,8 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_url = root_builder.write_root(&engine)?;
+        let root_metadata = root_builder.build(&engine, None)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 3: Batch-commit a remove (v2)
@@ -3092,6 +3096,7 @@ mod tests {
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
+        use crate::content_tree::writer::ContentTreeNodeWriter;
         use crate::content_tree::DataContentType;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
@@ -3159,7 +3164,8 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_url = root_builder.write_root(&engine)?;
+        let root_metadata = root_builder.build(&engine, None)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
