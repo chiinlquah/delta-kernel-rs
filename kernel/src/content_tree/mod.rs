@@ -241,6 +241,7 @@ impl ContentTreeNode {
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
+                    let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     let status: i32 = getters[1].get(i, "trackingInfo.status")?;
 
                     // Skip DELETED entries (status=3) — filtered out at read time
@@ -248,30 +249,18 @@ impl ContentTreeNode {
                         continue;
                     }
 
-                    // TODO: We have some tests where we roundtrip all the types
-                    // so we'll ignore this for now
-                    // let content_type_int: i32 = getters[0].get(i, "contentType")?;
-                    // match content_type_int {
-                    //     0 | 5 => {} // Data or CombinedManifest — supported
-                    //     3 | 4 => {
-                    //         return Err(Error::unsupported(
-                    //             "DataManifest/DeleteManifest format is not supported; \
-                    //              only CombinedManifest (type 5) is supported in the content tree",
-                    //         ))
-                    //     }
-                    //     1 => return Err(Error::unsupported(
-                    //         "PositionDeletes entries are not supported in the content tree root",
-                    //     )),
-                    //     2 => return Err(Error::unsupported("EqualityDeletes are not supported")),
-                    //     other => {
-                    //         return Err(Error::unsupported(format!(
-                    //             "Unknown content type {other} in content tree root"
-                    //         )))
-                    //     }
-                    // }
-                    let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     match content_type_int {
-                        0..=5 => {} // Data or CombinedManifest — supported
+                        0 | 5 => {} // Data or CombinedManifest — supported
+                        3 | 4 => {
+                            return Err(Error::unsupported(
+                                "DataManifest/DeleteManifest format is not supported; \
+                                 only CombinedManifest (type 5) is supported in the content tree",
+                            ))
+                        }
+                        1 => return Err(Error::unsupported(
+                            "PositionDeletes entries are not supported in the content tree root",
+                        )),
+                        2 => return Err(Error::unsupported("EqualityDeletes are not supported")),
                         other => {
                             return Err(Error::unsupported(format!(
                                 "Unknown content type {other} in content tree root"
@@ -3156,6 +3145,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // PositionDeletes is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_deletion_vector() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3175,6 +3165,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // DataManifest is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3194,6 +3185,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // DataManifest is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_inline_deletion_vector() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3232,6 +3224,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // Not all entry type are supported
     #[test]
     fn test_roundtrip_multiple_metadata_entries() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3267,6 +3260,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // Not all entry type are supported
     #[test]
     fn test_roundtrip_all_data_content_types() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3934,44 +3928,43 @@ mod tests {
         Ok(())
     }
 
-    // TOOD: reinstate test
-    // #[test]
-    // fn test_from_batches_with_version_rejects_unsupported_types() -> DeltaResult<()> {
-    //     // from_batches_with_version() should reject DataManifest, DeleteManifest,
-    //     // PositionDeletes, and EqualityDeletes entries at root-read time.
-    //     let engine = SyncEngine::new();
-    //     let temp_dir = tempdir().unwrap();
-    //     let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-    //
-    //     let unsupported_cases: &[(DataContentType, &str)] = &[
-    //         (DataContentType::DataManifest, "DataManifest"),
-    //         (DataContentType::DeleteManifest, "DeleteManifest"),
-    //         (DataContentType::PositionDeletes, "PositionDeletes"),
-    //         (DataContentType::EqualityDeletes, "EqualityDeletes"),
-    //     ];
-    //
-    //     for (content_type, label) in unsupported_cases {
-    //         let mut entry = create_data_manifest_entry("memory:///test.parquet");
-    //         entry.content_type = *content_type;
-    //
-    //         let batch = entry
-    //             .clone()
-    //             .into_engine_data(test_metadata_entry_schema(), &engine)?;
-    //
-    //         let result = ContentTreeNode::from_batches_with_version(
-    //             vec![batch],
-    //             0,
-    //             String::new(),
-    //             table_root_url.clone(),
-    //         );
-    //         assert!(
-    //             result.is_err(),
-    //             "{label} entries should be rejected by from_batches_with_version"
-    //         );
-    //     }
-    //
-    //     Ok(())
-    // }
+    #[test]
+    fn test_from_batches_with_version_rejects_unsupported_types() -> DeltaResult<()> {
+        // from_batches_with_version() should reject DataManifest, DeleteManifest,
+        // PositionDeletes, and EqualityDeletes entries at root-read time.
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let unsupported_cases: &[(DataContentType, &str)] = &[
+            (DataContentType::DataManifest, "DataManifest"),
+            (DataContentType::DeleteManifest, "DeleteManifest"),
+            (DataContentType::PositionDeletes, "PositionDeletes"),
+            (DataContentType::EqualityDeletes, "EqualityDeletes"),
+        ];
+
+        for (content_type, label) in unsupported_cases {
+            let mut entry = create_data_manifest_entry("memory:///test.parquet");
+            entry.content_type = *content_type;
+
+            let batch = entry
+                .clone()
+                .into_engine_data(test_metadata_entry_schema(), &engine)?;
+
+            let result = ContentTreeNode::from_batches_with_version(
+                vec![batch],
+                0,
+                String::new(),
+                table_root_url.clone(),
+            );
+            assert!(
+                result.is_err(),
+                "{label} entries should be rejected by from_batches_with_version"
+            );
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_manifest_references_combined_manifest() -> DeltaResult<()> {
