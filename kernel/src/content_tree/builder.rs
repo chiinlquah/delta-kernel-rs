@@ -2148,7 +2148,16 @@ mod tests {
         let table_root = root_metadata.table_root.clone();
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
         let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root = ContentTreeNode::read(engine, &root_url, root_path, table_root)?;
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &root_url,
+            root_path,
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let root =
+            ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
         root.entries()
     }
 
@@ -3011,8 +3020,20 @@ mod tests {
 
         // Step 4: Read the leaf and apply manifest DV to verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
-        let leaf_metadata =
-            ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &leaf_url,
+            leaf_path.clone(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let leaf_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root.clone(),
+        )?;
         let leaf_entries = leaf_metadata.entries()?;
         assert_eq!(leaf_entries.len(), 10); // Original 10 entries
 
@@ -3095,8 +3116,16 @@ mod tests {
 
         // Apply manifest DV and verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &leaf_url,
+            leaf_path.clone(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
         let leaf_metadata =
-            ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root)?;
+            ContentTreeNode::from_batches_with_version(data, version, path_in_log, table_root)?;
         let leaf_entries = leaf_metadata.entries()?;
         let filtered_entries = apply_manifest_dv(leaf_entries, manifest_dv_bytes)?;
         assert_eq!(filtered_entries.len(), 7); // 3 deleted, 7 remaining

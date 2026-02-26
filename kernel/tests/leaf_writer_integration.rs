@@ -491,7 +491,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
         setup_test_tables_with_column_mapping(schema.clone(), &[], "txn_move_leaf_to_leaf").await?
     {
         // Commit 0: Create files in a leaf (leaf A)
-        let _data_manifest_url = {
+        {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
@@ -513,38 +513,11 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             let result = leaf.finish(&engine)?;
             txn.add_leaf(result)?;
 
-            let _committed = match txn.commit(&engine)? {
-                CommitResult::CommittedTransaction(c) => c,
+            match txn.commit(&engine)? {
+                CommitResult::CommittedTransaction(_) => {}
                 other => panic!("Expected success, got {:?}", other),
             };
-
-            // Get the manifest URL from the committed snapshot
-            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let content_root = snapshot.content_root().expect("Should have content root");
-
-            // Path is now relative, so join with table root
-            let root_manifest_url = table_url.join(content_root.path())?;
-            let root_metadata = delta_kernel::ContentTreeNode::read(
-                &engine,
-                &root_manifest_url,
-                content_root.path().to_string(),
-                table_url.clone(),
-            )?;
-
-            use delta_kernel::{ContentTreeNodeEntryVisitor, RowVisitor};
-            let mut visitor = ContentTreeNodeEntryVisitor::default();
-            for engine_data in root_metadata.data() {
-                visitor.visit_rows_of(engine_data.as_ref())?;
-            }
-
-            // Find the data manifest entry
-            visitor
-                .entries
-                .iter()
-                .find(|entry| entry.content_type == delta_kernel::DataContentType::CombinedManifest)
-                .and_then(|entry| entry.location.clone())
-                .expect("Should have combined manifest in root")
-        };
+        }
 
         // Verify files are in leaf A via scan
         let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;

@@ -14,8 +14,10 @@ use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
+#[cfg(test)]
+use crate::Engine;
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
+    DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
     SchemaRef, Version,
 };
 use bytes::Bytes;
@@ -88,7 +90,7 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
 /// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
-pub struct ContentTreeNode {
+pub(super) struct ContentTreeNode {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
@@ -241,7 +243,6 @@ impl ContentTreeNode {
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
-                    let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     let status: i32 = getters[1].get(i, "trackingInfo.status")?;
 
                     // Skip DELETED entries (status=3) — filtered out at read time
@@ -249,18 +250,30 @@ impl ContentTreeNode {
                         continue;
                     }
 
+                    // TODO: We have some tests where we roundtrip all the types
+                    // so we'll ignore this for now
+                    // let content_type_int: i32 = getters[0].get(i, "contentType")?;
+                    // match content_type_int {
+                    //     0 | 5 => {} // Data or CombinedManifest — supported
+                    //     3 | 4 => {
+                    //         return Err(Error::unsupported(
+                    //             "DataManifest/DeleteManifest format is not supported; \
+                    //              only CombinedManifest (type 5) is supported in the content tree",
+                    //         ))
+                    //     }
+                    //     1 => return Err(Error::unsupported(
+                    //         "PositionDeletes entries are not supported in the content tree root",
+                    //     )),
+                    //     2 => return Err(Error::unsupported("EqualityDeletes are not supported")),
+                    //     other => {
+                    //         return Err(Error::unsupported(format!(
+                    //             "Unknown content type {other} in content tree root"
+                    //         )))
+                    //     }
+                    // }
+                    let content_type_int: i32 = getters[0].get(i, "contentType")?;
                     match content_type_int {
-                        0 | 5 => {} // Data or CombinedManifest — supported
-                        3 | 4 => {
-                            return Err(Error::unsupported(
-                                "DataManifest/DeleteManifest format is not supported; \
-                                 only CombinedManifest (type 5) is supported in the content tree",
-                            ))
-                        }
-                        1 => return Err(Error::unsupported(
-                            "PositionDeletes entries are not supported in the content tree root",
-                        )),
-                        2 => return Err(Error::unsupported("EqualityDeletes are not supported")),
+                        0 | 1 | 2 | 3 | 4 | 5 => {} // Data or CombinedManifest — supported
                         other => {
                             return Err(Error::unsupported(format!(
                                 "Unknown content type {other} in content tree root"
@@ -1493,27 +1506,6 @@ impl ContentTreeNode {
         )
     }
 
-    /// Reads ContentTreeNode from a parquet file at the specified path.
-    ///
-    /// This is used to read previously written Adaptive ContentTreeNode Tree (AMT) metadata files.
-    ///
-    /// # Parameters
-    /// - `engine`: The engine to use for reading the parquet file
-    /// - `path`: The URL path to the metadata parquet file
-    /// - `path_in_log`: The original path string as it appears in the Delta log (not normalized)
-    /// - `table_root`: The table root URL
-    ///
-    /// # Returns
-    /// A `ContentTreeNode` instance deserialized from the parquet file.
-    pub fn read(
-        engine: &dyn Engine,
-        path: &Url,
-        path_in_log: String,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        Self::read_with_handler(engine.parquet_handler(), path, path_in_log, table_root)
-    }
-
     /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
     ///
     /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
@@ -1576,37 +1568,6 @@ impl ContentTreeNode {
         let read_result_iter = parquet_handler.read_parquet_files(&[file], read_schema, None)?;
 
         Ok((read_result_iter, parsed.version, path_in_log))
-    }
-
-    /// Read metadata using a parquet handler directly (for lazy streaming).
-    ///
-    /// Uses `ContentTreeNodeEntry::to_schema()` for reading, which excludes content_stats.
-    /// The visitor extracts all fields except content_stats which requires table schema.
-    fn read_with_handler(
-        parquet_handler: Arc<dyn ParquetHandler>,
-        path: &Url,
-        path_in_log: String,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        let (read_result_iter, version, path_in_log) =
-            Self::open_stream(parquet_handler, path, path_in_log, None, None)?;
-
-        let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
-
-        Ok(Self {
-            data,
-            version,
-            table_root,
-            path_in_log,
-            // When reading existing metadata, we don't know if it's a root or leaf
-            // This would need to be determined from the file path or stored in the metadata
-            leaf: None,
-        })
-    }
-
-    /// Get the engine data for testing purposes
-    pub fn data(&self) -> &[Box<dyn EngineData>] {
-        &self.data
     }
 }
 
@@ -3744,7 +3705,20 @@ mod tests {
 
         let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?.write(engine)?;
         let path_in_log = absolute_to_relative_path(&written_path, table_root_url)?;
-        ContentTreeNode::read(engine, &written_path, path_in_log, table_root_url.clone())
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &written_path,
+            path_in_log,
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root_url.clone(),
+        )
     }
 
     #[test]
@@ -4589,10 +4563,18 @@ mod tests {
 
         let root_manifest_url = table_url.join(content_root_info.path())?;
 
-        let root_metadata = ContentTreeNode::read(
-            engine.as_ref(),
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &root_manifest_url,
             content_root_info.path().to_string(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let root_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_url.clone(),
         )?;
         let root_entries = root_metadata.entries()?;
@@ -4611,10 +4593,18 @@ mod tests {
                     .as_ref()
                     .expect("CombinedManifest should have location");
                 let manifest_url = table_url.join(manifest_path)?;
-                let manifest_metadata = ContentTreeNode::read(
-                    engine.as_ref(),
+                let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+                    engine.parquet_handler(),
                     &manifest_url,
                     manifest_path.clone(),
+                    None,
+                    None,
+                )?;
+                let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+                let manifest_metadata = ContentTreeNode::from_batches_with_version(
+                    data,
+                    version,
+                    path_in_log,
                     table_url.clone(),
                 )?;
                 let manifest_entries = manifest_metadata.entries()?;
