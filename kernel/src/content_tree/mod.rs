@@ -8,8 +8,7 @@ pub(crate) mod writer;
 
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
-use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
-use crate::content_tree::builder::ContentTreeNodeBuilder;
+use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
@@ -1609,76 +1608,6 @@ impl ContentTreeNode {
     pub fn data(&self) -> &[Box<dyn EngineData>] {
         &self.data
     }
-
-    /// Converts this ContentTreeNode into a ContentTreeNodeBuilder for further modifications.
-    ///
-    /// This creates a new builder initialized with the table root, allowing additional
-    /// metadata entries to be added before building a new ContentTreeNode instance.
-    ///
-    /// # Arguments
-    /// * `table_schema` - The table's data schema with PARQUET:field_id metadata on each field.
-    ///   This is used to convert Delta JSON stats to the content_stats StructData format.
-    ///
-    /// # Returns
-    /// A `ContentTreeNodeBuilder` that can be used to add more entries or build a new ContentTreeNode.
-    /// Convert this metadata to a builder for modification.
-    ///
-    /// # Arguments
-    /// * `table_schema` - The table schema for metadata entry construction
-    /// * `new_version` - The version number for the new metadata being built.
-    ///   This should typically be the commit version, NOT the version of the existing metadata.
-    pub(crate) fn to_builder(
-        &self,
-        table_schema: StructType,
-        new_version: Version,
-    ) -> ContentTreeNodeBuilder {
-        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
-        use crate::RowVisitor;
-
-        let mut builder =
-            ContentTreeNodeBuilder::new_for(self.table_root.clone(), new_version, table_schema);
-
-        // Copy existing entries from this metadata into the builder
-        for engine_data in &self.data {
-            let mut visitor = ContentTreeNodeEntryVisitor::default();
-            // Ignore errors - if we can't extract entries, just skip them
-            if visitor.visit_rows_of(engine_data.as_ref()).is_ok() {
-                for entry in visitor.entries {
-                    builder.add_entry(entry);
-                }
-            }
-        }
-
-        builder
-    }
-
-    /// Creates ContentTreeNode from a content root commit.
-    ///
-    /// This is an optimized path for batch commits that loads metadata directly from a
-    /// content root parquet file instead of replaying the entire log.
-    ///
-    /// # Parameters
-    /// - `engine`: The engine to use for reading the parquet file
-    /// - `content_root_commit`: The parsed log path of the commit containing the content root
-    ///
-    /// # Returns
-    /// A `ContentTreeNode` instance loaded from the content root file.
-    pub(crate) fn new_from_content_root(
-        engine: &dyn Engine,
-        content_root: &ContentRoot,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        // Parse and read from the content root file referenced by the ContentRoot action
-        let content_root_url = table_root
-            .join(&content_root.path)
-            .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
-        Self::read(
-            engine,
-            &content_root_url,
-            content_root.path.clone(),
-            table_root,
-        )
-    }
 }
 
 /// Parses a manifest DV into a selection vector.
@@ -3230,24 +3159,8 @@ mod tests {
 
         // Create original metadata
         let original_entry = create_simple_metadata_entry();
-        let metadata = ContentTreeNode {
-            data: vec![original_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
         let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            build_and_roundtrip(vec![original_entry.clone()], 0, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3400,24 +3313,8 @@ mod tests {
 
         // Create original metadata
         let original_entry = create_simple_metadata_entry();
-        let metadata = ContentTreeNode {
-            data: vec![original_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
         let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            build_and_roundtrip(vec![original_entry.clone()], 0, &table_root_url, &engine)?;
 
         // Verify data was preserved
         let entries = read_metadata.entries()?;
@@ -3435,24 +3332,8 @@ mod tests {
 
         // Create metadata with deletion vector
         let original_entry = create_metadata_entry_with_dv();
-        let metadata = ContentTreeNode {
-            data: vec![original_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 1,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
         let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            build_and_roundtrip(vec![original_entry.clone()], 1, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3470,24 +3351,8 @@ mod tests {
 
         // Create metadata with manifest stats
         let original_entry = create_metadata_entry_with_manifest_stats();
-        let metadata = ContentTreeNode {
-            data: vec![original_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 2,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
         let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            build_and_roundtrip(vec![original_entry.clone()], 2, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3505,24 +3370,8 @@ mod tests {
 
         // Create metadata with inline deletion vector
         let original_entry = create_metadata_entry_with_inline_dv();
-        let metadata = ContentTreeNode {
-            data: vec![original_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 3,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
         let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            build_and_roundtrip(vec![original_entry.clone()], 3, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3563,35 +3412,17 @@ mod tests {
         let entry3 = create_metadata_entry_with_manifest_stats();
         let entry4 = create_metadata_entry_with_inline_dv();
 
-        let metadata = ContentTreeNode {
-            data: vec![
-                entry1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                entry2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                entry3
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                entry4
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
+        let read_metadata = build_and_roundtrip(
+            vec![
+                entry1.clone(),
+                entry2.clone(),
+                entry3.clone(),
+                entry4.clone(),
             ],
-            version: 3,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
-        let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+            3,
+            &table_root_url,
+            &engine,
+        )?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3648,30 +3479,7 @@ mod tests {
             })
             .collect();
 
-        let data: Vec<Box<dyn EngineData>> = entries
-            .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        let metadata = ContentTreeNode {
-            data,
-            version: 4,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
-        let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+        let read_metadata = build_and_roundtrip(entries.clone(), 4, &table_root_url, &engine)?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3725,30 +3533,7 @@ mod tests {
             })
             .collect();
 
-        let data: Vec<Box<dyn EngineData>> = entries
-            .iter()
-            .map(|e| {
-                e.clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        let metadata = ContentTreeNode {
-            data,
-            version: 5,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
-        let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+        let read_metadata = build_and_roundtrip(entries.clone(), 5, &table_root_url, &engine)?;
 
         // Verify
         let read_entries = read_metadata.entries()?;
@@ -3792,24 +3577,7 @@ mod tests {
             equality_ids: None,
         };
 
-        let metadata = ContentTreeNode {
-            data: vec![entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 6,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
-        let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+        let read_metadata = build_and_roundtrip(vec![entry.clone()], 6, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3862,24 +3630,7 @@ mod tests {
             equality_ids: None,
         };
 
-        let metadata = ContentTreeNode {
-            data: vec![entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 7,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write metadata
-        let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
-
-        // Read metadata back
-        let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
-        let read_metadata =
-            ContentTreeNode::read(&engine, &written_file, path_in_log, table_root_url.clone())?;
+        let read_metadata = build_and_roundtrip(vec![entry.clone()], 7, &table_root_url, &engine)?;
 
         // Verify
         let entries = read_metadata.entries()?;
@@ -3957,33 +3708,43 @@ mod tests {
         }
     }
 
-    /// Helper to add _pos column to EngineData for testing
-    /// Real parquet files have this added by the reader, but test data needs it manually
-    fn add_pos_column(data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
-        use crate::expressions::{ArrayData, Scalar};
-        use crate::schema::{ArrayType, DataType, StructField, StructType};
+    /// Builds a ContentTreeNode from entries using the builder.
+    fn build_node(
+        entries: Vec<ContentTreeNodeEntry>,
+        version: Version,
+        table_root_url: &Url,
+        engine: &SyncEngine,
+    ) -> DeltaResult<ContentTreeNode> {
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
 
-        let num_rows = data.len();
-
-        // Build _pos values (0, 1, 2, ...) as LONG to match schema expectations
-        let pos_values: Vec<Scalar> = (0..num_rows as i64).map(Scalar::Long).collect();
-
-        let pos_array = ArrayData::try_new(ArrayType::new(DataType::LONG, false), pos_values)?;
-
-        let pos_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "_pos",
-            DataType::LONG,
-            false,
-        )]));
-
-        data.append_columns(pos_schema, vec![pos_array])
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root_url.clone(), version, test_table_schema());
+        for entry in entries {
+            builder.add_entry(entry);
+        }
+        builder.build(engine, 1)
     }
 
-    /// Helper to add _pos column to a vec of EngineData batches
-    fn add_pos_to_batches(
-        batches: Vec<Box<dyn EngineData>>,
-    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
-        batches.into_iter().map(add_pos_column).collect()
+    /// Builds a ContentTreeNode from entries using the builder, writes to disk, and reads back.
+    /// This ensures tests go through the same code path as production (builder -> write -> read).
+    fn build_and_roundtrip(
+        entries: Vec<ContentTreeNodeEntry>,
+        version: Version,
+        table_root_url: &Url,
+        engine: &SyncEngine,
+    ) -> DeltaResult<ContentTreeNode> {
+        use crate::content_tree::builder::ContentTreeNodeBuilder;
+
+        let mut builder =
+            ContentTreeNodeBuilder::new_for(table_root_url.clone(), version, test_table_schema());
+        for entry in entries {
+            builder.add_entry(entry);
+        }
+        let metadata = builder.build(engine, 1)?;
+
+        let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?.write(engine)?;
+        let path_in_log = absolute_to_relative_path(&written_path, table_root_url)?;
+        ContentTreeNode::read(engine, &written_path, path_in_log, table_root_url.clone())
     }
 
     #[test]
@@ -3999,15 +3760,7 @@ mod tests {
         // A Data entry with content_info: None produces an Add with no deletionVector.
         let data_entry = create_data_entry("memory:///data.parquet", 100);
 
-        let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![data_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
         let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
@@ -4039,15 +3792,7 @@ mod tests {
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let data_entry = create_data_entry_with_dv("memory:///data.parquet", 100, dv_location, 10);
 
-        let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![data_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
         let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
@@ -4079,16 +3824,7 @@ mod tests {
         // Create a data file without any corresponding DV
         let data_entry = create_data_entry("memory:///data.parquet", 50);
 
-        // Create metadata with only the data entry (no DV)
-        let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![data_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
@@ -4160,20 +3896,12 @@ mod tests {
         let data_entry_1 = create_data_entry_with_dv("memory:///data1.parquet", 100, dv_loc1, 15);
         let data_entry_2 = create_data_entry_with_dv("memory:///data2.parquet", 200, dv_loc2, 20);
 
-        let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![
-                data_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ])?,
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
+        let metadata = build_and_roundtrip(
+            vec![data_entry_1, data_entry_2],
+            0,
+            &table_root_url,
+            &engine,
+        )?;
 
         let schema = crate::actions::get_log_add_schema().clone();
         let action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
@@ -4226,15 +3954,7 @@ mod tests {
             ti.status = TrackingStatus::Deleted;
         }
 
-        let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![data_entry
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: "manifest.parquet".to_string(),
-            leaf: None,
-        };
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
         let action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
@@ -4347,20 +4067,12 @@ mod tests {
         let data_manifest = create_data_manifest_entry("memory:///data-manifest.parquet");
         let delete_manifest = create_delete_manifest_entry("memory:///delete-manifest.parquet");
 
-        let metadata = ContentTreeNode {
-            data: vec![
-                data_manifest
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                delete_manifest
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
+        let metadata = build_node(
+            vec![data_manifest, delete_manifest],
+            0,
+            &table_root_url,
+            &engine,
+        )?;
 
         // Old format should return an error
         let result = metadata.manifest_references(None, None, None, None, None);
@@ -4448,15 +4160,7 @@ mod tests {
             equality_ids: None,
         };
 
-        let metadata = ContentTreeNode {
-            data: vec![combined_manifest
-                .clone()
-                .into_engine_data(test_metadata_entry_schema(), &engine)?],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
+        let metadata = build_node(vec![combined_manifest], 0, &table_root_url, &engine)?;
 
         let root_state = metadata.manifest_references(None, None, None, None, None)?;
 
@@ -4484,24 +4188,16 @@ mod tests {
         let data_entry_1 = create_data_entry("child-data-1.parquet", 50);
         let data_entry_2 = create_data_entry("child-data-2.parquet", 60);
 
-        let child_metadata = ContentTreeNode {
-            data: vec![
-                data_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
+        let child_metadata = build_node(
+            vec![data_entry_1, data_entry_2],
+            0,
+            &table_root_url,
+            &engine,
+        )?;
 
         // Write the child manifest to a file
-        let child_manifest_writer = writer::ContentTreeNodeWriter::try_new(child_metadata)?;
-        let child_manifest_url = child_manifest_writer.write(&engine)?;
+        let child_manifest_url =
+            writer::ContentTreeNodeWriter::try_new(child_metadata)?.write(&engine)?;
 
         // Create a ContentTreeNodeEntry for the child manifest
         let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
@@ -4556,64 +4252,38 @@ mod tests {
         let data_entry_1 = create_data_entry("partition1/data-1.parquet", 50);
         let data_entry_2 = create_data_entry("partition1/data-2.parquet", 60);
 
-        let child_metadata_1 = ContentTreeNode {
-            data: vec![
-                data_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        let child_manifest_writer_1 = writer::ContentTreeNodeWriter::try_new(child_metadata_1)?;
-        let child_manifest_url_1 = child_manifest_writer_1.write(&engine)?;
+        let child_metadata_1 = build_node(
+            vec![data_entry_1, data_entry_2],
+            0,
+            &table_root_url,
+            &engine,
+        )?;
+        let child_manifest_url_1 =
+            writer::ContentTreeNodeWriter::try_new(child_metadata_1)?.write(&engine)?;
 
         // Child manifest 2 - use version 1 to avoid filename collision
         let data_entry_3 = create_data_entry("partition2/data-3.parquet", 70);
         let data_entry_4 = create_data_entry("partition2/data-4.parquet", 80);
 
-        let child_metadata_2 = ContentTreeNode {
-            data: vec![
-                data_entry_3
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_entry_4
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 1, // Use different version to avoid filename collision
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        let child_manifest_writer_2 = writer::ContentTreeNodeWriter::try_new(child_metadata_2)?;
-        let child_manifest_url_2 = child_manifest_writer_2.write(&engine)?;
+        let child_metadata_2 = build_node(
+            vec![data_entry_3, data_entry_4],
+            1,
+            &table_root_url,
+            &engine,
+        )?;
+        let child_manifest_url_2 =
+            writer::ContentTreeNodeWriter::try_new(child_metadata_2)?.write(&engine)?;
 
         // Create a root manifest that references both child manifests (as CombinedManifest, new format)
         let data_manifest_entry_1 = create_combined_manifest_entry(child_manifest_url_1.as_str());
         let data_manifest_entry_2 = create_combined_manifest_entry(child_manifest_url_2.as_str());
 
-        let root_metadata = ContentTreeNode {
-            data: vec![
-                data_manifest_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_manifest_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
+        let root_metadata = build_node(
+            vec![data_manifest_entry_1, data_manifest_entry_2],
+            0,
+            &table_root_url,
+            &engine,
+        )?;
 
         // Get manifest references from the root (no manifest-level skipping for this test)
         let root_state = root_metadata.manifest_references(None, None, None, None, None)?;
