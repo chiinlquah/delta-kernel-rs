@@ -1230,33 +1230,10 @@ impl ContentTreeNode {
     ///
     /// # Returns
     /// An iterator over action batches.
-    #[cfg(test)]
-    pub(crate) fn non_root_action_batches(
-        root_state: LeafReferences,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Capture the handlers we need (both are Arc, so cheap to clone)
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-        Self::non_root_action_batches_with_handlers(
-            root_state,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )
-    }
-
     /// Version of non_root_action_batches that takes handlers directly (for lazy streaming).
     // TODO: Refactor to reduce argument count (currently 7) - consider using a config struct
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn non_root_action_batches_with_handlers(
+    pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         parquet_handler: Arc<dyn ParquetHandler>,
         evaluation_handler: Arc<dyn EvaluationHandler>,
@@ -4038,6 +4015,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn test_full_hierarchical_metadata_tree() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
         use crate::engine_data::RowVisitor;
@@ -4092,9 +4070,12 @@ mod tests {
         // No data skipping for this test
         let action_batches = ContentTreeNode::non_root_action_batches(
             root_state,
-            &engine,
+            engine.parquet_handler(),
+            engine.evaluation_handler(),
             &schema,
             &table_root_url,
+            None,
+            None,
             None,
         )?;
 
