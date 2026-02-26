@@ -23,7 +23,7 @@ use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 /// Field name for the content_stats column in ContentTreeNodeEntry schema.
@@ -1114,9 +1114,13 @@ impl ContentTreeNode {
                 debug!("Failed to create expression-based filter");
             }
             filter
+        } else if predicate.is_some() {
+            // Predicate was provided but couldn't apply manifest-level pruning — log why.
+            warn!("Manifest-level data skipping disabled despite predicate: handler={}, stats_schema={}, table_schema={}, batch_schema={}",
+                evaluation_handler.is_some(), stats_schema.is_some(), table_schema.is_some(), manifest_batch_schema.is_some());
+            None
         } else {
-            debug!("Manifest-level data skipping: missing required parameters (predicate={}, handler={}, stats_schema={}, table_schema={}, batch_schema={})",
-                predicate.is_some(), evaluation_handler.is_some(), stats_schema.is_some(), table_schema.is_some(), manifest_batch_schema.is_some());
+            debug!("Manifest-level data skipping: no predicate provided");
             None
         };
 
@@ -1138,28 +1142,28 @@ impl ContentTreeNode {
                 // Apply the filter to get selection vector for this batch
                 let selection_vector = filter.apply(batch.as_ref())?;
 
-                // Filter entries based on selection vector
+                // Filter entries based on selection vector, logging per-entry decisions
                 let batch_entries: Vec<_> = visitor
                     .entries
                     .into_iter()
                     .zip(selection_vector.into_iter())
-                    .filter_map(|(entry, keep)| if keep { Some(entry) } else { None })
+                    .filter_map(|(entry, keep)| {
+                        debug!(
+                            "Manifest pruning: {} location={:?}",
+                            if keep { "KEEP" } else { "PRUNE" },
+                            entry.location,
+                        );
+                        if keep { Some(entry) } else { None }
+                    })
                     .collect();
 
                 let batch_kept = batch_entries.len();
                 total_after_filter += batch_kept;
 
-                debug!(
-                    "Expression-based filter: batch had {} entries, kept {} entries, skipped {}",
-                    batch_total,
-                    batch_kept,
-                    batch_total - batch_kept
-                );
-
                 all_entries.extend(batch_entries);
             }
             let total_skipped = total_before_filter - total_after_filter;
-            debug!("Expression-based manifest filtering: total entries={}, kept={}, skipped={} ({:.1}%)",
+            debug!("Manifest-level pruning result: total={}, kept={}, skipped={} ({:.1}%)",
                 total_before_filter, total_after_filter, total_skipped,
                 if total_before_filter > 0 { (total_skipped as f64 / total_before_filter as f64) * 100.0 } else { 0.0 });
             all_entries
