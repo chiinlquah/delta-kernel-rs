@@ -1709,10 +1709,12 @@ impl ContentTreeNodeBuilder {
     /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
     /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
     ///
-    /// All rows are processed via a single expression-evaluator path:
-    /// 1. Stats are parsed via `parse_json(stats)` into the AMT struct schema.
-    /// 2. DV columns are decoded (base85 UUID → relative path, sizes widened to LONG, +8 bytes
-    ///    for Iceberg framing) by `DecodedDvVisitor`, then appended as flat `_dv_*` columns.
+    /// The input data must include a `stats_parsed` column (added by `include_stats_columns()` in
+    /// the scan). All rows are processed via a single expression-evaluator path:
+    /// 1. DV columns are decoded (base85 UUID → relative path, sizes widened to LONG, +8 bytes
+    ///    for Iceberg framing) by `DecodedDvVisitor`.
+    /// 2. `stats_parsed` is resolved via `coalesce(stats_parsed, parse_json(stats, schema))`:
+    ///    prefers the already-parsed struct; falls back to parsing the raw JSON stats string.
     /// 3. The final transform maps the augmented schema → ContentTreeNodeEntry output.
     pub(crate) fn add_from_existing_scan_rows(
         &mut self,
@@ -1734,30 +1736,32 @@ impl ContentTreeNodeBuilder {
         let mut dv_visitor = DecodedDvVisitor::with_capacity(engine_data.len());
         dv_visitor.visit_rows_of(engine_data)?;
 
-        // Step 2: Parse stats JSON into Delta format via expression evaluator.
-        // Use a minimal input schema (path, size, stats) to avoid coupling to optional
-        // scan-row fields (e.g. fileConstantValues, deletionVector) that callers may not provide.
-        // parse_json uses the Delta JSON stats schema ({numRecords, minValues, maxValues, nullCount,
-        // tightBounds}), so stats_parsed holds Delta format data for the final transform.
+        // Step 2: Produce {path, size, stats_parsed} via coalesce(stats_parsed, parse_json(stats)).
+        // The input is always expected to have a `stats_parsed` column (added by
+        // `include_stats_columns()` in the scan). For rows sourced from JSON commits,
+        // `stats_parsed` will be null and the coalesce falls back to parsing the `stats` JSON.
+        // This mirrors the identical pattern in checkpoint/stats_transform.rs.
         let delta_stats_schema = Arc::new(build_delta_stats_schema(&self.table_schema));
+        let stats_parsed_type = DataType::Struct(Box::new(delta_stats_schema.as_ref().clone()));
         let step2_input_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable("stats", DataType::STRING),
+            StructField::nullable("stats_parsed", stats_parsed_type.clone()),
         ]));
         let stats_augmented_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
-            StructField::nullable(
-                "stats_parsed",
-                DataType::Struct(Box::new(delta_stats_schema.as_ref().clone())),
-            ),
+            StructField::nullable("stats_parsed", stats_parsed_type),
         ]));
         let parse_stats_expr = Expression::struct_from_with_schema(
             [
                 Expression::column(["path"]),
                 Expression::column(["size"]),
-                Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
+                Expression::coalesce([
+                    Expression::column(["stats_parsed"]),
+                    Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
+                ]),
             ],
             stats_augmented_schema.as_ref().clone(),
         );
@@ -1873,7 +1877,7 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// This schema is used with `Expression::parse_json` to parse the `stats` JSON string
 /// from scan rows into a typed struct. Field names match the table schema's field names
 /// (physical names when column mapping is enabled).
-fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::schema::StructType {
+pub(crate) fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::schema::StructType {
     use crate::schema::{StructField, StructType};
     let value_fields: Vec<StructField> = table_schema
         .fields()
@@ -1883,8 +1887,14 @@ fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::
         .fields()
         .map(|f| StructField::nullable(f.name(), DataType::LONG))
         .collect();
+    // Field order must match `expected_stats_schema` in scan/data_skipping/stats_schema/mod.rs,
+    // which is also the order written to parquet checkpoints/sidecars.
     StructType::new_unchecked(vec![
         StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "nullCount",
+            DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
+        ),
         StructField::nullable(
             "minValues",
             DataType::Struct(Box::new(StructType::new_unchecked(value_fields.clone()))),
@@ -1892,10 +1902,6 @@ fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::
         StructField::nullable(
             "maxValues",
             DataType::Struct(Box::new(StructType::new_unchecked(value_fields))),
-        ),
-        StructField::nullable(
-            "nullCount",
-            DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
         ),
         StructField::nullable("tightBounds", DataType::BOOLEAN),
     ])
