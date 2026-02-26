@@ -2003,7 +2003,7 @@ pub(crate) struct ContentInfo {
     #[field_id = 145]
     pub(crate) size_in_bytes: i64,
 
-    #[field_id = 153]
+    #[field_id = 154]
     pub(crate) cardinality: i64
 }
 
@@ -3343,7 +3343,7 @@ mod tests {
         assert_field_id(&dv_info_schema, "location", 152);
         assert_field_id(&dv_info_schema, "offset", 144);
         assert_field_id(&dv_info_schema, "sizeInBytes", 145);
-        assert_field_id(&dv_info_schema, "cardinality", 153);
+        assert_field_id(&dv_info_schema, "cardinality", 154);
 
         // Verify top-level ContentTreeNodeEntry field IDs
         let metadata_entry_schema = ContentTreeNodeEntry::to_schema();
