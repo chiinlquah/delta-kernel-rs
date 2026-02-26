@@ -391,9 +391,7 @@ impl DefaultExpressionEvaluator {
         }
         let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "output",
-            arrow_type,
-            true,
+            "output", arrow_type, true,
         )]));
         // In a race two threads may both compute; get_or_init stores only the first.
         Ok(self.output_schema.get_or_init(|| schema).clone())
