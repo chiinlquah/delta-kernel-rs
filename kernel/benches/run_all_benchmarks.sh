@@ -173,7 +173,7 @@ FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
 
 # Build benchmark-runner once
 echo -e "${BLUE}Building benchmark-runner...${NC}"
-cd "${REPO_ROOT}"
+cd "${KERNEL_DIR}"
 BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1"
 if [ "$FLAMEGRAPH_MODE" = true ]; then
     BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true"
