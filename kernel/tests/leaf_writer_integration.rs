@@ -541,9 +541,9 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             visitor
                 .entries
                 .iter()
-                .find(|entry| entry.content_type == delta_kernel::DataContentType::DataManifest)
+                .find(|entry| entry.content_type == delta_kernel::DataContentType::CombinedManifest)
                 .and_then(|entry| entry.location.clone())
-                .expect("Should have data manifest in root")
+                .expect("Should have combined manifest in root")
         };
 
         // Verify files are in leaf A via scan
@@ -554,8 +554,12 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
 
         // Commit 1: Move files from leaf A to leaf B
         {
-            // Scan to get existing files
-            let scan = snapshot_v1.clone().scan_builder().build()?;
+            // Scan to get existing files (stats_parsed column is required by add_existing_actions)
+            let scan = snapshot_v1
+                .clone()
+                .scan_builder()
+                .include_stats_columns()
+                .build()?;
 
             let mut txn = snapshot_v1
                 .clone()

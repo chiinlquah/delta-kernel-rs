@@ -183,6 +183,7 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
         StructField::nullable("nullCount", nullcount_schema),
         StructField::nullable("minValues", stats_schema.clone()),
         StructField::nullable("maxValues", stats_schema),
+        StructField::nullable("tightBounds", DataType::BOOLEAN),
     ])))
 }
 

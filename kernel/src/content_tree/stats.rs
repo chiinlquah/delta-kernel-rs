@@ -1576,6 +1576,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
             DataType::Struct(Box::new(min_max_schema.clone())),
         ),
         StructField::nullable("maxValues", DataType::Struct(Box::new(min_max_schema))),
+        StructField::nullable("tightBounds", DataType::BOOLEAN),
     ]);
 
     Ok(Arc::new(Expression::struct_from_with_schema(
@@ -1584,6 +1585,9 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
             null_count_struct,
             min_values_struct,
             max_values_struct,
+            // TODO: Finalize this, what is the mapping?
+            // tightBounds: bounds are not tight in iceberg by default.
+            Expression::literal(false),
         ],
         stats_parsed_schema,
     )))

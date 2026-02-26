@@ -1606,7 +1606,6 @@ impl ContentTreeNode {
     }
 
     /// Get the engine data for testing purposes
-    #[cfg(test)]
     pub fn data(&self) -> &[Box<dyn EngineData>] {
         &self.data
     }
