@@ -4,8 +4,8 @@ use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
-    DataFileFormat, ContentInfo, TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
+    DataFileFormat, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -1652,9 +1652,10 @@ impl ContentTreeNodeBuilder {
                                 ))
                             }
                         };
-                        let nullability = Expression::from_pred(Predicate::is_not_null(
-                            Expression::column(["_dv_location"]),
-                        ));
+                        let nullability =
+                            Expression::from_pred(Predicate::is_not_null(Expression::column([
+                                "_dv_location",
+                            ])));
                         Expression::struct_from_with_nullability(
                             [
                                 Expression::column(["_dv_location"]),
@@ -1797,8 +1798,7 @@ impl ContentTreeNodeBuilder {
                     )?,
                 ],
             )?;
-            let mut fields: Vec<StructField> =
-                stats_augmented_schema.fields().cloned().collect();
+            let mut fields: Vec<StructField> = stats_augmented_schema.fields().cloned().collect();
             fields.extend(DV_DECODED_FLAT_SCHEMA.fields().cloned());
             let schema = Arc::new(StructType::new_unchecked(fields));
             (augmented, schema)
@@ -1816,9 +1816,8 @@ impl ContentTreeNodeBuilder {
         )?;
 
         // Step 5: Apply selection vector, aggregate, and push.
-        let filtered =
-            FilteredEngineData::try_new(transformed, selection_vector.to_vec())?
-                .apply_selection_vector()?;
+        let filtered = FilteredEngineData::try_new(transformed, selection_vector.to_vec())?
+            .apply_selection_vector()?;
 
         let mut agg_visitor = TransformedAggregateVisitor::default();
         agg_visitor.visit_rows_of(filtered.as_ref())?;
@@ -1879,7 +1878,9 @@ impl RowVisitor for TransformedAggregateVisitor {
 /// This schema is used with `Expression::parse_json` to parse the `stats` JSON string
 /// from scan rows into a typed struct. Field names match the table schema's field names
 /// (physical names when column mapping is enabled).
-pub(crate) fn build_delta_stats_schema(table_schema: &crate::schema::StructType) -> crate::schema::StructType {
+pub(crate) fn build_delta_stats_schema(
+    table_schema: &crate::schema::StructType,
+) -> crate::schema::StructType {
     use crate::schema::{StructField, StructType};
     let value_fields: Vec<StructField> = table_schema
         .fields()
@@ -2037,7 +2038,9 @@ impl RowVisitor for DecodedDvVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+        use crate::actions::deletion_vector::{
+            DeletionVectorDescriptor, DeletionVectorStorageType,
+        };
         use crate::expressions::Scalar;
 
         for i in 0..row_count {
@@ -2059,15 +2062,19 @@ impl RowVisitor for DecodedDvVisitor {
                     cardinality,
                 };
                 let content_info = extract_deletion_vector_content(&dv)?;
-                self.decoded_paths.push(Scalar::String(content_info.location.into()));
+                self.decoded_paths
+                    .push(Scalar::String(content_info.location));
                 self.decoded_offsets.push(Scalar::Long(content_info.offset));
-                self.decoded_sizes.push(Scalar::Long(content_info.size_in_bytes));
-                self.decoded_cardinalities.push(Scalar::Long(content_info.cardinality));
+                self.decoded_sizes
+                    .push(Scalar::Long(content_info.size_in_bytes));
+                self.decoded_cardinalities
+                    .push(Scalar::Long(content_info.cardinality));
             } else {
                 self.decoded_paths.push(Scalar::Null(DataType::STRING));
                 self.decoded_offsets.push(Scalar::Null(DataType::LONG));
                 self.decoded_sizes.push(Scalar::Null(DataType::LONG));
-                self.decoded_cardinalities.push(Scalar::Null(DataType::LONG));
+                self.decoded_cardinalities
+                    .push(Scalar::Null(DataType::LONG));
             }
         }
         Ok(())
@@ -2085,22 +2092,13 @@ impl RowVisitor for DecodedDvVisitor {
 /// - deletionVector (nested)
 ///
 /// This visitor extracts these fields and constructs Add structs.
+#[derive(Default)]
 struct ScanRowToAddVisitor {
     pub adds: Vec<Add>,
     /// Selection vector controlling which rows to process. Empty means all rows selected.
     selection_vector: Vec<bool>,
     /// Running row offset across multiple `visit()` calls (for multi-batch inputs).
     row_offset: usize,
-}
-
-impl Default for ScanRowToAddVisitor {
-    fn default() -> Self {
-        Self {
-            adds: Vec::new(),
-            selection_vector: Vec::new(),
-            row_offset: 0,
-        }
-    }
 }
 
 impl RowVisitor for ScanRowToAddVisitor {
@@ -3169,7 +3167,10 @@ mod tests {
             ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
         let root_entries = read_root.entries()?;
         assert_eq!(root_entries.len(), 1);
-        assert_eq!(root_entries[0].content_type, DataContentType::CombinedManifest);
+        assert_eq!(
+            root_entries[0].content_type,
+            DataContentType::CombinedManifest
+        );
         assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
 
         // Step 6: Read back the leaf and verify
@@ -3254,7 +3255,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3353,7 +3354,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3439,7 +3440,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3517,7 +3518,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3597,7 +3598,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3780,7 +3781,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -4073,7 +4074,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,

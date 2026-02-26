@@ -12,7 +12,7 @@ use crate::actions::{ContentRoot, ADD_NAME, REMOVE_NAME};
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
-use crate::log_replay::{ActionsBatch, HasSelectionVector};
+use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
@@ -233,6 +233,7 @@ impl ContentTreeNode {
     /// - `data`: Pre-loaded batches containing metadata entries
     /// - `path_in_log`: The path as it appears in the Delta log
     /// - `table_root`: The root URL of the Delta table
+    #[allow(dead_code)]
     pub(crate) fn from_batches(
         data: Vec<Box<dyn EngineData>>,
         path_in_log: String,
@@ -318,16 +319,10 @@ impl ContentTreeNode {
                                  only CombinedManifest (type 5) is supported in the content tree",
                             ))
                         }
-                        1 => {
-                            return Err(Error::unsupported(
-                                "PositionDeletes entries are not supported in the content tree root",
-                            ))
-                        }
-                        2 => {
-                            return Err(Error::unsupported(
-                                "EqualityDeletes are not supported",
-                            ))
-                        }
+                        1 => return Err(Error::unsupported(
+                            "PositionDeletes entries are not supported in the content tree root",
+                        )),
+                        2 => return Err(Error::unsupported("EqualityDeletes are not supported")),
                         other => {
                             return Err(Error::unsupported(format!(
                                 "Unknown content type {other} in content tree root"
@@ -540,8 +535,6 @@ impl ContentTreeNode {
         Expression::struct_from_with_schema([action_expr], top_level_schema)
     }
 
-
-
     /// Appends 5 flat DV columns extracted directly from `contentInfo.*` on each Data entry.
     ///
     /// For Data entries (contentType=0): parses contentInfo.location into storageType/pathOrInlineDv,
@@ -725,10 +718,7 @@ impl ContentTreeNode {
         Ok(Some(batch.append_columns(
             DV_COLUMNS_SCHEMA_FINAL.clone(),
             vec![
-                ArrayData::try_new(
-                    ArrayType::new(DataType::LONG, true),
-                    visitor.cardinalities,
-                )?,
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), visitor.cardinalities)?,
                 ArrayData::try_new(
                     ArrayType::new(DataType::STRING, true),
                     visitor.storage_types,
@@ -737,10 +727,7 @@ impl ContentTreeNode {
                     ArrayType::new(DataType::STRING, true),
                     visitor.path_or_inline_dvs,
                 )?,
-                ArrayData::try_new(
-                    ArrayType::new(DataType::INTEGER, true),
-                    visitor.offsets,
-                )?,
+                ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), visitor.offsets)?,
                 ArrayData::try_new(
                     ArrayType::new(DataType::INTEGER, true),
                     visitor.size_in_bytes,
@@ -1008,8 +995,7 @@ impl ContentTreeNode {
             Self::extend_metadata_schema_with_dv_fields(&metadata_schema, &DV_COLUMNS_SCHEMA_FINAL);
         let eval_schema_with_dv =
             Self::get_evaluator_schema_with_stats(&metadata_schema, stats_schema);
-        let eval_schema_no_dv =
-            Self::get_evaluator_schema_no_dv(&metadata_schema, stats_schema);
+        let eval_schema_no_dv = Self::get_evaluator_schema_no_dv(&metadata_schema, stats_schema);
 
         let evaluators_with_dv = Self::build_action_evaluators(
             evaluation_handler,
@@ -1051,8 +1037,7 @@ impl ContentTreeNode {
 
         for batch in &self.data {
             // Try to append inline DV columns; None means no DVs present in this batch.
-            let dv_augmented =
-                Self::append_inline_dv_columns(batch.as_ref(), &self.table_root)?;
+            let dv_augmented = Self::append_inline_dv_columns(batch.as_ref(), &self.table_root)?;
             let (batch_initial, stats_transform, add_eval, remove_eval) = match &dv_augmented {
                 Some(b) => (
                     b.as_ref(),
@@ -1308,7 +1293,9 @@ impl ContentTreeNode {
             })
             .collect();
 
-        Ok(LeafReferences { manifest_references })
+        Ok(LeafReferences {
+            manifest_references,
+        })
     }
 
     /// Processes all manifest references from a `LeafReferences` into action batches.
@@ -1670,8 +1657,7 @@ impl ContentTreeNode {
         let read_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
             use crate::schema::MetadataColumnSpec;
 
-            let schema_with_stats =
-                ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)?;
+            let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)?;
             let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
 
             // Add _pos metadata column to track row indices (needed for data_manifest_position)
@@ -2008,9 +1994,9 @@ pub enum DataContentType {
     PositionDeletes = 1,
     EqualityDeletes = 2,
     // Types below are only allowed in the root
-    DataManifest = 3,      // kept for backwards compat reading
-    DeleteManifest = 4,    // kept for backwards compat reading
-    CombinedManifest = 5,  // unified manifest with inline DV info
+    DataManifest = 3,     // kept for backwards compat reading
+    DeleteManifest = 4,   // kept for backwards compat reading
+    CombinedManifest = 5, // unified manifest with inline DV info
 }
 
 // ToDataType implementations for enums
@@ -2110,7 +2096,7 @@ pub(crate) struct ContentInfo {
     pub(crate) size_in_bytes: i64,
 
     #[field_id = 154]
-    pub(crate) cardinality: i64
+    pub(crate) cardinality: i64,
 }
 
 #[allow(dead_code)]
@@ -2236,7 +2222,6 @@ pub struct ContentTreeNodeEntry {
     #[field_id = 147]
     pub tracking_info: Option<TrackingInfo>,
 
-    
     #[field_id = 148]
     pub(crate) content_info: Option<ContentInfo>,
 
@@ -2293,7 +2278,6 @@ pub struct ContentTreeNodeEntry {
     #[field_id = 151]
     pub(crate) manifest_dv: Option<Bytes>,
 }
-
 
 impl ContentTreeNodeEntry {
     /// Returns ContentTreeNodeEntry schema augmented with metadata columns for tracking.
@@ -3800,7 +3784,7 @@ mod tests {
                 file_size_in_bytes: Some((i * 512) as i64),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3877,7 +3861,7 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                    manifest_dv: None,
+                manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -3943,8 +3927,8 @@ mod tests {
             sort_order_id: Some(0),
             record_count: 42,
             file_size_in_bytes: Some(1024),
-            content_stats: None,   // None
-            manifest_stats: None,  // None
+            content_stats: None,  // None
+            manifest_stats: None, // None
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -4159,11 +4143,9 @@ mod tests {
         let data_entry = create_data_entry("memory:///data.parquet", 100);
 
         let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![
-                data_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ])?,
+            data: add_pos_to_batches(vec![data_entry
+                .clone()
+                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4198,15 +4180,12 @@ mod tests {
         // In the new CombinedManifest model, a Data entry with content_info produces an Add with a DV.
         // Use a relative DV path format: deletion_vector_{uuid}.bin
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
-        let data_entry =
-            create_data_entry_with_dv("memory:///data.parquet", 100, dv_location, 10);
+        let data_entry = create_data_entry_with_dv("memory:///data.parquet", 100, dv_location, 10);
 
         let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![
-                data_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ])?,
+            data: add_pos_to_batches(vec![data_entry
+                .clone()
+                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4350,7 +4329,11 @@ mod tests {
             visitor.visit_rows_of(batch.actions.as_ref())?;
             all_adds.extend(visitor.adds);
         }
-        assert_eq!(all_adds.len(), 2, "Both data entries should produce Add actions");
+        assert_eq!(
+            all_adds.len(),
+            2,
+            "Both data entries should produce Add actions"
+        );
 
         // Both entries should have their own DVs
         for add in &all_adds {
@@ -4387,11 +4370,9 @@ mod tests {
         }
 
         let metadata = ContentTreeNode {
-            data: add_pos_to_batches(vec![
-                data_entry
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ])?,
+            data: add_pos_to_batches(vec![data_entry
+                .clone()
+                .into_engine_data(test_metadata_entry_schema(), &engine)?])?,
             version: 0,
             table_root: table_root_url.clone(),
             path_in_log: "manifest.parquet".to_string(),
@@ -4412,8 +4393,7 @@ mod tests {
 
         // Data entry with Deleted status should not produce any Add actions
         assert_eq!(
-            total_adds,
-            0,
+            total_adds, 0,
             "Data entry with Deleted status should not produce an Add action"
         );
 
@@ -4508,8 +4488,7 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         let data_manifest = create_data_manifest_entry("memory:///data-manifest.parquet");
-        let delete_manifest =
-            create_delete_manifest_entry("memory:///delete-manifest.parquet");
+        let delete_manifest = create_delete_manifest_entry("memory:///delete-manifest.parquet");
 
         let metadata = ContentTreeNode {
             data: vec![
@@ -5058,7 +5037,7 @@ mod tests {
                 .with_operation("UPDATE".to_string())
                 .with_batch_commit();
 
-            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+            let leaf = txn.new_leaf_node_writer(engine.as_ref())?;
 
             // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
             // Previously used leaf.update_deletion_vectors(dv_updates) here.

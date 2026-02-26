@@ -3092,10 +3092,7 @@ mod tests {
     fn test_remove_file_with_dv_in_leaf_manifest() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
-        use crate::content_tree::{
-            ContentTreeNodeEntry, DataContentType, DataFileFormat, ContentInfo, TrackingInfo,
-            TrackingStatus,
-        };
+        use crate::content_tree::DataContentType;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 

@@ -6,8 +6,8 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use super::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, ContentInfo, ManifestStats, TrackingInfo,
-    TrackingStatus,
+    ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestStats,
+    TrackingInfo, TrackingStatus,
 };
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
@@ -130,12 +130,19 @@ fn visit_metadata_entry_at<'a>(
 
     // Extract content_info fields (location, offset, size_in_bytes, cardinality)
     let dv_location: Option<String> = getters[9].get_opt(row_index, "content_info.location")?;
-    let content_info = dv_location.map(|location| -> DeltaResult<ContentInfo> {
-        let offset: i64 = getters[10].get(row_index, "content_info.offset")?;
-        let size_in_bytes: i64 = getters[11].get(row_index, "content_info.size_in_bytes")?;
-        let cardinality: i64 = getters[12].get(row_index, "content_info.cardinality")?;
-        Ok(ContentInfo { location, offset, size_in_bytes, cardinality })
-    }).transpose()?;
+    let content_info = dv_location
+        .map(|location| -> DeltaResult<ContentInfo> {
+            let offset: i64 = getters[10].get(row_index, "content_info.offset")?;
+            let size_in_bytes: i64 = getters[11].get(row_index, "content_info.size_in_bytes")?;
+            let cardinality: i64 = getters[12].get(row_index, "content_info.cardinality")?;
+            Ok(ContentInfo {
+                location,
+                offset,
+                size_in_bytes,
+                cardinality,
+            })
+        })
+        .transpose()?;
 
     // Extract scalar fields
     let partition_spec_id: i64 = getters[13].get(row_index, "partition_spec_id")?;

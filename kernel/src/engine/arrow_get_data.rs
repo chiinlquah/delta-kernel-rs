@@ -200,7 +200,6 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -273,10 +273,7 @@ impl BulkManifestStreamProcessor {
         )?;
         let evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
             self.evaluation_handler.as_ref(),
-            super::ContentTreeNode::get_evaluator_schema_no_dv(
-                &metadata_schema,
-                stats_schema_ref,
-            ),
+            super::ContentTreeNode::get_evaluator_schema_no_dv(&metadata_schema, stats_schema_ref),
             &self.schema,
             &manifest_location,
             has_add,

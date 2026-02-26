@@ -1413,7 +1413,10 @@ fn filtered_stats_schema_fields(
 ) -> DeltaResult<Vec<StructField>> {
     // Collect unique column names across all three stat categories
     let mut col_names: Vec<&str> = Vec::new();
-    for schema in [null_count_cols, min_vals_cols, max_vals_cols].into_iter().flatten() {
+    for schema in [null_count_cols, min_vals_cols, max_vals_cols]
+        .into_iter()
+        .flatten()
+    {
         for field in schema.fields() {
             let name = field.name().as_str();
             if !col_names.contains(&name) {
@@ -1444,8 +1447,8 @@ fn filtered_stats_schema_fields(
 
         let stats_struct = match table_field.data_type() {
             DataType::Primitive(_) => {
-                let needs_min = min_vals_cols.map_or(false, |s| s.field(col_name).is_some());
-                let needs_max = max_vals_cols.map_or(false, |s| s.field(col_name).is_some());
+                let needs_min = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
+                let needs_max = max_vals_cols.is_some_and(|s| s.field(col_name).is_some());
                 build_primitive_amt_struct_for_stats(
                     base_stats_id,
                     table_field.data_type(),
@@ -1655,7 +1658,10 @@ fn collect_stats_expressions_filtered(
 ) -> DeltaResult<()> {
     // Collect unique column names across all three stat categories
     let mut col_names: Vec<&str> = Vec::new();
-    for schema in [null_count_cols, min_vals_cols, max_vals_cols].into_iter().flatten() {
+    for schema in [null_count_cols, min_vals_cols, max_vals_cols]
+        .into_iter()
+        .flatten()
+    {
         for field in schema.fields() {
             let name = field.name().as_str();
             if !col_names.contains(&name) {
@@ -1734,7 +1740,7 @@ fn collect_stats_expressions_filtered(
                 if !column_to_field_id.contains_key(&field_path) {
                     continue;
                 }
-                if null_count_cols.map_or(false, |s| s.field(col_name).is_some()) {
+                if null_count_cols.is_some_and(|s| s.field(col_name).is_some()) {
                     null_count_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
@@ -1743,8 +1749,8 @@ fn collect_stats_expressions_filtered(
                     null_count_fields
                         .push(StructField::nullable(table_field.name(), DataType::LONG));
                 }
-                let has_min = min_vals_cols.map_or(false, |s| s.field(col_name).is_some());
-                let has_max = max_vals_cols.map_or(false, |s| s.field(col_name).is_some());
+                let has_min = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
+                let has_max = max_vals_cols.is_some_and(|s| s.field(col_name).is_some());
                 if has_min {
                     min_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,

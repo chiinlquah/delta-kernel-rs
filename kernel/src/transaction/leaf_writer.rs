@@ -1,17 +1,13 @@
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::content_tree::builder::ContentTreeNodeBuilder;
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
 use crate::schema::DataType;
-use crate::{
-    DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version,
-};
+use crate::{DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
-
 
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
@@ -47,9 +43,6 @@ pub struct LeafNodeWriter {
     /// Wrapped ContentTreeNodeBuilder for file management
     data_builder: ContentTreeNodeBuilder,
 
-    /// Table root URL
-    table_root: Url,
-
     /// Version of the snapshot being written
     /// TODO: This field should not be needed for leaf writer. It's currently required
     /// as a workaround to force action tracking status to Existed (rather than Added).
@@ -77,41 +70,6 @@ pub struct LeafNodeWriter {
     /// Whether to track root entries for removal.
     /// Set to false when Transaction has released root to client control.
     track_root_removals: bool,
-}
-
-
-/// Helper function to extract a deletion vector from a slice of getters starting at DV fields.
-/// The slice should contain exactly 5 getters corresponding to the DV fields in order:
-/// [storageType, pathOrInlineDv, offset, sizeInBytes, cardinality]
-fn extract_deletion_vector_at<'a>(
-    row_index: usize,
-    dv_getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<DeletionVectorDescriptor>> {
-    // Check if we have enough getters for DV fields (need 5)
-    if dv_getters.len() < 5 {
-        return Ok(None);
-    }
-
-    let storage_type_opt: Option<String> =
-        dv_getters[0].get_opt(row_index, "deletionVector.storageType")?;
-    if let Some(storage_type_str) = storage_type_opt {
-        use crate::actions::deletion_vector::DeletionVectorStorageType;
-        let storage_type = storage_type_str.parse::<DeletionVectorStorageType>()?;
-        let path_or_inline_dv: String =
-            dv_getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = dv_getters[2].get_opt(row_index, "deletionVector.offset")?;
-        let size_in_bytes: i32 = dv_getters[3].get(row_index, "deletionVector.sizeInBytes")?;
-        let cardinality: i64 = dv_getters[4].get(row_index, "deletionVector.cardinality")?;
-        Ok(Some(DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-            size_in_bytes,
-            cardinality,
-        }))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Context for tracking manifest entry deletions
@@ -220,8 +178,6 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
-        const SIZE_IDX: usize = 1;
-        const DV_START_IDX: usize = 4; // indices 4-8 are DV fields
         const DATA_MANIFEST_PATH_IDX: usize = 12;
         const DATA_MANIFEST_POSITION_IDX: usize = 13;
 
@@ -256,7 +212,6 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 path.clone(),
                 &mut ctx,
             )?;
-
         }
         Ok(())
     }
@@ -286,7 +241,6 @@ impl LeafNodeWriter {
                 version,
                 table_schema.as_ref().clone(),
             ),
-            table_root,
             version,
             table_schema: table_schema.clone(),
             manifest_dvs: HashMap::new(),
@@ -399,7 +353,6 @@ impl LeafNodeWriter {
             data_file_manifest_written: data_manifest_entry,
         })
     }
-
 }
 
 #[cfg(test)]
@@ -827,12 +780,14 @@ mod tests {
         use crate::arrow::array::StringArray;
         use crate::utils::test_utils::string_array_to_engine_data;
         let strings: StringArray = json_rows.to_vec().into();
-        engine
-            .json_handler()
-            .parse_json(string_array_to_engine_data(strings), scan_row_schema_for_tests())
+        engine.json_handler().parse_json(
+            string_array_to_engine_data(strings),
+            scan_row_schema_for_tests(),
+        )
     }
 
     /// Verifies content_stats in a written manifest file.
+    #[allow(clippy::too_many_arguments)]
     fn verify_manifest_content_stats(
         engine: &Arc<dyn Engine>,
         manifest_entry: &ContentTreeNodeEntry,
@@ -849,7 +804,10 @@ mod tests {
         use crate::engine::arrow_data::ArrowEngineData as ArrowEngineData2;
         use crate::FileMeta;
 
-        let manifest_location = manifest_entry.location.as_ref().expect("Manifest should have location");
+        let manifest_location = manifest_entry
+            .location
+            .as_ref()
+            .expect("Manifest should have location");
         let manifest_url = table_root.join(manifest_location)?;
         let file_meta = FileMeta {
             location: manifest_url,
@@ -864,7 +822,11 @@ mod tests {
             )?,
         );
         let mut found = false;
-        for batch_result in engine.parquet_handler().read_parquet_files(&[file_meta], read_schema, None)? {
+        for batch_result in
+            engine
+                .parquet_handler()
+                .read_parquet_files(&[file_meta], read_schema, None)?
+        {
             let batch = batch_result?;
             let record_batch = batch
                 .any_ref()
@@ -872,9 +834,14 @@ mod tests {
                 .expect("Expected ArrowEngineData")
                 .record_batch();
 
-            let rc = record_batch.column_by_name("recordCount").expect("recordCount");
+            let rc = record_batch
+                .column_by_name("recordCount")
+                .expect("recordCount");
             assert_eq!(
-                rc.as_any().downcast_ref::<Int64Array>().expect("Int64").value(0),
+                rc.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .value(0),
                 expected_record_count,
                 "recordCount mismatch"
             );
@@ -883,41 +850,74 @@ mod tests {
                 .column_by_name(crate::content_tree::CONTENT_STATS_FIELD_NAME)
                 .expect("content_stats");
             assert!(cs.is_valid(0), "content_stats should not be null");
-            let stats = cs.as_any().downcast_ref::<StructArray>().expect("StructArray");
+            let stats = cs
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
 
             let id = stats.column_by_name("id").expect("id");
-            let id_struct = id.as_any().downcast_ref::<StructArray>().expect("StructArray");
+            let id_struct = id
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
             assert_eq!(
-                id_struct.column_by_name("lower_bound").expect("lower_bound")
-                    .as_any().downcast_ref::<Int32Array>().expect("Int32").value(0),
+                id_struct
+                    .column_by_name("lower_bound")
+                    .expect("lower_bound")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32")
+                    .value(0),
                 expected_id_min,
                 "id.lower_bound mismatch"
             );
             assert_eq!(
-                id_struct.column_by_name("upper_bound").expect("upper_bound")
-                    .as_any().downcast_ref::<Int32Array>().expect("Int32").value(0),
+                id_struct
+                    .column_by_name("upper_bound")
+                    .expect("upper_bound")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32")
+                    .value(0),
                 expected_id_max,
                 "id.upper_bound mismatch"
             );
 
             let val = stats.column_by_name("value").expect("value");
-            let val_struct = val.as_any().downcast_ref::<StructArray>().expect("StructArray");
+            let val_struct = val
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
             assert_eq!(
-                val_struct.column_by_name("lower_bound").expect("lower_bound")
-                    .as_any().downcast_ref::<StringArray>().expect("StringArray").value(0),
+                val_struct
+                    .column_by_name("lower_bound")
+                    .expect("lower_bound")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray")
+                    .value(0),
                 expected_value_min,
                 "value.lower_bound mismatch"
             );
             assert_eq!(
-                val_struct.column_by_name("upper_bound").expect("upper_bound")
-                    .as_any().downcast_ref::<StringArray>().expect("StringArray").value(0),
+                val_struct
+                    .column_by_name("upper_bound")
+                    .expect("upper_bound")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray")
+                    .value(0),
                 expected_value_max,
                 "value.upper_bound mismatch"
             );
             assert_eq!(
-                val_struct.column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                val_struct
+                    .column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
                     .expect("null_count")
-                    .as_any().downcast_ref::<Int64Array>().expect("Int64").value(0),
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .value(0),
                 expected_value_nc,
                 "value.null_value_count mismatch"
             );
@@ -1252,12 +1252,15 @@ mod tests {
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
         // 4 files with no stats — selection vector keeps rows 0 and 2
-        let engine_data = create_scan_row_engine_data(&engine, &[
-            r#"{"path":"file0.parquet","size":1000,"modificationTime":1000000,"fileConstantValues":{"partitionValues":{}}}"#,
-            r#"{"path":"file1.parquet","size":2000,"modificationTime":1000001,"fileConstantValues":{"partitionValues":{}}}"#,
-            r#"{"path":"file2.parquet","size":3000,"modificationTime":1000002,"fileConstantValues":{"partitionValues":{}}}"#,
-            r#"{"path":"file3.parquet","size":4000,"modificationTime":1000003,"fileConstantValues":{"partitionValues":{}}}"#,
-        ])?;
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1000,"modificationTime":1000000,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file1.parquet","size":2000,"modificationTime":1000001,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file2.parquet","size":3000,"modificationTime":1000002,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file3.parquet","size":4000,"modificationTime":1000003,"fileConstantValues":{"partitionValues":{}}}"#,
+            ],
+        )?;
 
         // Create a selection vector that marks rows 0 and 2 as selected, rows 1 and 3 as deleted
         let selection_vector = vec![true, false, true, false];
@@ -1363,22 +1366,42 @@ mod tests {
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema.clone(), true, None);
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
 
         // Scan row with non-null `stats` JSON and null `stats_parsed` — fallback path of coalesce.
-        let engine_data = create_scan_row_engine_data(&engine, &[
-            r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1,\"value\":\"alice\"},\"maxValues\":{\"id\":100,\"value\":\"zoe\"},\"nullCount\":{\"id\":0,\"value\":5},\"tightBounds\":true}","fileConstantValues":{"partitionValues":{}}}"#,
-        ])?;
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1,\"value\":\"alice\"},\"maxValues\":{\"id\":100,\"value\":\"zoe\"},\"nullCount\":{\"id\":0,\"value\":5},\"tightBounds\":true}","fileConstantValues":{"partitionValues":{}}}"#,
+            ],
+        )?;
 
         let filtered_data = FilteredEngineData::try_new(engine_data, vec![true])?;
         writer.add_existing_actions(engine.as_ref(), filtered_data)?;
         let result = writer.finish(engine.as_ref())?;
 
-        assert!(result.data_file_manifest_written.is_some(), "Data manifest should be written");
+        assert!(
+            result.data_file_manifest_written.is_some(),
+            "Data manifest should be written"
+        );
         verify_manifest_content_stats(
-            &engine, result.data_file_manifest_written.as_ref().unwrap(),
-            &table_root, &schema, 100, 1, 100, "alice", "zoe", 5,
+            &engine,
+            result.data_file_manifest_written.as_ref().unwrap(),
+            &table_root,
+            &schema,
+            100,
+            1,
+            100,
+            "alice",
+            "zoe",
+            5,
         )
     }
 
@@ -1386,29 +1409,50 @@ mod tests {
     /// Tests that a pre-populated `stats_parsed` column (preferred path of the coalesce) is used
     /// directly even when `stats` JSON is null. This covers scan rows from checkpoint scans where
     /// `include_stats_columns()` has already populated `stats_parsed` and `stats` is absent.
-    fn test_existing_actions_prefers_stats_parsed_column() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_existing_actions_prefers_stats_parsed_column() -> Result<(), Box<dyn std::error::Error>>
+    {
         let (engine, table_root, schema) = test_setup();
         let version = 1;
         let snapshot_id = 12345;
 
-        let mut writer =
-            LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema.clone(), true, None);
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
 
         // Scan row with null `stats` JSON and non-null `stats_parsed` — preferred path of coalesce.
         // The stats_parsed struct is parsed directly from the JSON (simulating what a checkpoint
         // scan produces when include_stats_columns() adds the pre-parsed column).
-        let engine_data = create_scan_row_engine_data(&engine, &[
-            r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats_parsed":{"numRecords":100,"minValues":{"id":1,"value":"alice"},"maxValues":{"id":100,"value":"zoe"},"nullCount":{"id":0,"value":5},"tightBounds":true},"fileConstantValues":{"partitionValues":{}}}"#,
-        ])?;
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats_parsed":{"numRecords":100,"minValues":{"id":1,"value":"alice"},"maxValues":{"id":100,"value":"zoe"},"nullCount":{"id":0,"value":5},"tightBounds":true},"fileConstantValues":{"partitionValues":{}}}"#,
+            ],
+        )?;
 
         let filtered_data = FilteredEngineData::try_new(engine_data, vec![true])?;
         writer.add_existing_actions(engine.as_ref(), filtered_data)?;
         let result = writer.finish(engine.as_ref())?;
 
-        assert!(result.data_file_manifest_written.is_some(), "Data manifest should be written");
+        assert!(
+            result.data_file_manifest_written.is_some(),
+            "Data manifest should be written"
+        );
         verify_manifest_content_stats(
-            &engine, result.data_file_manifest_written.as_ref().unwrap(),
-            &table_root, &schema, 100, 1, 100, "alice", "zoe", 5,
+            &engine,
+            result.data_file_manifest_written.as_ref().unwrap(),
+            &table_root,
+            &schema,
+            100,
+            1,
+            100,
+            "alice",
+            "zoe",
+            5,
         )
     }
 }
