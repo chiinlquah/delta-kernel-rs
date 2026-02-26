@@ -93,13 +93,14 @@ impl LazyContentRootIterator {
         let table_schema = table_schema.cloned();
 
         // Open the parquet stream using the metadata helper
-        // Pass table_schema so content_stats field is included in the read schema
+        // Pass both schemas so content_stats is filtered to only requested columns
         let (parquet_batches, version, path_in_log) =
             crate::content_tree::ContentTreeNode::open_stream(
                 parquet_handler.clone(),
                 content_root_url,
                 path_in_log,
                 table_schema.as_ref(),
+                stats_schema.as_ref(),
             )?;
 
         let context = ContentRootContext {
@@ -162,14 +163,16 @@ impl Iterator for LazyContentRootIterator {
                         None
                     } else {
                         // Lazily read leaf manifests now that root is exhausted
-                        // Construct manifest batch schema with content_stats for data skipping
-                        let manifest_batch_schema = context.table_schema.as_ref().and_then(|ts| {
-                            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
-                                ts,
-                            )
-                            .ok()
-                            .map(Arc::new)
-                        });
+                        // Construct manifest batch schema with filtered content_stats for data skipping
+                        let manifest_batch_schema = context
+                            .table_schema
+                            .as_ref()
+                            .zip(context.stats_schema.as_ref())
+                            .and_then(|(ts, ss)| {
+                                crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)
+                                    .ok()
+                                    .map(Arc::new)
+                            });
 
                         let leaf_refs = match metadata.manifest_references(
                             context.data_predicate.as_ref(),

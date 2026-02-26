@@ -392,8 +392,10 @@ impl ContentTreeNodeBuilder {
             return Ok(schema.clone());
         }
 
-        // Compute the schema
-        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema)?;
+        // Compute the schema (include all columns for writing)
+        let delta_stats = build_delta_stats_schema(&self.table_schema);
+        let schema =
+            ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema, &delta_stats)?;
         let schema_ref = Arc::new(schema);
 
         // Try to cache it (ignore if another thread beat us to it)

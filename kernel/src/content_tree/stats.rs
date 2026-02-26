@@ -1374,6 +1374,94 @@ pub(crate) fn try_pre_convert_stats_column(
     Ok(None)
 }
 
+/// Extracts the minValues schema from a Delta stats schema to determine which columns need stats.
+fn needed_stats_columns(stats_schema: &StructType) -> DeltaResult<&StructType> {
+    stats_schema
+        .field("minValues")
+        .and_then(|f| match f.data_type() {
+            DataType::Struct(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .ok_or_else(|| crate::Error::generic("stats_schema missing minValues field"))
+}
+
+/// Generates AMT-format stats schema fields for only the columns present in `needed_columns`.
+fn filtered_stats_schema_fields(
+    table_schema: &StructType,
+    needed_columns: &StructType,
+) -> DeltaResult<Vec<StructField>> {
+    let mut fields = Vec::new();
+    for needed_field in needed_columns.fields() {
+        let Some(table_field) = table_schema.field(needed_field.name()) else {
+            continue;
+        };
+        let field_id = get_field_id(table_field).ok_or_else(|| {
+            crate::Error::generic(format!(
+                "Field '{}' is missing field ID! ContentTreeNode: {:#?}",
+                table_field.name(),
+                table_field.metadata()
+            ))
+        })?;
+        let base_stats_id = field_id_to_statistics_base(field_id).ok_or_else(|| {
+            crate::Error::generic(format!(
+                "Failed to compute stats field ID for field '{}' with id {}",
+                table_field.name(),
+                field_id
+            ))
+        })?;
+        let stats_struct = match (table_field.data_type(), needed_field.data_type()) {
+            (DataType::Primitive(_), _) => build_primitive_stats_struct(
+                base_stats_id,
+                table_field.data_type.clone(),
+                table_field.nullable,
+            ),
+            (DataType::Struct(table_nested), DataType::Struct(needed_nested)) => {
+                StructType::new_unchecked(filtered_stats_schema_fields(
+                    table_nested,
+                    needed_nested,
+                )?)
+            }
+            _ => continue,
+        };
+        let metadata: Vec<(&str, MetadataValue)> = table_field
+            .metadata
+            .iter()
+            .map(|(k, v)| {
+                let value = if k == ColumnMetadataKey::ParquetFieldId.as_ref()
+                    || k == ColumnMetadataKey::ColumnMappingId.as_ref()
+                {
+                    MetadataValue::Number(base_stats_id as i64)
+                } else {
+                    v.clone()
+                };
+                (k.as_str(), value)
+            })
+            .collect();
+        fields.push(
+            StructField::new(
+                table_field.name(),
+                DataType::Struct(Box::new(stats_struct)),
+                true,
+            )
+            .with_metadata(metadata),
+        );
+    }
+    Ok(fields)
+}
+
+/// Generates AMT-format content_stats schema containing only the columns present in `stats_schema`.
+///
+/// Used to project parquet reads to only the stats columns needed for data skipping,
+/// avoiding wasteful reads of all per-column statistics when only a subset is needed.
+pub(crate) fn filtered_stats_schema(
+    table_schema: &StructType,
+    stats_schema: &StructType,
+) -> DeltaResult<StructType> {
+    let needed_columns = needed_stats_columns(stats_schema)?;
+    let fields = filtered_stats_schema_fields(table_schema, needed_columns)?;
+    Ok(StructType::new_unchecked(fields))
+}
+
 pub(crate) fn create_content_stats_to_stats_parsed_expr(
     table_schema: &StructType,
     stats_schema: &StructType,
@@ -1391,13 +1479,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     }
 
     // Extract the minValues schema from stats_schema to determine which columns we need stats for
-    let needed_columns_schema = stats_schema
-        .field("minValues")
-        .and_then(|f| match f.data_type() {
-            DataType::Struct(s) => Some(s.as_ref()),
-            _ => None,
-        })
-        .ok_or_else(|| crate::Error::generic("stats_schema missing minValues field"))?;
+    let needed_columns_schema = needed_stats_columns(stats_schema)?;
 
     // Build expressions for each stat type, but only for columns in stats_schema
     let mut null_count_exprs = Vec::new();

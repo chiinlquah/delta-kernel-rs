@@ -856,8 +856,12 @@ mod tests {
             last_modified: 0,
             size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
         };
+        let delta_stats = crate::content_tree::builder::build_delta_stats_schema(schema);
         let read_schema = Arc::new(
-            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(schema)?,
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                schema,
+                &delta_stats,
+            )?,
         );
         let mut found = false;
         for batch_result in engine.parquet_handler().read_parquet_files(&[file_meta], read_schema, None)? {
@@ -1001,8 +1005,12 @@ mod tests {
 
         // Use the production schema to ensure test matches actual behavior
         // This generates the full ContentTreeNodeEntry schema with content_stats based on table schema
+        let delta_stats = crate::content_tree::builder::build_delta_stats_schema(&schema);
         let read_schema = Arc::new(
-            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(&schema)?,
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                &schema,
+                &delta_stats,
+            )?,
         );
 
         let read_result_iter =

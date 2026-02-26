@@ -379,6 +379,7 @@ impl ContentTreeNode {
         action_name: &str,
         path_in_log: &str,
         has_stats_parsed: bool,
+        has_dv_columns: bool,
     ) -> DeltaResult<crate::expressions::Expression> {
         use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
         use crate::schema::{DataType, MapType};
@@ -420,19 +421,23 @@ impl ContentTreeNode {
                 use crate::actions::deletion_vector::DeletionVectorDescriptor;
                 use crate::schema::ToSchema;
                 let dv_schema = <DeletionVectorDescriptor as ToSchema>::to_schema();
-                Expression::Struct(
-                    vec![
-                        Arc::new(Expression::column(["dv_storageType"])),
-                        Arc::new(Expression::column(["dv_pathOrInlineDv"])),
-                        Arc::new(Expression::column(["dv_offset"])),
-                        Arc::new(Expression::column(["dv_sizeInBytes"])),
-                        Arc::new(Expression::column(["dv_cardinality"])),
-                    ],
-                    Some(Box::new(dv_schema)),
-                    Some(Arc::new(Expression::Predicate(Box::new(
-                        Expression::column(["dv_storageType"]).is_not_null(),
-                    )))),
-                )
+                if has_dv_columns {
+                    Expression::Struct(
+                        vec![
+                            Arc::new(Expression::column(["dv_storageType"])),
+                            Arc::new(Expression::column(["dv_pathOrInlineDv"])),
+                            Arc::new(Expression::column(["dv_offset"])),
+                            Arc::new(Expression::column(["dv_sizeInBytes"])),
+                            Arc::new(Expression::column(["dv_cardinality"])),
+                        ],
+                        Some(Box::new(dv_schema)),
+                        Some(Arc::new(Expression::Predicate(Box::new(
+                            Expression::column(["dv_storageType"]).is_not_null(),
+                        )))),
+                    )
+                } else {
+                    Expression::null_literal(DataType::Struct(Box::new(dv_schema)))
+                }
             }
 
             // Add-specific fields
@@ -477,6 +482,7 @@ impl ContentTreeNode {
         action_name: &str,
         path_in_log: &str,
         has_stats_parsed: bool,
+        has_dv_columns: bool,
     ) -> DeltaResult<Arc<crate::expressions::Expression>> {
         use crate::expressions::Expression;
         use crate::schema::DataType;
@@ -501,6 +507,7 @@ impl ContentTreeNode {
                 action_name,
                 path_in_log,
                 has_stats_parsed,
+                has_dv_columns,
             )?;
             field_exprs.push(Arc::new(expr));
         }
@@ -541,10 +548,12 @@ impl ContentTreeNode {
     /// casts contentInfo.offset i64→i32, subtracts 8 from contentInfo.sizeInBytes then casts i64→i32,
     /// reads contentInfo.cardinality directly.
     /// For non-Data entries: all 5 columns are null.
+    /// Returns `None` if no Data entries in the batch had a DV (all DV columns would be null),
+    /// avoiding unnecessary column allocation. Returns `Some` with DV columns appended otherwise.
     fn append_inline_dv_columns(
         batch: &dyn EngineData,
         table_root: &Url,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> DeltaResult<Option<Box<dyn EngineData>>> {
         use crate::actions::deletion_vector::DeletionVectorPath;
         use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
         use crate::expressions::{ArrayData, Scalar};
@@ -557,6 +566,21 @@ impl ContentTreeNode {
             offsets: Vec<Scalar>,
             size_in_bytes: Vec<Scalar>,
             table_root: Url,
+            has_dv: bool,
+            /// Total rows visited across all `visit()` calls before the current one.
+            /// Used to backfill null rows when the first DV is discovered mid-batch.
+            rows_seen: usize,
+        }
+
+        impl InlineDvVisitor {
+            /// Pushes one all-null row to each column vector.
+            fn push_null_row(&mut self) {
+                self.cardinalities.push(Scalar::Null(DataType::LONG));
+                self.storage_types.push(Scalar::Null(DataType::STRING));
+                self.path_or_inline_dvs.push(Scalar::Null(DataType::STRING));
+                self.offsets.push(Scalar::Null(DataType::INTEGER));
+                self.size_in_bytes.push(Scalar::Null(DataType::INTEGER));
+            }
         }
 
         impl RowVisitor for InlineDvVisitor {
@@ -589,17 +613,33 @@ impl ContentTreeNode {
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
                     let content_type: i32 = getters[0].get(i, "contentType")?;
-                    if content_type == 0 {
-                        let cardinality: Option<i64> =
-                            getters[1].get_opt(i, "contentInfo.cardinality")?;
-                        self.cardinalities.push(match cardinality {
-                            Some(v) => Scalar::Long(v),
-                            None => Scalar::Null(DataType::LONG),
-                        });
 
-                        let location_opt: Option<&str> =
-                            getters[2].get_opt(i, "contentInfo.location")?;
-                        let (storage_type, path_or_inline_dv) = if let Some(loc) = location_opt {
+                    // Only Data entries (contentType=0) can carry a DV location.
+                    let location_opt: Option<&str> = if content_type == 0 {
+                        getters[2].get_opt(i, "contentInfo.location")?
+                    } else {
+                        None
+                    };
+
+                    if let Some(loc) = location_opt {
+                        // First DV: allocate vectors and backfill nulls for all rows
+                        // that were skipped before this one (rows 0..rows_seen+i).
+                        if !self.has_dv {
+                            self.has_dv = true;
+                            let backfill = self.rows_seen + i;
+                            let remaining = row_count - i;
+                            self.cardinalities.reserve(backfill + remaining);
+                            self.storage_types.reserve(backfill + remaining);
+                            self.path_or_inline_dvs.reserve(backfill + remaining);
+                            self.offsets.reserve(backfill + remaining);
+                            self.size_in_bytes.reserve(backfill + remaining);
+                            for _ in 0..backfill {
+                                self.push_null_row();
+                            }
+                        }
+
+                        // Parse path and push storage_type / path_or_inline_dv.
+                        let (storage_type, path_or_inline_dv) =
                             match DeletionVectorPath::parse_path(loc, &self.table_root) {
                                 Ok((st, path)) => {
                                     (Scalar::String(st.to_string()), Scalar::String(path))
@@ -608,15 +648,17 @@ impl ContentTreeNode {
                                     Scalar::Null(DataType::STRING),
                                     Scalar::Null(DataType::STRING),
                                 ),
-                            }
-                        } else {
-                            (
-                                Scalar::Null(DataType::STRING),
-                                Scalar::Null(DataType::STRING),
-                            )
-                        };
+                            };
                         self.storage_types.push(storage_type);
                         self.path_or_inline_dvs.push(path_or_inline_dv);
+
+                        // Push cardinality, offset, sizeInBytes for this DV row.
+                        let cardinality: Option<i64> =
+                            getters[1].get_opt(i, "contentInfo.cardinality")?;
+                        self.cardinalities.push(match cardinality {
+                            Some(v) => Scalar::Long(v),
+                            None => Scalar::Null(DataType::LONG),
+                        });
 
                         let offset_opt: Option<i64> =
                             getters[3].get_opt(i, "contentInfo.offset")?;
@@ -653,30 +695,34 @@ impl ContentTreeNode {
                             }
                             None => Scalar::Null(DataType::INTEGER),
                         });
-                    } else {
-                        self.cardinalities.push(Scalar::Null(DataType::LONG));
-                        self.storage_types.push(Scalar::Null(DataType::STRING));
-                        self.path_or_inline_dvs.push(Scalar::Null(DataType::STRING));
-                        self.offsets.push(Scalar::Null(DataType::INTEGER));
-                        self.size_in_bytes.push(Scalar::Null(DataType::INTEGER));
+                    } else if self.has_dv {
+                        // Non-DV row after a DV has been seen: all columns are null.
+                        self.push_null_row();
                     }
+                    // else: no DV seen yet — skip entirely (no allocation).
                 }
+                self.rows_seen += row_count;
                 Ok(())
             }
         }
 
-        let batch_len = batch.len();
         let mut visitor = InlineDvVisitor {
-            cardinalities: Vec::with_capacity(batch_len),
-            storage_types: Vec::with_capacity(batch_len),
-            path_or_inline_dvs: Vec::with_capacity(batch_len),
-            offsets: Vec::with_capacity(batch_len),
-            size_in_bytes: Vec::with_capacity(batch_len),
+            cardinalities: Vec::new(),
+            storage_types: Vec::new(),
+            path_or_inline_dvs: Vec::new(),
+            offsets: Vec::new(),
+            size_in_bytes: Vec::new(),
             table_root: table_root.clone(),
+            has_dv: false,
+            rows_seen: 0,
         };
         visitor.visit_rows_of(batch)?;
 
-        batch.append_columns(
+        if !visitor.has_dv {
+            return Ok(None);
+        }
+
+        Ok(Some(batch.append_columns(
             DV_COLUMNS_SCHEMA_FINAL.clone(),
             vec![
                 ArrayData::try_new(
@@ -700,7 +746,7 @@ impl ContentTreeNode {
                     visitor.size_in_bytes,
                 )?,
             ],
-        )
+        )?))
     }
 
     /// Builds selection vectors for Add vs Remove entries based on trackingInfo.status.
@@ -808,6 +854,28 @@ impl ContentTreeNode {
         Self::extend_metadata_schema_with_dv_fields(metadata_schema, &DV_COLUMNS_SCHEMA_FINAL)
     }
 
+    /// Evaluator schema for batches with no DVs: metadata_schema as-is, plus stats_parsed if needed.
+    /// Does NOT include the `dv_*` columns — used when `append_inline_dv_columns` returns `None`.
+    fn get_evaluator_schema_no_dv(
+        metadata_schema: &SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> SchemaRef {
+        if let Some(stats_sch) = stats_schema {
+            if metadata_schema
+                .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+                .is_some()
+            {
+                let mut fields: Vec<StructField> = metadata_schema.fields().cloned().collect();
+                fields.push(StructField::nullable(
+                    "stats_parsed",
+                    DataType::Struct(Box::new(stats_sch.clone())),
+                ));
+                return Arc::new(StructType::new_unchecked(fields));
+            }
+        }
+        metadata_schema.clone()
+    }
+
     /// Determine the evaluator schema with stats_parsed if needed
     fn get_evaluator_schema_with_stats(
         metadata_schema: &SchemaRef,
@@ -837,7 +905,11 @@ impl ContentTreeNode {
         schema
     }
 
-    /// Build Add and/or Remove evaluators based on the schema
+    /// Build Add and/or Remove evaluators based on the schema.
+    ///
+    /// `has_dv_columns`: if true, the evaluator schema includes the 5 `dv_*` columns appended by
+    /// `append_inline_dv_columns`, and the `deletionVector` expression reads from them. If false,
+    /// `deletionVector` is a `null_literal` and the evaluator schema has no `dv_*` columns.
     fn build_action_evaluators(
         evaluation_handler: &dyn EvaluationHandler,
         evaluator_schema: SchemaRef,
@@ -845,6 +917,7 @@ impl ContentTreeNode {
         path_in_log: &str,
         has_add: bool,
         has_remove: bool,
+        has_dv_columns: bool,
     ) -> DeltaResult<EvaluatorPair> {
         // Check if stats_parsed is available in evaluator schema (indicates stats transformation is enabled)
         let has_stats_parsed = evaluator_schema.field("stats_parsed").is_some();
@@ -855,6 +928,7 @@ impl ContentTreeNode {
                 "add",
                 path_in_log,
                 has_stats_parsed,
+                has_dv_columns,
             )?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
@@ -871,6 +945,7 @@ impl ContentTreeNode {
                 "remove",
                 path_in_log,
                 has_stats_parsed,
+                has_dv_columns,
             )?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
@@ -922,36 +997,50 @@ impl ContentTreeNode {
         let has_add = schema.contains(ADD_NAME);
         let has_remove = schema.contains(REMOVE_NAME);
 
-        // Get metadata schema that matches actual batches from open_stream
-        // (includes _pos and content_stats if table_schema was provided)
-        let metadata_schema = ContentTreeNodeEntry::processing_schema_with_pos(table_schema)?;
+        // Get metadata schema that matches actual batches from open_stream.
+        let metadata_schema =
+            ContentTreeNodeEntry::processing_schema_with_pos(table_schema, stats_schema)?;
 
-        // Extend metadata schema with DV fields for evaluators
+        // Build two evaluator variants:
+        // - with_dv: for batches where append_inline_dv_columns appended DV columns
+        // - no_dv:   for batches with no DVs (null_literal used for deletionVector)
         let dv_extended_schema =
             Self::extend_metadata_schema_with_dv_fields(&metadata_schema, &DV_COLUMNS_SCHEMA_FINAL);
-
-        // Determine evaluator schema (always includes DV fields, and stats_parsed if needed)
-        let evaluator_schema =
+        let eval_schema_with_dv =
             Self::get_evaluator_schema_with_stats(&metadata_schema, stats_schema);
+        let eval_schema_no_dv =
+            Self::get_evaluator_schema_no_dv(&metadata_schema, stats_schema);
 
-        // Build evaluators for Add and/or Remove actions
-        let evaluators = Self::build_action_evaluators(
+        let evaluators_with_dv = Self::build_action_evaluators(
             evaluation_handler,
-            evaluator_schema,
+            eval_schema_with_dv,
             schema,
             &self.path_in_log,
             has_add,
             has_remove,
+            true,
         )?;
-        let add_evaluator_opt = evaluators.add_evaluator;
-        let remove_evaluator_opt = evaluators.remove_evaluator;
+        let evaluators_no_dv = Self::build_action_evaluators(
+            evaluation_handler,
+            eval_schema_no_dv,
+            schema,
+            &self.path_in_log,
+            has_add,
+            has_remove,
+            false,
+        )?;
 
-        // Create stats_parsed transformation evaluator if needed
-        // This transforms content_stats to stats_parsed and adds it as a top-level field in the metadata batch
-        // Pass the DV-extended schema so DV columns survive the stats transformation
-        let stats_transform_opt = ContentTreeNodeEntry::create_stats_transformation_evaluator(
+        // Stats transformation evaluators: one per DV variant so each uses the right input schema.
+        let stats_transform_with_dv = ContentTreeNodeEntry::create_stats_transformation_evaluator(
             evaluation_handler,
             &dv_extended_schema,
+            schema,
+            table_schema,
+            stats_schema,
+        )?;
+        let stats_transform_no_dv = ContentTreeNodeEntry::create_stats_transformation_evaluator(
+            evaluation_handler,
+            &metadata_schema,
             schema,
             table_schema,
             stats_schema,
@@ -961,31 +1050,46 @@ impl ContentTreeNode {
         let mut result_batches = Vec::new();
 
         for batch in &self.data {
-            // Append inline DV columns extracted from contentInfo.*
-            let batch_with_dvs = Self::append_inline_dv_columns(batch.as_ref(), &self.table_root)?;
+            // Try to append inline DV columns; None means no DVs present in this batch.
+            let dv_augmented =
+                Self::append_inline_dv_columns(batch.as_ref(), &self.table_root)?;
+            let (batch_initial, stats_transform, add_eval, remove_eval) = match &dv_augmented {
+                Some(b) => (
+                    b.as_ref(),
+                    &stats_transform_with_dv,
+                    &evaluators_with_dv.add_evaluator,
+                    &evaluators_with_dv.remove_evaluator,
+                ),
+                None => (
+                    batch.as_ref(),
+                    &stats_transform_no_dv,
+                    &evaluators_no_dv.add_evaluator,
+                    &evaluators_no_dv.remove_evaluator,
+                ),
+            };
 
             // Optionally transform content_stats to stats_parsed and augment batch
             let stats_augmented_batch;
-            let mut batch_ref: &dyn EngineData = batch_with_dvs.as_ref();
-            if let Some(ref stats_eval) = stats_transform_opt {
-                stats_augmented_batch = stats_eval.evaluate(batch_ref)?;
-                batch_ref = stats_augmented_batch.as_ref();
-            }
+            let batch_ref: &dyn EngineData = if let Some(ref stats_eval) = stats_transform {
+                stats_augmented_batch = stats_eval.evaluate(batch_initial)?;
+                stats_augmented_batch.as_ref()
+            } else {
+                batch_initial
+            };
 
             // Process Add entries if needed
-            if let Some(add_eval) = add_evaluator_opt.as_ref() {
+            if let Some(add_eval) = add_eval.as_ref() {
                 let (add_selection, _) = Self::build_add_remove_selection_vectors(batch_ref)?;
 
                 if add_selection.iter().any(|&b| b) {
                     let transformed = add_eval.evaluate(batch_ref)?;
-
                     let filtered_data = transformed.apply_selection_vector(add_selection)?;
                     result_batches.push(Ok(ActionsBatch::new(filtered_data, false)));
                 }
             }
 
             // Process Remove entries if needed
-            if let Some(remove_eval) = remove_evaluator_opt.as_ref() {
+            if let Some(remove_eval) = remove_eval.as_ref() {
                 let (_, remove_selection) = Self::build_add_remove_selection_vectors(batch_ref)?;
 
                 if remove_selection.iter().any(|&b| b) {
@@ -1541,9 +1645,10 @@ impl ContentTreeNode {
         path: &Url,
         path_in_log: String,
         table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
     ) -> DeltaResult<ParquetStreamResult> {
         // Cached schema for reading ContentTreeNodeEntry from parquet files without content_stats.
-        // Uses ToSchema which excludes content_stats (requires table schema).
+        // Uses ToSchema which excludes content_stats (requires both table and stats schemas).
         // Includes _pos metadata column for tracking row positions within the manifest.
         static READ_SCHEMA_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
             use crate::schema::MetadataColumnSpec;
@@ -1561,11 +1666,12 @@ impl ContentTreeNode {
             Arc::new(StructType::new_unchecked(fields))
         });
 
-        // Build read schema with content_stats if table schema is provided
-        let read_schema = if let Some(ts) = table_schema {
+        // Build read schema with content_stats if both table and stats schemas are provided
+        let read_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
             use crate::schema::MetadataColumnSpec;
 
-            let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(ts)?;
+            let schema_with_stats =
+                ContentTreeNodeEntry::to_schema_with_content_stats(ts, ss)?;
             let mut fields: Vec<StructField> = schema_with_stats.fields().cloned().collect();
 
             // Add _pos metadata column to track row indices (needed for data_manifest_position)
@@ -1604,7 +1710,7 @@ impl ContentTreeNode {
         table_root: Url,
     ) -> DeltaResult<Self> {
         let (read_result_iter, version, path_in_log) =
-            Self::open_stream(parquet_handler, path, path_in_log, None)?;
+            Self::open_stream(parquet_handler, path, path_in_log, None, None)?;
 
         let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
 
@@ -2200,10 +2306,11 @@ impl ContentTreeNodeEntry {
     #[allow(dead_code)]
     pub(crate) fn to_schema_with_metadata_columns(
         table_schema: &StructType,
+        stats_schema: &StructType,
     ) -> DeltaResult<SchemaRef> {
         use crate::schema::MetadataColumnSpec;
 
-        let base_schema = Self::to_schema_with_content_stats(table_schema)?;
+        let base_schema = Self::to_schema_with_content_stats(table_schema, stats_schema)?;
         let mut schema_with_tracking = base_schema;
 
         schema_with_tracking = schema_with_tracking
@@ -2221,11 +2328,12 @@ impl ContentTreeNodeEntry {
     /// Use this when you need a schema that matches actual manifest batch data.
     pub(crate) fn processing_schema_with_pos(
         table_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
     ) -> DeltaResult<SchemaRef> {
         use crate::schema::{MetadataColumnSpec, ToSchema as _};
 
-        let base_schema = if let Some(ts) = table_schema {
-            Self::to_schema_with_content_stats(ts)?
+        let base_schema = if let (Some(ts), Some(ss)) = (table_schema, stats_schema) {
+            Self::to_schema_with_content_stats(ts, ss)?
         } else {
             Self::to_schema()
         };
@@ -2343,18 +2451,19 @@ impl ContentTreeNodeEntry {
     #[allow(dead_code)]
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
+        stats_schema: &StructType,
     ) -> DeltaResult<StructType> {
         use crate::schema::{ColumnMetadataKey, ToSchema};
 
-        // Generate AMT-style stats schema format:
-        // {col: {value_count: LONG, null_value_count: LONG (if nullable), nan_value_count: LONG (if float/double), lower_bound: <type>, upper_bound: <type>, exact_bounds: BOOLEAN}, ...}
-        let stats_struct = stats::stats_schema(table_schema)?;
+        // Generate filtered AMT schema: only columns requested in stats_schema are included,
+        // avoiding wasteful reads of per-column statistics that won't be used.
+        let amt_stats = stats::filtered_stats_schema(table_schema, stats_schema)?;
 
         // Build on the derived base schema (which includes field_ids) and insert content_stats
         let base = Self::to_schema();
         let content_stats_field = StructField::nullable(
             CONTENT_STATS_FIELD_NAME,
-            DataType::Struct(Box::new(stats_struct)),
+            DataType::Struct(Box::new(amt_stats)),
         )
         .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 146i64)]);
 
@@ -2513,8 +2622,10 @@ mod tests {
             field_with_id("value", DataType::DOUBLE, true, 3),
         ]);
 
-        // Generate schema with content_stats
-        let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema)?;
+        // Generate schema with content_stats (using all columns)
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
+        let schema_with_stats =
+            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &delta_stats_schema)?;
 
         // Schema should have 15 top-level fields (14 base + 1 for content_stats)
         assert_eq!(schema_with_stats.fields().len(), 15);
@@ -2618,9 +2729,11 @@ mod tests {
             field_with_id("value", DataType::DOUBLE, true, 2),
         ]);
 
-        // Generate the schema with content_stats
+        // Generate the schema with content_stats (using all columns)
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
+            &delta_stats_schema,
         )?);
 
         // Create content_stats in AMT format:
@@ -2752,9 +2865,11 @@ mod tests {
                     ),
                 ])]);
 
-        // Generate the schema with content_stats
+        // Generate the schema with content_stats (using all columns)
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
+            &delta_stats_schema,
         )?);
 
         // Create a ContentTreeNodeEntry with content_stats set to None
@@ -2835,9 +2950,11 @@ mod tests {
             ]),
         ]);
 
-        // Generate the schema with content_stats
+        // Generate the schema with content_stats (using all columns)
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
         let schema_with_stats = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             &table_schema,
+            &delta_stats_schema,
         )?);
 
         // Create content_stats data in AMT format:
@@ -3000,11 +3117,32 @@ mod tests {
         ])
     }
 
+    /// Creates a minimal Delta stats_schema (with `minValues`) for all primitive leaf columns
+    /// in `table_schema`. Used to construct `content_stats` read schemas in tests.
+    fn test_delta_stats_schema(table_schema: &StructType) -> StructType {
+        fn min_values_fields(schema: &StructType) -> Vec<StructField> {
+            schema
+                .fields()
+                .flat_map(|f| match f.data_type() {
+                    DataType::Struct(nested) => min_values_fields(nested),
+                    _ => vec![StructField::nullable(f.name(), f.data_type.clone())],
+                })
+                .collect()
+        }
+        let min_values = StructType::new_unchecked(min_values_fields(table_schema));
+        StructType::new_unchecked([StructField::nullable(
+            "minValues",
+            DataType::Struct(Box::new(min_values)),
+        )])
+    }
+
     /// Helper function to get the test schema for ContentTreeNodeEntry with content_stats.
     /// Uses `test_table_schema()` to generate the dynamic schema.
     fn test_metadata_entry_schema() -> SchemaRef {
+        let table_schema = test_table_schema();
+        let stats_schema = test_delta_stats_schema(&table_schema);
         Arc::new(
-            ContentTreeNodeEntry::to_schema_with_content_stats(&test_table_schema())
+            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &stats_schema)
                 .expect("test schema should be valid"),
         )
     }
@@ -3363,7 +3501,9 @@ mod tests {
         let table_schema =
             StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)
                 .add_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), 1i64)])]);
-        let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema)?;
+        let delta_stats_schema = test_delta_stats_schema(&table_schema);
+        let schema_with_stats =
+            ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &delta_stats_schema)?;
         assert_field_id(&schema_with_stats, CONTENT_STATS_FIELD_NAME, 146);
 
         Ok(())
