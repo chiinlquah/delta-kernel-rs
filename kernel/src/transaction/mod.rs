@@ -583,16 +583,16 @@ impl<S> Transaction<S> {
             // Load existing metadata and determine the version from which to replay delta log
             let (mut metadata_builder, root_manifest_path, replay_from_version) =
                 if let Some((content_root_action, content_root_version)) = latest_content_root {
-                    // Load metadata from content root (gets root manifest + leaf references)
+                    // Load metadata from content root directly into the builder
                     let root_path = content_root_action.path.clone();
-                    let metadata = crate::content_tree::ContentTreeNode::new_from_content_root(
-                        engine,
-                        &content_root_action,
-                        table_root.clone(),
-                    )?;
-                    // Use commit_version for the new metadata, not the old content root version
                     let builder =
-                        metadata.to_builder(physical_table_schema.clone(), commit_version);
+                        crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
+                            engine,
+                            &content_root_action,
+                            table_root.clone(),
+                            physical_table_schema.clone(),
+                            commit_version,
+                        )?;
                     // Replay delta log from the version after the content root
                     (builder, Some(root_path), content_root_version + 1)
                 } else {

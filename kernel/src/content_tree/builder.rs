@@ -285,6 +285,53 @@ impl ContentTreeNodeBuilder {
         }
     }
 
+    /// Creates a [`ContentTreeNodeBuilder`] by reading an existing content root parquet file.
+    ///
+    /// This loads all entries from the content root directly into a builder, avoiding the
+    /// need to construct an intermediate [`ContentTreeNode`].
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for reading the parquet file
+    /// * `content_root` - The content root action referencing the manifest file
+    /// * `table_root` - The root URL of the table
+    /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion
+    /// * `new_version` - The version number for the new metadata being built
+    pub(crate) fn from_content_root(
+        engine: &dyn Engine,
+        content_root: &crate::actions::ContentRoot,
+        table_root: Url,
+        table_schema: Schema,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+
+        let content_root_url = table_root
+            .join(&content_root.path)
+            .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
+
+        let (read_result_iter, _version, _path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &content_root_url,
+            content_root.path.clone(),
+            None,
+            None,
+        )?;
+
+        let mut builder = Self::new_for(table_root, new_version, table_schema);
+
+        for batch_result in read_result_iter {
+            let batch = batch_result?;
+            let mut visitor = ContentTreeNodeEntryVisitor::default();
+            if visitor.visit_rows_of(batch.as_ref()).is_ok() {
+                for entry in visitor.entries {
+                    builder.add_entry(entry);
+                }
+            }
+        }
+
+        Ok(builder)
+    }
+
     /// Ensures a cache entry exists for the given manifest location.
     /// Cache should be populated in add_entry(), so this is mainly a safety check.
     fn ensure_dv_cache_exists(&mut self, manifest_location: &str) -> DeltaResult<()> {
