@@ -5,12 +5,10 @@ use url::Url;
 
 /// Orchestrates the process of creating a V3 checkpoint for a table.
 ///
-#[allow(dead_code)]
 pub(crate) struct ContentTreeNodeWriter {
     pub(crate) metadata: ContentTreeNode,
 }
 
-#[allow(dead_code)]
 impl ContentTreeNodeWriter {
     /// Creates a new [`ContentTreeNodeWriter`] for given content root metadata.
     pub(crate) fn try_new(metadata: ContentTreeNode) -> DeltaResult<Self> {

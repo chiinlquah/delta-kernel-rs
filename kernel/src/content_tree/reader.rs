@@ -12,7 +12,6 @@ use super::{
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct ContentTreeNodeEntryVisitor {
     pub entries: Vec<ContentTreeNodeEntry>,
 }
@@ -47,7 +46,6 @@ impl RowVisitor for ContentTreeNodeEntryVisitor {
     }
 }
 
-#[allow(dead_code)]
 fn visit_metadata_entry_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],

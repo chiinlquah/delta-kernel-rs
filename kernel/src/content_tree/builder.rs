@@ -1,5 +1,4 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
@@ -14,6 +13,7 @@ use crate::content_tree::ManifestStats;
 use crate::expressions::StructData;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+#[cfg(test)]
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
 use bytes::Bytes;
@@ -211,7 +211,6 @@ impl DvCache {
 }
 
 /// Builder for creating [`ContentTreeNode`] instances based on V4 ContentTreeNode
-#[allow(dead_code)]
 pub(crate) struct ContentTreeNodeBuilder {
     table_root: Url,
     pending_entries: Vec<ContentTreeNodeEntry>,
@@ -272,7 +271,6 @@ impl ContentTreeNodeBuilder {
     ///   to the content_stats StructData format when adding entries via `add()`. The schema must
     ///   match the schema used to write the files and must include PARQUET:field_id metadata on
     ///   fields for proper stats field mapping
-    #[allow(dead_code)]
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
             table_root,
@@ -409,7 +407,7 @@ impl ContentTreeNodeBuilder {
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax].
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn path_to_absolute(&self, path: &str) -> Result<String, crate::Error> {
         use url::Url;
 
@@ -432,7 +430,6 @@ impl ContentTreeNodeBuilder {
     }
 
     #[allow(unreachable_code)]
-    #[allow(dead_code)]
     pub(crate) fn add(
         &mut self,
         add: Add,
@@ -536,7 +533,6 @@ impl ContentTreeNodeBuilder {
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
     #[allow(unreachable_code)]
-    #[allow(dead_code)]
     pub(crate) fn add_with_dedup(
         &mut self,
         add: Add,
@@ -625,36 +621,6 @@ impl ContentTreeNodeBuilder {
         };
 
         self.pending_entries.push(data_file_entry);
-        Ok(())
-    }
-
-    /// Adds multiple `Add` records from `EngineData` to the metadata.
-    ///
-    /// This method uses the `AddVisitor` to extract all `Add` records from the provided
-    /// `EngineData` and adds each one to the metadata builder.
-    ///
-    /// # Arguments
-    /// * `engine_data` - The engine data containing Add records to extract and add
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error visiting the engine data
-    #[allow(dead_code)]
-    pub(crate) fn add_from_engine_data_add(
-        &mut self,
-        engine_data: &dyn EngineData,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> Result<(), crate::Error> {
-        let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(engine_data)?;
-
-        for add in visitor.adds {
-            self.add(add, version, snapshot_id)?;
-        }
-
         Ok(())
     }
 
@@ -860,34 +826,6 @@ impl ContentTreeNodeBuilder {
         Ok((transformed, aggregates))
     }
 
-    /// Adds multiple `Add` records from an iterator of `EngineData` results to the metadata.
-    ///
-    /// This method processes an iterator of `EngineData` results, extracting all `Add` records
-    /// from each batch and adding them to the metadata builder.
-    ///
-    /// # Arguments
-    /// * `engine_data_iter` - An iterator yielding Results containing EngineData batches with Add records
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error processing any batch or visiting the engine data
-    #[allow(dead_code)]
-    pub(crate) fn add_from_engine_data_iter<'a>(
-        &mut self,
-        engine_data_iter: impl Iterator<Item = Result<Box<dyn EngineData>, crate::Error>> + 'a,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> Result<(), crate::Error> {
-        for engine_data_result in engine_data_iter {
-            let engine_data = engine_data_result?;
-            self.add_from_engine_data_add(engine_data.as_ref(), version, snapshot_id)?;
-        }
-
-        Ok(())
-    }
-
     /// Adds file metadata from scan row format `EngineData` to the metadata.
     ///
     /// This method is designed for scenarios where the data comes from a scan operation
@@ -925,7 +863,6 @@ impl ContentTreeNodeBuilder {
     /// Adds a raw ContentTreeNodeEntry to the builder.
     ///
     /// This is useful when copying entries from existing metadata.
-    #[allow(dead_code)]
     pub(crate) fn add_entry(&mut self, mut entry: ContentTreeNodeEntry) {
         // Create DvCache for manifest entries
         if matches!(
@@ -961,7 +898,6 @@ impl ContentTreeNodeBuilder {
     }
 
     /// Returns true if this builder has any pending entries.
-    #[allow(dead_code)]
     pub(crate) fn has_entries(&self) -> bool {
         !self.pending_entries.is_empty() || !self.pre_built_data.is_empty()
     }
@@ -1122,52 +1058,9 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Marks a specific entry in a leaf manifest as deleted using a deletion vector.
-    ///
-    /// This method finds the leaf manifest entry corresponding to the provided file path,
-    /// and updates or creates a ManifestDV (deletion vector for manifest entries) to mark
-    /// the specified index as deleted. The deleted entries are tracked in a roaring bitmap
-    /// stored inline.
-    ///
-    /// The method gets the entry count from the leaf manifest's `manifest_stats` field,
-    /// which tracks file counts by status. If all entries become deleted, the manifest
-    /// entry is automatically marked as deleted.
-    ///
-    /// # Arguments
-    /// * `leaf_file_path` - The path to the leaf manifest file
-    /// * `index` - The index (row number) within the leaf manifest to mark as deleted
-    /// * `version` - The version at which this deletion occurs
-    /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
-    ///
-    /// Delete a single entry from a leaf manifest by marking it as deleted via ManifestDV.
-    ///
-    /// This method creates or updates a ManifestDV entry that tracks which entries in the leaf
-    /// manifest are deleted. When all active entries are deleted, the manifest itself is marked
-    /// as deleted.
-    ///
-    /// # Arguments
-    /// * `leaf_file_path` - Path to the leaf manifest file
-    /// * `index` - Index of the entry to mark as deleted (0-based position in the manifest)
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
-    #[allow(dead_code)]
-    pub(crate) fn delete_from_leaf(&mut self, leaf_file_path: &str, index: u64) -> DeltaResult<()> {
-        use roaring::RoaringTreemap;
-        let mut indices = RoaringTreemap::new();
-        indices.insert(index);
-        self.delete_indices_from_leaf(leaf_file_path, &indices, true)
-    }
-
     /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
     ///
-    /// This is the bulk version of `delete_from_leaf` that accepts a Roaring bitmap of indices.
-    /// It's used by the transaction layer when processing manifest DVs from leaf writers.
+    /// Used by the transaction layer when processing manifest DVs from leaf writers.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
@@ -1178,7 +1071,6 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of bounds, or serialization fails
-    #[allow(dead_code)]
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
         leaf_file_path: &str,
@@ -1190,15 +1082,13 @@ impl ContentTreeNodeBuilder {
 
     /// Core implementation for marking entries in a leaf manifest as deleted.
     ///
-    /// This is the shared logic used by both `delete_from_leaf` and `delete_multiple_from_leaf`.
-    /// It updates the manifest entry's DV fields to mark entries as deleted.
+    /// Updates the manifest entry's DV fields to mark entries as deleted.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
     /// * `set_changes_dv` - If true, sets tracking_info.changes_dv to track this as an actual deletion.
     ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
-    #[allow(dead_code)]
     fn delete_indices_from_leaf(
         &mut self,
         leaf_file_path: &str,
@@ -1256,7 +1146,6 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
-    #[allow(dead_code)]
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
@@ -1453,7 +1342,7 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(Url)` - The URL where the root manifest was written
     /// * `Err` if there was an error building or writing the metadata
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
         let root_metadata = self.build(engine, None)?;
         ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)
@@ -2387,122 +2276,50 @@ mod tests {
     }
 
     #[test]
-    fn test_add_from_engine_data() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create test data with Add actions
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        // Create builder and add from engine data
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
-
-        // Build metadata and verify
-        let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
-        let entries = metadata.entries()?;
-        assert_eq!(entries.len(), 2);
-
-        // Verify first entry
-        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
-        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
-
-        // Verify second entry
-        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
-        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_from_engine_data_iter() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create multiple batches of test data with Add actions
-        let json_strings1: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch1 = parse_json_batch(json_strings1);
-
-        let json_strings2: StringArray = vec![
-            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch2 = parse_json_batch(json_strings2);
-
-        // Create iterator of engine data results
-        let batches: Vec<Result<Box<dyn crate::EngineData>, crate::Error>> =
-            vec![Ok(batch1), Ok(batch2)];
-
-        // Create builder and add from engine data iterator
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
-
-        // Build metadata and verify
-        let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
-        let entries = metadata.entries()?;
-        assert_eq!(entries.len(), 3);
-
-        // Verify entries (now relative paths)
-        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
-        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
-
-        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
-        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
-
-        assert_eq!(entries[2].location, Some("part-00002.parquet".to_string()));
-        assert_eq!(entries[2].file_size_in_bytes, Some(3072));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_record_count_from_stats() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create test data with Add actions that have stats with numRecords
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":"{\"numRecords\":100}"}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":"{\"numRecords\":250}"}}"#,
-            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        // Create builder and add from engine data
+        // Create builder and add entries with specific record counts
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
-        // Build metadata and verify record counts
+        for (path, record_count) in [
+            ("part-00000.parquet", 100i64),
+            ("part-00001.parquet", 250i64),
+            ("part-00002.parquet", 0i64),
+        ] {
+            builder.add_entry(ContentTreeNodeEntry {
+                content_type: DataContentType::Data,
+                location: Some(path.to_string()),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                }),
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_stats: None,
+                manifest_dv: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            });
+        }
+
+        // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
         let metadata = builder.build(&engine, None)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
-
-        // Verify first entry has record_count from stats
         assert_eq!(entries[0].record_count, 100);
-
-        // Verify second entry has record_count from stats
         assert_eq!(entries[1].record_count, 250);
-
-        // Verify third entry has record_count of 0 when stats is null
         assert_eq!(entries[2].record_count, 0);
 
         Ok(())
@@ -3272,7 +3089,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
+        let mut indices = RoaringTreemap::new();
+        indices.insert(5u64);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         // Step 3: Write the root
         let root_url = root_builder.write_root(&engine)?;
@@ -3370,9 +3189,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
-        root_builder.delete_from_leaf(&leaf_path, 7)?;
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        let mut indices = RoaringTreemap::new();
+        indices.extend([2u64, 5, 7]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -3411,6 +3230,7 @@ mod tests {
     #[test]
     fn test_delete_from_leaf_all_entries_marks_deleted() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3456,10 +3276,10 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 0)?;
-        root_builder.delete_from_leaf(&leaf_path, 1)?;
-        // The third deletion should automatically mark the manifest as deleted
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        // Deleting all entries should automatically mark the manifest as deleted
+        let mut indices = RoaringTreemap::new();
+        indices.extend([0u64, 1, 2]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -3489,6 +3309,7 @@ mod tests {
     #[test]
     fn test_delete_from_leaf_index_out_of_bounds() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3534,7 +3355,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        let result = root_builder.delete_from_leaf(&leaf_path, 10);
+        let mut indices = RoaringTreemap::new();
+        indices.insert(10u64);
+        let result = root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of bounds"));
 
@@ -3543,6 +3366,7 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_nonexistent_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let temp_dir = tempdir()?;
@@ -3552,7 +3376,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Try to delete from a non-existent leaf
-        let result = root_builder.delete_from_leaf("nonexistent.parquet", 5);
+        let mut indices = RoaringTreemap::new();
+        indices.insert(5u64);
+        let result = root_builder.delete_multiple_from_leaf("nonexistent.parquet", &indices, true);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -3615,7 +3441,9 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        root_builder.delete_from_leaf(relative_path, 3)?;
+        let mut indices = RoaringTreemap::new();
+        indices.insert(3u64);
+        root_builder.delete_multiple_from_leaf(relative_path, &indices, true)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -3701,9 +3529,9 @@ mod tests {
         // Delete all 3 active entries (indices 0, 1, 2)
         // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be marked deleted
         // With the NEW logic: cardinality (3) == active_entry_count (3), so manifest IS marked deleted
-        root_builder.delete_from_leaf(&leaf_path, 0)?;
-        root_builder.delete_from_leaf(&leaf_path, 1)?;
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        let mut indices = RoaringTreemap::new();
+        indices.extend([0u64, 1, 2]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         let root_url = root_builder.write_root(&engine)?;
 
@@ -3796,8 +3624,9 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
+        let mut indices_v1 = RoaringTreemap::new();
+        indices_v1.extend([2u64, 5]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices_v1, true)?;
 
         let root_url_v1 = root_builder.write_root(&engine)?;
 
@@ -3844,8 +3673,9 @@ mod tests {
         }
 
         // Step 5: Add new deletions (entries 3 and 7) in the second commit
-        root_builder_v2.delete_from_leaf(&leaf_path, 3)?;
-        root_builder_v2.delete_from_leaf(&leaf_path, 7)?;
+        let mut indices_v2 = RoaringTreemap::new();
+        indices_v2.extend([3u64, 7]);
+        root_builder_v2.delete_multiple_from_leaf(&leaf_path, &indices_v2, true)?;
 
         let root_url_v2 = root_builder_v2.write_root(&engine)?;
 
@@ -3906,7 +3736,9 @@ mod tests {
         }
 
         // Step 9: Delete one additional record (entry 8) in the third commit
-        root_builder_v3.delete_from_leaf(&leaf_path, 8)?;
+        let mut indices_v3 = RoaringTreemap::new();
+        indices_v3.insert(8u64);
+        root_builder_v3.delete_multiple_from_leaf(&leaf_path, &indices_v3, true)?;
 
         let root_url_v3 = root_builder_v3.write_root(&engine)?;
 

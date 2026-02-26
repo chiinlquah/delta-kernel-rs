@@ -14,11 +14,10 @@ use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::scan::ScanBuilder;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
-    SchemaRef, SnapshotRef, Version,
+    SchemaRef, Version,
 };
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
@@ -90,7 +89,6 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
 /// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
-#[allow(dead_code)]
 pub struct ContentTreeNode {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
@@ -189,65 +187,6 @@ impl ManifestDvApplicator {
 }
 
 impl ContentTreeNode {
-    /// Creates a new empty ContentTreeNode instance for the specified table version.
-    ///
-    /// This creates a root manifest (leaf is `None`).
-    ///
-    /// # Parameters
-    /// - `version`: The Delta table version this metadata represents
-    /// - `table_root`: The root URL of the Delta table
-    #[allow(dead_code)]
-    pub(crate) fn new(version: Version, table_root: Url) -> Self {
-        Self {
-            data: vec![],
-            version,
-            table_root,
-            path_in_log: String::new(),
-            leaf: None,
-        }
-    }
-
-    /// Creates a new empty ContentTreeNode instance as a leaf manifest.
-    ///
-    /// Leaf manifests have a UUID automatically generated to uniquely identify them.
-    ///
-    /// # Parameters
-    /// - `version`: The Delta table version this metadata represents
-    /// - `table_root`: The root URL of the Delta table
-    #[allow(dead_code)]
-    pub(crate) fn new_leaf(version: Version, table_root: Url) -> Self {
-        Self {
-            data: vec![],
-            version,
-            table_root,
-            path_in_log: String::new(),
-            leaf: Some(uuid::Uuid::new_v4()),
-        }
-    }
-
-    /// Creates a ContentTreeNode instance from pre-loaded batches.
-    ///
-    /// This is used for parallel IO optimization where batches are read upfront.
-    ///
-    /// # Parameters
-    /// - `data`: Pre-loaded batches containing metadata entries
-    /// - `path_in_log`: The path as it appears in the Delta log
-    /// - `table_root`: The root URL of the Delta table
-    #[allow(dead_code)]
-    pub(crate) fn from_batches(
-        data: Vec<Box<dyn EngineData>>,
-        path_in_log: String,
-        table_root: Url,
-    ) -> Self {
-        Self {
-            data,
-            version: 0, // Version not relevant for child manifests
-            table_root,
-            path_in_log,
-            leaf: None,
-        }
-    }
-
     /// Construct ContentTreeNode from batches with a specific version (for content root reading).
     ///
     /// Validates that the root manifest only contains supported entry types
@@ -345,15 +284,8 @@ impl ContentTreeNode {
     }
 
     /// Returns the leaf UUID if this is a leaf manifest, or `None` if it's a root manifest.
-    #[allow(dead_code)]
     pub(crate) fn leaf(&self) -> Option<uuid::Uuid> {
         self.leaf
-    }
-
-    /// Returns `true` if this is a leaf manifest (has a UUID set).
-    #[allow(dead_code)]
-    pub(crate) fn is_leaf(&self) -> bool {
-        self.leaf.is_some()
     }
 
     pub(crate) fn entries(&self) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
@@ -1377,7 +1309,7 @@ impl ContentTreeNode {
     ///
     /// # Notes
     /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn manifest_to_action_batches(
         manifest_refs: ManifestReference,
         engine: &dyn Engine,
@@ -1409,6 +1341,7 @@ impl ContentTreeNode {
     /// Now allows:
     /// - Affiliated DV manifests (will be handled via lookup join)
     /// - Shared DVs (will be handled via lookup join)
+    #[cfg(test)]
     fn can_use_leaf_optimized_path(schema: &SchemaRef) -> bool {
         use crate::actions::{ADD_NAME, REMOVE_NAME};
 
@@ -1501,6 +1434,7 @@ impl ContentTreeNode {
     ///
     /// This wrapper converts a single manifest into a BulkManifestStreamProcessor
     /// which handles parallel IO and lazy processing.
+    #[cfg(test)]
     fn manifest_to_action_batches_optimized_with_handlers(
         manifest_refs: &ManifestReference,
         parquet_handler: Arc<dyn ParquetHandler>,
@@ -1533,6 +1467,7 @@ impl ContentTreeNode {
     /// This is an internal version of `manifest_to_action_batches` that takes Arc handlers
     /// instead of `&dyn Engine`, enabling it to be called from lazy iterators without
     /// lifetime issues.
+    #[cfg(test)]
     fn manifest_to_action_batches_with_handlers(
         manifest_refs: ManifestReference,
         parquet_handler: Arc<dyn ParquetHandler>,
@@ -1559,46 +1494,6 @@ impl ContentTreeNode {
         )
     }
 
-    /// Creates ContentTreeNode from a Delta table snapshot by replaying add actions from the transaction log.
-    ///
-    /// This method internally uses log replay to:
-    /// - Read actions from the log in reverse chronological order
-    /// - Deduplicate add/remove actions to get the current table state
-    /// - Convert Add actions to ContentTreeNodeEntry format (Adaptive ContentTreeNode Tree)
-    ///
-    /// # Parameters
-    /// - `snapshot`: The Delta table snapshot to build metadata from
-    /// - `engine`: The engine to use for reading log files and processing actions
-    ///
-    /// # Returns
-    /// A `ContentTreeNode` instance containing all active files in the table at the snapshot version.
-    #[allow(dead_code)]
-    pub(crate) fn new_from_snapshot(
-        engine: &dyn Engine,
-        snapshot: SnapshotRef,
-    ) -> DeltaResult<Self> {
-        let table_root = snapshot.table_root().clone();
-        let version = snapshot.version();
-        let table_schema = snapshot.schema().as_ref().clone();
-        let scan = ScanBuilder::new(snapshot).build()?;
-        let scan_metadata_iter = scan.scan_metadata(engine)?;
-
-        let mut metadata_builder =
-            ContentTreeNodeBuilder::new_for(table_root, version, table_schema);
-
-        for scan_metadata_result in scan_metadata_iter {
-            let scan_metadata = scan_metadata_result?;
-            let engine_data = scan_metadata.scan_files.data();
-
-            // When building from snapshot, we don't have a CommitInfo snapshot_id, so pass None.
-            // Note: scan_files.data() has scan row schema, not Add action schema, so we use
-            // add_from_scan_row_data instead of add_from_engine_data_add.
-            metadata_builder.add_from_scan_row_data(engine_data, version, None)?;
-        }
-
-        metadata_builder.build(engine, None)
-    }
-
     /// Reads ContentTreeNode from a parquet file at the specified path.
     ///
     /// This is used to read previously written Adaptive ContentTreeNode Tree (AMT) metadata files.
@@ -1611,7 +1506,6 @@ impl ContentTreeNode {
     ///
     /// # Returns
     /// A `ContentTreeNode` instance deserialized from the parquet file.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read(
         engine: &dyn Engine,
         path: &Url,
@@ -1712,7 +1606,7 @@ impl ContentTreeNode {
     }
 
     /// Get the engine data for testing purposes
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn data(&self) -> &[Box<dyn EngineData>] {
         &self.data
     }
@@ -1728,7 +1622,6 @@ impl ContentTreeNode {
     ///
     /// # Returns
     /// A `ContentTreeNodeBuilder` that can be used to add more entries or build a new ContentTreeNode.
-    #[allow(dead_code)]
     /// Convert this metadata to a builder for modification.
     ///
     /// # Arguments
@@ -1771,7 +1664,6 @@ impl ContentTreeNode {
     ///
     /// # Returns
     /// A `ContentTreeNode` instance loaded from the content root file.
-    #[allow(dead_code)]
     pub(crate) fn new_from_content_root(
         engine: &dyn Engine,
         content_root: &ContentRoot,
@@ -1987,7 +1879,6 @@ pub(crate) fn metadata_entry_to_scalars(
 }
 
 /// Type of content stored by the manifest entry
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DataContentType {
     Data = 0,
@@ -2013,7 +1904,6 @@ impl From<DataContentType> for Scalar {
 }
 
 /// Format of this data.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum DataFileFormat {
     /// Parquet file format: <https://parquet.apache.org/>
@@ -2058,7 +1948,6 @@ impl From<DataFileFormat> for Scalar {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TrackingStatus {
     Existed = 0,
@@ -2079,7 +1968,6 @@ impl From<TrackingStatus> for Scalar {
 }
 
 // TODO: rename ContentInfo to DvInfo once the field name is updated in the spec
-#[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ContentInfo {
     /// Path to location that DV is stored in.
@@ -2099,7 +1987,6 @@ pub(crate) struct ContentInfo {
     pub(crate) cardinality: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub struct TrackingInfo {
     #[field_id = 0]
@@ -2160,7 +2047,6 @@ impl From<TrackingInfo> for Scalar {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct ManifestStats {
     #[field_id = 504]
@@ -2203,7 +2089,6 @@ impl From<ManifestStats> for Scalar {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, ToSchema)]
 pub struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
@@ -2280,32 +2165,6 @@ pub struct ContentTreeNodeEntry {
 }
 
 impl ContentTreeNodeEntry {
-    /// Returns ContentTreeNodeEntry schema augmented with metadata columns for tracking.
-    /// Adds:
-    /// - RowIndex: 0-based position of entry within source manifest file
-    /// - FilePath: URL of the source manifest file
-    ///
-    /// # Arguments
-    /// * `table_schema` - The table's data schema to generate content_stats schema from
-    #[allow(dead_code)]
-    pub(crate) fn to_schema_with_metadata_columns(
-        table_schema: &StructType,
-        stats_schema: &StructType,
-    ) -> DeltaResult<SchemaRef> {
-        use crate::schema::MetadataColumnSpec;
-
-        let base_schema = Self::to_schema_with_content_stats(table_schema, stats_schema)?;
-        let mut schema_with_tracking = base_schema;
-
-        schema_with_tracking = schema_with_tracking
-            .add_metadata_column("__manifest_row_index", MetadataColumnSpec::RowIndex)?;
-
-        schema_with_tracking = schema_with_tracking
-            .add_metadata_column("__manifest_file_path", MetadataColumnSpec::FilePath)?;
-
-        Ok(Arc::new(schema_with_tracking))
-    }
-
     /// Helper to create metadata schema for reading/processing manifest batches.
     ///
     /// This includes `_pos` metadata column and optionally `content_stats` based on table_schema.
@@ -2432,7 +2291,6 @@ impl ContentTreeNodeEntry {
     ///
     /// Returns `Ok(StructType)` containing the full ContentTreeNodeEntry schema with content_stats,
     /// or an error if stats schema generation fails.
-    #[allow(dead_code)]
     pub(crate) fn to_schema_with_content_stats(
         table_schema: &StructType,
         stats_schema: &StructType,

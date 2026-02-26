@@ -55,7 +55,6 @@ const RESERVED_FIELD_IDS_START: i32 = i32::MAX - NUM_RESERVED_FIELD_IDS;
 /// let stats_id = field_id_to_statistics_base(1);
 /// assert_eq!(stats_id, Some(10_200));
 /// ```
-#[allow(dead_code)]
 pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
     if field_id < 0 {
         // Short circuit on negative field-IDs
@@ -110,7 +109,7 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 /// let field_id = statistics_base_to_field_id(10_200);
 /// assert_eq!(field_id, Some(1));
 /// ```
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
     // Invalid stats field ID: negative or not a multiple of NUM_STATS_PER_COLUMN
     if stats_field_id < 0 || stats_field_id % NUM_SUPPORTED_STATS_PER_COLUMN != 0 {
@@ -409,7 +408,6 @@ fn build_primitive_stats_struct(
 /// Returns `Ok(StructType)` containing the stats schema, or an error if:
 /// - Any field is missing the `PARQUET:field_id` metadata
 /// - Field ID computation fails (e.g., overflow)
-#[allow(dead_code)]
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
     let mut visitor = StatsSchemaVisitor;
     let fields = visit_struct(table_struct, &mut visitor)?;
@@ -563,7 +561,6 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
 /// * `max_value` - The maximum value (upper_bound)
 /// * `null_count` - The count of null values
 /// * `tight_bounds` - Whether the bounds are tight/exact (from Delta's `tightBounds` field)
-#[allow(dead_code)]
 fn build_column_stats(
     field: &StructField,
     stats_struct: &StructType,
@@ -607,7 +604,6 @@ fn build_column_stats(
 }
 
 /// Recursively builds content_stats StructData for a struct field.
-#[allow(dead_code)]
 fn build_struct_stats(
     table_struct: &StructType,
     stats_struct: &StructType,
@@ -708,7 +704,6 @@ fn build_struct_stats(
 ///
 /// Returns `Some(StructData)` with aggregated statistics if at least one input has stats,
 /// or `None` if all inputs are `None`.
-#[allow(dead_code)]
 pub(crate) fn aggregate_content_stats<'a>(
     stats_list: impl Iterator<Item = Option<&'a StructData>>,
 ) -> Option<StructData> {
@@ -973,21 +968,6 @@ fn sum_long_scalars(scalars: &[&Scalar]) -> Scalar {
     }
 }
 
-/// Takes the maximum of Long scalars, ignoring nulls.
-#[allow(dead_code)]
-fn max_long_scalars(scalars: &[&Scalar]) -> Scalar {
-    let mut max: Option<i64> = None;
-
-    for scalar in scalars {
-        if let Scalar::Long(v) = scalar {
-            max = Some(max.map_or(*v, |m| m.max(*v)));
-        }
-    }
-
-    max.map(Scalar::Long)
-        .unwrap_or_else(|| Scalar::Null(DataType::LONG))
-}
-
 /// Takes the minimum scalar value, ignoring nulls.
 fn min_scalar(scalars: &[&Scalar], data_type: &DataType) -> Scalar {
     let mut min: Option<&Scalar> = None;
@@ -1079,7 +1059,6 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 /// let stats_json = r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":100},"nullCount":{"id":0}}"#;
 /// let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?;
 /// ```
-#[allow(dead_code)]
 pub(crate) fn delta_json_stats_to_content_stats(
     stats_json: Option<&str>,
     table_schema: &StructType,
