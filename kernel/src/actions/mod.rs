@@ -737,11 +737,6 @@ impl CommitInfo {
             snapshot_id: Some(snapshot_id),
         }
     }
-
-    /// Get the snapshot ID for this commit
-    pub(crate) fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
