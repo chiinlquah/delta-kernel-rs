@@ -14,8 +14,6 @@ use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
-#[cfg(test)]
-use crate::Engine;
 use crate::{
     DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
     SchemaRef, Version,
@@ -893,22 +891,6 @@ impl ContentTreeNode {
         })
     }
 
-    #[cfg(test)]
-    fn root_action_batches_optimized(
-        &self,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        self.root_action_batches_optimized_with_handler(
-            engine.evaluation_handler().as_ref(),
-            schema,
-            predicate,
-            None, // table_schema not available in this code path
-            None, // stats_schema not available in this code path
-        )
-    }
-
     fn root_action_batches_optimized_with_handler(
         &self,
         evaluation_handler: &dyn EvaluationHandler,
@@ -1030,28 +1012,6 @@ impl ContentTreeNode {
         }
 
         Ok(Box::new(result_batches.into_iter()))
-    }
-
-    /// Converts root manifest entries to action batches.
-    ///
-    /// # Parameters
-    /// - `predicate`: Optional predicate for data skipping. When provided, entries whose
-    ///   `content_stats` indicate they cannot contain matching data will be skipped.
-    #[cfg(test)]
-    pub(crate) fn root_action_batches(
-        &self,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        _partition_keys: &[String],
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Return empty iterator if schema doesn't contain Add or Remove
-        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        debug!("Using optimized path for metadata reading");
-        self.root_action_batches_optimized(engine, schema, predicate)
     }
 
     /// Version of root_action_batches that takes handlers directly (for lazy streaming).
@@ -1242,37 +1202,6 @@ impl ContentTreeNode {
         })
     }
 
-    /// Processes all manifest references from a `LeafReferences` into action batches.
-    ///
-    /// # Parameters
-    /// - `root_state`: The leaf references obtained from `manifest_references()`
-    /// - `engine`: The engine for reading parquet files
-    ///
-    /// # Returns
-    /// An iterator over action batches.
-    #[cfg(test)]
-    pub(crate) fn non_root_action_batches(
-        root_state: LeafReferences,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Capture the handlers we need (both are Arc, so cheap to clone)
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-        Self::non_root_action_batches_with_handlers(
-            root_state,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )
-    }
-
     /// Version of non_root_action_batches that takes handlers directly (for lazy streaming).
     // TODO: Refactor to reduce argument count (currently 7) - consider using a config struct
     #[allow(clippy::too_many_arguments)]
@@ -1299,72 +1228,6 @@ impl ContentTreeNode {
         )?;
 
         Ok(Box::new(processor))
-    }
-
-    /// Processes a ManifestReference into action batches.
-    ///
-    /// Given a `ManifestReference`, this method:
-    ///
-    /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
-    /// 2. **Filters entries**: Applies predicate-based data skipping using content_stats
-    /// 3. **Converts entries to actions**: Transforms ContentTreeNodeEntry records into Add/Remove actions
-    /// 4. **Returns action batches**: Produces an iterator of ActionsBatch objects
-    ///
-    /// # Parameters
-    /// - `manifest_refs`: The manifest references to process
-    /// - `engine`: The engine for reading parquet files
-    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
-    /// - `predicate`: Optional predicate for data skipping
-    ///
-    /// # Returns
-    /// An iterator over `ActionsBatch` objects, each containing a single Add or Remove action.
-    ///
-    /// # Notes
-    /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
-    #[cfg(test)]
-    pub(crate) fn manifest_to_action_batches(
-        manifest_refs: ManifestReference,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Extract handlers and delegate to handler-based version
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-
-        Self::manifest_to_action_batches_with_handlers(
-            manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-        )
-    }
-
-    /// Checks if the optimized path can be used for a leaf manifest.
-    ///
-    /// Checks if we can use the optimized path for leaf manifests.
-    ///
-    /// Requirements:
-    /// - Schema is Add-only (no Remove actions)
-    ///
-    /// Now allows:
-    /// - Affiliated DV manifests (will be handled via lookup join)
-    /// - Shared DVs (will be handled via lookup join)
-    #[cfg(test)]
-    fn can_use_leaf_optimized_path(schema: &SchemaRef) -> bool {
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
-
-        // Allow both Add and Remove actions in the optimized path
-        // They will be handled via separate selection vectors
-        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
-            return false;
-        }
-
-        // Allow affiliated DV manifests and shared DVs - will be handled via lookup join
-        true
     }
 
     /// Merge manifest DV selection into an existing selection vector.
@@ -1440,70 +1303,6 @@ impl ContentTreeNode {
         }
 
         Ok(result_batches)
-    }
-
-    /// Process a manifest into action batches using the bulk processor.
-    ///
-    /// This wrapper converts a single manifest into a BulkManifestStreamProcessor
-    /// which handles parallel IO and lazy processing.
-    #[cfg(test)]
-    fn manifest_to_action_batches_optimized_with_handlers(
-        manifest_refs: &ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Convert borrowed parameters to owned for the processor
-        let manifest_iter = std::iter::once(manifest_refs.clone());
-        let schema_owned = schema.clone();
-        let table_root_owned = table_root.clone();
-
-        // Create bulk processor for this single manifest
-        let processor = bulk_processor::BulkManifestStreamProcessor::new(
-            manifest_iter,
-            parquet_handler,
-            evaluation_handler,
-            schema_owned,
-            table_root_owned,
-            None, // predicate
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )?;
-
-        Ok(Box::new(processor))
-    }
-
-    /// Processes a ManifestReference into action batches using captured handlers.
-    ///
-    /// This is an internal version of `manifest_to_action_batches` that takes Arc handlers
-    /// instead of `&dyn Engine`, enabling it to be called from lazy iterators without
-    /// lifetime issues.
-    #[cfg(test)]
-    fn manifest_to_action_batches_with_handlers(
-        manifest_refs: ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Check if we can use optimized path
-        if predicate.is_some() || !Self::can_use_leaf_optimized_path(schema) {
-            return Err(Error::generic(
-                "Cannot use optimized path for leaf manifest. \
-                 Predicate filtering on leaf manifests is not yet supported in optimized path.",
-            ));
-        }
-
-        debug!("Using optimized path for leaf manifest with handlers");
-        Self::manifest_to_action_batches_optimized_with_handlers(
-            &manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-        )
     }
 
     /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
@@ -2225,8 +2024,80 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 }
 
 #[cfg(test)]
+impl ContentTreeNode {
+    /// Converts root manifest entries to action batches (test helper).
+    pub(crate) fn root_action_batches(
+        &self,
+        engine: &dyn crate::Engine,
+        schema: &SchemaRef,
+        _partition_keys: &[String],
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        self.root_action_batches_optimized_with_handler(
+            engine.evaluation_handler().as_ref(),
+            schema,
+            predicate,
+            None,
+            None,
+        )
+    }
+
+    /// Processes all manifest references into action batches (test helper).
+    pub(crate) fn non_root_action_batches(
+        root_state: LeafReferences,
+        engine: &dyn crate::Engine,
+        schema: &SchemaRef,
+        table_root: &Url,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        Self::non_root_action_batches_with_handlers(
+            root_state,
+            engine.parquet_handler(),
+            engine.evaluation_handler(),
+            schema,
+            table_root,
+            predicate,
+            None,
+            None,
+        )
+    }
+
+    /// Processes a ManifestReference into action batches (test helper).
+    pub(crate) fn manifest_to_action_batches(
+        manifest_refs: ManifestReference,
+        engine: &dyn crate::Engine,
+        schema: &SchemaRef,
+        table_root: &Url,
+        predicate: Option<&PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        if predicate.is_some() || (!schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME)) {
+            return Err(Error::generic(
+                "Cannot use optimized path for leaf manifest. \
+                 Predicate filtering on leaf manifests is not yet supported in optimized path.",
+            ));
+        }
+
+        let processor = bulk_processor::BulkManifestStreamProcessor::new(
+            std::iter::once(manifest_refs),
+            engine.parquet_handler(),
+            engine.evaluation_handler(),
+            schema.clone(),
+            table_root.clone(),
+            None,
+            None,
+            None,
+        )?;
+        Ok(Box::new(processor))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Engine;
     use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
 
