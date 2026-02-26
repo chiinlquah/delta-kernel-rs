@@ -304,7 +304,7 @@ impl ContentTreeNodeBuilder {
     /// Only serializes entries that were modified (dirty flag set).
     /// Should be called before building to ensure DVs are properly persisted.
     /// Also updates tracking_info with snapshot_id and sequence numbers based on status.
-    fn serialize_dvs_to_entries(&mut self, snapshot_id: Option<i64>) -> DeltaResult<()> {
+    fn serialize_dvs_to_entries(&mut self, snapshot_id: i64) -> DeltaResult<()> {
         let version = self.version as i64;
 
         // Iterate over entries and look up in cache
@@ -364,7 +364,7 @@ impl ContentTreeNodeBuilder {
                 // Initialize tracking_info if not present (new manifest being added)
                 entry.tracking_info = Some(TrackingInfo {
                     status: TrackingStatus::Added,
-                    snapshot_id,
+                    snapshot_id: Some(snapshot_id),
                     sequence_number: Some(version),
                     file_sequence_number: Some(version),
                     first_row_id: None,
@@ -374,7 +374,7 @@ impl ContentTreeNodeBuilder {
                 // Update existing tracking_info based on status
                 // Only update snapshot_id when status is DELETED
                 if tracking_info.status == TrackingStatus::Deleted {
-                    tracking_info.snapshot_id = snapshot_id;
+                    tracking_info.snapshot_id = Some(snapshot_id);
                 }
             }
         }
@@ -430,12 +430,7 @@ impl ContentTreeNodeBuilder {
     }
 
     #[allow(unreachable_code)]
-    pub(crate) fn add(
-        &mut self,
-        add: Add,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> DeltaResult<()> {
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
     }
 
@@ -457,7 +452,7 @@ impl ContentTreeNodeBuilder {
         size: i64,
         content_stats: Option<StructData>,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
         content_info: Option<ContentInfo>,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
@@ -481,7 +476,7 @@ impl ContentTreeNodeBuilder {
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 // TODO: For newly added files (status = Added), sequence_number and file_sequence_number
                 // should be None to inherit from the manifest. Only existing files (status = Existed) need these set.
                 sequence_number: Some(version as i64),
@@ -537,7 +532,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         add: Add,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(add.path.clone()) {
@@ -581,7 +576,7 @@ impl ContentTreeNodeBuilder {
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 sequence_number: Some(version as i64),
                 file_sequence_number: Some(version as i64),
 
@@ -649,7 +644,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         use crate::content_tree::stats;
 
@@ -703,7 +698,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
         output_schema: &SchemaRef,
         stats_struct: Option<&crate::schema::StructType>,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
@@ -770,10 +765,7 @@ impl ContentTreeNodeBuilder {
                             ))
                         }
                     };
-                    let snapshot_id_expr = match snapshot_id {
-                        Some(id) => Expression::literal(Scalar::Long(id)),
-                        None => Expression::null_literal(DataType::LONG),
-                    };
+                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
                     Expression::struct_from_with_schema(
                         [
                             Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
@@ -844,7 +836,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> Result<(), crate::Error> {
         let mut visitor = ScanRowToAddVisitor {
             adds: vec![],
@@ -1022,7 +1014,7 @@ impl ContentTreeNodeBuilder {
         file_path: Option<&str>,
         dv_path: Option<&str>,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
         for entry in &mut self.pending_entries {
@@ -1039,13 +1031,13 @@ impl ContentTreeNodeBuilder {
                 // Update the tracking info to mark as deleted
                 if let Some(ref mut tracking_info) = entry.tracking_info {
                     tracking_info.status = TrackingStatus::Deleted;
-                    tracking_info.snapshot_id = snapshot_id;
+                    tracking_info.snapshot_id = Some(snapshot_id);
                     tracking_info.sequence_number = Some(version as i64);
                 } else {
                     // Create new tracking info if it doesn't exist
                     entry.tracking_info = Some(TrackingInfo {
                         status: TrackingStatus::Deleted,
-                        snapshot_id,
+                        snapshot_id: Some(snapshot_id),
                         sequence_number: Some(version as i64),
                         file_sequence_number: Some(version as i64),
                         first_row_id: None,
@@ -1149,7 +1141,7 @@ impl ContentTreeNodeBuilder {
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNodeEntry> {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
@@ -1235,7 +1227,7 @@ impl ContentTreeNodeBuilder {
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 // TODO: Manifest entries in root should have sequence_number and file_sequence_number
                 // set to self.version so that leaf entries can inherit them when null.
                 sequence_number: None,
@@ -1280,7 +1272,7 @@ impl ContentTreeNodeBuilder {
     pub(crate) fn build(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1334,7 +1326,7 @@ impl ContentTreeNodeBuilder {
     pub(crate) fn build_leaf(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1390,7 +1382,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1456,7 +1448,7 @@ impl ContentTreeNodeBuilder {
         engine_data: &dyn EngineData,
         scan_row_input_schema: &SchemaRef,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
         use crate::content_tree::stats;
         use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
@@ -1495,10 +1487,7 @@ impl ContentTreeNodeBuilder {
                             ))
                         }
                     };
-                    let snapshot_id_expr = match snapshot_id {
-                        Some(id) => Expression::literal(Scalar::Long(id)),
-                        None => Expression::null_literal(DataType::LONG),
-                    };
+                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
                     Expression::struct_from_with_schema(
                         [
                             Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
@@ -1596,7 +1585,7 @@ impl ContentTreeNodeBuilder {
         engine_data: &dyn EngineData,
         selection_vector: &[bool],
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         use crate::expressions::{ArrayData, Expression};
         use crate::schema::{ArrayType, StructField, StructType};
@@ -2106,7 +2095,7 @@ mod tests {
     fn build_and_read_root(
         builder: &mut ContentTreeNodeBuilder,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
         let root_metadata = builder.build(engine, snapshot_id)?;
         let table_root = root_metadata.table_root.clone();
@@ -2312,7 +2301,7 @@ mod tests {
 
         // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
+        let metadata = builder.build(&engine, 1)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].record_count, 100);
@@ -2386,7 +2375,7 @@ mod tests {
             delete_manifest_position: None,
         };
 
-        builder.add(add, 1, None)?;
+        builder.add(add, 1, 1)?;
 
         // Verify content_stats is populated by directly checking the conversion function
         // (The builder uses this function internally)
@@ -2488,7 +2477,7 @@ mod tests {
             delete_manifest_position: None,
         };
 
-        builder.add(add, 1, None)?;
+        builder.add(add, 1, 1)?;
 
         // Verify the builder has the entry
         assert_eq!(builder.pending_entries.len(), 1);
@@ -2602,7 +2591,7 @@ mod tests {
         builder.add_entry(entry2);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
 
         // Verify content_stats is populated on the leaf manifest entry
         assert!(
@@ -2717,7 +2706,7 @@ mod tests {
         builder.add_entry(entry);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
 
         // When all entries have None content_stats, the aggregate should also be None
         assert!(
@@ -2935,7 +2924,7 @@ mod tests {
         }
 
         // Write the leaf
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
@@ -2948,7 +2937,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
-        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         // Should have: 1 CombinedManifest (DV is now inline on this entry)
         assert_eq!(root_entries.len(), 1);
@@ -3028,7 +3017,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
@@ -3041,7 +3030,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         // Build, write, and read back the root to verify
-        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         assert_eq!(root_entries.len(), 1); // CombinedManifest (DV is inline)
 
         let data_manifest = root_entries
@@ -3109,7 +3098,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
@@ -3123,7 +3112,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         // Build, write, and read back the root to verify the manifest is marked as deleted
-        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -3182,7 +3171,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
@@ -3267,7 +3256,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
         // leaf_path is now already relative
         let relative_path = &leaf_path;
@@ -3281,7 +3270,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(relative_path, &indices, true)?;
 
         // Build, write, and read back the root to verify manifest DV is stored inline
-        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let data_manifest = root_entries
             .iter()
@@ -3363,7 +3352,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
         // Build, write, and read back the root to verify the manifest is marked as deleted
-        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -3440,7 +3429,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
@@ -3452,7 +3441,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices_v1, true)?;
 
         // Step 3: Build, write, and read back the root to verify changes_dv from first commit
-        let entries_v1 = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let entries_v1 = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest_v1 = entries_v1
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
@@ -3495,7 +3484,7 @@ mod tests {
         root_builder_v2.delete_multiple_from_leaf(&leaf_path, &indices_v2, true)?;
 
         // Build, write, and read back the root to verify changes_dv only contains NEW deletions
-        let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, Some(2))?;
+        let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, 2)?;
         let manifest_v2 = entries_v2
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
@@ -3552,7 +3541,7 @@ mod tests {
         root_builder_v3.delete_multiple_from_leaf(&leaf_path, &indices_v3, true)?;
 
         // Build, write, and read back the root to verify changes_dv only contains NEW deletion
-        let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, Some(3))?;
+        let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, 3)?;
         let manifest_v3 = entries_v3
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
@@ -3639,7 +3628,7 @@ mod tests {
         root_builder_v4.add_entry(new_data_entry);
 
         // Build, write, and read back the root to verify changes_dv is None (no deletions)
-        let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, Some(4))?;
+        let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, 4)?;
         let manifest_v4 = entries_v4
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
@@ -3713,7 +3702,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
@@ -3730,7 +3719,7 @@ mod tests {
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
         // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf reorganization
-        let entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
+        let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
