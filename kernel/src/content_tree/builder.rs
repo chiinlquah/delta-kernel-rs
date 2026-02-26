@@ -1460,24 +1460,6 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Writes the pending entries as a root manifest and returns the URL where it was written.
-    ///
-    /// This method builds a root ContentTreeNode (no UUID) and writes it to a parquet file.
-    /// The root manifest typically contains references to leaf manifests (DataManifest entries)
-    /// rather than individual data files.
-    ///
-    /// # Arguments
-    /// * `engine` - The engine to use for writing the parquet file
-    ///
-    /// # Returns
-    /// * `Ok(Url)` - The URL where the root manifest was written
-    /// * `Err` if there was an error building or writing the metadata
-    #[allow(dead_code)]
-    pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
-        let root_metadata = self.build(engine, None)?;
-        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)
-    }
-
     /// Builds a leaf ContentTreeNode instance with a generated UUID.
     pub(crate) fn build_leaf(
         &mut self,
@@ -1771,7 +1753,22 @@ impl RowVisitor for ScanRowToAddVisitor {
 mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::content_tree::ContentTreeNode;
     use serde_json::json;
+
+    /// Helper: builds a root manifest, writes it to disk, and reads it back.
+    fn build_and_read_root(
+        builder: &mut ContentTreeNodeBuilder,
+        engine: &dyn crate::Engine,
+        snapshot_id: Option<i64>,
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let root_metadata = builder.build(engine, snapshot_id)?;
+        let table_root = root_metadata.table_root.clone();
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
+        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root = ContentTreeNode::read(engine, &root_url, root_path, table_root)?;
+        root.entries()
+    }
 
     // TODO: Add tests for all tracking_info columns (status, snapshot_id, sequence_number,
     // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
@@ -2590,148 +2587,6 @@ mod tests {
         assert!(err.contains("Invalid length"));
     }
 
-    #[test]
-    fn test_write_root_with_leaf() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::content_tree::{ContentTreeNode, DataContentType};
-        use crate::engine::sync::SyncEngine;
-        use tempfile::tempdir;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Step 1: Create a leaf builder with data file entries
-        let mut leaf_builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-
-        // Add some data file entries to the leaf
-        let data_entry_1 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00000.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        let data_entry_2 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00001.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 200,
-            file_size_in_bytes: Some(2048),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        leaf_builder.add_entry(data_entry_1);
-        leaf_builder.add_entry(data_entry_2);
-
-        // Step 2: Write the leaf manifest and get a ContentTreeNodeEntry (DataManifest) back
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
-
-        // Verify the leaf manifest entry
-        assert_eq!(
-            leaf_manifest_entry.content_type,
-            DataContentType::DataManifest
-        );
-        assert!(leaf_manifest_entry.location.is_some());
-        let leaf_location = leaf_manifest_entry.location.as_ref().unwrap();
-        // Leaf should have UUID in filename: <version>.content.<uuid>.parquet
-        assert!(leaf_location.contains(".content."));
-        assert!(leaf_location.ends_with(".parquet"));
-        // Count the dots to verify UUID is present (should have 3 dots: version.content.uuid.parquet)
-        let dots_count = leaf_location.matches('.').count();
-        assert!(
-            dots_count >= 3,
-            "Leaf filename should contain UUID: {}",
-            leaf_location
-        );
-        // Verify aggregate stats
-        assert_eq!(leaf_manifest_entry.record_count, 300); // 100 + 200
-        assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
-
-        // Step 3: Create a root builder and add the leaf manifest entry
-        let mut root_builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        root_builder.add_entry(leaf_manifest_entry.clone());
-
-        // Step 4: Write the root manifest
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Verify the root was written
-        // Root should NOT have UUID in filename: <version>.content.parquet
-        let root_path = root_url.path();
-        assert!(root_path.contains(".content.parquet"));
-        // Root filename should only have 2 dots: version.content.parquet
-        let root_filename = root_path.rsplit('/').next().unwrap();
-        let root_dots_count = root_filename.matches('.').count();
-        assert_eq!(
-            root_dots_count, 2,
-            "Root filename should NOT contain UUID: {}",
-            root_filename
-        );
-
-        // Step 5: Read back the root and verify
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let read_root =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = read_root.entries()?;
-        assert_eq!(root_entries.len(), 1);
-        assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
-        assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
-
-        // Step 6: Read back the leaf and verify
-        let leaf_relative_path = leaf_manifest_entry.location.as_ref().unwrap();
-        let leaf_url = table_root.join(leaf_relative_path)?;
-        let read_leaf = ContentTreeNode::read(
-            &engine,
-            &leaf_url,
-            leaf_relative_path.clone(),
-            table_root.clone(),
-        )?;
-        let leaf_entries = read_leaf.entries()?;
-        assert_eq!(leaf_entries.len(), 2);
-        assert_eq!(leaf_entries[0].content_type, DataContentType::Data);
-        assert_eq!(leaf_entries[1].content_type, DataContentType::Data);
-
-        Ok(())
-    }
-
     /// Test helper: Applies a manifest deletion vector to filter entries from a manifest.
     ///
     /// Manifest deletion vectors (ManifestDV, content_type = 5) can filter out entries
@@ -2817,15 +2672,8 @@ mod tests {
 
         root_builder.delete_from_leaf(&leaf_path, 5)?;
 
-        // Step 3: Write the root
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Step 4: Read back the root and verify manifest DV is stored inline
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = root_metadata.entries()?;
+        // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         // Should have: 1 DataManifest (DV is now inline on this entry)
         assert_eq!(root_entries.len(), 1);
@@ -2850,7 +2698,7 @@ mod tests {
         assert!(treemap.contains(5));
         assert_eq!(treemap.len(), 1);
 
-        // Step 5: Read the leaf and apply manifest DV to verify filtering
+        // Step 4: Read the leaf and apply manifest DV to verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
         let leaf_metadata =
             ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
@@ -2918,14 +2766,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 7)?;
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
 
         let data_manifest = root_entries
@@ -3006,14 +2848,8 @@ mod tests {
         // The third deletion should automatically mark the manifest as deleted
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify the manifest is marked as deleted
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -3164,14 +3000,8 @@ mod tests {
         root_builder.add_entry(leaf_manifest_entry);
         root_builder.delete_from_leaf(relative_path, 3)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify manifest DV is stored inline
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let data_manifest = root_entries
             .iter()
@@ -3253,14 +3083,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 1)?;
         root_builder.delete_from_leaf(&leaf_path, 2)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify the manifest is marked as deleted
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
 
         let leaf_manifest = root_entries
             .iter()
@@ -3348,14 +3172,8 @@ mod tests {
         root_builder.delete_from_leaf(&leaf_path, 2)?;
         root_builder.delete_from_leaf(&leaf_path, 5)?;
 
-        let root_url_v1 = root_builder.write_root(&engine)?;
-
-        // Step 3: Read back and verify changes_dv from first commit
-        let root_path_v1 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v1, &table_root)?;
-        let root_metadata_v1 =
-            ContentTreeNode::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
-        let entries_v1 = root_metadata_v1.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv from first commit
+        let entries_v1 = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         let manifest_v1 = entries_v1
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3396,14 +3214,8 @@ mod tests {
         root_builder_v2.delete_from_leaf(&leaf_path, 3)?;
         root_builder_v2.delete_from_leaf(&leaf_path, 7)?;
 
-        let root_url_v2 = root_builder_v2.write_root(&engine)?;
-
-        // Step 7: Read back and verify changes_dv only contains NEW deletions
-        let root_path_v2 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v2, &table_root)?;
-        let root_metadata_v2 =
-            ContentTreeNode::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
-        let entries_v2 = root_metadata_v2.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletions
+        let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, Some(2))?;
         let manifest_v2 = entries_v2
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3457,14 +3269,8 @@ mod tests {
         // Step 9: Delete one additional record (entry 8) in the third commit
         root_builder_v3.delete_from_leaf(&leaf_path, 8)?;
 
-        let root_url_v3 = root_builder_v3.write_root(&engine)?;
-
-        // Step 10: Read back and verify changes_dv only contains NEW deletion
-        let root_path_v3 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v3, &table_root)?;
-        let root_metadata_v3 =
-            ContentTreeNode::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
-        let entries_v3 = root_metadata_v3.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletion
+        let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, Some(3))?;
         let manifest_v3 = entries_v3
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3551,14 +3357,8 @@ mod tests {
         };
         root_builder_v4.add_entry(new_data_entry);
 
-        let root_url_v4 = root_builder_v4.write_root(&engine)?;
-
-        // Step 13: Read back and verify changes_dv is None (no deletions)
-        let root_path_v4 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v4, &table_root)?;
-        let root_metadata_v4 =
-            ContentTreeNode::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
-        let entries_v4 = root_metadata_v4.entries()?;
+        // Build, write, and read back the root to verify changes_dv is None (no deletions)
+        let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, Some(4))?;
         let manifest_v4 = entries_v4
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
@@ -3649,13 +3449,8 @@ mod tests {
         // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Step 3: Read back and verify changes_dv is NOT set for leaf reorganization
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path, table_root.clone())?;
-        let entries = root_metadata.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf reorganization
+        let entries = build_and_read_root(&mut root_builder, &engine, Some(1))?;
         let manifest = entries
             .iter()
             .find(|e| matches!(e.content_type, DataContentType::DataManifest))
