@@ -81,6 +81,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
             &ArrowEngineData::new(data),
             write_context.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
 

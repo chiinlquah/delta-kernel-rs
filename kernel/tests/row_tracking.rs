@@ -70,7 +70,12 @@ async fn write_data_to_table(
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(&data, write_context.as_ref(), HashMap::new())
+                .write_parquet(
+                    &data,
+                    write_context.as_ref(),
+                    HashMap::new(),
+                    &Default::default(),
+                )
                 .await
         })
     });
@@ -671,6 +676,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data1),
             write_context1.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
 
@@ -679,6 +685,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data2),
             write_context2.as_ref(),
             HashMap::new(),
+            &Default::default(),
         )
         .await?;
 

@@ -1881,6 +1881,9 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
+            "keyMetadata" => Scalar::from(entry.key_metadata.clone()),
+            "splitOffsets" => entry.split_offsets.clone().try_into()?,
+            "equalityIds" => entry.equality_ids.clone().try_into()?,
             "manifestDv" => Scalar::from(entry.manifest_dv.clone()),
             _ => Scalar::Null(field.data_type().clone()),
         };
@@ -2166,26 +2169,17 @@ pub struct ContentTreeNodeEntry {
     /// #[field_id = 143]
     /// pub referenced_file: Option<String>,
 
-    /// Not used by Delta today
     /// Implementation-specific key metadata for encryption
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 131]
     pub(crate) key_metadata: Option<Bytes>,
 
-    /// Not used by Delta today
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 132]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
-    /// Not used by Delta today
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be null otherwise.
     /// Fields with ids listed in this column must be present in the delete file
-    // TODO: Remove the skip, and make sure that this is included all the way though
-    #[skip_schema]
     #[field_id = 135]
     pub(crate) equality_ids: Option<Vec<i32>>,
 
@@ -2481,19 +2475,18 @@ mod tests {
         // Verify the base schema has the expected structure (excludes content_stats)
         let schema = ContentTreeNodeEntry::to_schema();
 
-        // Schema should have all the top-level fields (excluding content_stats, key_metadata, split_offsets, equality_ids)
+        // Schema should have all the top-level fields (excluding content_stats)
         // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
-        // recordCount, fileSizeInBytes, manifestStats, manifestDv (11 total - no referencedFile)
-        assert_eq!(schema.fields().len(), 11);
+        // recordCount, fileSizeInBytes, manifestStats, keyMetadata, splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
+        assert_eq!(schema.fields().len(), 14);
 
         // Check leaves (flattened leaf fields)
         let leaves = schema.leaves(None::<&str>);
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
-        // Schema should have all the leaf fields (25 = flattened count, excluding key_metadata, split_offsets, equality_ids)
-        // contentInfo has 4 leaf fields (location, offset, sizeInBytes, cardinality) vs old contentInfo's 2,
-        // and referencedFile (1 field) was removed: net change is +2
-        assert_eq!(leaf_names.len(), 25);
+        // 28 leaf fields: 25 (our branch base) + keyMetadata(1) + splitOffsets(1) + equalityIds(1)
+        // (no referencedFile; dvInfo has 4 leaves vs old contentInfo's 2)
+        assert_eq!(leaf_names.len(), 28);
     }
 
     #[test]
@@ -2523,8 +2516,8 @@ mod tests {
         // Generate schema with content_stats
         let schema_with_stats = ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema)?;
 
-        // Schema should have 12 top-level fields (11 base + 1 for content_stats)
-        assert_eq!(schema_with_stats.fields().len(), 12);
+        // Schema should have 15 top-level fields (14 base + 1 for content_stats)
+        assert_eq!(schema_with_stats.fields().len(), 15);
 
         // Verify content_stats field exists
         let content_stats_field = schema_with_stats
@@ -3243,7 +3236,11 @@ mod tests {
             _ => panic!("manifest_stats presence mismatch"),
         }
 
-        // Note: key_metadata, split_offsets, equality_ids are not yet fully supported
+        assert_eq!(
+            expected.key_metadata, actual.key_metadata,
+            "key_metadata mismatch"
+        );
+        // Note: split_offsets and equality_ids are array types not extracted by the visitor
     }
 
     #[test]
