@@ -1153,7 +1153,11 @@ impl ContentTreeNode {
                             if keep { "KEEP" } else { "PRUNE" },
                             entry.location,
                         );
-                        if keep { Some(entry) } else { None }
+                        if keep {
+                            Some(entry)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
 
@@ -1163,9 +1167,17 @@ impl ContentTreeNode {
                 all_entries.extend(batch_entries);
             }
             let total_skipped = total_before_filter - total_after_filter;
-            debug!("Manifest-level pruning result: total={}, kept={}, skipped={} ({:.1}%)",
-                total_before_filter, total_after_filter, total_skipped,
-                if total_before_filter > 0 { (total_skipped as f64 / total_before_filter as f64) * 100.0 } else { 0.0 });
+            debug!(
+                "Manifest-level pruning result: total={}, kept={}, skipped={} ({:.1}%)",
+                total_before_filter,
+                total_after_filter,
+                total_skipped,
+                if total_before_filter > 0 {
+                    (total_skipped as f64 / total_before_filter as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
             all_entries
         } else {
             // No filtering - just materialize all entries
@@ -1269,7 +1281,6 @@ impl ContentTreeNode {
 
         Ok(Box::new(processor))
     }
-
 
     /// Merge manifest DV selection into an existing selection vector.
     ///

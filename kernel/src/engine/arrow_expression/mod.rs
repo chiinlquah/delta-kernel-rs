@@ -263,7 +263,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            input_schema: schema,
+            _input_schema: schema,
             expression,
             output_type,
             output_schema: OnceLock::new(),
@@ -276,7 +276,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
-            input_schema: schema,
+            _input_schema: schema,
             predicate,
         }))
     }
@@ -376,7 +376,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    input_schema: SchemaRef,
+    _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
     /// Lazily cached Arrow schema for non-struct output types (the `{output: <type>}` schema).
@@ -444,7 +444,7 @@ static PREDICATE_OUTPUT_SCHEMA: OnceLock<Arc<ArrowSchema>> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    input_schema: SchemaRef,
+    _input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
