@@ -2142,7 +2142,7 @@ pub struct ContentTreeNodeEntry {
     /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
     /// TODO: place holder for referenced file which is no longer necessary.
     /// #[field_id = 143]
-    /// pub referenced_file: Option<String>,
+    /// pub referenced_file: `Option<String>`,
 
     /// Implementation-specific key metadata for encryption
     #[field_id = 131]
