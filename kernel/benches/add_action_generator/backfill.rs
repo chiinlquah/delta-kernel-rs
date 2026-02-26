@@ -979,7 +979,6 @@ fn partition_actions_into_leaves(
     batch_size: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::transaction::leaf_writer::AddType;
 
     // TODO: Use stats_parsed.minValues.id to partition actions by actual ID values for better
     // data skipping. Currently we use a simple counting approach: create a new leaf for every
@@ -1038,11 +1037,7 @@ fn partition_actions_into_leaves(
         }
 
         let leaf_writer = current_leaf_writer.as_mut().unwrap();
-        leaf_writer.add_existing_actions(
-            engine,
-            scan_metadata.scan_files,
-            AddType::DataFileAndDV,
-        )?;
+        leaf_writer.add_existing_actions(engine, scan_metadata.scan_files)?;
         actions_in_current_leaf += selected_count;
 
         // If we've reached or exceeded batch_size, finish this leaf

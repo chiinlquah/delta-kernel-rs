@@ -131,7 +131,7 @@ fi
 BENCHMARK_RUNNER="${REPO_ROOT}/target/release/benchmark-runner"
 if [ ! -f "${BENCHMARK_RUNNER}" ]; then
     echo "Building benchmark-runner..."
-    cd "${REPO_ROOT}"
+    cd "${KERNEL_DIR}"
     FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
     AWS_LC_SYS_CMAKE_BUILDER=1 cargo build --release --bin benchmark-runner --features "${FEATURES}"
     echo ""

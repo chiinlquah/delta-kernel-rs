@@ -43,7 +43,7 @@ use delta_kernel_derive::internal_api;
 pub mod leaf_writer;
 
 // Re-export types needed for public API
-pub use leaf_writer::{AddType, DvUpdate, LeafNodeWriterResult, ManifestLocation};
+pub use leaf_writer::LeafNodeWriterResult;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -941,7 +941,7 @@ impl<S> Transaction<S> {
     ///     // Write to leaf manifests
     ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
     ///     for action in actions {
-    ///         leaf.add_existing_actions(engine, action, AddType::DataFileAndDV)?;
+    ///         leaf.add_existing_actions(engine, action)?;
     ///     }
     ///     let leaf_result = leaf.finish(engine)?;
     ///     txn.add_leaf(leaf_result)?;
@@ -1099,10 +1099,6 @@ impl<S> Transaction<S> {
         if let Some(data_manifest) = leaf_result.data_file_manifest_written {
             self.leaf_manifests.push(data_manifest);
         }
-        if let Some(dv_manifest) = leaf_result.dv_file_manifest_written {
-            self.leaf_manifests.push(dv_manifest);
-        }
-
         Ok(())
     }
 
@@ -1479,7 +1475,7 @@ impl<S> Transaction<S> {
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
     /// The `stats` field contains file-level statistics. The schema returned here shows the base
-    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
+    /// structure; the actual stats written by `DefaultEngine::write_parquet` include dynamically
     /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
     /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
     /// stats schema.
@@ -1489,7 +1485,6 @@ impl<S> Transaction<S> {
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
@@ -3101,10 +3096,7 @@ mod tests {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::content_tree::writer::ContentTreeNodeWriter;
-        use crate::content_tree::{
-            ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
-            TrackingStatus,
-        };
+        use crate::content_tree::DataContentType;
         use crate::engine::sync::SyncEngine;
         use tempfile::tempdir;
 
@@ -3166,82 +3158,11 @@ mod tests {
 
         let data_leaf_entry = data_leaf_builder.write_leaf(&engine, Some(1))?;
 
-        // Create delete leaf manifest with PositionDeletes entries for the DVs
-        let mut delete_leaf_builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
-
-        // DV entry for file-2.parquet
-        let dv_entry_2 = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
-            location: Some("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(2),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: Some(ContentInfo {
-                offset: 0,
-                size_in_bytes: 108, // 100 + 8
-            }),
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 5, // cardinality from the DV descriptor
-            file_size_in_bytes: Some(108),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: Some("data/file-2.parquet".to_string()),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        // DV entry for file-3.parquet
-        let dv_entry_3 = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
-            location: Some(
-                "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
-            ),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(2),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: Some(ContentInfo {
-                offset: 0,
-                size_in_bytes: 108,
-            }),
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 5,
-            file_size_in_bytes: Some(108),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: Some("data/file-3.parquet".to_string()),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        delete_leaf_builder.add_entry(dv_entry_2);
-        delete_leaf_builder.add_entry(dv_entry_3);
-
-        let delete_leaf_entry = delete_leaf_builder.write_leaf(&engine, Some(1))?;
-
-        // Create root manifest with both data and delete leaf manifests
+        // In the new CombinedManifest model, DV info is inline on Data entries.
+        // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        root_builder.add_entry(delete_leaf_entry);
         let root_metadata = root_builder.build(&engine, None)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
@@ -3359,27 +3280,31 @@ mod tests {
             root_visitor.visit_rows_of(engine_data.as_ref())?;
         }
 
-        // Find the delete manifest in the root
-        // With the fix to write_leaf, delete manifests are now correctly marked as DeleteManifest
-        let delete_manifest = root_visitor
+        // In the new CombinedManifest model, the data leaf (with inline DVs) is a CombinedManifest.
+        // After file removal, the CombinedManifest entry in the root should have a manifest_dv
+        // marking which data file entry indices are deleted.
+        let manifest_with_dv = root_visitor
             .entries
             .iter()
-            .find(|entry| entry.content_type == DataContentType::DeleteManifest)
-            .ok_or_else(|| Error::generic("No delete manifest found in root"))?;
+            .find(|entry| {
+                entry.content_type == DataContentType::CombinedManifest
+                    && entry.manifest_dv.is_some()
+            })
+            .ok_or_else(|| {
+                Error::generic(
+                    "No CombinedManifest with manifest_dv found in root after file removal",
+                )
+            })?;
 
-        let delete_manifest_path = delete_manifest
+        let delete_manifest_path = manifest_with_dv
             .location
             .clone()
-            .ok_or_else(|| Error::generic("Delete manifest has no location"))?;
+            .ok_or_else(|| Error::generic("CombinedManifest has no location"))?;
 
-        // Verify that manifest DV is stored inline on the delete manifest
-        // (No separate ManifestDV entries anymore)
-
-        // Check the delete manifest has a manifest_dv field
-        let manifest_dv_bytes = delete_manifest
+        let manifest_dv_bytes = manifest_with_dv
             .manifest_dv
             .as_ref()
-            .ok_or_else(|| Error::generic("Delete manifest has no manifest_dv"))?;
+            .ok_or_else(|| Error::generic("CombinedManifest has no manifest_dv"))?;
 
         if manifest_dv_bytes.len() < 4 {
             return Err(Box::new(Error::generic("manifest_dv bytes too short")));
@@ -3420,25 +3345,25 @@ mod tests {
             delete_visitor.visit_rows_of(engine_data.as_ref())?;
         }
 
-        // Get the DV entry at the deleted index
-        let deleted_dv_entry = delete_visitor
+        // Get the Data entry at the deleted index
+        let deleted_data_entry = delete_visitor
             .entries
             .get(deleted_index as usize)
             .ok_or_else(|| Error::generic(format!("No entry at index {}", deleted_index)))?;
 
-        // Verify it's a PositionDeletes entry for file-2.parquet
+        // In the new model, it's a Data entry (location is the data file path)
         assert_eq!(
-            deleted_dv_entry.content_type,
-            DataContentType::PositionDeletes,
-            "Deleted entry should be PositionDeletes"
+            deleted_data_entry.content_type,
+            DataContentType::Data,
+            "Deleted entry should be a Data entry"
         );
 
         assert!(
-            deleted_dv_entry
-                .referenced_file
+            deleted_data_entry
+                .location
                 .as_ref()
                 .is_some_and(|f| f.contains("file-2.parquet")),
-            "Deleted DV entry should reference file-2.parquet"
+            "Deleted Data entry should be for file-2.parquet"
         );
 
         Ok(())

@@ -173,7 +173,7 @@ FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
 
 # Build benchmark-runner once
 echo -e "${BLUE}Building benchmark-runner...${NC}"
-cd "${REPO_ROOT}"
+cd "${KERNEL_DIR}"
 BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1"
 if [ "$FLAMEGRAPH_MODE" = true ]; then
     BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true"
@@ -269,7 +269,7 @@ _run_benchmark_cmd() {
     # remaining args are passed directly to benchmark-runner
 
     if [ "$FLAMEGRAPH_MODE" = true ]; then
-        # Resolve to absolute paths before cd-ing to REPO_ROOT
+        # Resolve to absolute paths before cd-ing to KERNEL_DIR
         [[ "$output_file" = /* ]] || output_file="$(pwd)/${output_file}"
         [[ "$svg_file"    = /* ]] || svg_file="$(pwd)/${svg_file}"
         mkdir -p "$(dirname "${svg_file}")"
@@ -281,7 +281,7 @@ _run_benchmark_cmd() {
             --
         )
         # stdout (benchmark JSON) → output_file; stderr (cargo/perf/flamegraph messages) → .log
-        (cd "${REPO_ROOT}" && AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true \
+        (cd "${KERNEL_DIR}" && AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true \
             cargo flamegraph "${flamegraph_args[@]}" "$@") \
             > "${output_file}" 2>"${svg_file%.svg}.log"
     else
