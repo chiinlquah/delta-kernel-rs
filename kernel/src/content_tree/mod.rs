@@ -376,12 +376,6 @@ impl ContentTreeNode {
             "clusteringProvider" if action_name == "add" => {
                 Expression::null_literal(DataType::STRING)
             }
-            "deleteManifestPath" if action_name == "add" => {
-                Expression::null_literal(DataType::STRING)
-            }
-            "deleteManifestPosition" if action_name == "add" => {
-                Expression::null_literal(DataType::LONG)
-            }
             "stats_parsed" if action_name == "add" => {
                 if has_stats_parsed {
                     // Read stats_parsed from the augmented metadata batch
@@ -1080,23 +1074,6 @@ impl ContentTreeNode {
     /// # Returns
     /// A `LeafReferences` containing one `ManifestReference` per CombinedManifest in the root.
     ///
-    /// # Example Usage
-    /// ```ignore
-    /// // Get manifest references from the root (no manifest-level skipping)
-    /// let manifest_refs_iter = metadata.manifest_references(None)?;
-    ///
-    /// // Process each child manifest
-    /// for manifest_refs_result in manifest_refs_iter {
-    ///     let manifest_refs = manifest_refs_result?;
-    ///     let action_batches = ContentTreeNode::manifest_to_action_batches(
-    ///         manifest_refs,
-    ///         engine,
-    ///         schema,
-    ///         partition_keys
-    ///     )?;
-    ///     // Process action batches...
-    /// }
-    /// ```
     ///
     /// # Parameters
     /// - `predicate`: Optional predicate for manifest-level data skipping. When provided,
@@ -1289,71 +1266,6 @@ impl ContentTreeNode {
         Ok(Box::new(processor))
     }
 
-    /// Processes a ManifestReference into action batches.
-    ///
-    /// Given a `ManifestReference`, this method:
-    ///
-    /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
-    /// 2. **Filters entries**: Applies predicate-based data skipping using content_stats
-    /// 3. **Converts entries to actions**: Transforms ContentTreeNodeEntry records into Add/Remove actions
-    /// 4. **Returns action batches**: Produces an iterator of ActionsBatch objects
-    ///
-    /// # Parameters
-    /// - `manifest_refs`: The manifest references to process
-    /// - `engine`: The engine for reading parquet files
-    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
-    /// - `predicate`: Optional predicate for data skipping
-    ///
-    /// # Returns
-    /// An iterator over `ActionsBatch` objects, each containing a single Add or Remove action.
-    ///
-    /// # Notes
-    /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
-    #[cfg(test)]
-    pub(crate) fn manifest_to_action_batches(
-        manifest_refs: ManifestReference,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Extract handlers and delegate to handler-based version
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-
-        Self::manifest_to_action_batches_with_handlers(
-            manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-        )
-    }
-
-    /// Checks if the optimized path can be used for a leaf manifest.
-    ///
-    /// Checks if we can use the optimized path for leaf manifests.
-    ///
-    /// Requirements:
-    /// - Schema is Add-only (no Remove actions)
-    ///
-    /// Now allows:
-    /// - Affiliated DV manifests (will be handled via lookup join)
-    /// - Shared DVs (will be handled via lookup join)
-    #[cfg(test)]
-    fn can_use_leaf_optimized_path(schema: &SchemaRef) -> bool {
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
-
-        // Allow both Add and Remove actions in the optimized path
-        // They will be handled via separate selection vectors
-        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
-            return false;
-        }
-
-        // Allow affiliated DV manifests and shared DVs - will be handled via lookup join
-        true
-    }
 
     /// Merge manifest DV selection into an existing selection vector.
     ///
@@ -1428,70 +1340,6 @@ impl ContentTreeNode {
         }
 
         Ok(result_batches)
-    }
-
-    /// Process a manifest into action batches using the bulk processor.
-    ///
-    /// This wrapper converts a single manifest into a BulkManifestStreamProcessor
-    /// which handles parallel IO and lazy processing.
-    #[cfg(test)]
-    fn manifest_to_action_batches_optimized_with_handlers(
-        manifest_refs: &ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Convert borrowed parameters to owned for the processor
-        let manifest_iter = std::iter::once(manifest_refs.clone());
-        let schema_owned = schema.clone();
-        let table_root_owned = table_root.clone();
-
-        // Create bulk processor for this single manifest
-        let processor = bulk_processor::BulkManifestStreamProcessor::new(
-            manifest_iter,
-            parquet_handler,
-            evaluation_handler,
-            schema_owned,
-            table_root_owned,
-            None, // predicate
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )?;
-
-        Ok(Box::new(processor))
-    }
-
-    /// Processes a ManifestReference into action batches using captured handlers.
-    ///
-    /// This is an internal version of `manifest_to_action_batches` that takes Arc handlers
-    /// instead of `&dyn Engine`, enabling it to be called from lazy iterators without
-    /// lifetime issues.
-    #[cfg(test)]
-    fn manifest_to_action_batches_with_handlers(
-        manifest_refs: ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Check if we can use optimized path
-        if predicate.is_some() || !Self::can_use_leaf_optimized_path(schema) {
-            return Err(Error::generic(
-                "Cannot use optimized path for leaf manifest. \
-                 Predicate filtering on leaf manifests is not yet supported in optimized path.",
-            ));
-        }
-
-        debug!("Using optimized path for leaf manifest with handlers");
-        Self::manifest_to_action_batches_optimized_with_handlers(
-            &manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-        )
     }
 
     /// Reads ContentTreeNode from a parquet file at the specified path.
@@ -4467,77 +4315,6 @@ mod tests {
             refs.data_manifest.manifest.location.as_ref().unwrap(),
             "memory:///combined-manifest.parquet"
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_manifest_to_action_batches_integration() -> DeltaResult<()> {
-        use crate::actions::visitors::AddVisitor;
-        use crate::engine_data::RowVisitor;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Create a child data manifest with actual data files (using relative paths)
-        let data_entry_1 = create_data_entry("child-data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("child-data-2.parquet", 60);
-
-        let child_metadata = ContentTreeNode {
-            data: vec![
-                data_entry_1
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-                data_entry_2
-                    .clone()
-                    .into_engine_data(test_metadata_entry_schema(), &engine)?,
-            ],
-            version: 0,
-            table_root: table_root_url.clone(),
-            path_in_log: String::new(),
-            leaf: None,
-        };
-
-        // Write the child manifest to a file
-        let child_manifest_writer = writer::ContentTreeNodeWriter::try_new(child_metadata)?;
-        let child_manifest_url = child_manifest_writer.write(&engine)?;
-
-        // Create a ContentTreeNodeEntry for the child manifest
-        let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
-
-        // Create ManifestReference pointing to the child manifest
-        let manifest_refs = ManifestReference {
-            data_manifest: FilteredManifest::new(child_manifest_entry),
-        };
-
-        // Process manifest to action batches
-        let schema = crate::actions::get_log_add_schema().clone();
-        // No data skipping for this test
-        let action_batches = ContentTreeNode::manifest_to_action_batches(
-            manifest_refs,
-            &engine,
-            &schema,
-            &table_root_url,
-            None,
-        )?;
-
-        // Collect all Add actions
-        let mut all_adds = Vec::new();
-        for batch_result in action_batches {
-            let batch = batch_result?;
-            let mut visitor = AddVisitor::default();
-            visitor.visit_rows_of(batch.actions.as_ref())?;
-            all_adds.extend(visitor.adds);
-        }
-
-        // Verify we got both data files
-        assert_eq!(all_adds.len(), 2);
-
-        // Verify the paths (relative paths)
-        let paths: Vec<_> = all_adds.iter().map(|a| a.path.as_str()).collect();
-        assert!(paths.contains(&"child-data-1.parquet"));
-        assert!(paths.contains(&"child-data-2.parquet"));
 
         Ok(())
     }

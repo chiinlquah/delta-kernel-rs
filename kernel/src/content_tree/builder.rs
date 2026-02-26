@@ -1989,8 +1989,6 @@ impl RowVisitor for ScanRowToAddVisitor {
                 column_name!("fileConstantValues.partitionValues"),
                 column_name!("fileConstantValues.dataManifestPath"),
                 column_name!("fileConstantValues.dataManifestPosition"),
-                column_name!("fileConstantValues.deleteManifestPath"),
-                column_name!("fileConstantValues.deleteManifestPosition"),
             ];
             let types = vec![
                 DataType::STRING,
@@ -2007,8 +2005,6 @@ impl RowVisitor for ScanRowToAddVisitor {
                     DataType::STRING,
                     true,
                 ))),
-                DataType::STRING,
-                DataType::LONG,
                 DataType::STRING,
                 DataType::LONG,
             ];
@@ -2065,10 +2061,6 @@ impl RowVisitor for ScanRowToAddVisitor {
                     getters[10].get_opt(i, "scanRow.fileConstantValues.dataManifestPath")?;
                 let data_manifest_position: Option<i64> =
                     getters[11].get_opt(i, "scanRow.fileConstantValues.dataManifestPosition")?;
-                let delete_manifest_path: Option<String> =
-                    getters[12].get_opt(i, "scanRow.fileConstantValues.deleteManifestPath")?;
-                let delete_manifest_position: Option<i64> =
-                    getters[13].get_opt(i, "scanRow.fileConstantValues.deleteManifestPosition")?;
 
                 let add = Add {
                     path,
@@ -2084,8 +2076,6 @@ impl RowVisitor for ScanRowToAddVisitor {
                     clustering_provider: None,
                     data_manifest_path,
                     data_manifest_position,
-                    delete_manifest_path,
-                    delete_manifest_position,
                 };
                 self.adds.push(add);
             }
@@ -2382,8 +2372,6 @@ mod tests {
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         };
 
         builder.add(add, 1, None)?;
@@ -2484,8 +2472,6 @@ mod tests {
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         };
 
         builder.add(add, 1, None)?;

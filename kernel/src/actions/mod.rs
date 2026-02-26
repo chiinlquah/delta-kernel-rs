@@ -823,19 +823,6 @@ pub(crate) struct Add {
     /// Only present in tables that have metadata tree enabled.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) data_manifest_position: Option<i64>,
-
-    /// The path to the delete manifest the DV for this remove action is in.
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) delete_manifest_path: Option<String>,
-
-    /// The index in the delete manifest of this remove actions deletion
-    /// vector.
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) delete_manifest_position: Option<i64>,
 }
 
 impl Add {
@@ -912,19 +899,6 @@ pub(crate) struct Remove {
     /// Only present in tables that have metadata tree enabled.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) data_manifest_position: Option<i64>,
-
-    /// The path to the delete manifest the DV for this remove action is in.
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) delete_manifest_path: Option<String>,
-
-    /// The index in the delete manifest of this remove actions deletion
-    /// vector.
-    ///
-    /// Only present in tables that have metadata tree enabled.
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) delete_manifest_position: Option<i64>,
 }
 
 /// The ContentRoot action describes the root of the content metadata tree.
@@ -1308,8 +1282,6 @@ mod tests {
                 StructField::nullable("clusteringProvider", DataType::STRING),
                 StructField::nullable("dataManifestPath", DataType::STRING),
                 StructField::nullable("dataManifestPosition", DataType::LONG),
-                StructField::nullable("deleteManifestPath", DataType::STRING),
-                StructField::nullable("deleteManifestPosition", DataType::LONG),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1363,8 +1335,6 @@ mod tests {
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                 StructField::nullable("dataManifestPath", DataType::STRING),
                 StructField::nullable("dataManifestPosition", DataType::LONG),
-                StructField::nullable("deleteManifestPath", DataType::STRING),
-                StructField::nullable("deleteManifestPosition", DataType::LONG),
             ]),
         )]));
         assert_eq!(schema, expected);

@@ -136,8 +136,6 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         column_name!("fileConstantValues.defaultRowCommitVersion"),
         column_name!("fileConstantValues.dataManifestPath"),
         column_name!("fileConstantValues.dataManifestPosition"),
-        column_name!("fileConstantValues.deleteManifestPath"),
-        column_name!("fileConstantValues.deleteManifestPosition"),
     ];
     let types = vec![
         DataType::STRING,
@@ -158,8 +156,6 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         DataType::LONG,
         DataType::STRING,
         DataType::LONG,
-        DataType::STRING,
-        DataType::LONG,
     ];
     (names, types)
 });
@@ -172,8 +168,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         // Fixed getter indices for all columns (all primitive leaf values):
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
-        //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
-        //         deleteManifestPath, deleteManifestPosition
+        //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition
         // Note: stats_parsed is pre-extracted into self.stats_per_row before visit() is called.
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
@@ -761,8 +756,6 @@ mod tests {
                     StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                     StructField::nullable("dataManifestPath", DataType::STRING),
                     StructField::nullable("dataManifestPosition", DataType::LONG),
-                    StructField::nullable("deleteManifestPath", DataType::STRING),
-                    StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             ),
         ]))

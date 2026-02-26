@@ -757,10 +757,9 @@ impl<S> Transaction<S> {
 
                     // Mark all removes as deleted in the ContentRoot
                     for remove in visitor.removes.iter() {
-                        // Check if this remove has source manifest information (leaf manifest)
-                        // If data_manifest_path or delete_manifest_path are set AND they're not equal
-                        // to the root manifest path, we should use delete_from_leaf to mark the entry
-                        // in the leaf manifest
+                        // Check if this remove is in a leaf manifest (CombinedManifest).
+                        // In the flat structure DVs are inline on the data entry, so there
+                        // is no separate delete manifest — only data_manifest_path matters.
                         let data_in_leaf = remove
                             .data_manifest_path
                             .as_ref()
@@ -770,16 +769,6 @@ impl<S> Transaction<S> {
                             })
                             .is_some()
                             && remove.data_manifest_position.is_some();
-
-                        let dv_in_leaf = remove
-                            .delete_manifest_path
-                            .as_ref()
-                            .filter(|path| {
-                                // Check if path is not the root manifest
-                                root_manifest_path.as_ref() != Some(path)
-                            })
-                            .is_some()
-                            && remove.delete_manifest_position.is_some();
 
                         // Accumulate leaf manifest deletions to batch later
                         if data_in_leaf {
@@ -794,40 +783,15 @@ impl<S> Transaction<S> {
                             }
                         }
 
-                        if dv_in_leaf {
-                            if let (Some(dv_manifest_path), Some(dv_position)) = (
-                                remove.delete_manifest_path.as_ref(),
-                                remove.delete_manifest_position,
-                            ) {
-                                leaf_deletions
-                                    .entry(dv_manifest_path.clone())
-                                    .or_default()
-                                    .insert(dv_position as u64);
-                            }
-                        }
-
-                        // Use mark_deleted for entries in root manifest
-                        // If data file is in leaf, pass None for file_path
-                        // If DV is in leaf, pass None for dv_path
-                        if !data_in_leaf || !dv_in_leaf {
-                            let file_path = if data_in_leaf {
-                                None
-                            } else {
-                                Some(remove.path.as_str())
-                            };
-
-                            // Only mark DV as deleted in root if we didn't handle it via leaf
-                            let dv_path: Option<&str> = if dv_in_leaf {
-                                None
-                            } else {
-                                remove
-                                    .deletion_vector
-                                    .as_ref()
-                                    .map(|dv| dv.path_or_inline_dv.as_str())
-                            };
+                        // Use mark_deleted for entries in root manifest (not in a leaf)
+                        if !data_in_leaf {
+                            let dv_path: Option<&str> = remove
+                                .deletion_vector
+                                .as_ref()
+                                .map(|dv| dv.path_or_inline_dv.as_str());
 
                             metadata_builder.mark_deleted(
-                                file_path,
+                                Some(remove.path.as_str()),
                                 dv_path,
                                 commit_version,
                                 snapshot_id,
@@ -1878,14 +1842,6 @@ impl<S> Transaction<S> {
                 Some("deletionVector"),
                 Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPosition"]).into(),
             )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPath"]).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "deleteManifestPosition"]).into(),
-            )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
             .with_dropped_field("modificationTime");
 
@@ -2874,8 +2830,6 @@ mod tests {
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         }
     }
 
@@ -3085,8 +3039,6 @@ mod tests {
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         }
     }
 
@@ -3296,7 +3248,7 @@ mod tests {
                 )
             })?;
 
-        let delete_manifest_path = manifest_with_dv
+        let leaf_manifest_path = manifest_with_dv
             .location
             .clone()
             .ok_or_else(|| Error::generic("CombinedManifest has no location"))?;
@@ -3328,15 +3280,14 @@ mod tests {
 
         let deleted_index = deleted_indices.iter().next().unwrap();
 
-        // Read the delete manifest and verify the entry at the deleted index
-        // delete_manifest_path is now a relative path, join with table_root
-        let delete_manifest_url = table_root
-            .join(&delete_manifest_path)
-            .map_err(|e| Error::generic(format!("Failed to parse delete manifest URL: {e}")))?;
+        // Read the leaf manifest and verify the entry at the deleted index
+        let leaf_manifest_url = table_root
+            .join(&leaf_manifest_path)
+            .map_err(|e| Error::generic(format!("Failed to parse leaf manifest URL: {e}")))?;
         let delete_manifest_metadata = ContentTreeNode::read(
             &engine,
-            &delete_manifest_url,
-            delete_manifest_path.clone(),
+            &leaf_manifest_url,
+            leaf_manifest_path.clone(),
             table_root.clone(),
         )?;
 

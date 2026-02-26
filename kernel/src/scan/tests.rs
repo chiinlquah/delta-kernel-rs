@@ -602,8 +602,6 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         };
         builder.add(add, 3, None)?;
 
@@ -1001,8 +999,6 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             clustering_provider: None,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         };
         builder.add(add, 10, None)?;
 
