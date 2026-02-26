@@ -281,7 +281,7 @@ impl LeafNodeWriter {
             engine,
             data,
             self.version,
-            Some(self.snapshot_id),
+            self.snapshot_id,
         )?;
 
         Ok(())
@@ -308,7 +308,7 @@ impl LeafNodeWriter {
             data,
             &selection_vector,
             self.version,
-            Some(self.snapshot_id),
+            self.snapshot_id,
         )?;
 
         // Track manifest entry removals (mark source manifest entries as deleted via DVs).
@@ -333,9 +333,7 @@ impl LeafNodeWriter {
         // In the new CombinedManifest model, DV info is inline on data entries,
         // so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
-            let entry = self
-                .data_builder
-                .write_leaf(engine, Some(self.snapshot_id))?;
+            let entry = self.data_builder.write_leaf(engine, self.snapshot_id)?;
             Some(entry)
         } else {
             None

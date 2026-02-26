@@ -420,8 +420,8 @@ impl<S> Transaction<S> {
             self.snapshot_id,
             self.is_blind_append,
         );
-        // Extract snapshot_id before converting commit_info to engine data
-        let snapshot_id = commit_info.snapshot_id();
+        // Use transaction's snapshot_id directly (already i64)
+        let snapshot_id = self.snapshot_id;
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
@@ -509,7 +509,7 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
         commit_version: u64,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
         commit_info_action: DeltaResult<Box<dyn EngineData>>,
         set_transaction_actions: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
     ) -> DeltaResult<Vec<DeltaResult<FilteredEngineData>>> {
@@ -631,11 +631,14 @@ impl<S> Transaction<S> {
                     let engine_data = scan_metadata.scan_files.data();
 
                     // Add incremental actions from delta log to the metadata builder
-                    // Pass None for snapshot_id since we're replaying existing commits
                     // TODO: When replaying, we should preserve original sequence_numbers from the
                     // files' tracking_info instead of using current_version. This would require
                     // extracting sequence_number from the scan data and passing it through.
-                    metadata_builder.add_from_scan_row_data(engine_data, current_version, None)?;
+                    metadata_builder.add_from_scan_row_data(
+                        engine_data,
+                        current_version,
+                        snapshot_id,
+                    )?;
                 }
             }
 
@@ -2860,14 +2863,14 @@ mod tests {
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
 
         for path in &data_files {
-            leaf_builder.add(make_add_action(path.clone()), 1, Some(1))?;
+            leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, None)?;
+        let root_metadata = root_builder.build(&engine, 1)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)
@@ -2957,13 +2960,13 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
         for path in &data_files {
-            leaf_builder.add(make_add_action(path.clone()), 1, Some(1))?;
+            leaf_builder.add(make_add_action(path.clone()), 1, 1)?;
         }
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        let root_metadata = root_builder.build(&engine, None)?;
+        let root_metadata = root_builder.build(&engine, 1)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
 
@@ -3072,16 +3075,8 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
 
         // Files without DV
-        data_leaf_builder.add(
-            make_add_action("data/file-0.parquet".to_string()),
-            1,
-            Some(1),
-        )?;
-        data_leaf_builder.add(
-            make_add_action("data/file-1.parquet".to_string()),
-            1,
-            Some(1),
-        )?;
+        data_leaf_builder.add(make_add_action("data/file-0.parquet".to_string()), 1, 1)?;
+        data_leaf_builder.add(make_add_action("data/file-1.parquet".to_string()), 1, 1)?;
 
         // Files with DV (file-2 and file-3) - use the builder's add() method which extracts DV content
         data_leaf_builder.add(
@@ -3090,7 +3085,7 @@ mod tests {
                 "vBn[lx{q8@P<9BNH/isA".to_string(), // Valid 20-char encoded UUID
             ),
             1,
-            Some(1),
+            1,
         )?;
         data_leaf_builder.add(
             make_add_action_with_dv(
@@ -3098,24 +3093,20 @@ mod tests {
                 "^-aqEH.-t@S}K{vb[*k^".to_string(), // Another valid 20-char encoded UUID
             ),
             1,
-            Some(1),
+            1,
         )?;
 
         // File without DV
-        data_leaf_builder.add(
-            make_add_action("data/file-4.parquet".to_string()),
-            1,
-            Some(1),
-        )?;
+        data_leaf_builder.add(make_add_action("data/file-4.parquet".to_string()), 1, 1)?;
 
-        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, Some(1))?;
+        let data_leaf_entry = data_leaf_builder.write_leaf(&engine, 1)?;
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // No separate delete leaf is needed — DVs are already embedded via builder's add().
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
-        let root_metadata = root_builder.build(&engine, None)?;
+        let root_metadata = root_builder.build(&engine, 1)?;
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)

@@ -2824,4 +2824,56 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_stats_schema_with_metadata_columns() {
+        let id = field_with_id("id", DataType::LONG, false, 0);
+        let name = field_with_id("name", DataType::STRING, true, 1);
+        let score = field_with_id("score", DataType::DOUBLE, true, 2);
+        let file = field_with_id("_file", DataType::STRING, false, 2147483646);
+        let pos = field_with_id("_pos", DataType::LONG, false, 2147483645);
+        let row_id = field_with_id("_row_id", DataType::LONG, false, 2147483540);
+        let last_updated_seq_no = field_with_id(
+            "_last_updated_sequence_number",
+            DataType::LONG,
+            false,
+            2147483539,
+        );
+        let schema = StructType::new_unchecked([
+            id.clone(),
+            name.clone(),
+            score.clone(),
+            file.clone(),
+            pos.clone(),
+            row_id.clone(),
+            last_updated_seq_no.clone(),
+        ]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert_eq!(stats.fields().count(), 7);
+        assert_stats_field_ids(&_field_stats_struct_for(&id, &stats), 10_000, &id);
+        assert_stats_field_ids(&_field_stats_struct_for(&name, &stats), 10_200, &name);
+        assert_stats_field_ids(&_field_stats_struct_for(&score, &stats), 10_400, &score);
+        assert_stats_field_ids(&_field_stats_struct_for(&file, &stats), 2147039800, &file);
+        assert_stats_field_ids(&_field_stats_struct_for(&pos, &stats), 2147039600, &pos);
+        assert_stats_field_ids(
+            &_field_stats_struct_for(&row_id, &stats),
+            2147018600,
+            &row_id,
+        );
+        assert_stats_field_ids(
+            &_field_stats_struct_for(&last_updated_seq_no, &stats),
+            2147018400,
+            &last_updated_seq_no,
+        );
+    }
+
+    fn _field_stats_struct_for(field: &StructField, stats: &StructType) -> StructType {
+        let field_stats = stats.field(&field.name).expect("amount field should exist");
+        let field_stats_struct = match field_stats.data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("Expected struct type"),
+        };
+        field_stats_struct.clone()
+    }
 }
