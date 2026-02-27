@@ -106,7 +106,7 @@ impl AddVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 19,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -142,8 +142,6 @@ impl AddVisitor {
             clustering_provider,
             data_manifest_path: None,
             data_manifest_position: None,
-            delete_manifest_path: None,
-            delete_manifest_position: None,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -183,7 +181,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 19,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -212,10 +210,6 @@ impl RemoveVisitor {
             getters[15].get_opt(row_index, "remove.dataManifestPath")?;
         let data_manifest_position: Option<i64> =
             getters[16].get_opt(row_index, "remove.dataManifestPosition")?;
-        let delete_manifest_path: Option<String> =
-            getters[17].get_opt(row_index, "remove.deleteManifestPath")?;
-        let delete_manifest_position: Option<i64> =
-            getters[18].get_opt(row_index, "remove.deleteManifestPosition")?;
 
         Ok(Remove {
             path,
@@ -231,8 +225,6 @@ impl RemoveVisitor {
             default_row_commit_version,
             data_manifest_path,
             data_manifest_position,
-            delete_manifest_path,
-            delete_manifest_position,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -969,7 +961,7 @@ mod tests {
         let json_strings: StringArray = vec![
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
-            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5,"dataManifestPath":"data-manifest.json","dataManifestPosition":42,"deleteManifestPath":"delete-manifest.json","deleteManifestPosition":99}}"#,
+            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5,"dataManifestPath":"data-manifest.json","dataManifestPosition":42}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -1047,16 +1039,6 @@ mod tests {
             remove.data_manifest_position,
             Some(42),
             "data_manifest_position mismatch"
-        );
-        assert_eq!(
-            remove.delete_manifest_path,
-            Some("delete-manifest.json".to_string()),
-            "delete_manifest_path mismatch"
-        );
-        assert_eq!(
-            remove.delete_manifest_position,
-            Some(99),
-            "delete_manifest_position mismatch"
         );
     }
 
