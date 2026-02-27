@@ -54,14 +54,32 @@ impl RowVisitor for FilePathVisitor {
     }
 }
 
-/// Evaluators for a single DV-presence variant (with or without appended DV columns).
-struct BatchEvaluators {
-    /// Optional stats transformation evaluator (content_stats → stats_parsed)
-    stats_transform_opt: Option<Arc<dyn crate::ExpressionEvaluator>>,
-    /// Optional Add evaluator
-    add_evaluator_opt: Option<Arc<dyn crate::ExpressionEvaluator>>,
-    /// Optional Remove evaluator
-    remove_evaluator_opt: Option<Arc<dyn crate::ExpressionEvaluator>>,
+/// Evaluators shared across all manifests (computed once in `BulkManifestStreamProcessor::new`).
+///
+/// Stats transforms and remove evaluators don't embed any per-manifest literal, so they are
+/// identical for every manifest and can be reused.
+struct SharedEvaluators {
+    /// Evaluator input schema for batches that have DV columns appended (includes stats_parsed
+    /// when applicable). Passed to `build_action_evaluators` for per-manifest add evaluators.
+    evaluator_schema_with_dv: super::SchemaRef,
+    /// Evaluator input schema for batches without DV columns.
+    evaluator_schema_no_dv: super::SchemaRef,
+    /// Stats transform when DV columns are present.
+    stats_transform_with_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
+    /// Stats transform when no DV columns are present.
+    stats_transform_no_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
+    /// Remove evaluator when DV columns are present.
+    remove_evaluator_with_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
+    /// Remove evaluator when no DV columns are present.
+    remove_evaluator_no_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
+}
+
+/// Per-manifest add evaluators (depend on the manifest path literal for `dataManifestPath`).
+struct ManifestAddEvaluators {
+    /// Add evaluator when DV columns are present.
+    with_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
+    /// Add evaluator when no DV columns are present.
+    no_dv: Option<Arc<dyn crate::ExpressionEvaluator>>,
 }
 
 /// State for processing a single manifest.
@@ -72,11 +90,8 @@ struct ManifestProcessingState {
     /// Manifest DV applicator for this manifest
     manifest_dv_applicator: super::ManifestDvApplicator,
 
-    /// Evaluators used when `append_inline_dv_columns` returned `Some` (DV columns present)
-    with_dv: BatchEvaluators,
-
-    /// Evaluators used when `append_inline_dv_columns` returned `None` (no DVs in batch)
-    no_dv: BatchEvaluators,
+    /// Add evaluators (per-manifest: embed the manifest path as a literal)
+    add_evaluators: ManifestAddEvaluators,
 }
 
 /// Streaming processor with parallel IO optimization.
@@ -90,7 +105,7 @@ pub(crate) struct BulkManifestStreamProcessor {
     /// Iterator over manifest references to process
     manifest_iter: std::vec::IntoIter<ManifestReference>,
 
-    /// Evaluation handler for creating batches
+    /// Evaluation handler for creating per-manifest add evaluators
     evaluation_handler: Arc<dyn EvaluationHandler>,
 
     /// Schema for action batches
@@ -99,11 +114,11 @@ pub(crate) struct BulkManifestStreamProcessor {
     /// Table root URL
     table_root: Url,
 
-    /// Table schema (physical schema with field IDs for content_stats transformation)
-    table_schema: Option<Arc<StructType>>,
+    /// Evaluators shared across all manifests (computed once)
+    shared: SharedEvaluators,
 
-    /// Stats schema (for stats_parsed transformation)
-    stats_schema: Option<Arc<StructType>>,
+    /// Whether the output schema requests Add actions
+    has_add: bool,
 
     /// Current manifest processing state (if any)
     current_manifest_state: Option<ManifestProcessingState>,
@@ -189,14 +204,86 @@ impl BulkManifestStreamProcessor {
         let data_batch_iter =
             parquet_handler.read_parquet_files(&data_file_metas, read_schema, None)?;
 
+        // Pre-compute manifest-independent evaluators once.
+        let table_schema_ref = table_schema.as_ref().map(|s| s.as_ref());
+        let stats_schema_ref = stats_schema.as_ref().map(|s| s.as_ref());
+        let metadata_schema = super::ContentTreeNodeEntry::processing_schema_with_pos(
+            table_schema_ref,
+            stats_schema_ref,
+        )?;
+
+        // Evaluator input schemas are the same for all manifests.
+        let evaluator_schema_with_dv = super::ContentTreeNode::get_evaluator_schema_with_stats(
+            &metadata_schema,
+            stats_schema_ref,
+        );
+        let evaluator_schema_no_dv =
+            super::ContentTreeNode::get_evaluator_schema_no_dv(&metadata_schema, stats_schema_ref);
+
+        use crate::actions::REMOVE_NAME;
+        let has_add = schema.contains(crate::actions::ADD_NAME);
+        let has_remove = schema.contains(REMOVE_NAME);
+
+        // Remove evaluators are manifest-independent (no manifest path literal)
+        let remove_evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
+            evaluation_handler.as_ref(),
+            evaluator_schema_with_dv.clone(),
+            &schema,
+            "",    // path_in_log unused for remove actions
+            false, // has_add
+            has_remove,
+            true,
+        )?;
+        let remove_evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
+            evaluation_handler.as_ref(),
+            evaluator_schema_no_dv.clone(),
+            &schema,
+            "",    // path_in_log unused for remove actions
+            false, // has_add
+            has_remove,
+            false,
+        )?;
+
+        // Stats transform evaluators are also manifest-independent.
+        // They use the DV-extended schema (for with_dv) and base metadata schema (for no_dv).
+        let dv_extended_schema = super::ContentTreeNode::extend_metadata_schema_with_dv_fields(
+            &metadata_schema,
+            &super::DV_COLUMNS_SCHEMA_FINAL,
+        );
+        let stats_transform_with_dv =
+            super::ContentTreeNodeEntry::create_stats_transformation_evaluator(
+                evaluation_handler.as_ref(),
+                &dv_extended_schema,
+                &schema,
+                table_schema_ref,
+                stats_schema_ref,
+            )?;
+        let stats_transform_no_dv =
+            super::ContentTreeNodeEntry::create_stats_transformation_evaluator(
+                evaluation_handler.as_ref(),
+                &metadata_schema,
+                &schema,
+                table_schema_ref,
+                stats_schema_ref,
+            )?;
+
+        let shared = SharedEvaluators {
+            evaluator_schema_with_dv,
+            evaluator_schema_no_dv,
+            stats_transform_with_dv,
+            stats_transform_no_dv,
+            remove_evaluator_with_dv: remove_evaluators_with_dv.remove_evaluator,
+            remove_evaluator_no_dv: remove_evaluators_no_dv.remove_evaluator,
+        };
+
         Ok(BulkManifestStreamProcessor {
             data_batch_iter: data_batch_iter.peekable(),
             manifest_iter: manifest_refs.into_iter(),
             evaluation_handler,
             schema,
             table_root,
-            table_schema,
-            stats_schema,
+            shared,
+            has_add,
             current_manifest_state: None,
             pending_actions: std::collections::VecDeque::new(),
         })
@@ -224,94 +311,55 @@ impl BulkManifestStreamProcessor {
             .location
             .to_string();
 
-        // Build metadata schema that matches actual batches from parquet
-        // (includes _pos and content_stats if both schemas were provided)
-        let metadata_schema = super::ContentTreeNodeEntry::processing_schema_with_pos(
-            self.table_schema.as_ref().map(|s| s.as_ref()),
-            self.stats_schema.as_ref().map(|s| s.as_ref()),
-        )?;
-
         // Create manifest DV applicator
         let manifest_dv_applicator = super::ManifestDvApplicator::new(
             manifest_ref.data_manifest.manifest.manifest_dv.as_ref(),
         )?;
 
-        // Build evaluators
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
-        let has_add = self.schema.contains(ADD_NAME);
-        let has_remove = self.schema.contains(REMOVE_NAME);
+        // Build only the per-manifest add evaluators (embed manifest path as a literal).
+        // Stats transforms and remove evaluators are shared across all manifests (see `new()`).
+        let add_evaluators = if self.has_add {
+            let manifest_location = manifest_ref
+                .data_manifest
+                .manifest
+                .location
+                .clone()
+                .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
-        let manifest_location = manifest_ref
-            .data_manifest
-            .manifest
-            .location
-            .clone()
-            .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
-
-        let stats_schema_ref = self.stats_schema.as_ref().map(|s| s.as_ref());
-        let table_schema_ref = self.table_schema.as_ref().map(|s| s.as_ref());
-
-        // Build two evaluator variants:
-        // - with_dv: for batches where append_inline_dv_columns appended DV columns
-        // - no_dv:   for batches with no DVs (null_literal used for deletionVector)
-        let dv_extended_schema = super::ContentTreeNode::extend_metadata_schema_with_dv_fields(
-            &metadata_schema,
-            &super::DV_COLUMNS_SCHEMA_FINAL,
-        );
-
-        let evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
-            self.evaluation_handler.as_ref(),
-            super::ContentTreeNode::get_evaluator_schema_with_stats(
-                &metadata_schema,
-                stats_schema_ref,
-            ),
-            &self.schema,
-            &manifest_location,
-            has_add,
-            has_remove,
-            true,
-        )?;
-        let evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
-            self.evaluation_handler.as_ref(),
-            super::ContentTreeNode::get_evaluator_schema_no_dv(&metadata_schema, stats_schema_ref),
-            &self.schema,
-            &manifest_location,
-            has_add,
-            has_remove,
-            false,
-        )?;
-
-        let stats_transform_with_dv =
-            super::ContentTreeNodeEntry::create_stats_transformation_evaluator(
+            // Reuse pre-computed evaluator schemas from shared — avoids redundant schema building.
+            let evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
-                &dv_extended_schema,
+                self.shared.evaluator_schema_with_dv.clone(),
                 &self.schema,
-                table_schema_ref,
-                stats_schema_ref,
+                &manifest_location,
+                true,  // has_add
+                false, // has_remove (handled by shared evaluators)
+                true,
             )?;
-        let stats_transform_no_dv =
-            super::ContentTreeNodeEntry::create_stats_transformation_evaluator(
+            let evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
-                &metadata_schema,
+                self.shared.evaluator_schema_no_dv.clone(),
                 &self.schema,
-                table_schema_ref,
-                stats_schema_ref,
+                &manifest_location,
+                true,  // has_add
+                false, // has_remove
+                false,
             )?;
+            ManifestAddEvaluators {
+                with_dv: evaluators_with_dv.add_evaluator,
+                no_dv: evaluators_no_dv.add_evaluator,
+            }
+        } else {
+            ManifestAddEvaluators {
+                with_dv: None,
+                no_dv: None,
+            }
+        };
 
-        // Store state for processing this manifest
         self.current_manifest_state = Some(ManifestProcessingState {
             current_file_path,
             manifest_dv_applicator,
-            with_dv: BatchEvaluators {
-                stats_transform_opt: stats_transform_with_dv,
-                add_evaluator_opt: evaluators_with_dv.add_evaluator,
-                remove_evaluator_opt: evaluators_with_dv.remove_evaluator,
-            },
-            no_dv: BatchEvaluators {
-                stats_transform_opt: stats_transform_no_dv,
-                add_evaluator_opt: evaluators_no_dv.add_evaluator,
-                remove_evaluator_opt: evaluators_no_dv.remove_evaluator,
-            },
+            add_evaluators,
         });
 
         Ok(true)
@@ -406,25 +454,22 @@ impl Iterator for BulkManifestStreamProcessor {
                 None => batch,
             };
 
-            // Apply stats transformation if needed.  The borrow of the state evaluators is
-            // confined to this block so it doesn't overlap with the mutable process_batch call.
-            let batch_after_stats: Box<dyn EngineData> = {
-                let stats_eval = if has_dvs {
-                    state.with_dv.stats_transform_opt.as_ref()
-                } else {
-                    state.no_dv.stats_transform_opt.as_ref()
-                };
-                if let Some(eval) = stats_eval {
-                    match eval.evaluate(batch_owned.as_ref()) {
-                        Ok(augmented) => augmented,
-                        Err(e) => return Some(Err(e)),
-                    }
-                } else {
-                    batch_owned
+            // Apply stats transformation (from shared evaluators — same for all manifests).
+            let stats_eval = if has_dvs {
+                self.shared.stats_transform_with_dv.as_ref()
+            } else {
+                self.shared.stats_transform_no_dv.as_ref()
+            };
+            let batch_after_stats: Box<dyn EngineData> = if let Some(eval) = stats_eval {
+                match eval.evaluate(batch_owned.as_ref()) {
+                    Ok(augmented) => augmented,
+                    Err(e) => return Some(Err(e)),
                 }
+            } else {
+                batch_owned
             };
 
-            // Apply manifest DV to get FilteredEngineData
+            // Apply manifest DV to get FilteredEngineData.
             let batch_to_process = match state
                 .manifest_dv_applicator
                 .process_batch(batch_after_stats)
@@ -433,27 +478,26 @@ impl Iterator for BulkManifestStreamProcessor {
                 Err(e) => return Some(Err(e)),
             };
 
-            // Process the filtered batch to action batches using the appropriate evaluators.
-            let action_batches = {
-                let (add_eval, remove_eval) = if has_dvs {
-                    (
-                        state.with_dv.add_evaluator_opt.as_ref(),
-                        state.with_dv.remove_evaluator_opt.as_ref(),
-                    )
-                } else {
-                    (
-                        state.no_dv.add_evaluator_opt.as_ref(),
-                        state.no_dv.remove_evaluator_opt.as_ref(),
-                    )
-                };
-                match super::ContentTreeNode::process_filtered_batch_to_actions(
-                    batch_to_process,
-                    add_eval,
-                    remove_eval,
-                ) {
-                    Ok(batches) => batches,
-                    Err(e) => return Some(Err(e)),
-                }
+            // Select add/remove evaluators: add from per-manifest state, remove from shared.
+            let (add_eval, remove_eval) = if has_dvs {
+                (
+                    state.add_evaluators.with_dv.as_ref(),
+                    self.shared.remove_evaluator_with_dv.as_ref(),
+                )
+            } else {
+                (
+                    state.add_evaluators.no_dv.as_ref(),
+                    self.shared.remove_evaluator_no_dv.as_ref(),
+                )
+            };
+
+            let action_batches = match super::ContentTreeNode::process_filtered_batch_to_actions(
+                batch_to_process,
+                add_eval,
+                remove_eval,
+            ) {
+                Ok(batches) => batches,
+                Err(e) => return Some(Err(e)),
             };
 
             // Add action batches to pending queue

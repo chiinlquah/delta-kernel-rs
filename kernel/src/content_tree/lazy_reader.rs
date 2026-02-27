@@ -186,19 +186,19 @@ impl Iterator for LazyContentRootIterator {
                         };
 
                         let leaf_iter =
-                        match crate::content_tree::ContentTreeNode::non_root_action_batches_with_handlers(
-                            leaf_refs,
-                            context.parquet_handler.clone(),
-                            context.evaluation_handler.clone(),
-                            &context.checkpoint_read_schema,
-                            &context.table_root,
-                            context.data_predicate.as_ref(),
-                            context.table_schema.as_ref(),
-                            context.stats_schema.as_ref(),
-                        ) {
-                            Ok(iter) => iter,
-                            Err(e) => return Some(Err(e)),
-                        };
+                            match crate::content_tree::ContentTreeNode::non_root_action_batches(
+                                leaf_refs,
+                                context.parquet_handler.clone(),
+                                context.evaluation_handler.clone(),
+                                &context.checkpoint_read_schema,
+                                &context.table_root,
+                                context.data_predicate.as_ref(),
+                                context.table_schema.as_ref(),
+                                context.stats_schema.as_ref(),
+                            ) {
+                                Ok(iter) => iter,
+                                Err(e) => return Some(Err(e)),
+                            };
                         Some(LazyContentRootState::ReadingLeaves { leaf_iter })
                     };
                     // Get root batches using the handler-based method

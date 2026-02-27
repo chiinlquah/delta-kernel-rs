@@ -135,10 +135,6 @@ pub struct ScanFile {
     pub data_manifest_path: Option<String>,
     /// Position of this entry within the data manifest file
     pub data_manifest_position: Option<i64>,
-    /// Path to the delete manifest file containing the deletion vector for this entry (if from a leaf manifest)
-    pub delete_manifest_path: Option<String>,
-    /// Position of the deletion vector entry within the delete manifest file
-    pub delete_manifest_position: Option<i64>,
 }
 
 pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
@@ -194,7 +190,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 18,
+            getters.len() == 16,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -234,12 +230,6 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     row_index,
                     "scanFile.fileConstantValues.dataManifestPosition",
                 )?;
-                let delete_manifest_path: Option<String> = getters[16]
-                    .get_opt(row_index, "scanFile.fileConstantValues.deleteManifestPath")?;
-                let delete_manifest_position: Option<i64> = getters[17].get_opt(
-                    row_index,
-                    "scanFile.fileConstantValues.deleteManifestPosition",
-                )?;
 
                 let scan_file = ScanFile {
                     path,
@@ -251,8 +241,6 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     partition_values,
                     data_manifest_path,
                     data_manifest_position,
-                    delete_manifest_path,
-                    delete_manifest_position,
                 };
                 (self.callback)(&mut self.context, scan_file)
             }
