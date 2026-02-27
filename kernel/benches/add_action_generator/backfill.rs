@@ -192,6 +192,7 @@ async fn main() {
         args.uc_endpoint.as_deref(),
         args.uc_token.as_deref(),
         uc_client::prelude::Operation::ReadWrite,
+        None,
     )
     .await
     {

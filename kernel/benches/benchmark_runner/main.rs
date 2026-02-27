@@ -144,6 +144,7 @@ async fn setup_table_and_engine(
         args.uc_endpoint.as_deref(),
         args.uc_token.as_deref(),
         operation,
+        Some(500_000),
     )
     .await?;
 

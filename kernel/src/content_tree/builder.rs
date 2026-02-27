@@ -1264,7 +1264,7 @@ impl ContentTreeNodeBuilder {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let (content_metadata_path, _) = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
@@ -1475,7 +1475,7 @@ impl ContentTreeNodeBuilder {
     #[allow(dead_code)]
     pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
         let root_metadata = self.build(engine, None)?;
-        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)
+        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine).map(|(url, _)| url)
     }
 
     /// Builds a leaf ContentTreeNode instance with a generated UUID.

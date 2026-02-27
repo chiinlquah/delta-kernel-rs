@@ -1003,12 +1003,12 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// A [`DeltaResult`] containing the number of bytes written to the parquet file.
     fn write_parquet_file(
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<u64>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///

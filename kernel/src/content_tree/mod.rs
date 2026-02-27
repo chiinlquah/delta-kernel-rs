@@ -3624,7 +3624,7 @@ mod tests {
 
         // Write metadata using the writer
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Verify the file was written
         assert!(written_file.as_str().ends_with(".parquet"));
@@ -3951,7 +3951,13 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, written_size) = writer.write(&engine)?;
+
+        // Verify the reported size matches the actual file size on disk
+        let file_path = written_file.to_file_path().expect("should be a local path");
+        let disk_size = file_path.metadata().expect("file should exist").len();
+        assert!(written_size > 0, "written content root parquet file should be non-empty");
+        assert_eq!(written_size, disk_size, "reported size should match actual file size");
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4118,7 +4124,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4153,7 +4159,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4188,7 +4194,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4223,7 +4229,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4292,7 +4298,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4373,7 +4379,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4451,7 +4457,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4513,7 +4519,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -4585,7 +4591,7 @@ mod tests {
 
         // Write metadata
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let (written_file, _) = writer.write(&engine)?;
 
         // Read metadata back
         let path_in_log = absolute_to_relative_path(&written_file, &table_root_url)?;
@@ -5276,7 +5282,7 @@ mod tests {
 
         // Write the child manifest to a file
         let child_manifest_writer = writer::ContentTreeNodeWriter::try_new(child_metadata)?;
-        let child_manifest_url = child_manifest_writer.write(&engine)?;
+        let (child_manifest_url, _) = child_manifest_writer.write(&engine)?;
 
         // Create a ContentTreeNodeEntry for the child manifest
         let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
@@ -5353,7 +5359,7 @@ mod tests {
         };
 
         let child_manifest_writer_1 = writer::ContentTreeNodeWriter::try_new(child_metadata_1)?;
-        let child_manifest_url_1 = child_manifest_writer_1.write(&engine)?;
+        let (child_manifest_url_1, _) = child_manifest_writer_1.write(&engine)?;
 
         // Child manifest 2 - use version 1 to avoid filename collision
         let data_entry_3 = create_data_entry("partition2/data-3.parquet", 70);
@@ -5375,7 +5381,7 @@ mod tests {
         };
 
         let child_manifest_writer_2 = writer::ContentTreeNodeWriter::try_new(child_metadata_2)?;
-        let child_manifest_url_2 = child_manifest_writer_2.write(&engine)?;
+        let (child_manifest_url_2, _) = child_manifest_writer_2.write(&engine)?;
 
         // Create a root manifest that references both child manifests
         let data_manifest_entry_1 = create_data_manifest_entry(child_manifest_url_1.as_str());

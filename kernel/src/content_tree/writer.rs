@@ -41,14 +41,14 @@ impl ContentTreeNodeWriter {
         .map(|parsed| parsed.location)
     }
 
-    pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<Url> {
+    pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<(Url, u64)> {
         let path = self.checkpoint_path()?;
         let data_iter = self.metadata.data.into_iter().map(Ok);
 
-        engine
+        let size = engine
             .parquet_handler()
             .write_parquet_file(path.clone(), Box::new(data_iter))?;
 
-        Ok(path)
+        Ok((path, size))
     }
 }
