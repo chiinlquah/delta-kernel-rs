@@ -2012,7 +2012,6 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3532,7 +3531,14 @@ mod tests {
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches_with_handler(engine.evaluation_handler().as_ref(), &schema, &[], None, None, None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         let batch = action_batches.next().unwrap()?;
         let mut visitor = AddVisitor::default();
@@ -3564,7 +3570,14 @@ mod tests {
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches_with_handler(engine.evaluation_handler().as_ref(), &schema, &[], None, None, None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         let batch = action_batches.next().unwrap()?;
         let mut visitor = AddVisitor::default();
@@ -3597,7 +3610,14 @@ mod tests {
 
         // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches_with_handler(engine.evaluation_handler().as_ref(), &schema, &[], None, None, None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3673,7 +3693,14 @@ mod tests {
         )?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = metadata.root_action_batches_with_handler(engine.evaluation_handler().as_ref(), &schema, &[], None, None, None)?;
+        let action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Collect all adds from all batches (each data entry may produce a separate batch)
         let mut all_adds = Vec::new();
@@ -3726,7 +3753,14 @@ mod tests {
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = metadata.root_action_batches_with_handler(engine.evaluation_handler().as_ref(), &schema, &[], None, None, None)?;
+        let action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Collect all adds from all batches
         let mut total_adds = 0;
