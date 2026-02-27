@@ -2916,7 +2916,7 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let (root_url, _) = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
@@ -3012,7 +3012,7 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let (root_url, _) = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 3: Batch-commit a remove (v2)
@@ -3154,7 +3154,7 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let (root_url, _) = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
@@ -3667,7 +3667,10 @@ mod tests {
                         .metadata()
                         .expect("manifest file should exist")
                         .len();
-                    assert!(reported_size > 0, "ContentRoot sizeInBytes should be non-zero");
+                    assert!(
+                        reported_size > 0,
+                        "ContentRoot sizeInBytes should be non-zero"
+                    );
                     assert_eq!(
                         reported_size, disk_size,
                         "ContentRoot sizeInBytes should match actual file size"

@@ -93,7 +93,7 @@ impl ParquetHandler for SyncParquetHandler {
             schema,
             predicate,
             move |file_size, mut file, schema, _arrow_schema, predicate, location| {
-                if threshold.map_or(false, |t| file_size > 0 && file_size <= t) {
+                if threshold.is_some_and(|t| file_size > 0 && file_size <= t) {
                     let mut buf = Vec::with_capacity(file_size as usize);
                     file.read_to_end(&mut buf)?;
                     try_create_from_parquet(Bytes::from(buf), schema, predicate, location)
