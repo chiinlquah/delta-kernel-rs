@@ -1276,36 +1276,37 @@ mod tests {
             .expect("Manifest should have location");
 
         // Read back the manifest file to verify contents
-        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
         use crate::content_tree::ContentTreeNode;
 
         // manifest_location is now a relative path, join with table_root
         let manifest_url = table_root.join(manifest_location)?;
-        let manifest_metadata = ContentTreeNode::read(
-            engine.as_ref(),
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &manifest_url,
             manifest_location.to_string(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let manifest_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_root.clone(),
         )?;
-
-        // Use ContentTreeNodeEntryVisitor to extract all entries
-        let mut visitor = ContentTreeNodeEntryVisitor::default();
-        for engine_data in manifest_metadata.data() {
-            visitor.visit_rows_of(engine_data.as_ref())?;
-        }
+        let entries = manifest_metadata.entries()?;
 
         // The manifest should contain exactly 2 entries
         assert_eq!(
-            visitor.entries.len(),
+            entries.len(),
             2,
             "Manifest should contain exactly 2 files (selected rows 0 and 2), but found {}",
-            visitor.entries.len()
+            entries.len()
         );
 
         // Extract the location (file path) from the entries
         // These are now relative paths, so we can use them directly
-        let paths: Vec<String> = visitor
-            .entries
+        let paths: Vec<String> = entries
             .iter()
             .filter_map(|entry| {
                 entry.location.as_ref().map(|loc| {

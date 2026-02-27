@@ -3178,9 +3178,7 @@ mod tests {
         // Step 7: Verify the ManifestDV for the delete manifest
         // When delete_from_leaf is used, it creates a ManifestDV entry that marks which
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
-        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
         use crate::content_tree::ContentTreeNode;
-        use crate::RowVisitor;
 
         // Read the ContentRoot action from version 2 to get the new manifest path
         let delta_log_path = table_root
@@ -3210,24 +3208,26 @@ mod tests {
         let root_manifest_url = table_root
             .join(&content_root_path)
             .map_err(|e| Error::generic(format!("Failed to parse manifest URL: {e}")))?;
-        let root_metadata = ContentTreeNode::read(
-            &engine,
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &root_manifest_url,
             content_root_path.clone(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let root_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_root.clone(),
         )?;
-
-        // Extract all entries from the root manifest
-        let mut root_visitor = ContentTreeNodeEntryVisitor::default();
-        for engine_data in root_metadata.data() {
-            root_visitor.visit_rows_of(engine_data.as_ref())?;
-        }
+        let root_entries = root_metadata.entries()?;
 
         // In the new CombinedManifest model, the data leaf (with inline DVs) is a CombinedManifest.
         // After file removal, the CombinedManifest entry in the root should have a manifest_dv
         // marking which data file entry indices are deleted.
-        let manifest_with_dv = root_visitor
-            .entries
+        let manifest_with_dv = root_entries
             .iter()
             .find(|entry| {
                 entry.content_type == DataContentType::CombinedManifest
@@ -3275,21 +3275,24 @@ mod tests {
         let leaf_manifest_url = table_root
             .join(&leaf_manifest_path)
             .map_err(|e| Error::generic(format!("Failed to parse leaf manifest URL: {e}")))?;
-        let delete_manifest_metadata = ContentTreeNode::read(
-            &engine,
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &leaf_manifest_url,
             leaf_manifest_path.clone(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let delete_manifest_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_root.clone(),
         )?;
-
-        let mut delete_visitor = ContentTreeNodeEntryVisitor::default();
-        for engine_data in delete_manifest_metadata.data() {
-            delete_visitor.visit_rows_of(engine_data.as_ref())?;
-        }
+        let delete_entries = delete_manifest_metadata.entries()?;
 
         // Get the Data entry at the deleted index
-        let deleted_data_entry = delete_visitor
-            .entries
+        let deleted_data_entry = delete_entries
             .get(deleted_index as usize)
             .ok_or_else(|| Error::generic(format!("No entry at index {}", deleted_index)))?;
 
