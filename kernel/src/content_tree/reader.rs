@@ -12,8 +12,8 @@ use super::{
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
-pub struct ContentTreeNodeEntryVisitor {
-    pub entries: Vec<ContentTreeNodeEntry>,
+pub(super) struct ContentTreeNodeEntryVisitor {
+    pub(super) entries: Vec<ContentTreeNodeEntry>,
 }
 
 impl RowVisitor for ContentTreeNodeEntryVisitor {
