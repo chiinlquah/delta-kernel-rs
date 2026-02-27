@@ -803,6 +803,23 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// Compression codec to use when writing Parquet files.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ParquetCompression {
+    /// Snappy compression (default).
+    #[default]
+    Snappy,
+    /// Zstandard compression.
+    Zstd,
+}
+
+/// Configuration for writing Parquet files.
+#[derive(Debug, Clone, Default)]
+pub struct ParquetWriterConfig {
+    /// Compression codec to use. Defaults to [`ParquetCompression::Zstd`].
+    pub compression: ParquetCompression,
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -887,9 +904,11 @@ pub trait ParquetHandler: AsAny {
     /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
-    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"PARQUET:field_id": 1`
+    /// - Column 0:  `"i_logical"` (integer, non-null) with field ID 1 (via [`ColumnMetadataKey::ParquetFieldId`])
     /// - Column 1: `"s"` (string, nullable) with no field ID metadata
     /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     ///
     /// And a Parquet file containing these columns:
     /// - Column 0: `"i2"` (integer, nullable) with field ID 3
@@ -1000,6 +1019,8 @@ pub trait ParquetHandler: AsAny {
     /// - `url` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
+    /// - `write_config` - Configuration controlling how the Parquet file is written (e.g.
+    ///   compression codec).
     ///
     /// # Returns
     ///
@@ -1008,6 +1029,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<u64>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -1030,9 +1052,8 @@ pub trait ParquetHandler: AsAny {
     /// # Field IDs
     ///
     /// If the Parquet file contains field IDs (written when column mapping is enabled), they are
-    /// preserved in each [`StructField`]'s metadata under the key `"PARQUET:field_id"`. Callers
-    /// can access field IDs via [`StructField::get_config_value`] with
-    /// [`ColumnMetadataKey::ParquetFieldId`].
+    /// preserved in each [`StructField`]'s metadata. Callers can access field IDs via
+    /// [`StructField::get_config_value`] with [`ColumnMetadataKey::ParquetFieldId`].
     ///
     /// # Errors
     ///

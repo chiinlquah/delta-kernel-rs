@@ -1,56 +1,17 @@
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::content_tree::builder::ContentTreeNodeBuilder;
-use crate::content_tree::stats::try_pre_convert_stats_column;
-use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
-};
+use crate::content_tree::ContentTreeNodeEntry;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::ColumnName;
-use crate::schema::{DataType, StructField, StructType};
-use crate::{
-    DeltaResult, Engine, EngineData, Error, FilteredEngineData, RowVisitor, SchemaRef, Version,
-};
+use crate::schema::DataType;
+use crate::{DeltaResult, Engine, EngineData, FilteredEngineData, RowVisitor, SchemaRef, Version};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use url::Url;
-
-/// Schema for scan row data that includes stats_parsed with Delta JSON format marker.
-/// Used as the `input_schema` hint for [`crate::content_tree::stats::try_pre_convert_stats_column`]
-/// when converting stats_parsed in `add_existing_actions()`.
-///
-/// Built by extending SCAN_ROW_SCHEMA with a placeholder stats_parsed field.
-/// The actual stats_parsed structure will be determined by the checkpoint data.
-static SCAN_ROW_SCHEMA_WITH_STATS_PARSED: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::SCAN_ROW_SCHEMA;
-
-    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-
-    // Add a placeholder stats_parsed field with minimal structure (just numRecords).
-    // This signals that stats_parsed is expected and should be converted from Delta JSON format.
-    fields.push(StructField::nullable(
-        "stats_parsed",
-        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
-    ));
-
-    Arc::new(StructType::new_unchecked(fields))
-});
 
 /// Composite identifier for deletion vectors.
 /// Format: "{data_file_path}#{dv_unique_id}"
 pub(crate) type DVUniqueId = String;
-
-/// Creates a DVUniqueId from a data file path and DV descriptor.
-pub(crate) fn create_dv_unique_id(
-    data_file_path: &str,
-    dv_descriptor: &DeletionVectorDescriptor,
-) -> DVUniqueId {
-    // Use the storage_type and path_or_inline_dv as the unique ID component
-    format!(
-        "{}#{:?}:{}",
-        data_file_path, dv_descriptor.storage_type, dv_descriptor.path_or_inline_dv
-    )
-}
 
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
@@ -64,9 +25,6 @@ pub struct LeafNodeWriterResult {
 
     /// Written data file manifest (if any data files were added).
     pub(crate) data_file_manifest_written: Option<ContentTreeNodeEntry>,
-
-    /// Written DV manifest (if any DVs were added).
-    pub(crate) dv_file_manifest_written: Option<ContentTreeNodeEntry>,
 
     /// Root entries to remove (file paths that should be removed from root)
     pub(crate) root_entries_to_remove: HashSet<String>,
@@ -84,9 +42,6 @@ pub struct LeafNodeWriterResult {
 pub struct LeafNodeWriter {
     /// Wrapped ContentTreeNodeBuilder for file management
     data_builder: ContentTreeNodeBuilder,
-
-    /// Table root URL
-    table_root: Url,
 
     /// Version of the snapshot being written
     /// TODO: This field should not be needed for leaf writer. It's currently required
@@ -108,15 +63,6 @@ pub struct LeafNodeWriter {
     /// Snapshot ID for tracking info
     snapshot_id: i64,
 
-    /// Temporary tracking for DV writes. Value is (data_file_path, dv_descriptor, data_manifest_url).
-    /// data_manifest_url is used to determine affiliation (all DVs reference same manifest = affiliated).
-    /// HashMap of DVUniqueId -> (data_file_path, dv_descriptor, data_manifest_path)
-    /// data_manifest_path is the relative path to the manifest containing the data file
-    deletion_vectors: HashMap<DVUniqueId, (String, DeletionVectorDescriptor, Option<String>)>,
-
-    /// Track if any DVs were added via DvOnly mode. If true, forces unaffiliated DV manifest.
-    has_dv_only_entries: bool,
-
     /// Optional root manifest relative path for validation
     /// Used to prevent updating DVs for files still in the root manifest
     root_manifest_path: Option<String>,
@@ -124,68 +70,6 @@ pub struct LeafNodeWriter {
     /// Whether to track root entries for removal.
     /// Set to false when Transaction has released root to client control.
     track_root_removals: bool,
-}
-
-/// Type of action to add to the leaf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddType {
-    /// Add action contains only data file information (no deletion vector)
-    DataFileOnly,
-    /// Add action contains only deletion vector information (no new data file)
-    DVOnly,
-    /// Add action contains both data file and deletion vector information
-    DataFileAndDV,
-}
-
-/// Location of a file in a manifest.
-#[derive(Debug, Clone)]
-pub struct ManifestLocation {
-    /// Relative path to the manifest file (e.g., "_metadata_root/...")
-    pub manifest_path: String,
-    pub index: i64,
-}
-
-/// DV update information for a file.
-#[derive(Debug, Clone)]
-pub struct DvUpdate {
-    pub data_file_path: String,
-    pub dv_descriptor: DeletionVectorDescriptor,
-    pub data_file_location: ManifestLocation,
-    pub previous_delete_file_location: Option<ManifestLocation>,
-}
-
-/// Helper function to extract a deletion vector from a slice of getters starting at DV fields.
-/// The slice should contain exactly 5 getters corresponding to the DV fields in order:
-/// [storageType, pathOrInlineDv, offset, sizeInBytes, cardinality]
-fn extract_deletion_vector_at<'a>(
-    row_index: usize,
-    dv_getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<DeletionVectorDescriptor>> {
-    // Check if we have enough getters for DV fields (need 5)
-    if dv_getters.len() < 5 {
-        return Ok(None);
-    }
-
-    let storage_type_opt: Option<String> =
-        dv_getters[0].get_opt(row_index, "deletionVector.storageType")?;
-    if let Some(storage_type_str) = storage_type_opt {
-        use crate::actions::deletion_vector::DeletionVectorStorageType;
-        let storage_type = storage_type_str.parse::<DeletionVectorStorageType>()?;
-        let path_or_inline_dv: String =
-            dv_getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = dv_getters[2].get_opt(row_index, "deletionVector.offset")?;
-        let size_in_bytes: i32 = dv_getters[3].get(row_index, "deletionVector.sizeInBytes")?;
-        let cardinality: i64 = dv_getters[4].get(row_index, "deletionVector.cardinality")?;
-        Ok(Some(DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-            size_in_bytes,
-            cardinality,
-        }))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Context for tracking manifest entry deletions
@@ -229,16 +113,12 @@ fn track_manifest_entry_for_removal(
 /// Helper visitor to extract Add actions from scan rows and add them to a leaf
 struct ScanRowVisitor<'a> {
     leaf_writer: &'a mut LeafNodeWriter,
-    add_type: AddType,
     selection_vector: Vec<bool>,
-    /// Whether to request the stats_parsed column. Starts as true and is set to false
-    /// by visit_rows_of if the data doesn't have the column.
-    request_stats_parsed: bool,
 }
 
 type ColumnNamesAndTypes = (Vec<ColumnName>, Vec<DataType>);
 
-/// Base scan columns without stats_parsed.
+/// Scan columns (all primitive leaf values — no struct columns needed).
 static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     use crate::schema::{column_name, MapType};
     let names = vec![
@@ -284,75 +164,23 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     (names, types)
 });
 
-/// Extended scan columns including stats_parsed.
-static SCAN_COLUMNS_WITH_STATS_PARSED: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-    use crate::schema::{column_name, StructType};
-    let mut names = BASE_SCAN_COLUMNS.0.clone();
-    names.push(column_name!("stats_parsed"));
-    let mut types = BASE_SCAN_COLUMNS.1.clone();
-    // Use an empty struct type: extract_columns only checks
-    // matches!(type_option, Some(DataType::Struct(_))) to push the whole StructArray
-    // as a single getter, so the exact fields don't matter here.
-    types.push(DataType::Struct(Box::new(StructType::new_unchecked([]))));
-    (names, types)
-});
-
 impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        if self.request_stats_parsed {
-            (
-                &SCAN_COLUMNS_WITH_STATS_PARSED.0,
-                &SCAN_COLUMNS_WITH_STATS_PARSED.1,
-            )
-        } else {
-            (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
-        }
-    }
-
-    fn visit_rows_of(&mut self, data: &dyn EngineData) -> DeltaResult<()> {
-        // Try with stats_parsed first. If the data doesn't have the column,
-        // fall back to requesting without it.
-        match data.visit_rows(self.selected_column_names_and_types().0, self) {
-            Ok(()) => Ok(()),
-            Err(crate::Error::MissingColumn(_)) => {
-                self.request_stats_parsed = false;
-                data.visit_rows(self.selected_column_names_and_types().0, self)
-            }
-            Err(e) => Err(e),
-        }
+        (&BASE_SCAN_COLUMNS.0, &BASE_SCAN_COLUMNS.1)
     }
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
-        // Fixed getter indices for all columns (same layout for all AddTypes)
+        // Fixed getter indices for all columns (all primitive leaf values):
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
         //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
-        //         deleteManifestPath, deleteManifestPosition, stats_parsed (optional)
+        //         deleteManifestPath, deleteManifestPosition
+        // Note: stats_parsed is pre-extracted into self.stats_per_row before visit() is called.
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
         const PATH_IDX: usize = 0;
-        const SIZE_IDX: usize = 1;
-        const MODIFICATION_TIME_IDX: usize = 2;
-        const STATS_IDX: usize = 3;
-        const DV_START_IDX: usize = 4; // indices 4-8 are DV fields
-        const PARTITION_VALUES_IDX: usize = 9;
-        const BASE_ROW_ID_IDX: usize = 10;
-        const DEFAULT_ROW_COMMIT_VERSION_IDX: usize = 11;
         const DATA_MANIFEST_PATH_IDX: usize = 12;
         const DATA_MANIFEST_POSITION_IDX: usize = 13;
-        const DELETE_MANIFEST_PATH_IDX: usize = 14;
-        const DELETE_MANIFEST_POSITION_IDX: usize = 15;
-        const STATS_PARSED_IDX: usize = 16; // Optional - only present if include_stats_columns was called
 
-        let should_add_data_file = matches!(
-            self.add_type,
-            AddType::DataFileOnly | AddType::DataFileAndDV
-        );
-        let should_extract_dv = matches!(self.add_type, AddType::DVOnly | AddType::DataFileAndDV);
-
-        // Check if stats_parsed column is present (getters includes it when include_stats_columns was called)
-        let has_stats_parsed = getters.len() > STATS_PARSED_IDX;
-
-        // Use the pre-computed root manifest path passed from the transaction
         let root_manifest_path = self.leaf_writer.root_manifest_path.clone();
 
         for i in 0..row_count {
@@ -362,145 +190,28 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
                 continue;
             }
 
-            // Path is always needed
             let path_opt: Option<String> = getters[PATH_IDX].get_opt(i, "path")?;
             let Some(path) = path_opt else {
                 continue;
             };
 
-            // Extract data file fields if needed
-            #[allow(unused_variables)]
-            let (
-                size,
-                modification_time,
-                stats,
-                partition_values,
-                base_row_id,
-                default_row_commit_version,
-                content_stats,
-            ) = if should_add_data_file {
-                // Extract manifest metadata (always needed for tracking)
-                let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
-                    .get_opt(i, "fileConstantValues.dataManifestPath")?;
-                let data_manifest_position: Option<i64> = getters[DATA_MANIFEST_POSITION_IDX]
-                    .get_opt(i, "fileConstantValues.dataManifestPosition")?;
-
-                // Track data file manifest entry for removal
-                let mut ctx = ManifestRemovalContext {
-                    root_manifest_path: root_manifest_path.clone(),
-                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
-                    root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
-                    track_root_removals: self.leaf_writer.track_root_removals,
-                };
-                track_manifest_entry_for_removal(
-                    data_manifest_path,
-                    data_manifest_position,
-                    path.clone(),
-                    &mut ctx,
-                )?;
-
-                let size: i64 = getters[SIZE_IDX].get(i, "size")?;
-                let modification_time: i64 =
-                    getters[MODIFICATION_TIME_IDX].get(i, "modificationTime")?;
-                let stats: Option<String> = getters[STATS_IDX].get_opt(i, "stats")?;
-                let partition_values: HashMap<String, String> = getters[PARTITION_VALUES_IDX]
-                    .get_opt(i, "fileConstantValues.partitionValues")?
-                    .unwrap_or_default();
-                let base_row_id: Option<i64> =
-                    getters[BASE_ROW_ID_IDX].get_opt(i, "fileConstantValues.baseRowId")?;
-                let default_row_commit_version: Option<i64> = getters
-                    [DEFAULT_ROW_COMMIT_VERSION_IDX]
-                    .get_opt(i, "fileConstantValues.defaultRowCommitVersion")?;
-
-                // Extract stats_parsed as content_stats (already in AMT format after
-                // batch-level pre-conversion). Preferred over JSON stats string when available.
-                // Filter out empty structs (e.g. placeholder columns with no fields).
-                let content_stats = if has_stats_parsed {
-                    getters[STATS_PARSED_IDX]
-                        .get_struct(i, "stats_parsed")?
-                        .map(|struct_item| struct_item.materialize())
-                        .transpose()?
-                        .filter(|s| !s.fields().is_empty())
-                } else {
-                    None
-                };
-
-                (
-                    Some(size),
-                    Some(modification_time),
-                    stats,
-                    Some(partition_values),
-                    base_row_id,
-                    default_row_commit_version,
-                    content_stats,
-                )
-            } else {
-                (None, None, None, None, None, None, None)
+            // Track data file manifest entry for removal
+            let data_manifest_path: Option<String> = getters[DATA_MANIFEST_PATH_IDX]
+                .get_opt(i, "fileConstantValues.dataManifestPath")?;
+            let data_manifest_position: Option<i64> = getters[DATA_MANIFEST_POSITION_IDX]
+                .get_opt(i, "fileConstantValues.dataManifestPosition")?;
+            let mut ctx = ManifestRemovalContext {
+                root_manifest_path: root_manifest_path.clone(),
+                manifest_dvs: &mut self.leaf_writer.manifest_dvs,
+                root_entries_to_remove: &mut self.leaf_writer.root_entries_to_remove,
+                track_root_removals: self.leaf_writer.track_root_removals,
             };
-
-            // Extract deletion vector if needed
-            let deletion_vector = if should_extract_dv {
-                // Extract delete manifest metadata (for tracking old DV manifest entries)
-                let delete_manifest_path: Option<String> = getters[DELETE_MANIFEST_PATH_IDX]
-                    .get_opt(i, "fileConstantValues.deleteManifestPath")?;
-                let delete_manifest_position: Option<i64> =
-                    getters[DELETE_MANIFEST_POSITION_IDX]
-                        .get_opt(i, "fileConstantValues.deleteManifestPosition")?;
-                // Track old DV manifest entry for removal
-                let mut ctx = ManifestRemovalContext {
-                    root_manifest_path: root_manifest_path.clone(),
-                    manifest_dvs: &mut self.leaf_writer.manifest_dvs,
-                    root_entries_to_remove: &mut self.leaf_writer.root_dv_entries_to_remove,
-                    track_root_removals: self.leaf_writer.track_root_removals,
-                };
-                track_manifest_entry_for_removal(
-                    delete_manifest_path,
-                    delete_manifest_position,
-                    path.clone(),
-                    &mut ctx,
-                )?;
-
-                extract_deletion_vector_at(i, &getters[DV_START_IDX..])?
-            } else {
-                None
-            };
-
-            // Add data file if needed
-            if should_add_data_file {
-                // Safety: When should_add_data_file is true, these values are guaranteed to be Some
-                let (Some(_pv), Some(sz), Some(_mt)) = (partition_values, size, modification_time)
-                else {
-                    return Err(Error::generic("Missing required fields for data file"));
-                };
-
-                // For existing files being moved, use version - 1 so they get TrackingStatus::Existed
-                // TODO: Version manipulation is a workaround. The ContentTreeNodeBuilder API should
-                // support explicitly setting TrackingStatus without relying on version comparison.
-                let file_version = if self.leaf_writer.version > 0 {
-                    self.leaf_writer.version - 1
-                } else {
-                    0
-                };
-
-                // Use add_file_with_dedup which takes content_stats directly.
-                // If content_stats is None, the stats from checkpoint JSON will be parsed
-                // by the builder if available.
-                self.leaf_writer.data_builder.add_file_with_dedup(
-                    path.clone(),
-                    sz,
-                    content_stats,
-                    file_version,
-                    Some(self.leaf_writer.snapshot_id),
-                )?;
-            }
-
-            // Track deletion vector if present
-            if let Some(dv) = deletion_vector {
-                let dv_id = create_dv_unique_id(&path, &dv);
-                self.leaf_writer
-                    .deletion_vectors
-                    .insert(dv_id, (path, dv, None));
-            }
+            track_manifest_entry_for_removal(
+                data_manifest_path,
+                data_manifest_position,
+                path.clone(),
+                &mut ctx,
+            )?;
         }
         Ok(())
     }
@@ -530,15 +241,12 @@ impl LeafNodeWriter {
                 version,
                 table_schema.as_ref().clone(),
             ),
-            table_root,
             version,
             table_schema: table_schema.clone(),
             manifest_dvs: HashMap::new(),
             root_entries_to_remove: HashSet::new(),
             root_dv_entries_to_remove: HashSet::new(),
             snapshot_id,
-            deletion_vectors: HashMap::new(),
-            has_dv_only_entries: false,
             root_manifest_path,
             track_root_removals,
         }
@@ -578,7 +286,7 @@ impl LeafNodeWriter {
             engine,
             data,
             self.version,
-            Some(self.snapshot_id),
+            self.snapshot_id,
         )?;
 
         Ok(())
@@ -590,109 +298,31 @@ impl LeafNodeWriter {
     ///
     /// # Arguments
     /// * `scan_metadata` - FilteredEngineData with scan row schema including metadata columns
-    /// * `add_type` - Type of action to add (DataFileOnly, DVOnly, or DataFileAndDV). Note that
-    ///   DataFileAndDv is the only safe option that should always leave the tree in a good state.
-    ///   For DataFileOnly and DvOnly, callers must ensure that if DataFileOnly is called
-    ///   that either:
-    ///   1. The data files have no associated DV.
-    ///   2. The data files are either in the delta log OR the root.
-    ///   3. The DV is in an unaffiliated manifest.
-    ///   4. The DV is moved to a different leaf.
-    ///
-    ///   DvOnly calls must ensure either:
-    ///   1.  The data file is in a leaf already (leaf DV manifests are not applied to the root).
-    ///   2.  the data file in the root root is also moved to a leaf manifest separately with DataFileOnly.
     pub fn add_existing_actions(
         &mut self,
         engine: &dyn Engine,
         scan_metadata: FilteredEngineData,
-        add_type: AddType,
     ) -> DeltaResult<()> {
-        // Extract the selection vector to pass to the visitor
         let selection_vector = scan_metadata.selection_vector().to_vec();
+        let data = scan_metadata.data();
 
-        // Pre-convert stats_parsed column from Delta JSON to AMT format at the batch level
-        let converted = try_pre_convert_stats_column(
+        // Write files to new leaf using expression-based transform (scan rows → manifest entries).
+        // Stats handling (stats_parsed vs parse_json fallback) is managed inside this method.
+        self.data_builder.add_from_existing_scan_rows(
             engine,
-            scan_metadata.data(),
-            "stats_parsed",
-            &self.table_schema,
-            &SCAN_ROW_SCHEMA_WITH_STATS_PARSED,
+            data,
+            &selection_vector,
+            self.version,
+            self.snapshot_id,
         )?;
-        let data: &dyn EngineData = match &converted {
-            Some(c) => c.as_ref(),
-            None => scan_metadata.data(),
-        };
 
-        // Process the scan data with the visitor
+        // Track manifest entry removals (mark source manifest entries as deleted via DVs).
         let mut visitor = ScanRowVisitor {
             leaf_writer: self,
-            add_type,
             selection_vector,
-            request_stats_parsed: true,
         };
-
         visitor.visit_rows_of(data)?;
 
-        // If we're adding DVOnly, mark that we have DV-only entries
-        // This forces the DV manifest to be unaffiliated since we can't guarantee
-        // that all DVs reference files in the same manifest
-        if add_type == AddType::DVOnly {
-            self.has_dv_only_entries = true;
-        }
-
-        Ok(())
-    }
-
-    /// Record DV updates for files.
-    ///
-    /// Tracks cross-leaf updates via manifest DVs and handles DV replacement.
-    ///
-    /// # Arguments
-    /// * `new_dv_updates` - Vec of DV updates for files
-    pub fn update_deletion_vectors(&mut self, new_dv_updates: Vec<DvUpdate>) -> DeltaResult<()> {
-        for dv_update in new_dv_updates {
-            // Enhancement #2: Error if trying to update DVs for files still in the root manifest
-            // Leaf writers should only manage DVs for files that have been moved to leaves
-            if let Some(root_path) = &self.root_manifest_path {
-                if &dv_update.data_file_location.manifest_path == root_path {
-                    return Err(crate::Error::generic(format!(
-                        "Cannot update deletion vector for file '{}' that is still in the root manifest. \
-                        Files must be moved to a leaf manifest before their DVs can be managed by a leaf writer.",
-                        dv_update.data_file_path
-                    )));
-                }
-            }
-
-            let dv_id = create_dv_unique_id(&dv_update.data_file_path, &dv_update.dv_descriptor);
-
-            // Store the DV along with the manifest URL of where its data file lives
-            // This allows us to determine affiliation correctly in write_dv_manifest()
-            let data_manifest_url = Some(dv_update.data_file_location.manifest_path.clone());
-            self.deletion_vectors.insert(
-                dv_id,
-                (
-                    dv_update.data_file_path.clone(),
-                    dv_update.dv_descriptor,
-                    data_manifest_url,
-                ),
-            );
-
-            // Note: data_file_location tells us where the data file IS, but we're not marking it as deleted!
-            // We're just adding DV information. The data file should remain in its manifest.
-            // manifest_dvs is ONLY for marking entries as deleted (e.g., when moving files between leaves),
-            // which happens in add_existing_actions(), not here.
-
-            // Enhancement #1: If there was a previous DV in a different DELETE manifest (including root),
-            // mark that DV entry as deleted
-            if let Some(prev_dv_loc) = dv_update.previous_delete_file_location {
-                let prev_entry = self
-                    .manifest_dvs
-                    .entry(prev_dv_loc.manifest_path.to_string())
-                    .or_default();
-                prev_entry.insert(prev_dv_loc.index as u64);
-            }
-        }
         Ok(())
     }
 
@@ -705,18 +335,10 @@ impl LeafNodeWriter {
     /// LeafNodeWriterResult with written manifests and tracking info
     pub fn finish(mut self, engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
         // Write data manifest using ContentTreeNodeBuilder's write_leaf()
+        // In the new CombinedManifest model, DV info is inline on data entries,
+        // so no separate DV manifest is needed.
         let data_manifest_entry = if self.data_builder.has_entries() {
-            let entry = self
-                .data_builder
-                .write_leaf(engine, Some(self.snapshot_id))?;
-            Some(entry)
-        } else {
-            None
-        };
-
-        // Write DV manifest if we have deletion vectors
-        let dv_manifest_entry = if !self.deletion_vectors.is_empty() {
-            let entry = self.write_dv_manifest(engine, data_manifest_entry.as_ref())?;
+            let entry = self.data_builder.write_leaf(engine, self.snapshot_id)?;
             Some(entry)
         } else {
             None
@@ -727,107 +349,7 @@ impl LeafNodeWriter {
             root_entries_to_remove: self.root_entries_to_remove,
             root_dv_entries_to_remove: self.root_dv_entries_to_remove,
             data_file_manifest_written: data_manifest_entry,
-            dv_file_manifest_written: dv_manifest_entry,
         })
-    }
-
-    /// Write DV manifest and return ContentTreeNodeEntry.
-    fn write_dv_manifest(
-        &self,
-        engine: &dyn Engine,
-        data_manifest_entry: Option<&ContentTreeNodeEntry>,
-    ) -> DeltaResult<ContentTreeNodeEntry> {
-        // Create a separate ContentTreeNodeBuilder for DVs
-        let mut dv_builder = ContentTreeNodeBuilder::new_for(
-            self.table_root.clone(),
-            self.version,
-            self.table_schema.as_ref().clone(),
-        );
-
-        // Determine affiliation by checking if all DVs reference files in the SAME manifest
-        let this_leaf_data_manifest_url = data_manifest_entry
-            .and_then(|e| e.location.as_ref())
-            .cloned();
-
-        // Collect all unique manifest URLs that our DVs' data files are in
-        let mut manifest_urls: std::collections::HashSet<Option<String>> =
-            std::collections::HashSet::new();
-        for (_, _, data_manifest_url) in self.deletion_vectors.values() {
-            manifest_urls.insert(data_manifest_url.as_ref().map(|u| u.to_string()));
-        }
-
-        // Determine affiliated manifest URL:
-        // - If any DVs were added via DVOnly mode, force unaffiliated (can't guarantee affiliation)
-        // - If all DVs have None (files in THIS leaf), use this_leaf_data_manifest_url
-        // - If all DVs have the same external URL, use that URL
-        // - Otherwise (mixed sources), set to None (unaffiliated)
-        let affiliated_manifest_url = if self.has_dv_only_entries {
-            None // DVOnly entries force unaffiliated manifest
-        } else if manifest_urls.len() == 1 {
-            // Safety: We know there's exactly one element
-            if let Some(single_url) = manifest_urls.iter().next() {
-                match single_url {
-                    None => this_leaf_data_manifest_url,
-                    Some(url) => Some(url.clone()),
-                }
-            } else {
-                None
-            }
-        } else {
-            None // Mixed sources = unaffiliated
-        };
-
-        // Convert DV descriptors to ContentTreeNodeEntry
-        for (data_file_path, dv_descriptor, _) in self.deletion_vectors.values() {
-            let (content_info, location) =
-                crate::content_tree::builder::extract_deletion_vector_content(dv_descriptor)?;
-
-            // Use relative path for referenced_file to match data file paths in manifests
-            // Data file paths are stored as relative, so DV references must also be relative
-            // content_info already has the +8 conversion applied by extract_deletion_vector_content
-            // TODO: Should this at least be offset + size_in_bytes.
-            let file_size = content_info.size_in_bytes;
-
-            let dv_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::PositionDeletes,
-                location: Some(location),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(self.snapshot_id),
-                    // TODO: For newly added DVs, sequence_number and file_sequence_number should be None
-                    // to inherit from the manifest's tracking_info. Only needed for existing DVs.
-                    sequence_number: Some(self.version as i64),
-                    file_sequence_number: Some(self.version as i64),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: Some(content_info),
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: dv_descriptor.cardinality,
-                file_size_in_bytes: Some(file_size),
-                content_stats: None,
-                manifest_stats: None,
-                referenced_file: Some(data_file_path.to_string()),
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
-
-            dv_builder.add_entry(dv_entry);
-        }
-
-        // Write the DV manifest
-        let mut dv_manifest = dv_builder.write_leaf(engine, Some(self.snapshot_id))?;
-
-        // Set referenced_file to indicate if this DV manifest is affiliated with a data manifest.
-        // Affiliated: All DVs reference files in a single data manifest (enables efficient loading)
-        // Unaffiliated: DVs reference files from multiple sources (None)
-        dv_manifest.referenced_file = affiliated_manifest_url;
-
-        Ok(dv_manifest)
     }
 }
 
@@ -1192,6 +714,217 @@ mod tests {
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 
+    /// Returns the kernel `DataType` for the `stats_parsed` column (Delta JSON format)
+    /// for the test table schema {id: INTEGER, value: STRING}.
+    fn stats_parsed_kernel_type() -> DataType {
+        use crate::content_tree::builder::build_delta_stats_schema;
+        let test_schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ])
+        .expect("valid test schema");
+        DataType::Struct(Box::new(build_delta_stats_schema(&test_schema)))
+    }
+
+    /// Returns the kernel scan row schema (including `stats_parsed`) for the test table.
+    fn scan_row_schema_for_tests() -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable("stats_parsed", stats_parsed_kernel_type()),
+            StructField::nullable(
+                "deletionVector",
+                DataType::struct_type_unchecked(vec![
+                    StructField::nullable("storageType", DataType::STRING),
+                    StructField::nullable("pathOrInlineDv", DataType::STRING),
+                    StructField::nullable("offset", DataType::INTEGER),
+                    StructField::nullable("sizeInBytes", DataType::INTEGER),
+                    StructField::nullable("cardinality", DataType::LONG),
+                ]),
+            ),
+            StructField::not_null(
+                "fileConstantValues",
+                DataType::struct_type_unchecked(vec![
+                    StructField::not_null(
+                        "partitionValues",
+                        DataType::Map(Box::new(MapType::new(
+                            DataType::STRING,
+                            DataType::STRING,
+                            true,
+                        ))),
+                    ),
+                    StructField::nullable("baseRowId", DataType::LONG),
+                    StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                    StructField::nullable("dataManifestPath", DataType::STRING),
+                    StructField::nullable("dataManifestPosition", DataType::LONG),
+                    StructField::nullable("deleteManifestPath", DataType::STRING),
+                    StructField::nullable("deleteManifestPosition", DataType::LONG),
+                ]),
+            ),
+        ]))
+    }
+
+    /// Creates scan row `EngineData` by parsing JSON strings with the engine's JSON handler.
+    ///
+    /// Each JSON row is parsed against [`scan_row_schema_for_tests`]. Absent nullable fields
+    /// default to null. Include `"stats_parsed": {...}` for the preferred-path test, or
+    /// `"stats": "{...escaped...}"` for the JSON-fallback-path test.
+    fn create_scan_row_engine_data(
+        engine: &Arc<dyn Engine>,
+        json_rows: &[&str],
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        use crate::arrow::array::StringArray;
+        use crate::utils::test_utils::string_array_to_engine_data;
+        let strings: StringArray = json_rows.to_vec().into();
+        engine.json_handler().parse_json(
+            string_array_to_engine_data(strings),
+            scan_row_schema_for_tests(),
+        )
+    }
+
+    /// Verifies content_stats in a written manifest file.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_manifest_content_stats(
+        engine: &Arc<dyn Engine>,
+        manifest_entry: &ContentTreeNodeEntry,
+        table_root: &Url,
+        schema: &SchemaRef,
+        expected_record_count: i64,
+        expected_id_min: i32,
+        expected_id_max: i32,
+        expected_value_min: &str,
+        expected_value_max: &str,
+        expected_value_nc: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray, StructArray};
+        use crate::engine::arrow_data::ArrowEngineData as ArrowEngineData2;
+        use crate::FileMeta;
+
+        let manifest_location = manifest_entry
+            .location
+            .as_ref()
+            .expect("Manifest should have location");
+        let manifest_url = table_root.join(manifest_location)?;
+        let file_meta = FileMeta {
+            location: manifest_url,
+            last_modified: 0,
+            size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
+        };
+        let delta_stats = crate::content_tree::builder::build_delta_stats_schema(schema);
+        let read_schema = Arc::new(
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                schema,
+                &delta_stats,
+            )?,
+        );
+        let mut found = false;
+        for batch_result in
+            engine
+                .parquet_handler()
+                .read_parquet_files(&[file_meta], read_schema, None)?
+        {
+            let batch = batch_result?;
+            let record_batch = batch
+                .any_ref()
+                .downcast_ref::<ArrowEngineData2>()
+                .expect("Expected ArrowEngineData")
+                .record_batch();
+
+            let rc = record_batch
+                .column_by_name("recordCount")
+                .expect("recordCount");
+            assert_eq!(
+                rc.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .value(0),
+                expected_record_count,
+                "recordCount mismatch"
+            );
+
+            let cs = record_batch
+                .column_by_name(crate::content_tree::CONTENT_STATS_FIELD_NAME)
+                .expect("content_stats");
+            assert!(cs.is_valid(0), "content_stats should not be null");
+            let stats = cs
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
+
+            let id = stats.column_by_name("id").expect("id");
+            let id_struct = id
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
+            assert_eq!(
+                id_struct
+                    .column_by_name("lower_bound")
+                    .expect("lower_bound")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32")
+                    .value(0),
+                expected_id_min,
+                "id.lower_bound mismatch"
+            );
+            assert_eq!(
+                id_struct
+                    .column_by_name("upper_bound")
+                    .expect("upper_bound")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32")
+                    .value(0),
+                expected_id_max,
+                "id.upper_bound mismatch"
+            );
+
+            let val = stats.column_by_name("value").expect("value");
+            let val_struct = val
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
+            assert_eq!(
+                val_struct
+                    .column_by_name("lower_bound")
+                    .expect("lower_bound")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray")
+                    .value(0),
+                expected_value_min,
+                "value.lower_bound mismatch"
+            );
+            assert_eq!(
+                val_struct
+                    .column_by_name("upper_bound")
+                    .expect("upper_bound")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray")
+                    .value(0),
+                expected_value_max,
+                "value.upper_bound mismatch"
+            );
+            assert_eq!(
+                val_struct
+                    .column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                    .expect("null_count")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .value(0),
+                expected_value_nc,
+                "value.null_value_count mismatch"
+            );
+            found = true;
+        }
+        assert!(found, "Should have read the manifest");
+        Ok(())
+    }
+
     #[test]
     fn test_basic_leaf_writing() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root, schema) = test_setup();
@@ -1233,10 +966,6 @@ mod tests {
             "Data manifest should be written"
         );
         assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-        assert!(
             result.manifest_dvs.is_empty(),
             "Manifest DVs should be empty"
         );
@@ -1274,8 +1003,12 @@ mod tests {
 
         // Use the production schema to ensure test matches actual behavior
         // This generates the full ContentTreeNodeEntry schema with content_stats based on table schema
+        let delta_stats = crate::content_tree::builder::build_delta_stats_schema(&schema);
         let read_schema = Arc::new(
-            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(&schema)?,
+            crate::content_tree::ContentTreeNodeEntry::to_schema_with_content_stats(
+                &schema,
+                &delta_stats,
+            )?,
         );
 
         let read_result_iter =
@@ -1475,11 +1208,6 @@ mod tests {
             result.data_file_manifest_written.is_some(),
             "Data manifest should be written"
         );
-        assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-
         Ok(())
     }
 
@@ -1501,10 +1229,6 @@ mod tests {
             "Data manifest should not be written"
         );
         assert!(
-            result.dv_file_manifest_written.is_none(),
-            "DV manifest should not be written"
-        );
-        assert!(
             result.manifest_dvs.is_empty(),
             "Manifest DVs should be empty"
         );
@@ -1517,75 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dv_only_forces_unaffiliated() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, schema) = test_setup();
-        let version = 1;
-        let snapshot_id = 12345;
-
-        let mut writer = LeafNodeWriter::new(
-            table_root.clone(),
-            version,
-            snapshot_id,
-            schema.clone(),
-            true,
-            None,
-        );
-
-        // Verify initially has_dv_only_entries is false
-        assert!(
-            !writer.has_dv_only_entries,
-            "Initially should not have DV-only entries"
-        );
-
-        // Simulate DVOnly mode by setting the flag directly
-        // In real usage, this would be set by add_existing_actions with AddType::DVOnly
-        writer.has_dv_only_entries = true;
-
-        // Add a deletion vector (UUID must be at least 20 characters)
-        let dv_descriptor = DeletionVectorDescriptor {
-            storage_type:
-                crate::actions::deletion_vector::DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: "12345678901234567890".to_string(), // 20 chars minimum
-            offset: Some(0),
-            size_in_bytes: 10,
-            cardinality: 5,
-        };
-        let dv_id = create_dv_unique_id("test.parquet", &dv_descriptor);
-        writer
-            .deletion_vectors
-            .insert(dv_id, ("test.parquet".to_string(), dv_descriptor, None));
-
-        // Finish and verify the DV manifest is unaffiliated
-        let result = writer.finish(engine.as_ref())?;
-
-        // VERIFY: DV manifest was written
-        assert!(
-            result.dv_file_manifest_written.is_some(),
-            "DV manifest should be written"
-        );
-
-        // VERIFY: DV manifest is unaffiliated (referenced_file is None)
-        let dv_manifest = result.dv_file_manifest_written.unwrap();
-        assert!(
-            dv_manifest.referenced_file.is_none(),
-            "DVOnly mode should create unaffiliated DV manifest (referenced_file should be None), but got: {:?}",
-            dv_manifest.referenced_file
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn test_selection_vector_filtering() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::{
-            ArrayRef, Int32Array, Int64Array, MapArray, StringArray, StructArray,
-        };
-        use crate::arrow::buffer::OffsetBuffer;
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
-        use crate::arrow::record_batch::RecordBatch;
-        use crate::engine::arrow_conversion::TryFromKernel;
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let (engine, table_root, schema) = test_setup();
         let version = 1;
         let snapshot_id = 12345;
@@ -1593,206 +1249,23 @@ mod tests {
         let mut writer =
             LeafNodeWriter::new(table_root.clone(), version, snapshot_id, schema, true, None);
 
-        // Create scan data with 4 files
-        let num_files = 4;
-        let paths = vec![
-            "file0.parquet",
-            "file1.parquet",
-            "file2.parquet",
-            "file3.parquet",
-        ];
-        let sizes = vec![1000, 2000, 3000, 4000];
-        let mod_times = vec![1000000, 1000001, 1000002, 1000003];
-
-        // Build the scan schema with all required fields (properly nested)
-        let scan_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable(
-                "deletionVector",
-                DataType::struct_type_unchecked(vec![
-                    StructField::nullable("storageType", DataType::STRING),
-                    StructField::nullable("pathOrInlineDv", DataType::STRING),
-                    StructField::nullable("offset", DataType::INTEGER),
-                    StructField::nullable("sizeInBytes", DataType::INTEGER),
-                    StructField::nullable("cardinality", DataType::LONG),
-                ]),
-            ),
-            StructField::not_null(
-                "fileConstantValues",
-                DataType::struct_type_unchecked(vec![
-                    StructField::not_null(
-                        "partitionValues",
-                        DataType::Map(Box::new(MapType::new(
-                            DataType::STRING,
-                            DataType::STRING,
-                            true,
-                        ))),
-                    ),
-                    StructField::nullable("baseRowId", DataType::LONG),
-                    StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-                    StructField::nullable("dataManifestPath", DataType::STRING),
-                    StructField::nullable("dataManifestPosition", DataType::LONG),
-                    StructField::nullable("deleteManifestPath", DataType::STRING),
-                    StructField::nullable("deleteManifestPosition", DataType::LONG),
-                ]),
-            ),
-        ]));
-
-        // Create arrays
-        let path_array = StringArray::from(paths.clone());
-        let size_array = Int64Array::from(sizes.clone());
-        let mod_time_array = Int64Array::from(mod_times.clone());
-        let stats_array: StringArray = StringArray::from(vec![None::<&str>; num_files]);
-
-        // Create deletionVector struct (all null values)
-        let dv_storage_type: StringArray = StringArray::from(vec![None::<&str>; num_files]);
-        let dv_path: StringArray = StringArray::from(vec![None::<&str>; num_files]);
-        let dv_offset: Int32Array = Int32Array::from(vec![None::<i32>; num_files]);
-        let dv_size: Int32Array = Int32Array::from(vec![None::<i32>; num_files]);
-        let dv_cardinality: Int64Array = Int64Array::from(vec![None::<i64>; num_files]);
-
-        let deletion_vector_struct = StructArray::from(vec![
-            (
-                Arc::new(Field::new("storageType", ArrowDataType::Utf8, true)),
-                Arc::new(dv_storage_type) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("pathOrInlineDv", ArrowDataType::Utf8, true)),
-                Arc::new(dv_path) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("offset", ArrowDataType::Int32, true)),
-                Arc::new(dv_offset) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("sizeInBytes", ArrowDataType::Int32, true)),
-                Arc::new(dv_size) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("cardinality", ArrowDataType::Int64, true)),
-                Arc::new(dv_cardinality) as ArrayRef,
-            ),
-        ]);
-
-        // Create empty partition values map
-        let entries_field = Arc::new(Field::new(
-            "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
-                    Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let empty_keys = StringArray::from(Vec::<&str>::new());
-        let empty_values = StringArray::from(Vec::<Option<&str>>::new());
-        let empty_entries = StructArray::from(vec![
-            (
-                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
-                Arc::new(empty_keys) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
-                Arc::new(empty_values) as ArrayRef,
-            ),
-        ]);
-        let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
-        let partition_values_array =
-            MapArray::new(entries_field, offsets, empty_entries, None, false);
-
-        // Create fileConstantValues struct
-        let base_row_id: Int64Array = Int64Array::from(vec![None::<i64>; num_files]);
-        let default_row_commit_version: Int64Array = Int64Array::from(vec![None::<i64>; num_files]);
-        let data_manifest_path: StringArray = StringArray::from(vec![None::<&str>; num_files]);
-        let data_manifest_position: Int64Array = Int64Array::from(vec![None::<i64>; num_files]);
-        let delete_manifest_path: StringArray = StringArray::from(vec![None::<&str>; num_files]);
-        let delete_manifest_position: Int64Array = Int64Array::from(vec![None::<i64>; num_files]);
-
-        let file_constant_values_struct = StructArray::from(vec![
-            (
-                Arc::new(Field::new(
-                    "partitionValues",
-                    ArrowDataType::Map(
-                        Arc::new(Field::new(
-                            "key_value",
-                            ArrowDataType::Struct(
-                                vec![
-                                    Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
-                                    Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
-                                ]
-                                .into(),
-                            ),
-                            false,
-                        )),
-                        false,
-                    ),
-                    false,
-                )),
-                Arc::new(partition_values_array) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("baseRowId", ArrowDataType::Int64, true)),
-                Arc::new(base_row_id) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new(
-                    "defaultRowCommitVersion",
-                    ArrowDataType::Int64,
-                    true,
-                )),
-                Arc::new(default_row_commit_version) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("dataManifestPath", ArrowDataType::Utf8, true)),
-                Arc::new(data_manifest_path) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new(
-                    "dataManifestPosition",
-                    ArrowDataType::Int64,
-                    true,
-                )),
-                Arc::new(data_manifest_position) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("deleteManifestPath", ArrowDataType::Utf8, true)),
-                Arc::new(delete_manifest_path) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new(
-                    "deleteManifestPosition",
-                    ArrowDataType::Int64,
-                    true,
-                )),
-                Arc::new(delete_manifest_position) as ArrayRef,
-            ),
-        ]);
-
-        let batch = RecordBatch::try_new(
-            Arc::new(TryFromKernel::try_from_kernel(scan_schema.as_ref())?),
-            vec![
-                Arc::new(path_array) as ArrayRef,
-                Arc::new(size_array) as ArrayRef,
-                Arc::new(mod_time_array) as ArrayRef,
-                Arc::new(stats_array) as ArrayRef,
-                Arc::new(deletion_vector_struct) as ArrayRef,
-                Arc::new(file_constant_values_struct) as ArrayRef,
+        // 4 files with no stats — selection vector keeps rows 0 and 2
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1000,"modificationTime":1000000,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file1.parquet","size":2000,"modificationTime":1000001,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file2.parquet","size":3000,"modificationTime":1000002,"fileConstantValues":{"partitionValues":{}}}"#,
+                r#"{"path":"file3.parquet","size":4000,"modificationTime":1000003,"fileConstantValues":{"partitionValues":{}}}"#,
             ],
         )?;
-
-        let engine_data = Box::new(ArrowEngineData::new(batch));
 
         // Create a selection vector that marks rows 0 and 2 as selected, rows 1 and 3 as deleted
         let selection_vector = vec![true, false, true, false];
         let filtered_data = FilteredEngineData::try_new(engine_data, selection_vector)?;
 
         // Add the existing actions with the filtered data
-        writer.add_existing_actions(engine.as_ref(), filtered_data, AddType::DataFileOnly)?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data)?;
 
         // Finish and check the result
         let result = writer.finish(engine.as_ref())?;
@@ -1881,4 +1354,103 @@ mod tests {
     // more complex setup with scan data and deletion vector descriptors.
     // These will be better tested in the Level 2 (transaction) tests where we can
     // use the full table infrastructure.
+
+    #[test]
+    /// Tests that `stats` JSON string (fallback path of the coalesce) is parsed into
+    /// `content_stats` correctly. This covers the case where scan rows come from JSON
+    /// commit log files (stats_parsed is null, stats is a JSON string).
+    fn test_existing_actions_stats_preserved() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, schema) = test_setup();
+        let version = 1;
+        let snapshot_id = 12345;
+
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
+
+        // Scan row with non-null `stats` JSON and null `stats_parsed` — fallback path of coalesce.
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1,\"value\":\"alice\"},\"maxValues\":{\"id\":100,\"value\":\"zoe\"},\"nullCount\":{\"id\":0,\"value\":5},\"tightBounds\":true}","fileConstantValues":{"partitionValues":{}}}"#,
+            ],
+        )?;
+
+        let filtered_data = FilteredEngineData::try_new(engine_data, vec![true])?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data)?;
+        let result = writer.finish(engine.as_ref())?;
+
+        assert!(
+            result.data_file_manifest_written.is_some(),
+            "Data manifest should be written"
+        );
+        verify_manifest_content_stats(
+            &engine,
+            result.data_file_manifest_written.as_ref().unwrap(),
+            &table_root,
+            &schema,
+            100,
+            1,
+            100,
+            "alice",
+            "zoe",
+            5,
+        )
+    }
+
+    #[test]
+    /// Tests that a pre-populated `stats_parsed` column (preferred path of the coalesce) is used
+    /// directly even when `stats` JSON is null. This covers scan rows from checkpoint scans where
+    /// `include_stats_columns()` has already populated `stats_parsed` and `stats` is absent.
+    fn test_existing_actions_prefers_stats_parsed_column() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (engine, table_root, schema) = test_setup();
+        let version = 1;
+        let snapshot_id = 12345;
+
+        let mut writer = LeafNodeWriter::new(
+            table_root.clone(),
+            version,
+            snapshot_id,
+            schema.clone(),
+            true,
+            None,
+        );
+
+        // Scan row with null `stats` JSON and non-null `stats_parsed` — preferred path of coalesce.
+        // The stats_parsed struct is parsed directly from the JSON (simulating what a checkpoint
+        // scan produces when include_stats_columns() adds the pre-parsed column).
+        let engine_data = create_scan_row_engine_data(
+            &engine,
+            &[
+                r#"{"path":"file0.parquet","size":1024,"modificationTime":1000000,"stats_parsed":{"numRecords":100,"minValues":{"id":1,"value":"alice"},"maxValues":{"id":100,"value":"zoe"},"nullCount":{"id":0,"value":5},"tightBounds":true},"fileConstantValues":{"partitionValues":{}}}"#,
+            ],
+        )?;
+
+        let filtered_data = FilteredEngineData::try_new(engine_data, vec![true])?;
+        writer.add_existing_actions(engine.as_ref(), filtered_data)?;
+        let result = writer.finish(engine.as_ref())?;
+
+        assert!(
+            result.data_file_manifest_written.is_some(),
+            "Data manifest should be written"
+        );
+        verify_manifest_content_stats(
+            &engine,
+            result.data_file_manifest_written.as_ref().unwrap(),
+            &table_root,
+            &schema,
+            100,
+            1,
+            100,
+            "alice",
+            "zoe",
+            5,
+        )
+    }
 }

@@ -1,5 +1,5 @@
 //! Expression handling based on arrow-rs compute kernels.
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
@@ -266,6 +266,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             input_schema: schema,
             expression,
             output_type,
+            output_schema: OnceLock::new(),
         }))
     }
 
@@ -378,6 +379,23 @@ pub struct DefaultExpressionEvaluator {
     input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
+    /// Lazily cached Arrow schema for non-struct output types (the `{output: <type>}` schema).
+    output_schema: OnceLock<Arc<ArrowSchema>>,
+}
+
+impl DefaultExpressionEvaluator {
+    /// Returns the cached Arrow schema for non-struct outputs, computing it on first call.
+    fn get_arrow_output_schema(&self) -> DeltaResult<Arc<ArrowSchema>> {
+        if let Some(schema) = self.output_schema.get() {
+            return Ok(schema.clone());
+        }
+        let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "output", arrow_type, true,
+        )]));
+        // In a race two threads may both compute; get_or_init stores only the first.
+        Ok(self.output_schema.get_or_init(|| schema).clone())
+    }
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
@@ -412,9 +430,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+                let schema = self.get_arrow_output_schema()?;
+                RecordBatch::try_new(schema, vec![array_ref])?
             }
         };
 

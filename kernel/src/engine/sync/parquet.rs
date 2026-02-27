@@ -12,6 +12,7 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
+use crate::engine::default::parquet::build_writer_properties;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -136,6 +137,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
+        write_config: &crate::ParquetWriterConfig,
     ) -> DeltaResult<u64> {
         // Convert URL to file path
         let path = location
@@ -158,7 +160,8 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), None)?;
+        let props = build_writer_properties(write_config);
+        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), Some(props))?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -196,6 +199,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::ColumnMetadataKey;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -230,7 +234,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &Default::default())
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -350,7 +356,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &Default::default())
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -425,7 +433,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter1, &Default::default())
+            .unwrap();
         assert!(file_path.exists());
 
         // Create second data set with different data
@@ -441,7 +451,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Overwrite with second file (overwrite=true)
-        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter2, &Default::default())
+            .unwrap();
 
         // Read back and verify it contains the second data set
         let file = File::open(&file_path).unwrap();
@@ -500,7 +512,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter1, &Default::default())
+            .unwrap();
         assert!(file_path.exists());
 
         // Create second data set
@@ -516,7 +530,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Write again - should overwrite successfully (new behavior always overwrites)
-        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter2, &Default::default())
+            .unwrap();
 
         // Verify the file was overwritten with the new data
         let file = File::open(&file_path).unwrap();
@@ -592,7 +608,9 @@ mod tests {
         > = Box::new(batches.into_iter());
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &Default::default())
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -676,17 +694,22 @@ mod tests {
 
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
 
-        // Verify field IDs are preserved
+        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
+        // The field IDs should be accessible using get_config_value (the documented API)
         let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
         assert_eq!(
-            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"1".into())
+            id_field
+                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                .map(|v| v.to_string()),
+            Some("1".to_string())
         );
 
         let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
         assert_eq!(
-            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"2".into())
+            name_field
+                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                .map(|v| v.to_string()),
+            Some("2".to_string())
         );
     }
 
@@ -706,19 +729,27 @@ mod tests {
                         Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
                     )])
                     .unwrap(),
-                )) as Box<dyn crate::EngineData>))),
+                ))
+                    as Box<dyn crate::EngineData>))),
+                &Default::default(),
             )
             .unwrap();
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let schema: SchemaRef = {
             let file = File::open(&file_path).unwrap();
-            let reader = crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let reader =
+                crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap();
             Arc::new(reader.schema().clone().try_into_kernel().unwrap())
         };
 
         let read_rows = |handler: SyncParquetHandler, size: u64| -> usize {
-            let file_meta = FileMeta { location: url.clone(), last_modified: 0, size };
+            let file_meta = FileMeta {
+                location: url.clone(),
+                last_modified: 0,
+                size,
+            };
             let mut iter = handler
                 .read_parquet_files(&[file_meta], schema.clone(), None)
                 .unwrap();
@@ -729,12 +760,36 @@ mod tests {
         };
 
         // threshold above file size: uses bytes path
-        assert_eq!(read_rows(SyncParquetHandler::new().with_small_file_threshold(file_size + 1), file_size), 3);
+        assert_eq!(
+            read_rows(
+                SyncParquetHandler::new().with_small_file_threshold(file_size + 1),
+                file_size
+            ),
+            3
+        );
         // threshold equal to file size: also uses bytes path
-        assert_eq!(read_rows(SyncParquetHandler::new().with_small_file_threshold(file_size), file_size), 3);
+        assert_eq!(
+            read_rows(
+                SyncParquetHandler::new().with_small_file_threshold(file_size),
+                file_size
+            ),
+            3
+        );
         // threshold below file size: uses normal file path
-        assert_eq!(read_rows(SyncParquetHandler::new().with_small_file_threshold(file_size - 1), file_size), 3);
+        assert_eq!(
+            read_rows(
+                SyncParquetHandler::new().with_small_file_threshold(file_size - 1),
+                file_size
+            ),
+            3
+        );
         // size=0 (unknown): skips bytes path even when threshold is max
-        assert_eq!(read_rows(SyncParquetHandler::new().with_small_file_threshold(u64::MAX), 0), 3);
+        assert_eq!(
+            read_rows(
+                SyncParquetHandler::new().with_small_file_threshold(u64::MAX),
+                0
+            ),
+            3
+        );
     }
 }

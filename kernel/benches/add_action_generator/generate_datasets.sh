@@ -205,7 +205,7 @@ run_backfill() {
 
     echo -e "${GREEN}${description}${NC}"
 
-    if ! AWS_LC_SYS_CMAKE_BUILDER=1 cargo run --release --bin backfill-delta-table \
+    if ! AWS_LC_SYS_CMAKE_BUILDER=1 cargo run --release -p delta_kernel --bin backfill-delta-table \
         --features "${FEATURES}" \
         -- \
         "${cmd_args[@]}"; then

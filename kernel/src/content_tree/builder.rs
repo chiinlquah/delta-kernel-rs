@@ -1,5 +1,4 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::visitors::AddVisitor;
 use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
@@ -14,8 +13,9 @@ use crate::content_tree::ManifestStats;
 use crate::expressions::StructData;
 use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+#[cfg(test)]
 use crate::utils::try_parse_uri;
-use crate::{DeltaResult, EngineData, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -81,19 +81,11 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
 /// # Returns
-/// A tuple of `(ContentInfo, String)` where the String is the DV file path.
+/// A [`ContentInfo`] containing the DV location and size information.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<(ContentInfo, String)> {
+) -> DeltaResult<ContentInfo> {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
-    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
-    // - 4 bytes: size prefix
-    // - 4 bytes: CRC checksum
-    let content_info = ContentInfo {
-        offset: dv.offset.map(|v| v as i64).unwrap_or(0),
-        size_in_bytes: dv.size_in_bytes as i64 + 8,
-    };
-
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -110,8 +102,15 @@ pub(crate) fn extract_deletion_vector_content(
             ));
         }
     };
-
-    Ok((content_info, location))
+    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
+    // - 4 bytes: size prefix
+    // - 4 bytes: CRC checksum
+    Ok(ContentInfo {
+        location,
+        offset: dv.offset.map(|v| v as i64).unwrap_or(0),
+        size_in_bytes: dv.size_in_bytes as i64 + 8,
+        cardinality: dv.cardinality,
+    })
 }
 
 /// Extracts record_count from content_stats by finding the first column's value_count.
@@ -212,7 +211,6 @@ impl DvCache {
 }
 
 /// Builder for creating [`ContentTreeNode`] instances based on V4 ContentTreeNode
-#[allow(dead_code)]
 pub(crate) struct ContentTreeNodeBuilder {
     table_root: Url,
     pending_entries: Vec<ContentTreeNodeEntry>,
@@ -239,9 +237,9 @@ pub(crate) struct ContentTreeNodeBuilder {
 }
 
 /// Lightweight aggregate stats computed when adding pre-built columnar batches.
-/// All pre-built entries are `TrackingStatus::Added` at the builder's version.
 struct BatchAggregates {
-    file_count: i64,
+    added_file_count: i64,
+    existing_file_count: i64,
     total_record_count: i64,
     total_file_size: i64,
 }
@@ -273,7 +271,6 @@ impl ContentTreeNodeBuilder {
     ///   to the content_stats StructData format when adding entries via `add()`. The schema must
     ///   match the schema used to write the files and must include PARQUET:field_id metadata on
     ///   fields for proper stats field mapping
-    #[allow(dead_code)]
     pub(crate) fn new_for(table_root: Url, version: Version, table_schema: Schema) -> Self {
         Self {
             table_root,
@@ -286,6 +283,53 @@ impl ContentTreeNodeBuilder {
             pre_built_data: Vec::new(),
             pre_built_aggregates: Vec::new(),
         }
+    }
+
+    /// Creates a [`ContentTreeNodeBuilder`] by reading an existing content root parquet file.
+    ///
+    /// This loads all entries from the content root directly into a builder, avoiding the
+    /// need to construct an intermediate [`ContentTreeNode`].
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for reading the parquet file
+    /// * `content_root` - The content root action referencing the manifest file
+    /// * `table_root` - The root URL of the table
+    /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion
+    /// * `new_version` - The version number for the new metadata being built
+    pub(crate) fn from_content_root(
+        engine: &dyn Engine,
+        content_root: &crate::actions::ContentRoot,
+        table_root: Url,
+        table_schema: Schema,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
+
+        let content_root_url = table_root
+            .join(&content_root.path)
+            .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
+
+        let (read_result_iter, _version, _path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &content_root_url,
+            content_root.path.clone(),
+            None,
+            None,
+        )?;
+
+        let mut builder = Self::new_for(table_root, new_version, table_schema);
+
+        for batch_result in read_result_iter {
+            let batch = batch_result?;
+            let mut visitor = ContentTreeNodeEntryVisitor::default();
+            if visitor.visit_rows_of(batch.as_ref()).is_ok() {
+                for entry in visitor.entries {
+                    builder.add_entry(entry);
+                }
+            }
+        }
+
+        Ok(builder)
     }
 
     /// Ensures a cache entry exists for the given manifest location.
@@ -307,7 +351,7 @@ impl ContentTreeNodeBuilder {
     /// Only serializes entries that were modified (dirty flag set).
     /// Should be called before building to ensure DVs are properly persisted.
     /// Also updates tracking_info with snapshot_id and sequence numbers based on status.
-    fn serialize_dvs_to_entries(&mut self, snapshot_id: Option<i64>) -> DeltaResult<()> {
+    fn serialize_dvs_to_entries(&mut self, snapshot_id: i64) -> DeltaResult<()> {
         let version = self.version as i64;
 
         // Iterate over entries and look up in cache
@@ -315,7 +359,9 @@ impl ContentTreeNodeBuilder {
             // Only process manifest entries
             if !matches!(
                 entry.content_type,
-                DataContentType::DataManifest | DataContentType::DeleteManifest
+                DataContentType::DataManifest
+                    | DataContentType::DeleteManifest
+                    | DataContentType::CombinedManifest
             ) {
                 continue;
             }
@@ -365,7 +411,7 @@ impl ContentTreeNodeBuilder {
                 // Initialize tracking_info if not present (new manifest being added)
                 entry.tracking_info = Some(TrackingInfo {
                     status: TrackingStatus::Added,
-                    snapshot_id,
+                    snapshot_id: Some(snapshot_id),
                     sequence_number: Some(version),
                     file_sequence_number: Some(version),
                     first_row_id: None,
@@ -375,7 +421,7 @@ impl ContentTreeNodeBuilder {
                 // Update existing tracking_info based on status
                 // Only update snapshot_id when status is DELETED
                 if tracking_info.status == TrackingStatus::Deleted {
-                    tracking_info.snapshot_id = snapshot_id;
+                    tracking_info.snapshot_id = Some(snapshot_id);
                 }
             }
         }
@@ -391,8 +437,10 @@ impl ContentTreeNodeBuilder {
             return Ok(schema.clone());
         }
 
-        // Compute the schema
-        let schema = ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema)?;
+        // Compute the schema (include all columns for writing)
+        let delta_stats = build_delta_stats_schema(&self.table_schema);
+        let schema =
+            ContentTreeNodeEntry::to_schema_with_content_stats(&self.table_schema, &delta_stats)?;
         let schema_ref = Arc::new(schema);
 
         // Try to cache it (ignore if another thread beat us to it)
@@ -406,7 +454,7 @@ impl ContentTreeNodeBuilder {
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax].
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn path_to_absolute(&self, path: &str) -> Result<String, crate::Error> {
         use url::Url;
 
@@ -429,13 +477,7 @@ impl ContentTreeNodeBuilder {
     }
 
     #[allow(unreachable_code)]
-    #[allow(dead_code)]
-    pub(crate) fn add(
-        &mut self,
-        add: Add,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> DeltaResult<()> {
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
     }
 
@@ -457,7 +499,8 @@ impl ContentTreeNodeBuilder {
         size: i64,
         content_stats: Option<StructData>,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
+        content_info: Option<ContentInfo>,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(path.clone()) {
@@ -480,7 +523,7 @@ impl ContentTreeNodeBuilder {
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 // TODO: For newly added files (status = Added), sequence_number and file_sequence_number
                 // should be None to inherit from the manifest. Only existing files (status = Existed) need these set.
                 sequence_number: Some(version as i64),
@@ -492,10 +535,8 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
-            content_info: None,
+            // DV info inline (from deletion vector if present)
+            content_info,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -509,9 +550,6 @@ impl ContentTreeNodeBuilder {
             content_stats,
 
             manifest_stats: None,
-
-            // Path to file where to apply the DV to
-            referenced_file: None,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -537,12 +575,11 @@ impl ContentTreeNodeBuilder {
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
     #[allow(unreachable_code)]
-    #[allow(dead_code)]
     pub(crate) fn add_with_dedup(
         &mut self,
         add: Add,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(add.path.clone()) {
@@ -580,15 +617,13 @@ impl ContentTreeNodeBuilder {
         let content_stats =
             delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
 
-        let (content_info, referenced_file) = dv_content.unzip();
-
         let data_file_entry = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some(add.path.clone()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 sequence_number: Some(version as i64),
                 file_sequence_number: Some(version as i64),
 
@@ -598,10 +633,8 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
-            content_info,
+            // DV info inline (from deletion vector if present)
+            content_info: dv_content,
 
             // TODO: Check how to set these based on uniform as a first iteration.
             partition_spec_id: 0,
@@ -615,9 +648,6 @@ impl ContentTreeNodeBuilder {
             content_stats,
 
             manifest_stats: None,
-
-            // Path to file where to apply the DV to
-            referenced_file,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -633,36 +663,6 @@ impl ContentTreeNodeBuilder {
         };
 
         self.pending_entries.push(data_file_entry);
-        Ok(())
-    }
-
-    /// Adds multiple `Add` records from `EngineData` to the metadata.
-    ///
-    /// This method uses the `AddVisitor` to extract all `Add` records from the provided
-    /// `EngineData` and adds each one to the metadata builder.
-    ///
-    /// # Arguments
-    /// * `engine_data` - The engine data containing Add records to extract and add
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error visiting the engine data
-    #[allow(dead_code)]
-    pub(crate) fn add_from_engine_data_add(
-        &mut self,
-        engine_data: &dyn EngineData,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> Result<(), crate::Error> {
-        let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(engine_data)?;
-
-        for add in visitor.adds {
-            self.add(add, version, snapshot_id)?;
-        }
-
         Ok(())
     }
 
@@ -691,7 +691,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         use crate::content_tree::stats;
 
@@ -745,7 +745,7 @@ impl ContentTreeNodeBuilder {
         engine: &dyn crate::Engine,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
         output_schema: &SchemaRef,
         stats_struct: Option<&crate::schema::StructType>,
     ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
@@ -812,10 +812,7 @@ impl ContentTreeNodeBuilder {
                             ))
                         }
                     };
-                    let snapshot_id_expr = match snapshot_id {
-                        Some(id) => Expression::literal(Scalar::Long(id)),
-                        None => Expression::null_literal(DataType::LONG),
-                    };
+                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
                     Expression::struct_from_with_schema(
                         [
                             Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
@@ -859,40 +856,13 @@ impl ContentTreeNodeBuilder {
         agg_visitor.visit_rows_of(transformed.as_ref())?;
 
         let aggregates = BatchAggregates {
-            file_count: engine_data.len() as i64,
+            added_file_count: engine_data.len() as i64,
+            existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
             total_file_size: agg_visitor.total_file_size,
         };
 
         Ok((transformed, aggregates))
-    }
-
-    /// Adds multiple `Add` records from an iterator of `EngineData` results to the metadata.
-    ///
-    /// This method processes an iterator of `EngineData` results, extracting all `Add` records
-    /// from each batch and adding them to the metadata builder.
-    ///
-    /// # Arguments
-    /// * `engine_data_iter` - An iterator yielding Results containing EngineData batches with Add records
-    /// * `version` - The version at which these files are being added
-    /// * `snapshot_id` - Optional snapshot ID to use for tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if there was an error processing any batch or visiting the engine data
-    #[allow(dead_code)]
-    pub(crate) fn add_from_engine_data_iter<'a>(
-        &mut self,
-        engine_data_iter: impl Iterator<Item = Result<Box<dyn EngineData>, crate::Error>> + 'a,
-        version: Version,
-        snapshot_id: Option<i64>,
-    ) -> Result<(), crate::Error> {
-        for engine_data_result in engine_data_iter {
-            let engine_data = engine_data_result?;
-            self.add_from_engine_data_add(engine_data.as_ref(), version, snapshot_id)?;
-        }
-
-        Ok(())
     }
 
     /// Adds file metadata from scan row format `EngineData` to the metadata.
@@ -913,9 +883,13 @@ impl ContentTreeNodeBuilder {
         &mut self,
         engine_data: &dyn EngineData,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> Result<(), crate::Error> {
-        let mut visitor = ScanRowToAddVisitor::default();
+        let mut visitor = ScanRowToAddVisitor {
+            adds: vec![],
+            selection_vector: vec![],
+            row_offset: 0,
+        };
         visitor.visit_rows_of(engine_data)?;
 
         for add in visitor.adds {
@@ -928,12 +902,13 @@ impl ContentTreeNodeBuilder {
     /// Adds a raw ContentTreeNodeEntry to the builder.
     ///
     /// This is useful when copying entries from existing metadata.
-    #[allow(dead_code)]
     pub(crate) fn add_entry(&mut self, mut entry: ContentTreeNodeEntry) {
         // Create DvCache for manifest entries
         if matches!(
             entry.content_type,
-            DataContentType::DataManifest | DataContentType::DeleteManifest
+            DataContentType::DataManifest
+                | DataContentType::DeleteManifest
+                | DataContentType::CombinedManifest
         ) {
             if let Some(ref location) = entry.location {
                 // Get total entry count from manifest_stats for bounds checking
@@ -962,7 +937,6 @@ impl ContentTreeNodeBuilder {
     }
 
     /// Returns true if this builder has any pending entries.
-    #[allow(dead_code)]
     pub(crate) fn has_entries(&self) -> bool {
         !self.pending_entries.is_empty() || !self.pre_built_data.is_empty()
     }
@@ -977,9 +951,9 @@ impl ContentTreeNodeBuilder {
     /// * `file_path` - The file path to match against entry locations
     pub(crate) fn remove_data_file(&mut self, file_path: &str) -> DeltaResult<()> {
         self.pending_entries.retain(|entry| {
-            // Only match data files (location matches, no referenced_file)
-            let is_data_file =
-                entry.location.as_deref() == Some(file_path) && entry.referenced_file.is_none();
+            // Only match data files (location matches, content type is Data)
+            let is_data_file = entry.location.as_deref() == Some(file_path)
+                && entry.content_type == DataContentType::Data;
             !is_data_file
         });
 
@@ -999,9 +973,8 @@ impl ContentTreeNodeBuilder {
     /// * `dv_identifier` - The DV path to match (can be location or referenced file)
     pub(crate) fn remove_dv(&mut self, dv_identifier: &str) -> DeltaResult<()> {
         self.pending_entries.retain(|entry| {
-            // Match DVs by location OR referenced_file
-            let is_dv = entry.location.as_deref() == Some(dv_identifier)
-                || entry.referenced_file.as_deref() == Some(dv_identifier);
+            // Match DVs by location (DV info is now inline on data entries)
+            let is_dv = entry.location.as_deref() == Some(dv_identifier);
             !is_dv
         });
 
@@ -1037,7 +1010,9 @@ impl ContentTreeNodeBuilder {
             .filter(|entry| {
                 !matches!(
                     entry.content_type,
-                    DataContentType::DataManifest | DataContentType::DeleteManifest
+                    DataContentType::DataManifest
+                        | DataContentType::DeleteManifest
+                        | DataContentType::CombinedManifest
                 )
             })
             .filter_map(|entry| entry.location.clone())
@@ -1048,7 +1023,9 @@ impl ContentTreeNodeBuilder {
             // Remove actual data/DV entries from root
             matches!(
                 entry.content_type,
-                DataContentType::DataManifest | DataContentType::DeleteManifest
+                DataContentType::DataManifest
+                    | DataContentType::DeleteManifest
+                    | DataContentType::CombinedManifest
             )
         });
 
@@ -1084,14 +1061,13 @@ impl ContentTreeNodeBuilder {
         file_path: Option<&str>,
         dv_path: Option<&str>,
         version: Version,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<()> {
         // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
         for entry in &mut self.pending_entries {
             // Check if this entry matches the file path or deletion vector path
             let matches = if let Some(path) = file_path {
                 entry.location.as_deref() == Some(path)
-                    || entry.referenced_file.as_deref() == Some(path)
             } else if let Some(dv) = dv_path {
                 entry.location.as_deref() == Some(dv)
             } else {
@@ -1102,13 +1078,13 @@ impl ContentTreeNodeBuilder {
                 // Update the tracking info to mark as deleted
                 if let Some(ref mut tracking_info) = entry.tracking_info {
                     tracking_info.status = TrackingStatus::Deleted;
-                    tracking_info.snapshot_id = snapshot_id;
+                    tracking_info.snapshot_id = Some(snapshot_id);
                     tracking_info.sequence_number = Some(version as i64);
                 } else {
                     // Create new tracking info if it doesn't exist
                     entry.tracking_info = Some(TrackingInfo {
                         status: TrackingStatus::Deleted,
-                        snapshot_id,
+                        snapshot_id: Some(snapshot_id),
                         sequence_number: Some(version as i64),
                         file_sequence_number: Some(version as i64),
                         first_row_id: None,
@@ -1121,52 +1097,9 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Marks a specific entry in a leaf manifest as deleted using a deletion vector.
-    ///
-    /// This method finds the leaf manifest entry corresponding to the provided file path,
-    /// and updates or creates a ManifestDV (deletion vector for manifest entries) to mark
-    /// the specified index as deleted. The deleted entries are tracked in a roaring bitmap
-    /// stored inline.
-    ///
-    /// The method gets the entry count from the leaf manifest's `manifest_stats` field,
-    /// which tracks file counts by status. If all entries become deleted, the manifest
-    /// entry is automatically marked as deleted.
-    ///
-    /// # Arguments
-    /// * `leaf_file_path` - The path to the leaf manifest file
-    /// * `index` - The index (row number) within the leaf manifest to mark as deleted
-    /// * `version` - The version at which this deletion occurs
-    /// * `snapshot_id` - Optional snapshot ID for the deletion tracking info
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
-    ///
-    /// Delete a single entry from a leaf manifest by marking it as deleted via ManifestDV.
-    ///
-    /// This method creates or updates a ManifestDV entry that tracks which entries in the leaf
-    /// manifest are deleted. When all active entries are deleted, the manifest itself is marked
-    /// as deleted.
-    ///
-    /// # Arguments
-    /// * `leaf_file_path` - Path to the leaf manifest file
-    /// * `index` - Index of the entry to mark as deleted (0-based position in the manifest)
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` if the leaf manifest is not found, missing manifest_stats, index is out of bounds, or serialization fails
-    #[allow(dead_code)]
-    pub(crate) fn delete_from_leaf(&mut self, leaf_file_path: &str, index: u64) -> DeltaResult<()> {
-        use roaring::RoaringTreemap;
-        let mut indices = RoaringTreemap::new();
-        indices.insert(index);
-        self.delete_indices_from_leaf(leaf_file_path, &indices, true)
-    }
-
     /// Delete multiple entries from a leaf manifest by marking them as deleted via ManifestDV.
     ///
-    /// This is the bulk version of `delete_from_leaf` that accepts a Roaring bitmap of indices.
-    /// It's used by the transaction layer when processing manifest DVs from leaf writers.
+    /// Used by the transaction layer when processing manifest DVs from leaf writers.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
@@ -1177,7 +1110,6 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if the leaf manifest is not found, missing manifest_stats, any index is out of bounds, or serialization fails
-    #[allow(dead_code)]
     pub(crate) fn delete_multiple_from_leaf(
         &mut self,
         leaf_file_path: &str,
@@ -1189,15 +1121,13 @@ impl ContentTreeNodeBuilder {
 
     /// Core implementation for marking entries in a leaf manifest as deleted.
     ///
-    /// This is the shared logic used by both `delete_from_leaf` and `delete_multiple_from_leaf`.
-    /// It updates the manifest entry's DV fields to mark entries as deleted.
+    /// Updates the manifest entry's DV fields to mark entries as deleted.
     ///
     /// # Arguments
     /// * `leaf_file_path` - Path to the leaf manifest file
     /// * `indices` - Roaring bitmap containing indices to mark as deleted
     /// * `set_changes_dv` - If true, sets tracking_info.changes_dv to track this as an actual deletion.
     ///   If false (e.g., when moving entries between leaves), only updates manifest_dv.
-    #[allow(dead_code)]
     fn delete_indices_from_leaf(
         &mut self,
         leaf_file_path: &str,
@@ -1255,16 +1185,16 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
-    #[allow(dead_code)]
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNodeEntry> {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let (content_metadata_path, _) = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let (content_metadata_path, _) =
+            ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
@@ -1307,11 +1237,12 @@ impl ContentTreeNodeBuilder {
             }
         }
 
-        // Include pre-built batch aggregates (all entries are Added at self.version)
+        // Include pre-built batch aggregates
         for agg in &self.pre_built_aggregates {
             record_count += agg.total_record_count;
             file_size_in_bytes += agg.total_file_size;
-            added_files_count += agg.file_count;
+            added_files_count += agg.added_file_count;
+            existing_files_count += agg.existing_file_count;
             added_rows_count += agg.total_record_count;
             min_sequence_number = min_sequence_number.min(self.version as i64);
         }
@@ -1338,29 +1269,13 @@ impl ContentTreeNodeBuilder {
                 .map(|e| e.content_stats.as_ref()),
         );
 
-        // Determine content type based on what's in the manifest
-        // If all entries are PositionDeletes, this is a DeleteManifest
-        // Otherwise, it's a DataManifest
-        // Pre-built data is always Data type, so if we have any, it's a DataManifest
-        let content_type = if self.pre_built_data.is_empty()
-            && self
-                .pending_entries
-                .iter()
-                .all(|entry| entry.content_type == DataContentType::PositionDeletes)
-            && !self.pending_entries.is_empty()
-        {
-            DataContentType::DeleteManifest
-        } else {
-            DataContentType::DataManifest
-        };
-
         Ok(ContentTreeNodeEntry {
-            content_type,
+            content_type: DataContentType::CombinedManifest,
             location: Some(manifest_path),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
                 status: TrackingStatus::Added,
-                snapshot_id,
+                snapshot_id: Some(snapshot_id),
                 // TODO: Manifest entries in root should have sequence_number and file_sequence_number
                 // set to self.version so that leaf entries can inherit them when null.
                 sequence_number: None,
@@ -1370,9 +1285,7 @@ impl ContentTreeNodeBuilder {
                 changes_dv: None,
             }),
 
-            // Data files don't have inline content
-
-            // Content info from deletion vector (if present)
+            // DV info is inline on data entries inside the manifest, not on the manifest entry itself
             content_info: None,
 
             // TODO: Check how to set these based on uniform as a first iteration.
@@ -1388,9 +1301,6 @@ impl ContentTreeNodeBuilder {
 
             // Manifest statistics tracking entry counts by status
             manifest_stats,
-
-            // Path to file where to apply the DV to
-            referenced_file: None,
 
             // Manifest DVs stored inline on manifest entries
             manifest_dv: None,
@@ -1410,7 +1320,7 @@ impl ContentTreeNodeBuilder {
     pub(crate) fn build(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1460,29 +1370,11 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Writes the pending entries as a root manifest and returns the URL where it was written.
-    ///
-    /// This method builds a root ContentTreeNode (no UUID) and writes it to a parquet file.
-    /// The root manifest typically contains references to leaf manifests (DataManifest entries)
-    /// rather than individual data files.
-    ///
-    /// # Arguments
-    /// * `engine` - The engine to use for writing the parquet file
-    ///
-    /// # Returns
-    /// * `Ok(Url)` - The URL where the root manifest was written
-    /// * `Err` if there was an error building or writing the metadata
-    #[allow(dead_code)]
-    pub(crate) fn write_root(&mut self, engine: &dyn crate::Engine) -> DeltaResult<Url> {
-        let root_metadata = self.build(engine, None)?;
-        ContentTreeNodeWriter::try_new(root_metadata)?.write(engine).map(|(url, _)| url)
-    }
-
     /// Builds a leaf ContentTreeNode instance with a generated UUID.
     pub(crate) fn build_leaf(
         &mut self,
         engine: &dyn crate::Engine,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1538,7 +1430,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         engine: &dyn crate::Engine,
         leaf_uuid: uuid::Uuid,
-        snapshot_id: Option<i64>,
+        snapshot_id: i64,
     ) -> DeltaResult<ContentTreeNode> {
         use crate::content_tree::metadata_entry_to_scalars;
         use crate::expressions::Scalar;
@@ -1587,6 +1479,268 @@ impl ContentTreeNodeBuilder {
             leaf: Some(leaf_uuid),
         })
     }
+
+    /// Build and evaluate a scan-row transformation expression.
+    ///
+    /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
+    /// for all rows. `scan_row_input_schema` must include a `stats_parsed` field (Delta JSON format:
+    /// `{numRecords, minValues, maxValues, nullCount, tightBounds}`), which is converted to AMT
+    /// format for `content_stats` using [`build_content_stats_from_delta_stats_parsed`].
+    ///
+    /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
+    /// `add_from_existing_scan_rows`), `contentInfo` is projected from those columns with a
+    /// nullability predicate so non-DV rows produce a null struct. Otherwise `contentInfo` is null.
+    fn evaluate_scan_row_transform(
+        &self,
+        engine: &dyn Engine,
+        engine_data: &dyn EngineData,
+        scan_row_input_schema: &SchemaRef,
+        version: Version,
+        snapshot_id: i64,
+    ) -> DeltaResult<(Box<dyn EngineData>, BatchAggregates)> {
+        use crate::content_tree::stats;
+        use crate::content_tree::{DataContentType, TrackingStatus, CONTENT_STATS_FIELD_NAME};
+        use crate::expressions::{Expression, Predicate, Scalar};
+        use crate::schema::DataType;
+
+        let output_schema = self.get_schema()?;
+        let stats_struct = stats::stats_schema(&self.table_schema)?;
+        let version_i64 = version as i64;
+
+        // Detect whether flat decoded DV columns are present in the input schema.
+        let has_decoded_dv = scan_row_input_schema.field("_dv_location").is_some();
+
+        // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta format).
+        // record_count reads numRecords directly; content_stats converts Delta→AMT via expressions.
+        let record_count_expr = Expression::coalesce([
+            Expression::column(["stats_parsed", "numRecords"]),
+            Expression::literal(Scalar::Long(0)),
+        ]);
+        let content_stats_expr =
+            build_content_stats_from_delta_stats_parsed(&self.table_schema, &stats_struct)?;
+
+        // Build field expressions mapping scan_row input → ContentTreeNodeEntry output
+        let mut field_exprs: Vec<Arc<Expression>> = Vec::new();
+        for field in output_schema.fields() {
+            let expr: Expression = match field.name().as_str() {
+                "contentType" => Expression::literal(Scalar::Integer(DataContentType::Data as i32)),
+                "location" => Expression::column(["path"]),
+                "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
+                "trackingInfo" => {
+                    let tracking_struct = match field.data_type() {
+                        DataType::Struct(s) => s.as_ref().clone(),
+                        _ => {
+                            return Err(crate::Error::generic(
+                                "trackingInfo field should be a struct type",
+                            ))
+                        }
+                    };
+                    let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
+                    Expression::struct_from_with_schema(
+                        [
+                            Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                            snapshot_id_expr,
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::literal(Scalar::Long(version_i64)),
+                            Expression::null_literal(DataType::LONG), // firstRowId
+                            Expression::null_literal(DataType::BINARY), // changesDv
+                        ],
+                        tracking_struct,
+                    )
+                }
+                "contentInfo" => {
+                    if has_decoded_dv {
+                        // Flat decoded DV columns: project into contentInfo struct.
+                        // Nullability predicate: null struct for non-DV rows (_dv_location is null).
+                        let content_info_type = match field.data_type() {
+                            DataType::Struct(s) => s.as_ref().clone(),
+                            _ => {
+                                return Err(crate::Error::generic(
+                                    "contentInfo field should be a struct type",
+                                ))
+                            }
+                        };
+                        let nullability =
+                            Expression::from_pred(Predicate::is_not_null(Expression::column([
+                                "_dv_location",
+                            ])));
+                        Expression::struct_from_with_nullability(
+                            [
+                                Expression::column(["_dv_location"]),
+                                Expression::column(["_dv_offset"]),
+                                Expression::column(["_dv_size_in_bytes"]),
+                                Expression::column(["_dv_cardinality"]),
+                            ],
+                            content_info_type,
+                            nullability,
+                        )
+                    } else {
+                        Expression::null_literal(field.data_type().clone())
+                    }
+                }
+                "partitionSpecId" => Expression::literal(Scalar::Long(0)),
+                "sortOrderId" => Expression::null_literal(DataType::LONG),
+                "recordCount" => record_count_expr.clone(),
+                "fileSizeInBytes" => Expression::column(["size"]),
+                CONTENT_STATS_FIELD_NAME => content_stats_expr.clone(),
+                "manifestStats" => Expression::null_literal(field.data_type().clone()),
+                "referencedFile" => Expression::null_literal(DataType::STRING),
+                "manifestDv" => Expression::null_literal(DataType::BINARY),
+                _ => Expression::null_literal(field.data_type().clone()),
+            };
+            field_exprs.push(Arc::new(expr));
+        }
+
+        let transform_expr =
+            Expression::struct_from_with_schema(field_exprs, output_schema.as_ref().clone());
+
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            scan_row_input_schema.clone(),
+            Arc::new(transform_expr),
+            DataType::Struct(Box::new(output_schema.as_ref().clone())),
+        )?;
+        let transformed = evaluator.evaluate(engine_data)?;
+
+        // Compute aggregates from the transformed output
+        let mut agg_visitor = TransformedAggregateVisitor::default();
+        agg_visitor.visit_rows_of(transformed.as_ref())?;
+
+        let aggregates = BatchAggregates {
+            added_file_count: 0,
+            existing_file_count: engine_data.len() as i64,
+            total_record_count: agg_visitor.total_record_count,
+            total_file_size: agg_visitor.total_file_size,
+        };
+
+        Ok((transformed, aggregates))
+    }
+
+    /// Adds file metadata from existing scan rows to the leaf manifest.
+    ///
+    /// Unlike `add_from_engine_data_write` (for new files), this method handles rows from
+    /// a scan over an existing Delta table, writing them as `TrackingStatus::Existed` entries.
+    ///
+    /// The input data must include a `stats_parsed` column (added by `include_stats_columns()` in
+    /// the scan). All rows are processed via a single expression-evaluator path:
+    /// 1. DV columns are decoded (base85 UUID → relative path, sizes widened to LONG, +8 bytes
+    ///    for Iceberg framing) by `DecodedDvVisitor`.
+    /// 2. `stats_parsed` is resolved via `coalesce(stats_parsed, parse_json(stats, schema))`:
+    ///    prefers the already-parsed struct; falls back to parsing the raw JSON stats string.
+    /// 3. The final transform maps the augmented schema → ContentTreeNodeEntry output.
+    pub(crate) fn add_from_existing_scan_rows(
+        &mut self,
+        engine: &dyn Engine,
+        engine_data: &dyn EngineData,
+        selection_vector: &[bool],
+        version: Version,
+        snapshot_id: i64,
+    ) -> DeltaResult<()> {
+        use crate::expressions::{ArrayData, Expression};
+        use crate::schema::{ArrayType, StructField, StructType};
+
+        if engine_data.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1: Detect + decode DV columns in one pass from the original engine_data.
+        // (Done first so we can use the original data's nullable DV fields directly.)
+        let mut dv_visitor = DecodedDvVisitor::with_capacity(engine_data.len());
+        dv_visitor.visit_rows_of(engine_data)?;
+
+        // Step 2: Produce {path, size, stats_parsed} via coalesce(stats_parsed, parse_json(stats)).
+        // The input is always expected to have a `stats_parsed` column (added by
+        // `include_stats_columns()` in the scan). For rows sourced from JSON commits,
+        // `stats_parsed` will be null and the coalesce falls back to parsing the `stats` JSON.
+        // This mirrors the identical pattern in checkpoint/stats_transform.rs.
+        let delta_stats_schema = Arc::new(build_delta_stats_schema(&self.table_schema));
+        let stats_parsed_type = DataType::Struct(Box::new(delta_stats_schema.as_ref().clone()));
+        let step2_input_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable("stats_parsed", stats_parsed_type.clone()),
+        ]));
+        let stats_augmented_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("stats_parsed", stats_parsed_type),
+        ]));
+        let parse_stats_expr = Expression::struct_from_with_schema(
+            [
+                Expression::column(["path"]),
+                Expression::column(["size"]),
+                Expression::coalesce([
+                    Expression::column(["stats_parsed"]),
+                    Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
+                ]),
+            ],
+            stats_augmented_schema.as_ref().clone(),
+        );
+        let stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
+            step2_input_schema,
+            Arc::new(parse_stats_expr),
+            DataType::Struct(Box::new(stats_augmented_schema.as_ref().clone())),
+        )?;
+        let stats_engine_data = stats_evaluator.evaluate(engine_data)?;
+
+        // Step 3: Append 4 flat _dv_* columns if any DV rows are present; build input schema.
+        let (transformed_data, input_schema) = if dv_visitor.has_any_dv() {
+            let augmented = stats_engine_data.append_columns(
+                DV_DECODED_FLAT_SCHEMA.clone(),
+                vec![
+                    ArrayData::try_new(
+                        ArrayType::new(DataType::STRING, true),
+                        dv_visitor.decoded_paths,
+                    )?,
+                    ArrayData::try_new(
+                        ArrayType::new(DataType::LONG, true),
+                        dv_visitor.decoded_offsets,
+                    )?,
+                    ArrayData::try_new(
+                        ArrayType::new(DataType::LONG, true),
+                        dv_visitor.decoded_sizes,
+                    )?,
+                    ArrayData::try_new(
+                        ArrayType::new(DataType::LONG, true),
+                        dv_visitor.decoded_cardinalities,
+                    )?,
+                ],
+            )?;
+            let mut fields: Vec<StructField> = stats_augmented_schema.fields().cloned().collect();
+            fields.extend(DV_DECODED_FLAT_SCHEMA.fields().cloned());
+            let schema = Arc::new(StructType::new_unchecked(fields));
+            (augmented, schema)
+        } else {
+            (stats_engine_data, stats_augmented_schema)
+        };
+
+        // Step 4: Final transform → ContentTreeNodeEntry schema.
+        let (transformed, _) = self.evaluate_scan_row_transform(
+            engine,
+            transformed_data.as_ref(),
+            &input_schema,
+            version,
+            snapshot_id,
+        )?;
+
+        // Step 5: Apply selection vector, aggregate, and push.
+        let filtered = FilteredEngineData::try_new(transformed, selection_vector.to_vec())?
+            .apply_selection_vector()?;
+
+        let mut agg_visitor = TransformedAggregateVisitor::default();
+        agg_visitor.visit_rows_of(filtered.as_ref())?;
+
+        let aggregates = BatchAggregates {
+            added_file_count: 0,
+            existing_file_count: filtered.len() as i64,
+            total_record_count: agg_visitor.total_record_count,
+            total_file_size: agg_visitor.total_file_size,
+        };
+        self.pre_built_data.push(filtered);
+        self.pre_built_aggregates.push(aggregates);
+
+        Ok(())
+    }
 }
 
 /// Visitor that reads aggregate statistics from the transformed output.
@@ -1621,6 +1775,220 @@ impl RowVisitor for TransformedAggregateVisitor {
     }
 }
 
+/// Builds the Delta JSON stats schema for a given table schema.
+///
+/// The Delta JSON stats format is:
+/// ```json
+/// { "numRecords": 100, "minValues": {"col": val, ...}, "maxValues": {"col": val, ...},
+///   "nullCount": {"col": 0, ...}, "tightBounds": true }
+/// ```
+///
+/// This schema is used with `Expression::parse_json` to parse the `stats` JSON string
+/// from scan rows into a typed struct. Field names match the table schema's field names
+/// (physical names when column mapping is enabled).
+pub(crate) fn build_delta_stats_schema(
+    table_schema: &crate::schema::StructType,
+) -> crate::schema::StructType {
+    use crate::schema::{StructField, StructType};
+    let value_fields: Vec<StructField> = table_schema
+        .fields()
+        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+        .collect();
+    let null_count_fields: Vec<StructField> = table_schema
+        .fields()
+        .map(|f| StructField::nullable(f.name(), DataType::LONG))
+        .collect();
+    // Field order must match `expected_stats_schema` in scan/data_skipping/stats_schema/mod.rs,
+    // which is also the order written to parquet checkpoints/sidecars.
+    StructType::new_unchecked(vec![
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "nullCount",
+            DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
+        ),
+        StructField::nullable(
+            "minValues",
+            DataType::Struct(Box::new(StructType::new_unchecked(value_fields.clone()))),
+        ),
+        StructField::nullable(
+            "maxValues",
+            DataType::Struct(Box::new(StructType::new_unchecked(value_fields))),
+        ),
+        StructField::nullable("tightBounds", DataType::BOOLEAN),
+    ])
+}
+
+/// Builds a content_stats expression (AMT format) from a `stats_parsed` column in Delta format.
+///
+/// Converts `stats_parsed: {numRecords, minValues, maxValues, nullCount, tightBounds}` (Delta JSON
+/// format) to `content_stats: {col: {value_count, [null_value_count], lower_bound, upper_bound,
+/// exact_bounds}}` (AMT format) using struct expressions.
+///
+/// Column names used for field access come from `table_schema` field names (physical names when
+/// column mapping is enabled, which must match the JSON keys in the Delta stats).
+fn build_content_stats_from_delta_stats_parsed(
+    table_schema: &crate::schema::StructType,
+    amt_schema: &crate::schema::StructType,
+) -> DeltaResult<crate::expressions::Expression> {
+    use crate::expressions::{Expression, Scalar};
+    let col_exprs: Vec<Arc<Expression>> = table_schema
+        .fields()
+        .zip(amt_schema.fields())
+        .map(|(table_field, amt_field)| {
+            let col_name = table_field.name();
+            let col_stats_type = match amt_field.data_type() {
+                DataType::Struct(s) => s.as_ref().clone(),
+                _ => {
+                    return Err(crate::Error::generic(format!(
+                        "Expected AMT stats field '{}' to be a struct, got {:?}",
+                        col_name,
+                        amt_field.data_type()
+                    )))
+                }
+            };
+            let field_exprs: Vec<Arc<Expression>> = col_stats_type
+                .fields()
+                .map(|f| {
+                    Arc::new(match f.name().as_str() {
+                        "value_count" => Expression::column(["stats_parsed", "numRecords"]),
+                        crate::content_tree::NULL_COUNT_FIELD_NAME => {
+                            Expression::column(["stats_parsed", "nullCount", col_name.as_str()])
+                        }
+                        "nan_value_count" => Expression::null_literal(DataType::LONG),
+                        "avg_value_size" => Expression::null_literal(DataType::INTEGER),
+                        "max_value_size" => Expression::null_literal(DataType::INTEGER),
+                        "lower_bound" => {
+                            Expression::column(["stats_parsed", "minValues", col_name.as_str()])
+                        }
+                        "upper_bound" => {
+                            Expression::column(["stats_parsed", "maxValues", col_name.as_str()])
+                        }
+                        "exact_bounds" => Expression::coalesce([
+                            Expression::column(["stats_parsed", "tightBounds"]),
+                            Expression::literal(Scalar::Boolean(true)),
+                        ]),
+                        _ => Expression::null_literal(f.data_type().clone()),
+                    })
+                })
+                .collect();
+            Ok(Arc::new(Expression::struct_from_with_schema(
+                field_exprs,
+                col_stats_type,
+            )))
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(Expression::struct_from_with_schema(
+        col_exprs,
+        amt_schema.clone(),
+    ))
+}
+
+/// Schema for the 4 flat DV columns appended to scan-row data before the final transform.
+/// These columns carry decoded DV info (path decoded, sizes widened to LONG, +8 for Iceberg framing).
+static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    use crate::schema::{StructField, StructType};
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::nullable("_dv_location", DataType::STRING),
+        StructField::nullable("_dv_offset", DataType::LONG),
+        StructField::nullable("_dv_size_in_bytes", DataType::LONG),
+        StructField::nullable("_dv_cardinality", DataType::LONG),
+    ]))
+});
+
+/// Visits all scan-row rows in one pass, accumulating decoded DV columns.
+///
+/// For rows with a DV: decodes path (base85 UUID → relative path), widens offset/sizeInBytes
+/// to LONG, adds 8 to sizeInBytes (Delta → Iceberg framing), stores cardinality.
+/// For rows without a DV: pushes Null scalars for all 4 columns.
+struct DecodedDvVisitor {
+    decoded_paths: Vec<crate::expressions::Scalar>,
+    decoded_offsets: Vec<crate::expressions::Scalar>,
+    decoded_sizes: Vec<crate::expressions::Scalar>,
+    decoded_cardinalities: Vec<crate::expressions::Scalar>,
+}
+
+impl DecodedDvVisitor {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            decoded_paths: Vec::with_capacity(n),
+            decoded_offsets: Vec::with_capacity(n),
+            decoded_sizes: Vec::with_capacity(n),
+            decoded_cardinalities: Vec::with_capacity(n),
+        }
+    }
+
+    fn has_any_dv(&self) -> bool {
+        self.decoded_paths.iter().any(|s| !s.is_null())
+    }
+}
+
+impl RowVisitor for DecodedDvVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        use crate::schema::column_name;
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("deletionVector.storageType"),
+                column_name!("deletionVector.pathOrInlineDv"),
+                column_name!("deletionVector.offset"),
+                column_name!("deletionVector.sizeInBytes"),
+                column_name!("deletionVector.cardinality"),
+            ];
+            let types = vec![
+                DataType::STRING,
+                DataType::STRING,
+                DataType::INTEGER,
+                DataType::INTEGER,
+                DataType::LONG,
+            ];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        use crate::actions::deletion_vector::{
+            DeletionVectorDescriptor, DeletionVectorStorageType,
+        };
+        use crate::expressions::Scalar;
+
+        for i in 0..row_count {
+            let storage_type_opt: Option<String> =
+                getters[0].get_opt(i, "deletionVector.storageType")?;
+            if let Some(storage_type_str) = storage_type_opt {
+                let storage_type: DeletionVectorStorageType = storage_type_str.parse()?;
+                let path_or_inline_dv: String =
+                    getters[1].get(i, "deletionVector.pathOrInlineDv")?;
+                let offset: Option<i32> = getters[2].get_opt(i, "deletionVector.offset")?;
+                let size_in_bytes: i32 = getters[3].get(i, "deletionVector.sizeInBytes")?;
+                let cardinality: i64 = getters[4].get(i, "deletionVector.cardinality")?;
+
+                let dv = DeletionVectorDescriptor {
+                    storage_type,
+                    path_or_inline_dv,
+                    offset,
+                    size_in_bytes,
+                    cardinality,
+                };
+                let content_info = extract_deletion_vector_content(&dv)?;
+                self.decoded_paths
+                    .push(Scalar::String(content_info.location));
+                self.decoded_offsets.push(Scalar::Long(content_info.offset));
+                self.decoded_sizes
+                    .push(Scalar::Long(content_info.size_in_bytes));
+                self.decoded_cardinalities
+                    .push(Scalar::Long(content_info.cardinality));
+            } else {
+                self.decoded_paths.push(Scalar::Null(DataType::STRING));
+                self.decoded_offsets.push(Scalar::Null(DataType::LONG));
+                self.decoded_sizes.push(Scalar::Null(DataType::LONG));
+                self.decoded_cardinalities
+                    .push(Scalar::Null(DataType::LONG));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Visitor that extracts Add-like data from scan row schema.
 ///
 /// The scan row schema has a different structure than the log Add action schema:
@@ -1635,22 +2003,15 @@ impl RowVisitor for TransformedAggregateVisitor {
 #[derive(Default)]
 struct ScanRowToAddVisitor {
     pub adds: Vec<Add>,
+    /// Selection vector controlling which rows to process. Empty means all rows selected.
+    selection_vector: Vec<bool>,
+    /// Running row offset across multiple `visit()` calls (for multi-batch inputs).
+    row_offset: usize,
 }
 
 impl RowVisitor for ScanRowToAddVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         use crate::schema::{column_name, MapType};
-        // Scan row schema has these fields at top level or nested:
-        // - path (top level)
-        // - size (top level)
-        // - modificationTime (top level)
-        // - stats (top level, string)
-        // - deletionVector (top level, struct with 5 fields)
-        // - fileConstantValues.partitionValues (nested)
-        // - fileConstantValues.dataManifestPath (nested)
-        // - fileConstantValues.dataManifestPosition (nested)
-        // - fileConstantValues.deleteManifestPath (nested)
-        // - fileConstantValues.deleteManifestPosition (nested)
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let names = vec![
                 column_name!("path"),
@@ -1699,12 +2060,16 @@ impl RowVisitor for ScanRowToAddVisitor {
         };
 
         for i in 0..row_count {
+            let global_i = self.row_offset + i;
+            if global_i < self.selection_vector.len() && !self.selection_vector[global_i] {
+                continue;
+            }
+
             if let Some(path) = getters[0].get_opt(i, "scanRow.path")? {
                 let size: i64 = getters[1].get(i, "scanRow.size")?;
                 let modification_time: i64 = getters[2].get(i, "scanRow.modificationTime")?;
                 let stats: Option<String> = getters[3].get_opt(i, "scanRow.stats")?;
 
-                // Extract deletion vector if present
                 let storage_type_str_opt: Option<String> =
                     getters[4].get_opt(i, "scanRow.deletionVector.storageType")?;
                 let deletion_vector = if let Some(storage_type_str) = storage_type_str_opt {
@@ -1733,7 +2098,6 @@ impl RowVisitor for ScanRowToAddVisitor {
                     .get_opt(i, "scanRow.fileConstantValues.partitionValues")?
                     .unwrap_or_default();
 
-                // Extract manifest location fields
                 let data_manifest_path: Option<String> =
                     getters[10].get_opt(i, "scanRow.fileConstantValues.dataManifestPath")?;
                 let data_manifest_position: Option<i64> =
@@ -1748,7 +2112,7 @@ impl RowVisitor for ScanRowToAddVisitor {
                     partition_values,
                     size,
                     modification_time,
-                    data_change: true, // will be overridden by transaction
+                    data_change: true,
                     stats,
                     tags: None,
                     deletion_vector,
@@ -1763,6 +2127,7 @@ impl RowVisitor for ScanRowToAddVisitor {
                 self.adds.push(add);
             }
         }
+        self.row_offset += row_count;
         Ok(())
     }
 }
@@ -1771,7 +2136,22 @@ impl RowVisitor for ScanRowToAddVisitor {
 mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::content_tree::ContentTreeNode;
     use serde_json::json;
+
+    /// Helper: builds a root manifest, writes it to disk, and reads it back.
+    fn build_and_read_root(
+        builder: &mut ContentTreeNodeBuilder,
+        engine: &dyn crate::Engine,
+        snapshot_id: i64,
+    ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
+        let root_metadata = builder.build(engine, snapshot_id)?;
+        let table_root = root_metadata.table_root.clone();
+        let (root_url, _) = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
+        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
+        let root = ContentTreeNode::read(engine, &root_url, root_path, table_root)?;
+        root.entries()
+    }
 
     // TODO: Add tests for all tracking_info columns (status, snapshot_id, sequence_number,
     // file_sequence_number, first_row_id, changes_dv) to verify they are correctly set during
@@ -1930,122 +2310,50 @@ mod tests {
     }
 
     #[test]
-    fn test_add_from_engine_data() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create test data with Add actions
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        // Create builder and add from engine data
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
-
-        // Build metadata and verify
-        let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
-        let entries = metadata.entries()?;
-        assert_eq!(entries.len(), 2);
-
-        // Verify first entry
-        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
-        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
-
-        // Verify second entry
-        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
-        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_from_engine_data_iter() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create multiple batches of test data with Add actions
-        let json_strings1: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":null}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch1 = parse_json_batch(json_strings1);
-
-        let json_strings2: StringArray = vec![
-            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch2 = parse_json_batch(json_strings2);
-
-        // Create iterator of engine data results
-        let batches: Vec<Result<Box<dyn crate::EngineData>, crate::Error>> =
-            vec![Ok(batch1), Ok(batch2)];
-
-        // Create builder and add from engine data iterator
-        let table_root = Url::parse("s3://my-bucket/my-table/")?;
-        let mut builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_iter(batches.into_iter(), 1, None)?;
-
-        // Build metadata and verify
-        let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
-        let entries = metadata.entries()?;
-        assert_eq!(entries.len(), 3);
-
-        // Verify entries (now relative paths)
-        assert_eq!(entries[0].location, Some("part-00000.parquet".to_string()));
-        assert_eq!(entries[0].file_size_in_bytes, Some(1024));
-
-        assert_eq!(entries[1].location, Some("part-00001.parquet".to_string()));
-        assert_eq!(entries[1].file_size_in_bytes, Some(2048));
-
-        assert_eq!(entries[2].location, Some("part-00002.parquet".to_string()));
-        assert_eq!(entries[2].file_size_in_bytes, Some(3072));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_record_count_from_stats() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::StringArray;
-        use crate::utils::test_utils::parse_json_batch;
-
-        // Create test data with Add actions that have stats with numRecords
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true,"stats":"{\"numRecords\":100}"}}"#,
-            r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":2048,"modificationTime":1587968587000,"dataChange":true,"stats":"{\"numRecords\":250}"}}"#,
-            r#"{"add":{"path":"part-00002.parquet","partitionValues":{},"size":3072,"modificationTime":1587968588000,"dataChange":true,"stats":null}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        // Create builder and add from engine data
+        // Create builder and add entries with specific record counts
         let table_root = Url::parse("s3://my-bucket/my-table/")?;
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        builder.add_from_engine_data_add(batch.as_ref(), 1, None)?;
 
-        // Build metadata and verify record counts
+        for (path, record_count) in [
+            ("part-00000.parquet", 100i64),
+            ("part-00001.parquet", 250i64),
+            ("part-00002.parquet", 0i64),
+        ] {
+            builder.add_entry(ContentTreeNodeEntry {
+                content_type: DataContentType::Data,
+                location: Some(path.to_string()),
+                file_format: DataFileFormat::Parquet,
+                tracking_info: Some(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    first_row_id: None,
+                    changes_dv: None,
+                }),
+                content_info: None,
+                partition_spec_id: 0,
+                sort_order_id: None,
+                record_count,
+                file_size_in_bytes: Some(1024),
+                content_stats: None,
+                manifest_stats: None,
+                manifest_dv: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+            });
+        }
+
+        // Build metadata and verify record counts are preserved through roundtrip
         let engine = crate::engine::sync::SyncEngine::new();
-        let metadata = builder.build(&engine, None)?;
+        let metadata = builder.build(&engine, 1)?;
         let entries = metadata.entries()?;
         assert_eq!(entries.len(), 3);
-
-        // Verify first entry has record_count from stats
         assert_eq!(entries[0].record_count, 100);
-
-        // Verify second entry has record_count from stats
         assert_eq!(entries[1].record_count, 250);
-
-        // Verify third entry has record_count of 0 when stats is null
         assert_eq!(entries[2].record_count, 0);
 
         Ok(())
@@ -2115,7 +2423,7 @@ mod tests {
             delete_manifest_position: None,
         };
 
-        builder.add(add, 1, None)?;
+        builder.add(add, 1, 1)?;
 
         // Verify content_stats is populated by directly checking the conversion function
         // (The builder uses this function internally)
@@ -2217,7 +2525,7 @@ mod tests {
             delete_manifest_position: None,
         };
 
-        builder.add(add, 1, None)?;
+        builder.add(add, 1, 1)?;
 
         // Verify the builder has the entry
         assert_eq!(builder.pending_entries.len(), 1);
@@ -2292,7 +2600,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: content_stats_1,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2322,7 +2629,6 @@ mod tests {
             file_size_in_bytes: Some(2048),
             content_stats: content_stats_2,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2333,7 +2639,7 @@ mod tests {
         builder.add_entry(entry2);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
 
         // Verify content_stats is populated on the leaf manifest entry
         assert!(
@@ -2439,7 +2745,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None, // No stats
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -2449,7 +2754,7 @@ mod tests {
         builder.add_entry(entry);
 
         // Write the leaf manifest
-        let leaf_manifest_entry = builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = builder.write_leaf(&engine, 1)?;
 
         // When all entries have None content_stats, the aggregate should also be None
         assert!(
@@ -2477,17 +2782,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path
         assert_eq!(
-            location,
+            content_info.location,
             "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
-        // Should have content_info with offset and size (+8 for size field and CRC)
+        // Should have offset and size (+8 for size field and CRC)
         assert_eq!(content_info.offset, 4);
         assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(content_info.cardinality, 6);
 
         Ok(())
     }
@@ -2507,17 +2813,18 @@ mod tests {
             cardinality: 2,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path (no prefix directory)
         assert_eq!(
-            location,
+            content_info.location,
             "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
-        // Should have content_info with offset and size (+8 for size field and CRC)
+        // Should have offset and size (+8 for size field and CRC)
         assert_eq!(content_info.offset, 1);
         assert_eq!(content_info.size_in_bytes, 44); // 36 + 8
+        assert_eq!(content_info.cardinality, 2);
 
         Ok(())
     }
@@ -2536,17 +2843,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let (content_info, location) = extract_deletion_vector_content(&dv)?;
+        let content_info = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
-            location,
+            content_info.location,
             "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
-        // Should have content_info with offset and size (+8)
+        // Should have offset and size (+8)
         assert_eq!(content_info.offset, 4);
         assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(content_info.cardinality, 6);
 
         Ok(())
     }
@@ -2588,148 +2896,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid length"));
-    }
-
-    #[test]
-    fn test_write_root_with_leaf() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::content_tree::{ContentTreeNode, DataContentType};
-        use crate::engine::sync::SyncEngine;
-        use tempfile::tempdir;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir()?;
-        let table_root = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Step 1: Create a leaf builder with data file entries
-        let mut leaf_builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-
-        // Add some data file entries to the leaf
-        let data_entry_1 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00000.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        let data_entry_2 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00001.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 200,
-            file_size_in_bytes: Some(2048),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-
-        leaf_builder.add_entry(data_entry_1);
-        leaf_builder.add_entry(data_entry_2);
-
-        // Step 2: Write the leaf manifest and get a ContentTreeNodeEntry (DataManifest) back
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
-
-        // Verify the leaf manifest entry
-        assert_eq!(
-            leaf_manifest_entry.content_type,
-            DataContentType::DataManifest
-        );
-        assert!(leaf_manifest_entry.location.is_some());
-        let leaf_location = leaf_manifest_entry.location.as_ref().unwrap();
-        // Leaf should have UUID in filename: <version>.content.<uuid>.parquet
-        assert!(leaf_location.contains(".content."));
-        assert!(leaf_location.ends_with(".parquet"));
-        // Count the dots to verify UUID is present (should have 3 dots: version.content.uuid.parquet)
-        let dots_count = leaf_location.matches('.').count();
-        assert!(
-            dots_count >= 3,
-            "Leaf filename should contain UUID: {}",
-            leaf_location
-        );
-        // Verify aggregate stats
-        assert_eq!(leaf_manifest_entry.record_count, 300); // 100 + 200
-        assert_eq!(leaf_manifest_entry.file_size_in_bytes, Some(3072)); // 1024 + 2048
-
-        // Step 3: Create a root builder and add the leaf manifest entry
-        let mut root_builder =
-            ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
-        root_builder.add_entry(leaf_manifest_entry.clone());
-
-        // Step 4: Write the root manifest
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Verify the root was written
-        // Root should NOT have UUID in filename: <version>.content.parquet
-        let root_path = root_url.path();
-        assert!(root_path.contains(".content.parquet"));
-        // Root filename should only have 2 dots: version.content.parquet
-        let root_filename = root_path.rsplit('/').next().unwrap();
-        let root_dots_count = root_filename.matches('.').count();
-        assert_eq!(
-            root_dots_count, 2,
-            "Root filename should NOT contain UUID: {}",
-            root_filename
-        );
-
-        // Step 5: Read back the root and verify
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let read_root =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = read_root.entries()?;
-        assert_eq!(root_entries.len(), 1);
-        assert_eq!(root_entries[0].content_type, DataContentType::DataManifest);
-        assert_eq!(root_entries[0].location, leaf_manifest_entry.location);
-
-        // Step 6: Read back the leaf and verify
-        let leaf_relative_path = leaf_manifest_entry.location.as_ref().unwrap();
-        let leaf_url = table_root.join(leaf_relative_path)?;
-        let read_leaf = ContentTreeNode::read(
-            &engine,
-            &leaf_url,
-            leaf_relative_path.clone(),
-            table_root.clone(),
-        )?;
-        let leaf_entries = read_leaf.entries()?;
-        assert_eq!(leaf_entries.len(), 2);
-        assert_eq!(leaf_entries[0].content_type, DataContentType::Data);
-        assert_eq!(leaf_entries[1].content_type, DataContentType::Data);
-
-        Ok(())
     }
 
     /// Test helper: Applies a manifest deletion vector to filter entries from a manifest.
@@ -2797,7 +2963,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -2807,7 +2972,7 @@ mod tests {
         }
 
         // Write the leaf
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create a root with the leaf, then delete entry at index 5
@@ -2815,25 +2980,20 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
+        let mut indices = RoaringTreemap::new();
+        indices.insert(5u64);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
-        // Step 3: Write the root
-        let root_url = root_builder.write_root(&engine)?;
+        // Step 3: Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
-        // Step 4: Read back the root and verify manifest DV is stored inline
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = root_metadata.entries()?;
-
-        // Should have: 1 DataManifest (DV is now inline on this entry)
+        // Should have: 1 CombinedManifest (DV is now inline on this entry)
         assert_eq!(root_entries.len(), 1);
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
 
@@ -2850,7 +3010,7 @@ mod tests {
         assert!(treemap.contains(5));
         assert_eq!(treemap.len(), 1);
 
-        // Step 5: Read the leaf and apply manifest DV to verify filtering
+        // Step 4: Read the leaf and apply manifest DV to verify filtering
         let leaf_url = table_root.join(&leaf_path)?;
         let leaf_metadata =
             ContentTreeNode::read(&engine, &leaf_url, leaf_path.clone(), table_root.clone())?;
@@ -2897,7 +3057,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -2906,7 +3065,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete multiple entries
@@ -2914,23 +3073,17 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
-        root_builder.delete_from_leaf(&leaf_path, 7)?;
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        let mut indices = RoaringTreemap::new();
+        indices.extend([2u64, 5, 7]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root.clone())?;
-        let root_entries = root_metadata.entries()?;
-        assert_eq!(root_entries.len(), 1); // DataManifest (DV is inline)
+        // Build, write, and read back the root to verify
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
+        assert_eq!(root_entries.len(), 1); // CombinedManifest (DV is inline)
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
             .unwrap();
 
         // Verify all deleted indices in manifest_dv field
@@ -2955,6 +3108,7 @@ mod tests {
     #[test]
     fn test_delete_from_leaf_all_entries_marks_deleted() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -2984,7 +3138,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -2993,7 +3146,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Create root and delete all 3 entries
@@ -3001,24 +3154,18 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        root_builder.delete_from_leaf(&leaf_path, 0)?;
-        root_builder.delete_from_leaf(&leaf_path, 1)?;
-        // The third deletion should automatically mark the manifest as deleted
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        // Deleting all entries should automatically mark the manifest as deleted
+        let mut indices = RoaringTreemap::new();
+        indices.extend([0u64, 1, 2]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify the manifest is marked as deleted
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::DataManifest
+                e.content_type == DataContentType::CombinedManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3034,6 +3181,7 @@ mod tests {
     #[test]
     fn test_delete_from_leaf_index_out_of_bounds() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3063,7 +3211,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -3072,7 +3219,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Try to delete index 10 (out of bounds, valid indices are 0-9 for 10 entries)
@@ -3080,7 +3227,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
 
-        let result = root_builder.delete_from_leaf(&leaf_path, 10);
+        let mut indices = RoaringTreemap::new();
+        indices.insert(10u64);
+        let result = root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of bounds"));
 
@@ -3089,6 +3238,7 @@ mod tests {
 
     #[test]
     fn test_delete_from_leaf_nonexistent_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        use roaring::RoaringTreemap;
         use tempfile::tempdir;
 
         let temp_dir = tempdir()?;
@@ -3098,7 +3248,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Try to delete from a non-existent leaf
-        let result = root_builder.delete_from_leaf("nonexistent.parquet", 5);
+        let mut indices = RoaringTreemap::new();
+        indices.insert(5u64);
+        let result = root_builder.delete_multiple_from_leaf("nonexistent.parquet", &indices, true);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -3144,7 +3296,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -3153,7 +3304,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
         // leaf_path is now already relative
         let relative_path = &leaf_path;
@@ -3162,20 +3313,16 @@ mod tests {
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry);
-        root_builder.delete_from_leaf(relative_path, 3)?;
+        let mut indices = RoaringTreemap::new();
+        indices.insert(3u64);
+        root_builder.delete_multiple_from_leaf(relative_path, &indices, true)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify manifest DV is stored inline
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify manifest DV is stored inline
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let data_manifest = root_entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
             .unwrap();
 
         assert_eq!(data_manifest.location.as_ref(), Some(&leaf_path));
@@ -3210,7 +3357,7 @@ mod tests {
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
         let manifest_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::DataManifest,
+            content_type: DataContentType::CombinedManifest,
             location: Some("leaf-manifest.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: Some(TrackingInfo {
@@ -3236,7 +3383,6 @@ mod tests {
                 delete_rows_count: 200,
                 min_sequence_number: 1,
             }),
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3249,23 +3395,17 @@ mod tests {
         // Delete all 3 active entries (indices 0, 1, 2)
         // With the OLD logic: cardinality (3) != total_entry_count (5), so manifest would NOT be marked deleted
         // With the NEW logic: cardinality (3) == active_entry_count (3), so manifest IS marked deleted
-        root_builder.delete_from_leaf(&leaf_path, 0)?;
-        root_builder.delete_from_leaf(&leaf_path, 1)?;
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
+        let mut indices = RoaringTreemap::new();
+        indices.extend([0u64, 1, 2]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices, true)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Read back and verify the manifest is marked as deleted
-        let root_path_in_log =
-            crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path_in_log, table_root)?;
-        let root_entries = root_metadata.entries()?;
+        // Build, write, and read back the root to verify the manifest is marked as deleted
+        let root_entries = build_and_read_root(&mut root_builder, &engine, 1)?;
 
         let leaf_manifest = root_entries
             .iter()
             .find(|e| {
-                e.content_type == DataContentType::DataManifest
+                e.content_type == DataContentType::CombinedManifest
                     && e.location.as_ref() == Some(&leaf_path)
             })
             .expect("Leaf manifest should exist");
@@ -3329,7 +3469,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -3338,28 +3477,23 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and delete entries 2 and 5 (first commit)
         let mut root_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         root_builder.add_entry(leaf_manifest_entry.clone());
-        root_builder.delete_from_leaf(&leaf_path, 2)?;
-        root_builder.delete_from_leaf(&leaf_path, 5)?;
+        let mut indices_v1 = RoaringTreemap::new();
+        indices_v1.extend([2u64, 5]);
+        root_builder.delete_multiple_from_leaf(&leaf_path, &indices_v1, true)?;
 
-        let root_url_v1 = root_builder.write_root(&engine)?;
-
-        // Step 3: Read back and verify changes_dv from first commit
-        let root_path_v1 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v1, &table_root)?;
-        let root_metadata_v1 =
-            ContentTreeNode::read(&engine, &root_url_v1, root_path_v1, table_root.clone())?;
-        let entries_v1 = root_metadata_v1.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv from first commit
+        let entries_v1 = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest_v1 = entries_v1
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains both deletions (2 and 5)
         let manifest_dv_v1 = manifest_v1
@@ -3393,21 +3527,16 @@ mod tests {
         }
 
         // Step 5: Add new deletions (entries 3 and 7) in the second commit
-        root_builder_v2.delete_from_leaf(&leaf_path, 3)?;
-        root_builder_v2.delete_from_leaf(&leaf_path, 7)?;
+        let mut indices_v2 = RoaringTreemap::new();
+        indices_v2.extend([3u64, 7]);
+        root_builder_v2.delete_multiple_from_leaf(&leaf_path, &indices_v2, true)?;
 
-        let root_url_v2 = root_builder_v2.write_root(&engine)?;
-
-        // Step 7: Read back and verify changes_dv only contains NEW deletions
-        let root_path_v2 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v2, &table_root)?;
-        let root_metadata_v2 =
-            ContentTreeNode::read(&engine, &root_url_v2, root_path_v2, table_root.clone())?;
-        let entries_v2 = root_metadata_v2.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletions
+        let entries_v2 = build_and_read_root(&mut root_builder_v2, &engine, 2)?;
         let manifest_v2 = entries_v2
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7)
         let manifest_dv_v2 = manifest_v2
@@ -3455,20 +3584,16 @@ mod tests {
         }
 
         // Step 9: Delete one additional record (entry 8) in the third commit
-        root_builder_v3.delete_from_leaf(&leaf_path, 8)?;
+        let mut indices_v3 = RoaringTreemap::new();
+        indices_v3.insert(8u64);
+        root_builder_v3.delete_multiple_from_leaf(&leaf_path, &indices_v3, true)?;
 
-        let root_url_v3 = root_builder_v3.write_root(&engine)?;
-
-        // Step 10: Read back and verify changes_dv only contains NEW deletion
-        let root_path_v3 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v3, &table_root)?;
-        let root_metadata_v3 =
-            ContentTreeNode::read(&engine, &root_url_v3, root_path_v3, table_root.clone())?;
-        let entries_v3 = root_metadata_v3.entries()?;
+        // Build, write, and read back the root to verify changes_dv only contains NEW deletion
+        let entries_v3 = build_and_read_root(&mut root_builder_v3, &engine, 3)?;
         let manifest_v3 = entries_v3
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains ALL deletions (2, 3, 5, 7, 8)
         let manifest_dv_v3 = manifest_v3
@@ -3543,7 +3668,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3551,18 +3675,12 @@ mod tests {
         };
         root_builder_v4.add_entry(new_data_entry);
 
-        let root_url_v4 = root_builder_v4.write_root(&engine)?;
-
-        // Step 13: Read back and verify changes_dv is None (no deletions)
-        let root_path_v4 =
-            crate::content_tree::absolute_to_relative_path(&root_url_v4, &table_root)?;
-        let root_metadata_v4 =
-            ContentTreeNode::read(&engine, &root_url_v4, root_path_v4, table_root.clone())?;
-        let entries_v4 = root_metadata_v4.entries()?;
+        // Build, write, and read back the root to verify changes_dv is None (no deletions)
+        let entries_v4 = build_and_read_root(&mut root_builder_v4, &engine, 4)?;
         let manifest_v4 = entries_v4
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv still contains all previous deletions (2, 3, 5, 7, 8)
         let manifest_dv_v4 = manifest_v4
@@ -3624,7 +3742,6 @@ mod tests {
                 file_size_in_bytes: Some(1024),
                 content_stats: None,
                 manifest_stats: None,
-                referenced_file: None,
                 manifest_dv: None,
                 key_metadata: None,
                 split_offsets: None,
@@ -3633,7 +3750,7 @@ mod tests {
             leaf_builder.add_entry(data_entry);
         }
 
-        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, Some(1))?;
+        let leaf_manifest_entry = leaf_builder.write_leaf(&engine, 1)?;
         let leaf_path = leaf_manifest_entry.location.as_ref().unwrap().clone();
 
         // Step 2: Create root and simulate leaf reorganization by calling delete_multiple_from_leaf
@@ -3649,17 +3766,12 @@ mod tests {
         // Call delete_multiple_from_leaf with set_changes_dv=false to simulate leaf reorganization
         root_builder.delete_multiple_from_leaf(&leaf_path, &indices, false)?;
 
-        let root_url = root_builder.write_root(&engine)?;
-
-        // Step 3: Read back and verify changes_dv is NOT set for leaf reorganization
-        let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
-        let root_metadata =
-            ContentTreeNode::read(&engine, &root_url, root_path, table_root.clone())?;
-        let entries = root_metadata.entries()?;
+        // Step 3: Build, write, and read back the root to verify changes_dv is NOT set for leaf reorganization
+        let entries = build_and_read_root(&mut root_builder, &engine, 1)?;
         let manifest = entries
             .iter()
-            .find(|e| matches!(e.content_type, DataContentType::DataManifest))
-            .expect("DataManifest should exist");
+            .find(|e| matches!(e.content_type, DataContentType::CombinedManifest))
+            .expect("CombinedManifest should exist");
 
         // Verify manifest_dv contains the deletions (for internal tracking)
         let manifest_dv = manifest
@@ -3711,7 +3823,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3729,7 +3840,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3747,7 +3857,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3797,9 +3906,9 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Add DV entry
-        let dv_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
+        // Add a Data entry with inline DV info
+        let data_entry_with_dv = ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
             location: Some("dv1.bin".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
@@ -3810,7 +3919,6 @@ mod tests {
             file_size_in_bytes: Some(128),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: Some("data1.parquet".to_string()),
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
@@ -3828,19 +3936,18 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         };
 
-        builder.add_entry(dv_entry);
+        builder.add_entry(data_entry_with_dv);
         builder.add_entry(data_entry);
 
         assert_eq!(builder.pending_entries.len(), 2);
 
-        // Remove by DV path
+        // Remove by location path
         builder.remove_dv("dv1.bin")?;
 
         // Should have 1 entry remaining (the data entry)
@@ -3854,7 +3961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_entries_by_referenced_file() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_remove_data_file_keeps_other_entries() -> Result<(), Box<dyn std::error::Error>> {
         use tempfile::tempdir;
 
         let temp_dir = tempdir()?;
@@ -3866,55 +3973,61 @@ mod tests {
         let mut builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
-        // Add DV entry that references a data file
-        let dv_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
-            location: Some("dv1.bin".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 10,
-            file_size_in_bytes: Some(128),
-            content_stats: None,
-            manifest_stats: None,
-            referenced_file: Some("data1.parquet".to_string()),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let data_entry = ContentTreeNodeEntry {
+        // Add two data entries; data1 has inline DV info, data2 doesn't
+        let data_entry1 = ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: Some("data1.parquet".to_string()),
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            content_info: Some(ContentInfo {
+                location: "dv1.bin".to_string(),
+                offset: 0,
+                size_in_bytes: 48,
+                cardinality: 6,
+            }),
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 100,
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
+            manifest_dv: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        };
+        let data_entry2 = ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
+            location: Some("data2.parquet".to_string()),
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            content_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 50,
+            file_size_in_bytes: Some(512),
+            content_stats: None,
+            manifest_stats: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,
             equality_ids: None,
         };
 
-        builder.add_entry(dv_entry);
-        builder.add_entry(data_entry);
+        builder.add_entry(data_entry1);
+        builder.add_entry(data_entry2);
 
         assert_eq!(builder.pending_entries.len(), 2);
 
-        // Remove by data file path - should remove both the DV (which references it) and the data file itself
-        builder.remove_dv("data1.parquet")?; // Removes DV entry with referenced_file = data1.parquet
-        builder.remove_data_file("data1.parquet")?; // Removes data file entry
+        // Remove only the first data file (also removes its inline DV)
+        builder.remove_data_file("data1.parquet")?;
 
-        // Should have 0 entries remaining
-        assert_eq!(builder.pending_entries.len(), 0);
+        // Should have 1 entry remaining (data2 without DV)
+        assert_eq!(builder.pending_entries.len(), 1);
+        assert_eq!(
+            builder.pending_entries[0].location.as_deref(),
+            Some("data2.parquet")
+        );
 
         Ok(())
     }
@@ -3942,7 +4055,6 @@ mod tests {
             file_size_in_bytes: Some(1024),
             content_stats: None,
             manifest_stats: None,
-            referenced_file: None,
             manifest_dv: None,
             key_metadata: None,
             split_offsets: None,

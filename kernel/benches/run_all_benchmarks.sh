@@ -17,6 +17,7 @@ UC_ENDPOINT="https://e2-dogfood.staging.cloud.databricks.com"
 UC_TOKEN=""
 TABLE_PREFIX=""
 CLEAN_BEFORE_BACKFILL=false
+FLAMEGRAPH_MODE=false
 
 # Parse command line arguments
 usage() {
@@ -31,6 +32,8 @@ OPTIONS (for Unity Catalog mode):
                                    (default: https://e2-dogfood.staging.cloud.databricks.com)
     --uc-token TOKEN               Unity Catalog access token
     --clean-before-backfill        Regenerate UC tables before running benchmarks
+    --flamegraph                   Generate a flamegraph SVG for each benchmark scenario
+                                   (requires cargo-flamegraph; uses --no-inline and debuginfo)
     -h, --help                     Show this help message
 
 ARGUMENTS:
@@ -74,6 +77,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clean-before-backfill)
             CLEAN_BEFORE_BACKFILL=true
+            shift
+            ;;
+        --flamegraph)
+            FLAMEGRAPH_MODE=true
             shift
             ;;
         -h|--help)
@@ -166,8 +173,12 @@ FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
 
 # Build benchmark-runner once
 echo -e "${BLUE}Building benchmark-runner...${NC}"
-cd "${REPO_ROOT}"
-if ! AWS_LC_SYS_CMAKE_BUILDER=1 cargo build --release --bin benchmark-runner --features "${FEATURES}"; then
+cd "${KERNEL_DIR}"
+BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1"
+if [ "$FLAMEGRAPH_MODE" = true ]; then
+    BUILD_ENV="AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true"
+fi
+if ! eval "${BUILD_ENV} cargo build --release --bin benchmark-runner --features \"${FEATURES}\""; then
     echo -e "${RED}Failed to build benchmark-runner${NC}"
     exit 1
 fi
@@ -250,6 +261,34 @@ echo "  \"results\": {" >> "${SUMMARY_FILE}"
 
 FIRST_DATASET=true
 
+# Helper: run benchmark-runner, optionally wrapped in cargo flamegraph
+_run_benchmark_cmd() {
+    local output_file=$1
+    local svg_file=$2
+    shift 2
+    # remaining args are passed directly to benchmark-runner
+
+    if [ "$FLAMEGRAPH_MODE" = true ]; then
+        # Resolve to absolute paths before cd-ing to KERNEL_DIR
+        [[ "$output_file" = /* ]] || output_file="$(pwd)/${output_file}"
+        [[ "$svg_file"    = /* ]] || svg_file="$(pwd)/${svg_file}"
+        mkdir -p "$(dirname "${svg_file}")"
+        local flamegraph_args=(
+            --bin benchmark-runner
+            --features "${FEATURES}"
+            --no-inline
+            -o "${svg_file}"
+            --
+        )
+        # stdout (benchmark JSON) → output_file; stderr (cargo/perf/flamegraph messages) → .log
+        (cd "${KERNEL_DIR}" && AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true \
+            cargo flamegraph "${flamegraph_args[@]}" "$@") \
+            > "${output_file}" 2>"${svg_file%.svg}.log"
+    else
+        ${BENCHMARK_RUNNER} "$@" > "${output_file}" 2>&1
+    fi
+}
+
 # Function to run a benchmark and save results
 run_benchmark() {
     local dataset=$1
@@ -257,6 +296,7 @@ run_benchmark() {
     local args=$3
     local phase=$4
     local output_file=$5
+    local svg_file="${output_file%.json}.svg"
 
     if [ "$UC_MODE" = true ]; then
         local table_path="${TABLE_PREFIX}.${dataset}"
@@ -267,7 +307,8 @@ run_benchmark() {
     echo -e "${GREEN}  Running: ${scenario} ${args}${NC}"
 
     if [ "$UC_MODE" = true ]; then
-        if ${BENCHMARK_RUNNER} -t "${table_path}" --uc-endpoint "${UC_ENDPOINT}" --uc-token "${UC_TOKEN}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+        if _run_benchmark_cmd "${output_file}" "${svg_file}" \
+            -t "${table_path}" --uc-endpoint "${UC_ENDPOINT}" --uc-token "${UC_TOKEN}" -o json ${scenario} ${args}; then
             echo -e "    ${GREEN}✓ Success${NC}"
             return 0
         else
@@ -276,7 +317,8 @@ run_benchmark() {
             return 1
         fi
     else
-        if ${BENCHMARK_RUNNER} -t "${table_path}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+        if _run_benchmark_cmd "${output_file}" "${svg_file}" \
+            -t "${table_path}" -o json ${scenario} ${args}; then
             echo -e "    ${GREEN}✓ Success${NC}"
             return 0
         else
@@ -298,6 +340,8 @@ run_dml_scenario() {
     # Create a temp directory for this scenario
     local temp_dataset="/tmp/benchmark_temp_${dataset}_$$"
 
+    local svg_file="${output_file%.json}.svg"
+
     echo -e "${GREEN}  Running: ${scenario} ${args}${NC}"
     echo -e "    ${BLUE}Creating clean copy...${NC}"
 
@@ -306,12 +350,15 @@ run_dml_scenario() {
 
     # Run the DML operation on the temp copy
     local table_path="${temp_dataset}"
-    if ${BENCHMARK_RUNNER} -t "${table_path}" -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+    if _run_benchmark_cmd "${output_file}" "${svg_file}" \
+        -t "${table_path}" -o json ${scenario} ${args}; then
         echo -e "    ${GREEN}✓ DML operation succeeded${NC}"
 
         # Run a post-DML scan on the modified copy
         local scan_output="${output_file%.json}_post_scan.json"
-        if ${BENCHMARK_RUNNER} -t "${table_path}" -o json full-table-scan > "${scan_output}" 2>&1; then
+        local scan_svg="${output_file%.json}_post_scan.svg"
+        if _run_benchmark_cmd "${scan_output}" "${scan_svg}" \
+            -t "${table_path}" -o json full-table-scan; then
             echo -e "    ${GREEN}✓ Post-DML scan succeeded${NC}"
         else
             echo -e "    ${RED}✗ Post-DML scan failed${NC}"
@@ -352,19 +399,24 @@ run_uc_dml_scenario() {
 
     echo -e "    ${GREEN}✓ Table copy succeeded${NC}"
 
+    local svg_file="${output_file%.json}.svg"
+
     # Step 2: Run DML operation on temp table
-    if ${BENCHMARK_RUNNER} -t "${temp_table}" \
+    if _run_benchmark_cmd "${output_file}" "${svg_file}" \
+        -t "${temp_table}" \
         --uc-endpoint "${UC_ENDPOINT}" \
         --uc-token "${UC_TOKEN}" \
-        -o json ${scenario} ${args} > "${output_file}" 2>&1; then
+        -o json ${scenario} ${args}; then
         echo -e "    ${GREEN}✓ DML operation succeeded${NC}"
 
         # Step 3: Run post-DML scan
         local scan_output="${output_file%.json}_post_scan.json"
-        if ${BENCHMARK_RUNNER} -t "${temp_table}" \
+        local scan_svg="${output_file%.json}_post_scan.svg"
+        if _run_benchmark_cmd "${scan_output}" "${scan_svg}" \
+            -t "${temp_table}" \
             --uc-endpoint "${UC_ENDPOINT}" \
             --uc-token "${UC_TOKEN}" \
-            -o json full-table-scan > "${scan_output}" 2>&1; then
+            -o json full-table-scan; then
             echo -e "    ${GREEN}✓ Post-DML scan succeeded${NC}"
         else
             echo -e "    ${RED}✗ Post-DML scan failed${NC}"

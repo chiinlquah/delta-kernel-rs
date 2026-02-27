@@ -216,8 +216,8 @@ pub async fn setup_table_access(
 
         let engine = if let Some(threshold) = parquet_small_file_threshold {
             // Safe: the Arc was just created with a single reference
-            let inner = Arc::try_unwrap(engine)
-                .unwrap_or_else(|_| unreachable!("engine Arc just created"));
+            let inner =
+                Arc::try_unwrap(engine).unwrap_or_else(|_| unreachable!("engine Arc just created"));
             Arc::new(inner.with_parquet_small_file_threshold(threshold))
         } else {
             engine

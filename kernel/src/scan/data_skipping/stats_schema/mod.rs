@@ -183,6 +183,7 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
         StructField::nullable("nullCount", nullcount_schema),
         StructField::nullable("minValues", stats_schema.clone()),
         StructField::nullable("maxValues", stats_schema),
+        StructField::nullable("tightBounds", DataType::BOOLEAN),
     ])))
 }
 
@@ -360,14 +361,15 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 /// `tightBounds`) that don't have column mapping metadata. Only the nested struct fields inside
 /// `nullCount`, `minValues`, and `maxValues` need physical name conversion.
 ///
-/// Unlike [`StructField::make_physical`], this transform does not inject `parquet.field.id`
-/// metadata. The physical stats schema is used to read stats from JSON commit files and from
-/// `stats_parsed` in checkpoint Parquet files. Neither format uses parquet field IDs: JSON doesn't
-/// use them at all, and checkpoint files are written without them. Injecting field IDs would cause
-/// engines to attempt field-ID-based column matching against checkpoint files that have no field
-/// IDs.
+/// Unlike [`StructField::make_physical`], this transform does not inject
+/// [`ColumnMetadataKey::ParquetFieldId`] metadata. The physical stats schema is used to read stats
+/// from JSON commit files and from `stats_parsed` in checkpoint Parquet files. Neither format uses
+/// parquet field IDs: JSON doesn't use them at all, and checkpoint files are written without them.
+/// Injecting field IDs would cause engines to attempt field-ID-based column matching against
+/// checkpoint files that have no field IDs.
 ///
 /// [`StructField::make_physical`]: crate::schema::StructField::make_physical
+/// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
 pub(crate) struct PhysicalStatsSchemaTransform {
     pub column_mapping_mode: ColumnMappingMode,
 }
@@ -395,7 +397,9 @@ impl<'a> SchemaTransform<'a> for PhysicalStatsSchemaTransform {
 }
 
 /// Recursively converts fields to physical names, stripping all column mapping metadata
-/// (including `parquet.field.id`).
+/// (including [`ColumnMetadataKey::ParquetFieldId`]).
+///
+/// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
 struct MakePhysicalStatsNames {
     column_mapping_mode: ColumnMappingMode,
 }

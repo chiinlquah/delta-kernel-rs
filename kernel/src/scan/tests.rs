@@ -605,9 +605,9 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
             delete_manifest_path: None,
             delete_manifest_position: None,
         };
-        builder.add(add, 3, None)?;
+        builder.add(add, 3, 1)?;
 
-        let metadata = builder.build(engine.as_ref(), None).unwrap();
+        let metadata = builder.build(engine.as_ref(), 1).unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().0
     };
@@ -1004,9 +1004,9 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             delete_manifest_path: None,
             delete_manifest_position: None,
         };
-        builder.add(add, 10, None)?;
+        builder.add(add, 10, 1)?;
 
-        let metadata = builder.build(engine.as_ref(), None).unwrap();
+        let metadata = builder.build(engine.as_ref(), 1).unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
         writer.write(engine.as_ref()).unwrap().0
     };
