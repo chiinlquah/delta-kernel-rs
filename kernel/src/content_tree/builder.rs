@@ -3,8 +3,8 @@ use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry, DataContentType,
-    DataFileFormat, TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry,
+    ContentTreeNodeEntryBuilder, DataContentType, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -508,61 +508,17 @@ impl ContentTreeNodeBuilder {
             return Ok(());
         }
 
-        let status = if version == self.version {
-            TrackingStatus::Added
-        } else {
-            TrackingStatus::Existed
-        };
-
         // Extract record_count from the content_stats (from any column's value_count)
         let record_count = extract_record_count_from_stats(content_stats.as_ref());
 
-        let data_file_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some(path),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status,
-                snapshot_id: Some(snapshot_id),
-                // TODO: For newly added files (status = Added), sequence_number and file_sequence_number
-                // should be None to inherit from the manifest. Only existing files (status = Existed) need these set.
-                sequence_number: Some(version as i64),
-                file_sequence_number: Some(version as i64),
-
-                // We could set it, but then we can't do fast-retries
-                // first_row_id: add.base_row_id,
-                first_row_id: None,
-                changes_dv: None,
-            }),
-
-            // DV info inline (from deletion vector if present)
-            content_info,
-
-            // TODO: Check how to set these based on uniform as a first iteration.
-            partition_spec_id: 0,
-            sort_order_id: None,
-
-            record_count,
-
-            file_size_in_bytes: Some(size),
-
-            // Content stats passed directly
-            content_stats,
-
-            manifest_stats: None,
-
-            // Manifest DVs stored inline on manifest entries
-            manifest_dv: None,
-
-            // Encryption is not supported
-            key_metadata: None,
-
-            // Not tracked by the current Kernel implementation
-            split_offsets: None,
-
-            // Equality deletes are not supported, passing in null
-            equality_ids: None,
-        };
+        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(path)
+            .with_tracking(version, self.version, snapshot_id)
+            .content_info_opt(content_info)
+            .record_count(record_count)
+            .file_size_in_bytes(size)
+            .content_stats_opt(content_stats)
+            .build();
 
         self.pending_entries.push(data_file_entry);
         Ok(())
@@ -594,12 +550,6 @@ impl ContentTreeNodeBuilder {
             .map(extract_deletion_vector_content)
             .transpose()?;
 
-        let status = if version == self.version {
-            TrackingStatus::Added
-        } else {
-            TrackingStatus::Existed
-        };
-
         // Parse stats to extract record_count
         // TODO: This might evolve based on https://github.com/delta-io/delta-kernel-rs/pull/1464
         let record_count = add
@@ -617,50 +567,14 @@ impl ContentTreeNodeBuilder {
         let content_stats =
             delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
 
-        let data_file_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some(add.path.clone()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status,
-                snapshot_id: Some(snapshot_id),
-                sequence_number: Some(version as i64),
-                file_sequence_number: Some(version as i64),
-
-                // We could set it, but then we can't do fast-retries
-                // first_row_id: add.base_row_id,
-                first_row_id: None,
-                changes_dv: None,
-            }),
-
-            // DV info inline (from deletion vector if present)
-            content_info: dv_content,
-
-            // TODO: Check how to set these based on uniform as a first iteration.
-            partition_spec_id: 0,
-            sort_order_id: None,
-
-            record_count,
-
-            file_size_in_bytes: Some(add.size),
-
-            // Content stats converted from Delta JSON stats blob
-            content_stats,
-
-            manifest_stats: None,
-
-            // Manifest DVs stored inline on manifest entries
-            manifest_dv: None,
-
-            // Encryption is not supported
-            key_metadata: None,
-
-            // Not tracked by the current Kernel implementation
-            split_offsets: None,
-
-            // Equality deletes are not supported, passing in null
-            equality_ids: None,
-        };
+        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(add.path.clone())
+            .with_tracking(version, self.version, snapshot_id)
+            .content_info_opt(dv_content)
+            .record_count(record_count)
+            .file_size_in_bytes(add.size)
+            .content_stats_opt(content_stats)
+            .build();
 
         self.pending_entries.push(data_file_entry);
         Ok(())
@@ -1268,51 +1182,25 @@ impl ContentTreeNodeBuilder {
                 .map(|e| e.content_stats.as_ref()),
         );
 
-        Ok(ContentTreeNodeEntry {
-            content_type: DataContentType::CombinedManifest,
-            location: Some(manifest_path),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(snapshot_id),
-                // TODO: Manifest entries in root should have sequence_number and file_sequence_number
-                // set to self.version so that leaf entries can inherit them when null.
-                sequence_number: None,
-                file_sequence_number: None,
-                // Maybe later
-                first_row_id: None,
-                changes_dv: None,
-            }),
-
-            // DV info is inline on data entries inside the manifest, not on the manifest entry itself
-            content_info: None,
-
-            // TODO: Check how to set these based on uniform as a first iteration.
-            partition_spec_id: 0,
-            sort_order_id: None,
-
-            record_count,
-
-            file_size_in_bytes: Some(file_size_in_bytes),
-
-            // Aggregated content_stats from all entries in this manifest
-            content_stats,
-
-            // Manifest statistics tracking entry counts by status
-            manifest_stats,
-
-            // Manifest DVs stored inline on manifest entries
-            manifest_dv: None,
-
-            // Encryption is not supported
-            key_metadata: None,
-
-            // Not tracked by the current Kernel implementation
-            split_offsets: None,
-
-            // Equality deletes are not supported, passing in null
-            equality_ids: None,
-        })
+        Ok(
+            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+                .location(manifest_path)
+                .tracking_info(TrackingInfo {
+                    status: TrackingStatus::Added,
+                    snapshot_id: Some(snapshot_id),
+                    // TODO: Manifest entries in root should have sequence_number and file_sequence_number
+                    // set to self.version so that leaf entries can inherit them when null.
+                    sequence_number: None,
+                    file_sequence_number: None,
+                    first_row_id: None,
+                    changes_dv: None,
+                })
+                .record_count(record_count)
+                .file_size_in_bytes(file_size_in_bytes)
+                .content_stats_opt(content_stats)
+                .manifest_stats_opt(manifest_stats)
+                .build(),
+        )
     }
 
     /// Builds a root ContentTreeNode instance (leaf is `None`).
@@ -2319,30 +2207,14 @@ mod tests {
             ("part-00001.parquet", 250i64),
             ("part-00002.parquet", 0i64),
         ] {
-            builder.add_entry(ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(path.to_string()),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            });
+            builder.add_entry(
+                ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                    .location(path)
+                    .with_tracking(1, 1, 1)
+                    .record_count(record_count)
+                    .file_size_in_bytes(1024)
+                    .build(),
+            );
         }
 
         // Build metadata and verify record counts are preserved through roundtrip
@@ -2575,59 +2447,25 @@ mod tests {
         let stats1_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":50,"name":"mike"},"nullCount":{"id":0,"name":5}}"#;
         let content_stats_1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)?;
 
-        let entry1 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00000.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: content_stats_1,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data/part-00000.parquet")
+            .with_tracking(1, 1, 1)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .content_stats_opt(content_stats_1)
+            .build();
 
         // Create content_stats for file 2: id=[40, 100], name=["bob", "zoe"]
         let stats2_json = r#"{"numRecords":150,"minValues":{"id":40,"name":"bob"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":10}}"#;
         let content_stats_2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)?;
 
-        let entry2 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00001.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 150,
-            file_size_in_bytes: Some(2048),
-            content_stats: content_stats_2,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data/part-00001.parquet")
+            .with_tracking(1, 1, 1)
+            .record_count(150)
+            .file_size_in_bytes(2048)
+            .content_stats_opt(content_stats_2)
+            .build();
 
         builder.add_entry(entry1);
         builder.add_entry(entry2);
@@ -2720,30 +2558,12 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Create entries without content_stats
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data/part-00000.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None, // No stats
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data/part-00000.parquet")
+            .with_tracking(1, 1, 1)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         builder.add_entry(entry);
 
@@ -2938,30 +2758,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("data/part-{:05}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("data/part-{:05}.parquet", i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3044,30 +2846,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("data/part-{:05}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("data/part-{:05}.parquet", i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3133,30 +2917,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..3 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("data/part-{:05}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("data/part-{:05}.parquet", i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3206,30 +2972,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("data/part-{:05}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("data/part-{:05}.parquet", i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3291,30 +3039,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..5 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("data/part-{:05}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("data/part-{:05}.parquet", i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3370,25 +3100,12 @@ mod tests {
         // - 1 existing file (index 2)
         // - 2 deleted files (indices 3, 4)
         // Total: 5 entries, but only 3 are active (non-deleted)
-        let manifest_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::CombinedManifest,
-            location: Some("leaf-manifest.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 5, // Total entries in the leaf
-            file_size_in_bytes: Some(2048),
-            content_stats: None,
-            manifest_stats: Some(ManifestStats {
+        let manifest_entry = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+            .location("leaf-manifest.parquet")
+            .with_tracking(1, 1, 1)
+            .record_count(5) // Total entries in the leaf
+            .file_size_in_bytes(2048)
+            .manifest_stats(ManifestStats {
                 added_files_count: 2,
                 existing_files_count: 1,
                 deletes_files_count: 2, // 2 entries are already deleted
@@ -3396,12 +3113,8 @@ mod tests {
                 existing_rows_count: 100,
                 delete_rows_count: 200,
                 min_sequence_number: 1,
-            }),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .build();
 
         let leaf_path = manifest_entry.location.as_ref().unwrap().clone();
         root_builder.add_entry(manifest_entry);
@@ -3464,30 +3177,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..10 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("{}data/part-{:05}.parquet", table_root, i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3663,30 +3358,12 @@ mod tests {
         }
 
         // Step 12: Make an unrelated change - add a new data entry (no deletions)
-        let new_data_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some(format!("{}data/part-{:05}.parquet", table_root, 100)),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(4),
-                sequence_number: Some(4),
-                file_sequence_number: Some(4),
-                first_row_id: None,
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let new_data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location(format!("{}data/part-{:05}.parquet", table_root, 100))
+            .with_tracking(4, 4, 4)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
         root_builder_v4.add_entry(new_data_entry);
 
         // Build, write, and read back the root to verify changes_dv is None (no deletions)
@@ -3737,30 +3414,12 @@ mod tests {
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
         for i in 0..5 {
-            let data_entry = ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("{}data/part-{:05}.parquet", table_root, i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(1),
-                    sequence_number: Some(1),
-                    file_sequence_number: Some(1),
-                    first_row_id: None,
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: None,
-                record_count: 100,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
-            };
+            let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                .location(format!("{}data/part-{:05}.parquet", table_root, i))
+                .with_tracking(1, 1, 1)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .build();
             leaf_builder.add_entry(data_entry);
         }
 
@@ -3825,57 +3484,21 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add three entries with different file paths
-        let entry1 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("file1.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let entry2 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("file2.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let entry3 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("file3.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("file1.parquet")
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("file2.parquet")
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let entry3 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("file3.parquet")
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         builder.add_entry(entry1);
         builder.add_entry(entry2);
@@ -3921,40 +3544,16 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add a Data entry with inline DV info
-        let data_entry_with_dv = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("dv1.bin".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 10,
-            file_size_in_bytes: Some(128),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let data_entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data1.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let data_entry_with_dv = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("dv1.bin")
+            .record_count(10)
+            .file_size_in_bytes(128)
+            .build();
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data1.parquet")
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         builder.add_entry(data_entry_with_dv);
         builder.add_entry(data_entry);
@@ -3988,45 +3587,22 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add two data entries; data1 has inline DV info, data2 doesn't
-        let data_entry1 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data1.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: Some(ContentInfo {
+        let data_entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data1.parquet")
+            .content_info(ContentInfo {
                 location: "dv1.bin".to_string(),
                 offset: 0,
                 size_in_bytes: 48,
                 cardinality: 6,
-            }),
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
-        let data_entry2 = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("data2.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 50,
-            file_size_in_bytes: Some(512),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let data_entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("data2.parquet")
+            .record_count(50)
+            .file_size_in_bytes(512)
+            .build();
 
         builder.add_entry(data_entry1);
         builder.add_entry(data_entry2);
@@ -4057,23 +3633,11 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_schema());
 
         // Add entry
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("file1.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: None,
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("file1.parquet")
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         builder.add_entry(entry);
 
