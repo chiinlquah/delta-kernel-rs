@@ -41,7 +41,7 @@ type ParquetStreamResult = (
 );
 
 /// Flat schema for DV columns appended by `append_inline_dv_columns`.
-/// Contains the 5 fields extracted from `contentInfo.*` on each Data entry.
+/// Contains the 5 fields extracted from `dvInfo.*` on each Data entry.
 static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("dv_cardinality", DataType::LONG, true),
@@ -460,11 +460,11 @@ impl ContentTreeNode {
         Expression::struct_from_with_schema([action_expr], top_level_schema)
     }
 
-    /// Appends 5 flat DV columns extracted directly from `contentInfo.*` on each Data entry.
+    /// Appends 5 flat DV columns extracted directly from `dvInfo.*` on each Data entry.
     ///
-    /// For Data entries (contentType=0): parses contentInfo.location into storageType/pathOrInlineDv,
-    /// casts contentInfo.offset i64→i32, subtracts 8 from contentInfo.sizeInBytes then casts i64→i32,
-    /// reads contentInfo.cardinality directly.
+    /// For Data entries (contentType=0): parses dvInfo.location into storageType/pathOrInlineDv,
+    /// casts dvInfo.offset i64→i32, subtracts 8 from dvInfo.sizeInBytes then casts i64→i32,
+    /// reads dvInfo.cardinality directly.
     /// For non-Data entries: all 5 columns are null.
     /// Returns `None` if no Data entries in the batch had a DV (all DV columns would be null),
     /// avoiding unnecessary column allocation. Returns `Some` with DV columns appended otherwise.
@@ -508,10 +508,10 @@ impl ContentTreeNode {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["contentInfo", "cardinality"]),
-                        ColumnName::new(["contentInfo", "location"]),
-                        ColumnName::new(["contentInfo", "offset"]),
-                        ColumnName::new(["contentInfo", "sizeInBytes"]),
+                        ColumnName::new(["dvInfo", "cardinality"]),
+                        ColumnName::new(["dvInfo", "location"]),
+                        ColumnName::new(["dvInfo", "offset"]),
+                        ColumnName::new(["dvInfo", "sizeInBytes"]),
                     ]
                 });
                 static TYPES: &[DataType] = &[
@@ -534,7 +534,7 @@ impl ContentTreeNode {
 
                     // Only Data entries (contentType=0) can carry a DV location.
                     let location_opt: Option<&str> = if content_type == 0 {
-                        getters[2].get_opt(i, "contentInfo.location")?
+                        getters[2].get_opt(i, "dvInfo.location")?
                     } else {
                         None
                     };
@@ -572,14 +572,13 @@ impl ContentTreeNode {
 
                         // Push cardinality, offset, sizeInBytes for this DV row.
                         let cardinality: Option<i64> =
-                            getters[1].get_opt(i, "contentInfo.cardinality")?;
+                            getters[1].get_opt(i, "dvInfo.cardinality")?;
                         self.cardinalities.push(match cardinality {
                             Some(v) => Scalar::Long(v),
                             None => Scalar::Null(DataType::LONG),
                         });
 
-                        let offset_opt: Option<i64> =
-                            getters[3].get_opt(i, "contentInfo.offset")?;
+                        let offset_opt: Option<i64> = getters[3].get_opt(i, "dvInfo.offset")?;
                         self.offsets.push(match offset_opt {
                             Some(v) => Scalar::Integer(i32::try_from(v).map_err(|_| {
                                 Error::generic(format!(
@@ -592,8 +591,7 @@ impl ContentTreeNode {
                             None => Scalar::Null(DataType::INTEGER),
                         });
 
-                        let size_opt: Option<i64> =
-                            getters[4].get_opt(i, "contentInfo.sizeInBytes")?;
+                        let size_opt: Option<i64> = getters[4].get_opt(i, "dvInfo.sizeInBytes")?;
                         self.size_in_bytes.push(match size_opt {
                             Some(v) => {
                                 let adjusted = v.checked_sub(8).ok_or_else(|| {
@@ -1491,15 +1489,13 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "contentInfo" => match &entry.content_info {
+            "dvInfo" => match &entry.dv_info {
                 Some(dv) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
                             st.fields().cloned().collect::<Vec<_>>()
                         } else {
-                            return Err(crate::Error::generic(
-                                "contentInfo field should be a struct",
-                            ));
+                            return Err(crate::Error::generic("dvInfo field should be a struct"));
                         };
                     let values = vec![
                         Scalar::from(dv.location.clone()),
@@ -1644,9 +1640,8 @@ impl From<TrackingStatus> for Scalar {
     }
 }
 
-// TODO: rename ContentInfo to DvInfo once the field name is updated in the spec
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct ContentInfo {
+pub(crate) struct DvInfo {
     /// Path to location that DV is stored in.
     #[field_id = 152]
     pub(crate) location: String,
@@ -1785,7 +1780,7 @@ pub(super) struct ContentTreeNodeEntry {
     pub tracking_info: Option<TrackingInfo>,
 
     #[field_id = 148]
-    pub(crate) content_info: Option<ContentInfo>,
+    pub(crate) dv_info: Option<DvInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     #[field_id = 149]
@@ -1858,7 +1853,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     location: Option<String>,
     file_format: DataFileFormat,
     tracking_info: Option<TrackingInfo>,
-    content_info: Option<ContentInfo>,
+    dv_info: Option<DvInfo>,
     partition_spec_id: i64,
     sort_order_id: Option<i64>,
     record_count: i64,
@@ -1881,7 +1876,7 @@ impl ContentTreeNodeEntryBuilder {
             location: None,
             file_format: DataFileFormat::Parquet,
             tracking_info: None,
-            content_info: None,
+            dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
             record_count: 0,
@@ -1931,8 +1926,8 @@ impl ContentTreeNodeEntryBuilder {
         self
     }
 
-    pub(crate) fn content_info_opt(mut self, content_info: Option<ContentInfo>) -> Self {
-        self.content_info = content_info;
+    pub(crate) fn dv_info_opt(mut self, dv_info: Option<DvInfo>) -> Self {
+        self.dv_info = dv_info;
         self
     }
 
@@ -1963,8 +1958,8 @@ impl ContentTreeNodeEntryBuilder {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn content_info(mut self, content_info: ContentInfo) -> Self {
-        self.content_info = Some(content_info);
+    pub(crate) fn dv_info(mut self, dv_info: DvInfo) -> Self {
+        self.dv_info = Some(dv_info);
         self
     }
 
@@ -2005,7 +2000,7 @@ impl ContentTreeNodeEntryBuilder {
             location: self.location,
             file_format: self.file_format,
             tracking_info: self.tracking_info,
-            content_info: self.content_info,
+            dv_info: self.dv_info,
             partition_spec_id: self.partition_spec_id,
             sort_order_id: self.sort_order_id,
             record_count: self.record_count,
@@ -2274,7 +2269,7 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
+        // Fields: contentType, location, fileFormat, trackingInfo, dvInfo, partitionSpecId, sortOrderId,
         // recordCount, fileSizeInBytes, manifestStats, keyMetadata, splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
         assert_eq!(schema.fields().len(), 14);
 
@@ -2283,7 +2278,7 @@ mod tests {
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
         // 28 leaf fields: 25 (our branch base) + keyMetadata(1) + splitOffsets(1) + equalityIds(1)
-        // (no referencedFile; dvInfo has 4 leaves vs old contentInfo's 2)
+        // (no referencedFile; dvInfo has 4 leaves vs old dvInfo's 2)
         assert_eq!(leaf_names.len(), 28);
     }
 
@@ -3011,8 +3006,8 @@ mod tests {
         assert_field_id(&manifest_stats_schema, "deleteRowsCount", 514);
         assert_field_id(&manifest_stats_schema, "minSequenceNumber", 516);
 
-        // Verify ContentInfo field IDs
-        let dv_info_schema = ContentInfo::to_schema();
+        // Verify DvInfo field IDs
+        let dv_info_schema = DvInfo::to_schema();
         assert_field_id(&dv_info_schema, "location", 152);
         assert_field_id(&dv_info_schema, "offset", 144);
         assert_field_id(&dv_info_schema, "sizeInBytes", 145);
@@ -3024,7 +3019,7 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "location", 100);
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
         assert_field_id(&metadata_entry_schema, "trackingInfo", 147);
-        assert_field_id(&metadata_entry_schema, "contentInfo", 148);
+        assert_field_id(&metadata_entry_schema, "dvInfo", 148);
         assert_field_id(&metadata_entry_schema, "partitionSpecId", 149);
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
@@ -3585,7 +3580,7 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // In the new CombinedManifest model, DV is inline on Data entries.
-        // A Data entry with content_info: None produces an Add with no deletionVector.
+        // A Data entry with dv_info: None produces an Add with no deletionVector.
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
             .tracking_info(TrackingInfo {
@@ -3620,7 +3615,7 @@ mod tests {
 
         assert!(
             visitor.adds[0].deletion_vector.is_none(),
-            "Data entry without content_info should not have a deletion vector"
+            "Data entry without dv_info should not have a deletion vector"
         );
 
         Ok(())
@@ -3635,7 +3630,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with content_info produces an Add with a DV.
+        // In the new CombinedManifest model, a Data entry with dv_info produces an Add with a DV.
         // Use a relative DV path format: deletion_vector_{uuid}.bin
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
@@ -3648,7 +3643,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .content_info(ContentInfo {
+            .dv_info(DvInfo {
                 location: dv_location.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -3679,7 +3674,7 @@ mod tests {
 
         assert!(
             add.deletion_vector.is_some(),
-            "Data entry with inline content_info should have a deletion vector"
+            "Data entry with inline dv_info should have a deletion vector"
         );
         assert_eq!(add.deletion_vector.as_ref().unwrap().cardinality, 10);
 
@@ -3812,7 +3807,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .content_info(ContentInfo {
+            .dv_info(DvInfo {
                 location: dv_loc1.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -3832,7 +3827,7 @@ mod tests {
                 first_row_id: Some(0),
                 changes_dv: None,
             })
-            .content_info(ContentInfo {
+            .dv_info(DvInfo {
                 location: dv_loc2.to_string(),
                 offset: 0,
                 size_in_bytes: 108,
@@ -3878,7 +3873,7 @@ mod tests {
         for add in &all_adds {
             assert!(
                 add.deletion_vector.is_some(),
-                "Each data entry with inline content_info should have a deletion vector"
+                "Each data entry with inline dv_info should have a deletion vector"
             );
         }
         // Cardinalities should be 15 and 20 (in some order)
@@ -4552,7 +4547,7 @@ mod tests {
             // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
             // Previously used leaf.update_deletion_vectors(dv_updates) here.
             // In the new model DVs are inline on data entries, so updating a DV requires
-            // re-writing the data entry with updated content_info.
+            // re-writing the data entry with updated dv_info.
             let _ = (&file_locations, known_dv_size_in_bytes);
 
             let result = leaf.finish(engine.as_ref())?;
@@ -4594,7 +4589,7 @@ mod tests {
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // Check CombinedManifest entries in root — they point to leaf manifests
-        // that contain Data entries with inline content_info.
+        // that contain Data entries with inline dv_info.
         for entry in &root_entries {
             if matches!(entry.content_type, DataContentType::CombinedManifest) {
                 let manifest_path = entry
@@ -4620,16 +4615,16 @@ mod tests {
 
                 for manifest_entry in manifest_entries {
                     if manifest_entry.content_type == DataContentType::Data {
-                        if let Some(content_info) = &manifest_entry.content_info {
+                        if let Some(dv_info) = &manifest_entry.dv_info {
                             // Verify the DV size includes the +8 Iceberg framing
                             let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
                             assert_eq!(
-                                content_info.size_in_bytes,
+                                dv_info.size_in_bytes,
                                 expected_iceberg_size,
-                                "Persisted content_info.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
+                                "Persisted dv_info.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
                                 expected_iceberg_size,
                                 known_dv_size_in_bytes,
-                                content_info.size_in_bytes
+                                dv_info.size_in_bytes
                             );
                             found_position_deletes_count += 1;
                         }
@@ -4640,12 +4635,12 @@ mod tests {
 
         assert!(
             found_position_deletes_count > 0,
-            "Should have Data entries with inline content_info in CombinedManifest leaf manifests"
+            "Should have Data entries with inline dv_info in CombinedManifest leaf manifests"
         );
 
         // The test successfully proves:
-        // 1. Persisted manifests have Data entries with inline content_info using Iceberg sizes (Delta + 8)
-        //    - We verified content_info.size_in_bytes = 42 + 8 = 50
+        // 1. Persisted manifests have Data entries with inline dv_info using Iceberg sizes (Delta + 8)
+        //    - We verified dv_info.size_in_bytes = 42 + 8 = 50
         // 2. The size conversion happens at write time in:
         //    - extract_deletion_vector_content (+8): builder.rs
         // 3. On read, the size is subtracted back to Delta format in the visitor
