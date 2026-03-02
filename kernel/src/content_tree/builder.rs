@@ -21,12 +21,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
 use url::Url;
 
+/// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
+const ROARING_BITMAP_PORTABLE_MAGIC_BYTES: [u8; 4] = 1681511377u32.to_be_bytes();
+const ROARING_BITMAP_PORTABLE_MAGIC_LEN: usize = ROARING_BITMAP_PORTABLE_MAGIC_BYTES.len();
+
 /// Helper function to serialize a RoaringTreemap with the portable magic number prefix.
 fn serialize_roaring_treemap(treemap: &roaring::RoaringTreemap) -> DeltaResult<Bytes> {
-    let mut serialized = Vec::new();
-    // Magic number for portable format
-    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-    serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+    let mut serialized =
+        Vec::with_capacity(ROARING_BITMAP_PORTABLE_MAGIC_LEN + treemap.serialized_size());
+    serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC_BYTES);
     treemap.serialize_into(&mut serialized).map_err(|e| {
         Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
     })?;
@@ -35,17 +38,20 @@ fn serialize_roaring_treemap(treemap: &roaring::RoaringTreemap) -> DeltaResult<B
 
 /// Helper function to deserialize a RoaringTreemap from bytes with magic number prefix.
 fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTreemap> {
-    if bytes.len() < 4 {
-        return Err(Error::generic(
-            "Invalid manifest DV: bytes too small (less than 4 bytes)",
-        ));
+    if bytes.len() < ROARING_BITMAP_PORTABLE_MAGIC_LEN {
+        return Err(Error::generic(format!(
+            "Invalid manifest DV: bytes too small (less than {} bytes)",
+            ROARING_BITMAP_PORTABLE_MAGIC_LEN
+        )));
     }
-    roaring::RoaringTreemap::deserialize_from(&bytes[4..]).map_err(|e| {
-        Error::generic(format!(
-            "Failed to deserialize deletion vector bitmap: {}",
-            e
-        ))
-    })
+    roaring::RoaringTreemap::deserialize_from(&bytes[ROARING_BITMAP_PORTABLE_MAGIC_LEN..]).map_err(
+        |e| {
+            Error::generic(format!(
+                "Failed to deserialize deletion vector bitmap: {}",
+                e
+            ))
+        },
+    )
 }
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
