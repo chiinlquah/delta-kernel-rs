@@ -288,7 +288,8 @@ impl ContentTreeNode {
     }
 
     pub(crate) fn entries(&self) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let mut all_entries = Vec::new();
+        let total_rows: usize = self.data.iter().map(|b| b.len()).sum();
+        let mut all_entries = Vec::with_capacity(total_rows);
         use crate::engine_data::RowVisitor;
         for batch in self.data.iter() {
             let mut visitor = reader::ContentTreeNodeEntryVisitor::default();
