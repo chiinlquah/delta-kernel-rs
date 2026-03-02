@@ -476,7 +476,6 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    #[allow(unreachable_code)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
     }
@@ -530,7 +529,6 @@ impl ContentTreeNodeBuilder {
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    #[allow(unreachable_code)]
     pub(crate) fn add_with_dedup(
         &mut self,
         add: Add,
