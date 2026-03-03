@@ -3,8 +3,8 @@ use crate::actions::Add;
 use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_content_stats};
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
-    absolute_to_relative_path, ContentInfo, ContentTreeNode, ContentTreeNodeEntry,
-    ContentTreeNodeEntryBuilder, DataContentType, TrackingInfo, TrackingStatus,
+    absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
+    DataContentType, DvInfo, TrackingInfo, TrackingStatus,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -21,12 +21,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
 use url::Url;
 
+/// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
+const ROARING_BITMAP_PORTABLE_MAGIC_BYTES: [u8; 4] = 1681511377u32.to_be_bytes();
+const ROARING_BITMAP_PORTABLE_MAGIC_LEN: usize = ROARING_BITMAP_PORTABLE_MAGIC_BYTES.len();
+
 /// Helper function to serialize a RoaringTreemap with the portable magic number prefix.
 fn serialize_roaring_treemap(treemap: &roaring::RoaringTreemap) -> DeltaResult<Bytes> {
-    let mut serialized = Vec::new();
-    // Magic number for portable format
-    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
-    serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_be_bytes());
+    let mut serialized =
+        Vec::with_capacity(ROARING_BITMAP_PORTABLE_MAGIC_LEN + treemap.serialized_size());
+    serialized.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC_BYTES);
     treemap.serialize_into(&mut serialized).map_err(|e| {
         Error::generic(format!("Failed to serialize deletion vector bitmap: {}", e))
     })?;
@@ -35,17 +38,20 @@ fn serialize_roaring_treemap(treemap: &roaring::RoaringTreemap) -> DeltaResult<B
 
 /// Helper function to deserialize a RoaringTreemap from bytes with magic number prefix.
 fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTreemap> {
-    if bytes.len() < 4 {
-        return Err(Error::generic(
-            "Invalid manifest DV: bytes too small (less than 4 bytes)",
-        ));
+    if bytes.len() < ROARING_BITMAP_PORTABLE_MAGIC_LEN {
+        return Err(Error::generic(format!(
+            "Invalid manifest DV: bytes too small (less than {} bytes)",
+            ROARING_BITMAP_PORTABLE_MAGIC_LEN
+        )));
     }
-    roaring::RoaringTreemap::deserialize_from(&bytes[4..]).map_err(|e| {
-        Error::generic(format!(
-            "Failed to deserialize deletion vector bitmap: {}",
-            e
-        ))
-    })
+    roaring::RoaringTreemap::deserialize_from(&bytes[ROARING_BITMAP_PORTABLE_MAGIC_LEN..]).map_err(
+        |e| {
+            Error::generic(format!(
+                "Failed to deserialize deletion vector bitmap: {}",
+                e
+            ))
+        },
+    )
 }
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -77,14 +83,14 @@ fn deserialize_roaring_treemap(bytes: &Bytes) -> DeltaResult<roaring::RoaringTre
 /// - `size_in_bytes` represents the total blob size including all framing
 /// - This includes the size prefix + bitmap data + CRC checksum
 ///
-/// Therefore, when converting from Delta to Iceberg's [`ContentInfo`], we add 8 bytes
+/// Therefore, when converting from Delta to Iceberg's [`DvInfo`], we add 8 bytes
 /// (4 for size prefix + 4 for CRC) to Delta's `size_in_bytes`.
 ///
 /// # Returns
-/// A [`ContentInfo`] containing the DV location and size information.
+/// A [`DvInfo`] containing the DV location and size information.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<ContentInfo> {
+) -> DeltaResult<DvInfo> {
     use crate::actions::deletion_vector::DeletionVectorStorageType;
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
@@ -105,7 +111,7 @@ pub(crate) fn extract_deletion_vector_content(
     // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
     // - 4 bytes: size prefix
     // - 4 bytes: CRC checksum
-    Ok(ContentInfo {
+    Ok(DvInfo {
         location,
         offset: dv.offset.map(|v| v as i64).unwrap_or(0),
         size_in_bytes: dv.size_in_bytes as i64 + 8,
@@ -476,7 +482,6 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    #[allow(unreachable_code)]
     pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         self.add_with_dedup(add, version, snapshot_id)
     }
@@ -500,7 +505,7 @@ impl ContentTreeNodeBuilder {
         content_stats: Option<StructData>,
         version: Version,
         snapshot_id: i64,
-        content_info: Option<ContentInfo>,
+        dv_info: Option<DvInfo>,
     ) -> DeltaResult<()> {
         // Check for duplicates and skip if already seen
         if !self.values_seen.insert(path.clone()) {
@@ -514,7 +519,7 @@ impl ContentTreeNodeBuilder {
         let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(path)
             .with_tracking(version, self.version, snapshot_id)
-            .content_info_opt(content_info)
+            .dv_info_opt(dv_info)
             .record_count(record_count)
             .file_size_in_bytes(size)
             .content_stats_opt(content_stats)
@@ -530,7 +535,6 @@ impl ContentTreeNodeBuilder {
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    #[allow(unreachable_code)]
     pub(crate) fn add_with_dedup(
         &mut self,
         add: Add,
@@ -570,7 +574,7 @@ impl ContentTreeNodeBuilder {
         let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(add.path.clone())
             .with_tracking(version, self.version, snapshot_id)
-            .content_info_opt(dv_content)
+            .dv_info_opt(dv_content)
             .record_count(record_count)
             .file_size_in_bytes(add.size)
             .content_stats_opt(content_stats)
@@ -739,7 +743,7 @@ impl ContentTreeNodeBuilder {
                         tracking_struct,
                     )
                 }
-                "contentInfo" => Expression::null_literal(field.data_type().clone()),
+                "dvInfo" => Expression::null_literal(field.data_type().clone()),
                 "partitionSpecId" => Expression::literal(Scalar::Long(0)),
                 "sortOrderId" => Expression::null_literal(DataType::LONG),
                 "recordCount" => record_count_expr.clone(),
@@ -1311,62 +1315,6 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Builds a leaf ContentTreeNode instance with a specific UUID.
-    #[allow(dead_code)]
-    pub(crate) fn build_leaf_with_uuid(
-        &mut self,
-        engine: &dyn crate::Engine,
-        leaf_uuid: uuid::Uuid,
-        snapshot_id: i64,
-    ) -> DeltaResult<ContentTreeNode> {
-        use crate::content_tree::metadata_entry_to_scalars;
-        use crate::expressions::Scalar;
-
-        // Serialize all in-memory DVs back to entries
-        self.serialize_dvs_to_entries(snapshot_id)?;
-
-        // Use cached schema with content_stats based on table schema
-        let schema = self.get_schema()?;
-
-        // Handle empty case early
-        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(ContentTreeNode {
-                table_root: self.table_root.clone(),
-                data: vec![],
-                version: self.version,
-                path_in_log: String::new(),
-                leaf: Some(leaf_uuid),
-            });
-        }
-
-        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
-
-        // Add scalar-built batch from pending_entries (existing path)
-        if !self.pending_entries.is_empty() {
-            let fields_per_row = schema.fields().len();
-            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-            for entry in &self.pending_entries {
-                let scalars = metadata_entry_to_scalars(entry, &schema)?;
-                all_scalars.extend(scalars);
-            }
-            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-            let evaluation_handler = engine.evaluation_handler();
-            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-            data.push(engine_data);
-        }
-
-        // Add pre-transformed columnar batches
-        data.append(&mut self.pre_built_data);
-
-        Ok(ContentTreeNode {
-            table_root: self.table_root.clone(),
-            data,
-            version: self.version,
-            path_in_log: String::new(), // Will be set when written
-            leaf: Some(leaf_uuid),
-        })
-    }
-
     /// Build and evaluate a scan-row transformation expression.
     ///
     /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
@@ -1375,8 +1323,8 @@ impl ContentTreeNodeBuilder {
     /// format for `content_stats` using [`build_content_stats_from_delta_stats_parsed`].
     ///
     /// If `scan_row_input_schema` has `_dv_location` (flat decoded DV columns appended by
-    /// `add_from_existing_scan_rows`), `contentInfo` is projected from those columns with a
-    /// nullability predicate so non-DV rows produce a null struct. Otherwise `contentInfo` is null.
+    /// `add_from_existing_scan_rows`), `dvInfo` is projected from those columns with a
+    /// nullability predicate so non-DV rows produce a null struct. Otherwise `dvInfo` is null.
     fn evaluate_scan_row_transform(
         &self,
         engine: &dyn Engine,
@@ -1435,15 +1383,15 @@ impl ContentTreeNodeBuilder {
                         tracking_struct,
                     )
                 }
-                "contentInfo" => {
+                "dvInfo" => {
                     if has_decoded_dv {
-                        // Flat decoded DV columns: project into contentInfo struct.
+                        // Flat decoded DV columns: project into dvInfo struct.
                         // Nullability predicate: null struct for non-DV rows (_dv_location is null).
-                        let content_info_type = match field.data_type() {
+                        let dv_info_type = match field.data_type() {
                             DataType::Struct(s) => s.as_ref().clone(),
                             _ => {
                                 return Err(crate::Error::generic(
-                                    "contentInfo field should be a struct type",
+                                    "dvInfo field should be a struct type",
                                 ))
                             }
                         };
@@ -1458,7 +1406,7 @@ impl ContentTreeNodeBuilder {
                                 Expression::column(["_dv_size_in_bytes"]),
                                 Expression::column(["_dv_cardinality"]),
                             ],
-                            content_info_type,
+                            dv_info_type,
                             nullability,
                         )
                     } else {
@@ -1856,14 +1804,12 @@ impl RowVisitor for DecodedDvVisitor {
                     size_in_bytes,
                     cardinality,
                 };
-                let content_info = extract_deletion_vector_content(&dv)?;
-                self.decoded_paths
-                    .push(Scalar::String(content_info.location));
-                self.decoded_offsets.push(Scalar::Long(content_info.offset));
-                self.decoded_sizes
-                    .push(Scalar::Long(content_info.size_in_bytes));
+                let dv_info = extract_deletion_vector_content(&dv)?;
+                self.decoded_paths.push(Scalar::String(dv_info.location));
+                self.decoded_offsets.push(Scalar::Long(dv_info.offset));
+                self.decoded_sizes.push(Scalar::Long(dv_info.size_in_bytes));
                 self.decoded_cardinalities
-                    .push(Scalar::Long(content_info.cardinality));
+                    .push(Scalar::Long(dv_info.cardinality));
             } else {
                 self.decoded_paths.push(Scalar::Null(DataType::STRING));
                 self.decoded_offsets.push(Scalar::Null(DataType::LONG));
@@ -2596,18 +2542,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let content_info = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path
         assert_eq!(
-            content_info.location,
+            dv_info.location,
             "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(content_info.offset, 4);
-        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(content_info.cardinality, 6);
+        assert_eq!(dv_info.offset, 4);
+        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(dv_info.cardinality, 6);
 
         Ok(())
     }
@@ -2627,18 +2573,18 @@ mod tests {
             cardinality: 2,
         };
 
-        let content_info = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should have location set to the relative path (no prefix directory)
         assert_eq!(
-            content_info.location,
+            dv_info.location,
             "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
         );
 
         // Should have offset and size (+8 for size field and CRC)
-        assert_eq!(content_info.offset, 1);
-        assert_eq!(content_info.size_in_bytes, 44); // 36 + 8
-        assert_eq!(content_info.cardinality, 2);
+        assert_eq!(dv_info.offset, 1);
+        assert_eq!(dv_info.size_in_bytes, 44); // 36 + 8
+        assert_eq!(dv_info.cardinality, 2);
 
         Ok(())
     }
@@ -2657,18 +2603,18 @@ mod tests {
             cardinality: 6,
         };
 
-        let content_info = extract_deletion_vector_content(&dv)?;
+        let dv_info = extract_deletion_vector_content(&dv)?;
 
         // Should preserve the absolute path as-is
         assert_eq!(
-            content_info.location,
+            dv_info.location,
             "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
         );
 
         // Should have offset and size (+8)
-        assert_eq!(content_info.offset, 4);
-        assert_eq!(content_info.size_in_bytes, 48); // 40 + 8
-        assert_eq!(content_info.cardinality, 6);
+        assert_eq!(dv_info.offset, 4);
+        assert_eq!(dv_info.size_in_bytes, 48); // 40 + 8
+        assert_eq!(dv_info.cardinality, 6);
 
         Ok(())
     }
@@ -3589,7 +3535,7 @@ mod tests {
         // Add two data entries; data1 has inline DV info, data2 doesn't
         let data_entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data1.parquet")
-            .content_info(ContentInfo {
+            .dv_info(DvInfo {
                 location: "dv1.bin".to_string(),
                 offset: 0,
                 size_in_bytes: 48,
