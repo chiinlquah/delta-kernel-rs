@@ -293,8 +293,8 @@ impl ContentTreeNodeBuilder {
 
     /// Creates a [`ContentTreeNodeBuilder`] by reading an existing content root parquet file.
     ///
-    /// This loads all entries from the content root directly into a builder, avoiding the
-    /// need to construct an intermediate [`ContentTreeNode`].
+    /// This reads and validates the content root via [`ContentTreeNode::from_batches_with_version`],
+    /// then populates a builder from the validated entries.
     ///
     /// # Arguments
     /// * `engine` - The engine to use for reading the parquet file
@@ -309,13 +309,11 @@ impl ContentTreeNodeBuilder {
         table_schema: Schema,
         new_version: Version,
     ) -> DeltaResult<Self> {
-        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
-
         let content_root_url = table_root
             .join(&content_root.path)
             .map_err(|e| Error::generic(format!("Failed to parse content root URL: {}", e)))?;
 
-        let (read_result_iter, _version, _path_in_log) = ContentTreeNode::open_stream(
+        let (read_result_iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &content_root_url,
             content_root.path.clone(),
@@ -323,18 +321,27 @@ impl ContentTreeNodeBuilder {
             None,
         )?;
 
+        let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
+
+        let node = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root.clone(),
+        )?;
+
+        let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
-
-        for batch_result in read_result_iter {
-            let batch = batch_result?;
-            let mut visitor = ContentTreeNodeEntryVisitor::default();
-            if visitor.visit_rows_of(batch.as_ref()).is_ok() {
-                for entry in visitor.entries {
-                    builder.add_entry(entry);
-                }
-            }
+        for entry in entries {
+            let entry = if entry.tracking_info.as_ref().is_some_and(|ti| {
+                ti.status == TrackingStatus::Added && ti.sequence_number != Some(new_version as i64)
+            }) {
+                entry.with_status(TrackingStatus::Existed)
+            } else {
+                entry
+            };
+            builder.add_entry(entry);
         }
-
         Ok(builder)
     }
 
