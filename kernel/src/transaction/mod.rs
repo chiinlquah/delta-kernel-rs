@@ -1846,7 +1846,8 @@ impl<S> Transaction<S> {
                 Expression::column([FILE_CONSTANT_VALUES_NAME, "dataManifestPosition"]).into(),
             )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime");
+            .with_dropped_field("modificationTime")
+            .with_dropped_field("numRecords");
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {

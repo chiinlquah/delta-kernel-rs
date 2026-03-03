@@ -756,6 +756,7 @@ mod tests {
                     StructField::nullable("dataManifestPosition", DataType::LONG),
                 ]),
             ),
+            StructField::nullable("numRecords", DataType::LONG),
         ]))
     }
 

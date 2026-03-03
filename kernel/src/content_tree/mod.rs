@@ -52,12 +52,6 @@ static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Cached schema for stats with just numRecords field.
-/// Used when building Add action stats from metadata entries.
-static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
-    StructType::new_unchecked(vec![StructField::new("numRecords", DataType::LONG, false)])
-});
-
 /// A stats provider that extracts min/max statistics from AMT manifest `content_stats`.
 ///
 /// This struct implements `ParquetStatsProvider` to enable predicate evaluation against
@@ -307,7 +301,7 @@ impl ContentTreeNode {
         has_stats_parsed: bool,
         has_dv_columns: bool,
     ) -> DeltaResult<crate::expressions::Expression> {
-        use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
+        use crate::expressions::{Expression, MapData, VariadicExpressionOp};
         use crate::schema::{DataType, MapType};
 
         Ok(match field_name {
@@ -320,14 +314,7 @@ impl ContentTreeNode {
                     Expression::literal(0i64),
                 ],
             ),
-            "stats" => {
-                // Use cached stats schema
-                let num_records_struct = Expression::struct_from_with_schema(
-                    [Expression::column(["recordCount"])],
-                    (*STATS_NUM_RECORDS_SCHEMA).clone(),
-                );
-                Expression::unary(UnaryExpressionOp::ToJson, num_records_struct)
-            }
+            "stats" => Expression::null_literal(DataType::STRING),
             "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
             "defaultRowCommitVersion" => Expression::column(["trackingInfo", "snapshotId"]),
             "partitionValues" => {
@@ -382,8 +369,24 @@ impl ContentTreeNode {
                     // (see root_action_batches_optimized_with_handler)
                     Expression::column(["stats_parsed"])
                 } else {
-                    // Stats transformation not available, return null
-                    Expression::null_literal(field_type.clone())
+                    // No full stats transformation available; populate numRecords from recordCount
+                    // so callers still get a meaningful row count without JSON serialization.
+                    let DataType::Struct(stats_struct) = field_type else {
+                        return Err(Error::internal_error(format!(
+                            "stats_parsed field type should be a struct, got {field_type:?}"
+                        )));
+                    };
+                    let field_exprs: Vec<_> = stats_struct
+                        .fields()
+                        .map(|f| {
+                            if f.name() == "numRecords" {
+                                Expression::column(["recordCount"])
+                            } else {
+                                Expression::null_literal(f.data_type().clone())
+                            }
+                        })
+                        .collect();
+                    Expression::struct_from_with_schema(field_exprs, stats_struct.as_ref().clone())
                 }
             }
 
@@ -4757,6 +4760,122 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Native serialization format"));
+
+        Ok(())
+    }
+
+    /// Verifies that `stats` is null and `stats_parsed.numRecords` is populated from
+    /// `recordCount` when no `table_schema` is provided (so `has_stats_parsed = false`).
+    #[test]
+    fn test_stats_null_and_stats_parsed_num_records_from_record_count() -> DeltaResult<()> {
+        use crate::actions::{Add, ADD_NAME};
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+        use crate::schema::{ColumnName, ToSchema as _};
+        use std::sync::LazyLock;
+
+        const RECORD_COUNT: i64 = 42;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(RECORD_COUNT)
+            .file_size_in_bytes(1024)
+            .build();
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
+
+        // Build a minimal stats schema with just numRecords
+        let stats_schema =
+            StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
+
+        // Build action schema with stats_parsed added to the add struct (mirrors log_segment.rs)
+        let mut add_fields: Vec<StructField> = Add::to_schema().fields().cloned().collect();
+        add_fields.push(StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(stats_schema.clone())),
+        ));
+        let action_schema: SchemaRef =
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                ADD_NAME,
+                StructType::new_unchecked(add_fields),
+            )]));
+
+        // table_schema = None → no content_stats in metadata → has_stats_parsed = false
+        // The new code should populate stats_parsed.numRecords from recordCount
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &action_schema,
+            &[],
+            None,
+            None, // table_schema
+            Some(&stats_schema),
+        )?;
+
+        let batch = action_batches.next().unwrap()?;
+
+        struct StatsChecker {
+            stats: Vec<Option<String>>,
+            num_records: Vec<Option<i64>>,
+        }
+
+        impl RowVisitor for StatsChecker {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                    LazyLock::new(|| {
+                        (
+                            vec![
+                                ColumnName::new(["add", "stats"]),
+                                ColumnName::new(["add", "stats_parsed", "numRecords"]),
+                            ],
+                            vec![DataType::STRING, DataType::LONG],
+                        )
+                    });
+                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.stats.push(getters[0].get_opt(i, "add.stats")?);
+                    self.num_records
+                        .push(getters[1].get_opt(i, "add.stats_parsed.numRecords")?);
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = StatsChecker {
+            stats: vec![],
+            num_records: vec![],
+        };
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+
+        assert_eq!(visitor.stats.len(), 1);
+        assert!(
+            visitor.stats[0].is_none(),
+            "stats JSON field should be null (no to_json serialization)"
+        );
+        assert_eq!(
+            visitor.num_records[0],
+            Some(RECORD_COUNT),
+            "stats_parsed.numRecords should be populated from recordCount"
+        );
 
         Ok(())
     }

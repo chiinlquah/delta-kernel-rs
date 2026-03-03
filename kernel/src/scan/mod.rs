@@ -1091,7 +1091,8 @@ impl Scan {
 ///      clusteringProvider: string,
 ///      dataManifestPath: string,
 ///      dataManifestPosition: long,
-///    }
+///    },
+///    numRecords: long,
 /// }
 /// ```
 pub fn scan_row_schema() -> SchemaRef {

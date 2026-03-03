@@ -190,7 +190,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -205,15 +205,25 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
-                let stats: Option<Stats> =
-                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
+                // Prefer pre-parsed numRecords (populated from stats_parsed for checkpoint/content
+                // tree data) and fall back to parsing the JSON stats string for log file data.
+                let num_records: Option<i64> =
+                    getters[16].get_opt(row_index, "scanFile.numRecords")?;
+                let stats: Option<Stats> = if let Some(nr) = num_records {
+                    Some(Stats {
+                        num_records: nr as u64,
+                    })
+                } else {
+                    let stats_json: Option<String> =
+                        getters[3].get_opt(row_index, "scanFile.stats")?;
+                    stats_json.and_then(|json| match serde_json::from_str(json.as_str()) {
                         Ok(stats) => Some(stats),
                         Err(e) => {
                             warn!("Invalid stats string in Add file {json}: {}", e);
                             None
                         }
-                    });
+                    })
+                };
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
