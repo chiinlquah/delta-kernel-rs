@@ -1315,62 +1315,6 @@ impl ContentTreeNodeBuilder {
         })
     }
 
-    /// Builds a leaf ContentTreeNode instance with a specific UUID.
-    #[allow(dead_code)]
-    pub(crate) fn build_leaf_with_uuid(
-        &mut self,
-        engine: &dyn crate::Engine,
-        leaf_uuid: uuid::Uuid,
-        snapshot_id: i64,
-    ) -> DeltaResult<ContentTreeNode> {
-        use crate::content_tree::metadata_entry_to_scalars;
-        use crate::expressions::Scalar;
-
-        // Serialize all in-memory DVs back to entries
-        self.serialize_dvs_to_entries(snapshot_id)?;
-
-        // Use cached schema with content_stats based on table schema
-        let schema = self.get_schema()?;
-
-        // Handle empty case early
-        if self.pending_entries.is_empty() && self.pre_built_data.is_empty() {
-            return Ok(ContentTreeNode {
-                table_root: self.table_root.clone(),
-                data: vec![],
-                version: self.version,
-                path_in_log: String::new(),
-                leaf: Some(leaf_uuid),
-            });
-        }
-
-        let mut data: Vec<Box<dyn EngineData>> = Vec::new();
-
-        // Add scalar-built batch from pending_entries (existing path)
-        if !self.pending_entries.is_empty() {
-            let fields_per_row = schema.fields().len();
-            let mut all_scalars = Vec::with_capacity(self.pending_entries.len() * fields_per_row);
-            for entry in &self.pending_entries {
-                let scalars = metadata_entry_to_scalars(entry, &schema)?;
-                all_scalars.extend(scalars);
-            }
-            let scalar_row_refs: Vec<&[Scalar]> = all_scalars.chunks(fields_per_row).collect();
-            let evaluation_handler = engine.evaluation_handler();
-            let engine_data = evaluation_handler.create_many(schema.clone(), &scalar_row_refs)?;
-            data.push(engine_data);
-        }
-
-        // Add pre-transformed columnar batches
-        data.append(&mut self.pre_built_data);
-
-        Ok(ContentTreeNode {
-            table_root: self.table_root.clone(),
-            data,
-            version: self.version,
-            path_in_log: String::new(), // Will be set when written
-            leaf: Some(leaf_uuid),
-        })
-    }
-
     /// Build and evaluate a scan-row transformation expression.
     ///
     /// Transforms scan rows into ContentTreeNodeEntry schema, using `TrackingStatus::Existed`
