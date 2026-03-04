@@ -37,11 +37,18 @@ impl Committer for FileSystemCommitter {
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
+        let result = {
+            let _write_span = tracing::info_span!(
+                "txn.write_delta_file",
+                path = %published_commit_path,
+            )
+            .entered();
+            engine
+                .json_handler()
+                .write_json_file(&published_commit_path, Box::new(actions), false)
+        };
+
+        match result {
             Ok(()) => {
                 info!(
                     committed_version = version,
