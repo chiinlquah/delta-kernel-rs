@@ -430,7 +430,7 @@ generate_dv_comparison_table_from_files() {
     fi
 
     # Get all scenarios from baseline dataset
-    local scenarios=$(ls -1 "${baseline_dir}"/*.json 2>/dev/null | xargs -n1 basename | sed 's/\.json$//' | sort)
+    local scenarios=$(ls -1 "${baseline_dir}"/*.json 2>/dev/null | grep -v '\.trace\.json$' | xargs -n1 basename | sed 's/\.json$//' | sort)
 
     if [ -z "$scenarios" ]; then
         echo "Skipping DV ${dv_pct}% - no scenarios found" >> "${ANALYSIS_FILE}"
