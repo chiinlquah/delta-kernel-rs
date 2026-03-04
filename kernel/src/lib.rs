@@ -159,11 +159,7 @@ pub(crate) mod content_tree;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 // Export metadata types needed for testing
-pub use content_tree::{
-    ContentTreeNode, ContentTreeNodeEntry, DataContentType, TrackingInfo, TrackingStatus,
-};
-// Export metadata reader for testing
-pub use content_tree::reader::ContentTreeNodeEntryVisitor;
+pub use content_tree::{DataContentType, TrackingInfo, TrackingStatus};
 // Benchmarking infrastructure (only public for benchmarks and tests)
 #[cfg(any(test, feature = "internal-api"))]
 pub mod benchmarks;

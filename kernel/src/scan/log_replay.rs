@@ -536,8 +536,6 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
         StructField::nullable("dataManifestPath", DataType::STRING),
         StructField::nullable("dataManifestPosition", DataType::LONG),
-        StructField::nullable("deleteManifestPath", DataType::STRING),
-        StructField::nullable("deleteManifestPosition", DataType::LONG),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -546,6 +544,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
         StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
+        StructField::nullable("numRecords", DataType::LONG),
     ]))
 });
 
@@ -615,6 +614,14 @@ fn get_add_transform_expr(
     } else {
         column_expr_ref!("add.stats")
     };
+    // Populate numRecords from stats_parsed when available (checkpoint/content tree path).
+    // For log files (has_stats_parsed=false), output null and let the visitor fall back to
+    // parsing the JSON stats string.
+    let num_records_expr = if skip_stats || !has_stats_parsed {
+        Arc::new(Expression::Literal(Scalar::Null(DataType::LONG)))
+    } else {
+        column_expr_ref!("add.stats_parsed.numRecords")
+    };
     let mut fields = vec![
         column_expr_ref!("add.path"),
         column_expr_ref!("add.size"),
@@ -629,9 +636,8 @@ fn get_add_transform_expr(
             column_expr_ref!("add.clusteringProvider"),
             column_expr_ref!("add.dataManifestPath"),
             column_expr_ref!("add.dataManifestPosition"),
-            column_expr_ref!("add.deleteManifestPath"),
-            column_expr_ref!("add.deleteManifestPosition"),
         ])),
+        num_records_expr,
     ];
 
     // Add stats_parsed when stats output is requested (using physical column names)
@@ -670,8 +676,6 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                     column_expr_ref!("fileConstantValues.clusteringProvider"),
                     column_expr_ref!("fileConstantValues.dataManifestPath"),
                     column_expr_ref!("fileConstantValues.dataManifestPosition"),
-                    column_expr_ref!("fileConstantValues.deleteManifestPath"),
-                    column_expr_ref!("fileConstantValues.deleteManifestPosition"),
                 ],
                 None,
                 None,

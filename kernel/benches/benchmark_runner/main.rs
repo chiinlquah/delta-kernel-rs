@@ -54,6 +54,10 @@ struct Args {
     /// Output format
     #[arg(short = 'o', long, default_value = "json")]
     output_format: OutputFormat,
+
+    /// Path to write Chrome trace spans JSON (requires trace-spans feature)
+    #[arg(long)]
+    trace_file: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +128,15 @@ enum Scenario {
     },
 }
 
+#[cfg(feature = "trace-spans")]
+fn setup_span_capture(path: &str) -> impl Drop {
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::prelude::*;
+    let (chrome_layer, guard) = ChromeLayerBuilder::new().file(path).build();
+    tracing_subscriber::registry().with(chrome_layer).init();
+    guard
+}
+
 /// Set up the table URL and engine, either from Unity Catalog or direct path
 async fn setup_table_and_engine(
     args: &Args,
@@ -184,6 +197,9 @@ fn run_scenario(
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    #[cfg(feature = "trace-spans")]
+    let _trace_guard = args.trace_file.as_deref().map(setup_span_capture);
 
     // Set up table and engine
     let (table_url, engine) = match setup_table_and_engine(&args).await {

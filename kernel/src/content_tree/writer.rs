@@ -1,12 +1,19 @@
 use crate::content_tree::ContentTreeNode;
 use crate::path::ParsedLogPath;
 use crate::{DeltaResult, Engine, ParquetCompression, ParquetWriterConfig};
+use tracing::instrument;
 use url::Url;
 
 /// Orchestrates the process of creating a V3 checkpoint for a table.
 ///
 pub(crate) struct ContentTreeNodeWriter {
     pub(crate) metadata: ContentTreeNode,
+}
+
+/// The result of writing a content tree node to a parquet file.
+pub(crate) struct ContentTreeWriteResult {
+    pub(crate) location: Url,
+    pub(crate) size_in_bytes: u64,
 }
 
 impl ContentTreeNodeWriter {
@@ -39,19 +46,31 @@ impl ContentTreeNodeWriter {
         .map(|parsed| parsed.location)
     }
 
-    pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<(Url, u64)> {
+    #[instrument(
+        name = "content_tree.write_manifest",
+        skip_all,
+        fields(is_leaf = self.metadata.leaf().is_some()),
+        err
+    )]
+    pub(crate) fn write(self, engine: &dyn Engine) -> DeltaResult<ContentTreeWriteResult> {
         let path = self.checkpoint_path()?;
         let data_iter = self.metadata.data.into_iter().map(Ok);
 
         let write_config = ParquetWriterConfig {
             compression: ParquetCompression::Zstd,
         };
-        let size = engine.parquet_handler().write_parquet_file(
-            path.clone(),
-            Box::new(data_iter),
-            &write_config,
-        )?;
 
-        Ok((path, size))
+        let size_in_bytes = {
+            let _parquet_span = tracing::info_span!("content_tree.write_parquet").entered();
+            engine
+                .parquet_handler()
+                .write_parquet_file(path.clone(), Box::new(data_iter), &write_config)?
+                .size_in_bytes
+        };
+
+        Ok(ContentTreeWriteResult {
+            location: path,
+            size_in_bytes,
+        })
     }
 }

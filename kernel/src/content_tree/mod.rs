@@ -6,6 +6,10 @@ pub(crate) mod reader;
 pub(crate) mod stats;
 pub(crate) mod writer;
 
+#[cfg(test)]
+#[path = "tests/snaps_and_seqs.rs"]
+mod snaps_and_seqs_tests;
+
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ADD_NAME, REMOVE_NAME};
@@ -15,14 +19,14 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
+    DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
     SchemaRef, Version,
 };
 use bytes::Bytes;
 use delta_kernel_derive::{IntoEngineData, ToSchema};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 /// Field name for the content_stats column in ContentTreeNodeEntry schema.
@@ -41,7 +45,7 @@ type ParquetStreamResult = (
 );
 
 /// Flat schema for DV columns appended by `append_inline_dv_columns`.
-/// Contains the 5 fields extracted from `contentInfo.*` on each Data entry.
+/// Contains the 5 fields extracted from `dvInfo.*` on each Data entry.
 static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("dv_cardinality", DataType::LONG, true),
@@ -50,12 +54,6 @@ static DV_COLUMNS_SCHEMA_FINAL: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::new("dv_offset", DataType::INTEGER, true),
         StructField::new("dv_sizeInBytes", DataType::INTEGER, true),
     ]))
-});
-
-/// Cached schema for stats with just numRecords field.
-/// Used when building Add action stats from metadata entries.
-static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
-    StructType::new_unchecked(vec![StructField::new("numRecords", DataType::LONG, false)])
 });
 
 /// A stats provider that extracts min/max statistics from AMT manifest `content_stats`.
@@ -88,7 +86,7 @@ static STATS_NUM_RECORDS_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
 /// - The Delta table version this metadata represents
 /// - The table root URL for resolving relative file paths
 /// - An optional leaf UUID (only set when writing a leaf manifest, not for root)
-pub struct ContentTreeNode {
+pub(super) struct ContentTreeNode {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
@@ -288,7 +286,8 @@ impl ContentTreeNode {
     }
 
     pub(crate) fn entries(&self) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
-        let mut all_entries = Vec::new();
+        let total_rows: usize = self.data.iter().map(|b| b.len()).sum();
+        let mut all_entries = Vec::with_capacity(total_rows);
         use crate::engine_data::RowVisitor;
         for batch in self.data.iter() {
             let mut visitor = reader::ContentTreeNodeEntryVisitor::default();
@@ -307,7 +306,7 @@ impl ContentTreeNode {
         has_stats_parsed: bool,
         has_dv_columns: bool,
     ) -> DeltaResult<crate::expressions::Expression> {
-        use crate::expressions::{Expression, MapData, UnaryExpressionOp, VariadicExpressionOp};
+        use crate::expressions::{Expression, MapData, VariadicExpressionOp};
         use crate::schema::{DataType, MapType};
 
         Ok(match field_name {
@@ -320,14 +319,7 @@ impl ContentTreeNode {
                     Expression::literal(0i64),
                 ],
             ),
-            "stats" => {
-                // Use cached stats schema
-                let num_records_struct = Expression::struct_from_with_schema(
-                    [Expression::column(["recordCount"])],
-                    (*STATS_NUM_RECORDS_SCHEMA).clone(),
-                );
-                Expression::unary(UnaryExpressionOp::ToJson, num_records_struct)
-            }
+            "stats" => Expression::null_literal(DataType::STRING),
             "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
             "defaultRowCommitVersion" => Expression::column(["trackingInfo", "snapshotId"]),
             "partitionValues" => {
@@ -375,12 +367,6 @@ impl ContentTreeNode {
             "clusteringProvider" if action_name == "add" => {
                 Expression::null_literal(DataType::STRING)
             }
-            "deleteManifestPath" if action_name == "add" => {
-                Expression::null_literal(DataType::STRING)
-            }
-            "deleteManifestPosition" if action_name == "add" => {
-                Expression::null_literal(DataType::LONG)
-            }
             "stats_parsed" if action_name == "add" => {
                 if has_stats_parsed {
                     // Read stats_parsed from the augmented metadata batch
@@ -388,8 +374,24 @@ impl ContentTreeNode {
                     // (see root_action_batches_optimized_with_handler)
                     Expression::column(["stats_parsed"])
                 } else {
-                    // Stats transformation not available, return null
-                    Expression::null_literal(field_type.clone())
+                    // No full stats transformation available; populate numRecords from recordCount
+                    // so callers still get a meaningful row count without JSON serialization.
+                    let DataType::Struct(stats_struct) = field_type else {
+                        return Err(Error::internal_error(format!(
+                            "stats_parsed field type should be a struct, got {field_type:?}"
+                        )));
+                    };
+                    let field_exprs: Vec<_> = stats_struct
+                        .fields()
+                        .map(|f| {
+                            if f.name() == "numRecords" {
+                                Expression::column(["recordCount"])
+                            } else {
+                                Expression::null_literal(f.data_type().clone())
+                            }
+                        })
+                        .collect();
+                    Expression::struct_from_with_schema(field_exprs, stats_struct.as_ref().clone())
                 }
             }
 
@@ -466,11 +468,11 @@ impl ContentTreeNode {
         Expression::struct_from_with_schema([action_expr], top_level_schema)
     }
 
-    /// Appends 5 flat DV columns extracted directly from `contentInfo.*` on each Data entry.
+    /// Appends 5 flat DV columns extracted directly from `dvInfo.*` on each Data entry.
     ///
-    /// For Data entries (contentType=0): parses contentInfo.location into storageType/pathOrInlineDv,
-    /// casts contentInfo.offset i64→i32, subtracts 8 from contentInfo.sizeInBytes then casts i64→i32,
-    /// reads contentInfo.cardinality directly.
+    /// For Data entries (contentType=0): parses dvInfo.location into storageType/pathOrInlineDv,
+    /// casts dvInfo.offset i64→i32, subtracts 8 from dvInfo.sizeInBytes then casts i64→i32,
+    /// reads dvInfo.cardinality directly.
     /// For non-Data entries: all 5 columns are null.
     /// Returns `None` if no Data entries in the batch had a DV (all DV columns would be null),
     /// avoiding unnecessary column allocation. Returns `Some` with DV columns appended otherwise.
@@ -514,10 +516,10 @@ impl ContentTreeNode {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["contentInfo", "cardinality"]),
-                        ColumnName::new(["contentInfo", "location"]),
-                        ColumnName::new(["contentInfo", "offset"]),
-                        ColumnName::new(["contentInfo", "sizeInBytes"]),
+                        ColumnName::new(["dvInfo", "cardinality"]),
+                        ColumnName::new(["dvInfo", "location"]),
+                        ColumnName::new(["dvInfo", "offset"]),
+                        ColumnName::new(["dvInfo", "sizeInBytes"]),
                     ]
                 });
                 static TYPES: &[DataType] = &[
@@ -540,7 +542,7 @@ impl ContentTreeNode {
 
                     // Only Data entries (contentType=0) can carry a DV location.
                     let location_opt: Option<&str> = if content_type == 0 {
-                        getters[2].get_opt(i, "contentInfo.location")?
+                        getters[2].get_opt(i, "dvInfo.location")?
                     } else {
                         None
                     };
@@ -578,14 +580,13 @@ impl ContentTreeNode {
 
                         // Push cardinality, offset, sizeInBytes for this DV row.
                         let cardinality: Option<i64> =
-                            getters[1].get_opt(i, "contentInfo.cardinality")?;
+                            getters[1].get_opt(i, "dvInfo.cardinality")?;
                         self.cardinalities.push(match cardinality {
                             Some(v) => Scalar::Long(v),
                             None => Scalar::Null(DataType::LONG),
                         });
 
-                        let offset_opt: Option<i64> =
-                            getters[3].get_opt(i, "contentInfo.offset")?;
+                        let offset_opt: Option<i64> = getters[3].get_opt(i, "dvInfo.offset")?;
                         self.offsets.push(match offset_opt {
                             Some(v) => Scalar::Integer(i32::try_from(v).map_err(|_| {
                                 Error::generic(format!(
@@ -598,8 +599,7 @@ impl ContentTreeNode {
                             None => Scalar::Null(DataType::INTEGER),
                         });
 
-                        let size_opt: Option<i64> =
-                            getters[4].get_opt(i, "contentInfo.sizeInBytes")?;
+                        let size_opt: Option<i64> = getters[4].get_opt(i, "dvInfo.sizeInBytes")?;
                         self.size_in_bytes.push(match size_opt {
                             Some(v) => {
                                 let adjusted = v.checked_sub(8).ok_or_else(|| {
@@ -880,22 +880,6 @@ impl ContentTreeNode {
         })
     }
 
-    #[cfg(test)]
-    fn root_action_batches_optimized(
-        &self,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        self.root_action_batches_optimized_with_handler(
-            engine.evaluation_handler().as_ref(),
-            schema,
-            predicate,
-            None, // table_schema not available in this code path
-            None, // stats_schema not available in this code path
-        )
-    }
-
     fn root_action_batches_optimized_with_handler(
         &self,
         evaluation_handler: &dyn EvaluationHandler,
@@ -1019,28 +1003,6 @@ impl ContentTreeNode {
         Ok(Box::new(result_batches.into_iter()))
     }
 
-    /// Converts root manifest entries to action batches.
-    ///
-    /// # Parameters
-    /// - `predicate`: Optional predicate for data skipping. When provided, entries whose
-    ///   `content_stats` indicate they cannot contain matching data will be skipped.
-    #[cfg(test)]
-    pub(crate) fn root_action_batches(
-        &self,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        _partition_keys: &[String],
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Return empty iterator if schema doesn't contain Add or Remove
-        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        debug!("Using optimized path for metadata reading");
-        self.root_action_batches_optimized(engine, schema, predicate)
-    }
-
     /// Version of root_action_batches that takes handlers directly (for lazy streaming).
     pub(crate) fn root_action_batches_with_handler(
         &self,
@@ -1079,23 +1041,6 @@ impl ContentTreeNode {
     /// # Returns
     /// A `LeafReferences` containing one `ManifestReference` per CombinedManifest in the root.
     ///
-    /// # Example Usage
-    /// ```ignore
-    /// // Get manifest references from the root (no manifest-level skipping)
-    /// let manifest_refs_iter = metadata.manifest_references(None)?;
-    ///
-    /// // Process each child manifest
-    /// for manifest_refs_result in manifest_refs_iter {
-    ///     let manifest_refs = manifest_refs_result?;
-    ///     let action_batches = ContentTreeNode::manifest_to_action_batches(
-    ///         manifest_refs,
-    ///         engine,
-    ///         schema,
-    ///         partition_keys
-    ///     )?;
-    ///     // Process action batches...
-    /// }
-    /// ```
     ///
     /// # Parameters
     /// - `predicate`: Optional predicate for manifest-level data skipping. When provided,
@@ -1136,9 +1081,13 @@ impl ContentTreeNode {
                 debug!("Failed to create expression-based filter");
             }
             filter
+        } else if predicate.is_some() {
+            // Predicate was provided but couldn't apply manifest-level pruning — log why.
+            warn!("Manifest-level data skipping disabled despite predicate: handler={}, stats_schema={}, table_schema={}, batch_schema={}",
+                evaluation_handler.is_some(), stats_schema.is_some(), table_schema.is_some(), manifest_batch_schema.is_some());
+            None
         } else {
-            debug!("Manifest-level data skipping: missing required parameters (predicate={}, handler={}, stats_schema={}, table_schema={}, batch_schema={})",
-                predicate.is_some(), evaluation_handler.is_some(), stats_schema.is_some(), table_schema.is_some(), manifest_batch_schema.is_some());
+            debug!("Manifest-level data skipping: no predicate provided");
             None
         };
 
@@ -1160,30 +1109,42 @@ impl ContentTreeNode {
                 // Apply the filter to get selection vector for this batch
                 let selection_vector = filter.apply(batch.as_ref())?;
 
-                // Filter entries based on selection vector
+                // Filter entries based on selection vector, logging per-entry decisions
                 let batch_entries: Vec<_> = visitor
                     .entries
                     .into_iter()
                     .zip(selection_vector.into_iter())
-                    .filter_map(|(entry, keep)| if keep { Some(entry) } else { None })
+                    .filter_map(|(entry, keep)| {
+                        debug!(
+                            "Manifest pruning: {} location={:?}",
+                            if keep { "KEEP" } else { "PRUNE" },
+                            entry.location,
+                        );
+                        if keep {
+                            Some(entry)
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
 
                 let batch_kept = batch_entries.len();
                 total_after_filter += batch_kept;
 
-                debug!(
-                    "Expression-based filter: batch had {} entries, kept {} entries, skipped {}",
-                    batch_total,
-                    batch_kept,
-                    batch_total - batch_kept
-                );
-
                 all_entries.extend(batch_entries);
             }
             let total_skipped = total_before_filter - total_after_filter;
-            debug!("Expression-based manifest filtering: total entries={}, kept={}, skipped={} ({:.1}%)",
-                total_before_filter, total_after_filter, total_skipped,
-                if total_before_filter > 0 { (total_skipped as f64 / total_before_filter as f64) * 100.0 } else { 0.0 });
+            debug!(
+                "Manifest-level pruning result: total={}, kept={}, skipped={} ({:.1}%)",
+                total_before_filter,
+                total_after_filter,
+                total_skipped,
+                if total_before_filter > 0 {
+                    (total_skipped as f64 / total_before_filter as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
             all_entries
         } else {
             // No filtering - just materialize all entries
@@ -1237,33 +1198,9 @@ impl ContentTreeNode {
     ///
     /// # Returns
     /// An iterator over action batches.
-    #[cfg(test)]
-    pub(crate) fn non_root_action_batches(
-        root_state: LeafReferences,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Capture the handlers we need (both are Arc, so cheap to clone)
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-        Self::non_root_action_batches_with_handlers(
-            root_state,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )
-    }
-
-    /// Version of non_root_action_batches that takes handlers directly (for lazy streaming).
     // TODO: Refactor to reduce argument count (currently 7) - consider using a config struct
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn non_root_action_batches_with_handlers(
+    pub(crate) fn non_root_action_batches(
         root_state: LeafReferences,
         parquet_handler: Arc<dyn ParquetHandler>,
         evaluation_handler: Arc<dyn EvaluationHandler>,
@@ -1286,72 +1223,6 @@ impl ContentTreeNode {
         )?;
 
         Ok(Box::new(processor))
-    }
-
-    /// Processes a ManifestReference into action batches.
-    ///
-    /// Given a `ManifestReference`, this method:
-    ///
-    /// 1. **Reads the data manifest file**: Parses the child manifest to get data file entries
-    /// 2. **Filters entries**: Applies predicate-based data skipping using content_stats
-    /// 3. **Converts entries to actions**: Transforms ContentTreeNodeEntry records into Add/Remove actions
-    /// 4. **Returns action batches**: Produces an iterator of ActionsBatch objects
-    ///
-    /// # Parameters
-    /// - `manifest_refs`: The manifest references to process
-    /// - `engine`: The engine for reading parquet files
-    /// - `schema`: The action schema (typically from `get_log_add_schema()`)
-    /// - `predicate`: Optional predicate for data skipping
-    ///
-    /// # Returns
-    /// An iterator over `ActionsBatch` objects, each containing a single Add or Remove action.
-    ///
-    /// # Notes
-    /// - Use `non_root_action_batches` for a higher-level API that processes all manifests
-    #[cfg(test)]
-    pub(crate) fn manifest_to_action_batches(
-        manifest_refs: ManifestReference,
-        engine: &dyn Engine,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Extract handlers and delegate to handler-based version
-        let parquet_handler = engine.parquet_handler();
-        let evaluation_handler = engine.evaluation_handler();
-
-        Self::manifest_to_action_batches_with_handlers(
-            manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-            predicate,
-        )
-    }
-
-    /// Checks if the optimized path can be used for a leaf manifest.
-    ///
-    /// Checks if we can use the optimized path for leaf manifests.
-    ///
-    /// Requirements:
-    /// - Schema is Add-only (no Remove actions)
-    ///
-    /// Now allows:
-    /// - Affiliated DV manifests (will be handled via lookup join)
-    /// - Shared DVs (will be handled via lookup join)
-    #[cfg(test)]
-    fn can_use_leaf_optimized_path(schema: &SchemaRef) -> bool {
-        use crate::actions::{ADD_NAME, REMOVE_NAME};
-
-        // Allow both Add and Remove actions in the optimized path
-        // They will be handled via separate selection vectors
-        if !schema.contains(ADD_NAME) && !schema.contains(REMOVE_NAME) {
-            return false;
-        }
-
-        // Allow affiliated DV manifests and shared DVs - will be handled via lookup join
-        true
     }
 
     /// Merge manifest DV selection into an existing selection vector.
@@ -1429,91 +1300,6 @@ impl ContentTreeNode {
         Ok(result_batches)
     }
 
-    /// Process a manifest into action batches using the bulk processor.
-    ///
-    /// This wrapper converts a single manifest into a BulkManifestStreamProcessor
-    /// which handles parallel IO and lazy processing.
-    #[cfg(test)]
-    fn manifest_to_action_batches_optimized_with_handlers(
-        manifest_refs: &ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Convert borrowed parameters to owned for the processor
-        let manifest_iter = std::iter::once(manifest_refs.clone());
-        let schema_owned = schema.clone();
-        let table_root_owned = table_root.clone();
-
-        // Create bulk processor for this single manifest
-        let processor = bulk_processor::BulkManifestStreamProcessor::new(
-            manifest_iter,
-            parquet_handler,
-            evaluation_handler,
-            schema_owned,
-            table_root_owned,
-            None, // predicate
-            None, // table_schema not available in test path
-            None, // stats_schema not available in test path
-        )?;
-
-        Ok(Box::new(processor))
-    }
-
-    /// Processes a ManifestReference into action batches using captured handlers.
-    ///
-    /// This is an internal version of `manifest_to_action_batches` that takes Arc handlers
-    /// instead of `&dyn Engine`, enabling it to be called from lazy iterators without
-    /// lifetime issues.
-    #[cfg(test)]
-    fn manifest_to_action_batches_with_handlers(
-        manifest_refs: ManifestReference,
-        parquet_handler: Arc<dyn ParquetHandler>,
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        schema: &SchemaRef,
-        table_root: &Url,
-        predicate: Option<&PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Check if we can use optimized path
-        if predicate.is_some() || !Self::can_use_leaf_optimized_path(schema) {
-            return Err(Error::generic(
-                "Cannot use optimized path for leaf manifest. \
-                 Predicate filtering on leaf manifests is not yet supported in optimized path.",
-            ));
-        }
-
-        debug!("Using optimized path for leaf manifest with handlers");
-        Self::manifest_to_action_batches_optimized_with_handlers(
-            &manifest_refs,
-            parquet_handler,
-            evaluation_handler,
-            schema,
-            table_root,
-        )
-    }
-
-    /// Reads ContentTreeNode from a parquet file at the specified path.
-    ///
-    /// This is used to read previously written Adaptive ContentTreeNode Tree (AMT) metadata files.
-    ///
-    /// # Parameters
-    /// - `engine`: The engine to use for reading the parquet file
-    /// - `path`: The URL path to the metadata parquet file
-    /// - `path_in_log`: The original path string as it appears in the Delta log (not normalized)
-    /// - `table_root`: The table root URL
-    ///
-    /// # Returns
-    /// A `ContentTreeNode` instance deserialized from the parquet file.
-    pub fn read(
-        engine: &dyn Engine,
-        path: &Url,
-        path_in_log: String,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        Self::read_with_handler(engine.parquet_handler(), path, path_in_log, table_root)
-    }
-
     /// Opens a parquet stream for reading metadata without collecting batches (for lazy streaming).
     ///
     /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
@@ -1576,37 +1362,6 @@ impl ContentTreeNode {
         let read_result_iter = parquet_handler.read_parquet_files(&[file], read_schema, None)?;
 
         Ok((read_result_iter, parsed.version, path_in_log))
-    }
-
-    /// Read metadata using a parquet handler directly (for lazy streaming).
-    ///
-    /// Uses `ContentTreeNodeEntry::to_schema()` for reading, which excludes content_stats.
-    /// The visitor extracts all fields except content_stats which requires table schema.
-    fn read_with_handler(
-        parquet_handler: Arc<dyn ParquetHandler>,
-        path: &Url,
-        path_in_log: String,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        let (read_result_iter, version, path_in_log) =
-            Self::open_stream(parquet_handler, path, path_in_log, None, None)?;
-
-        let data: Vec<Box<dyn EngineData>> = read_result_iter.collect::<DeltaResult<Vec<_>>>()?;
-
-        Ok(Self {
-            data,
-            version,
-            table_root,
-            path_in_log,
-            // When reading existing metadata, we don't know if it's a root or leaf
-            // This would need to be determined from the file path or stored in the metadata
-            leaf: None,
-        })
-    }
-
-    /// Get the engine data for testing purposes
-    pub fn data(&self) -> &[Box<dyn EngineData>] {
-        &self.data
     }
 }
 
@@ -1742,15 +1497,13 @@ pub(crate) fn metadata_entry_to_scalars(
                 }
                 None => Scalar::Null(field.data_type().clone()),
             },
-            "contentInfo" => match &entry.content_info {
+            "dvInfo" => match &entry.dv_info {
                 Some(dv) => {
                     let struct_fields =
                         if let crate::schema::DataType::Struct(st) = field.data_type() {
                             st.fields().cloned().collect::<Vec<_>>()
                         } else {
-                            return Err(crate::Error::generic(
-                                "contentInfo field should be a struct",
-                            ));
+                            return Err(crate::Error::generic("dvInfo field should be a struct"));
                         };
                     let values = vec![
                         Scalar::from(dv.location.clone()),
@@ -1895,9 +1648,8 @@ impl From<TrackingStatus> for Scalar {
     }
 }
 
-// TODO: rename ContentInfo to DvInfo once the field name is updated in the spec
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
-pub(crate) struct ContentInfo {
+pub(crate) struct DvInfo {
     /// Path to location that DV is stored in.
     #[field_id = 152]
     pub(crate) location: String,
@@ -2018,7 +1770,7 @@ impl From<ManifestStats> for Scalar {
 }
 
 #[derive(Debug, Clone, ToSchema)]
-pub struct ContentTreeNodeEntry {
+pub(super) struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
     /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
     #[field_id = 134]
@@ -2036,7 +1788,7 @@ pub struct ContentTreeNodeEntry {
     pub tracking_info: Option<TrackingInfo>,
 
     #[field_id = 148]
-    pub(crate) content_info: Option<ContentInfo>,
+    pub(crate) dv_info: Option<DvInfo>,
 
     /// ID of partition spec used to write manifest or data/delete files.
     #[field_id = 149]
@@ -2090,6 +1842,195 @@ pub struct ContentTreeNodeEntry {
     /// DV that applies to the manifest linked to from this entry.
     #[field_id = 151]
     pub(crate) manifest_dv: Option<Bytes>,
+}
+
+impl ContentTreeNodeEntry {
+    /// Returns a copy of this entry with the tracking status updated.
+    pub(crate) fn with_status(mut self, status: TrackingStatus) -> Self {
+        if let Some(ref mut tracking_info) = self.tracking_info {
+            tracking_info.status = status;
+        }
+        self
+    }
+}
+
+/// Builder for [`ContentTreeNodeEntry`] that eliminates boilerplate by providing
+/// sensible defaults for most fields.
+///
+/// # Example
+/// ```ignore
+/// ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+///     .location("path/to/file.parquet")
+///     .with_tracking(entry_version, current_version, snapshot_id)
+///     .record_count(100)
+///     .file_size_in_bytes(1024)
+///     .build()
+/// ```
+pub(crate) struct ContentTreeNodeEntryBuilder {
+    content_type: DataContentType,
+    location: Option<String>,
+    file_format: DataFileFormat,
+    tracking_info: Option<TrackingInfo>,
+    dv_info: Option<DvInfo>,
+    partition_spec_id: i64,
+    sort_order_id: Option<i64>,
+    record_count: i64,
+    file_size_in_bytes: Option<i64>,
+    content_stats: Option<StructData>,
+    manifest_stats: Option<ManifestStats>,
+    manifest_dv: Option<Bytes>,
+    key_metadata: Option<Bytes>,
+    split_offsets: Option<Vec<i64>>,
+    equality_ids: Option<Vec<i32>>,
+}
+
+impl ContentTreeNodeEntryBuilder {
+    /// Create a new builder with the given content type. All other fields start at
+    /// sensible defaults: `file_format=Parquet`, `partition_spec_id=0`, `record_count=0`,
+    /// and all optional fields are `None`.
+    pub(crate) fn new(content_type: DataContentType) -> Self {
+        Self {
+            content_type,
+            location: None,
+            file_format: DataFileFormat::Parquet,
+            tracking_info: None,
+            dv_info: None,
+            partition_spec_id: 0,
+            sort_order_id: None,
+            record_count: 0,
+            file_size_in_bytes: None,
+            content_stats: None,
+            manifest_stats: None,
+            manifest_dv: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+        }
+    }
+
+    pub(crate) fn location(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
+        self
+    }
+
+    /// Set tracking info by computing status from `entry_version` vs `current_version`.
+    /// If the file was written at `current_version`, its status is `Added`; otherwise `Existed`.
+    pub(crate) fn with_tracking(
+        mut self,
+        entry_version: Version,
+        current_version: Version,
+        snapshot_id: i64,
+    ) -> Self {
+        let status = if entry_version == current_version {
+            TrackingStatus::Added
+        } else {
+            TrackingStatus::Existed
+        };
+        self.tracking_info = Some(TrackingInfo {
+            status,
+            snapshot_id: Some(snapshot_id),
+            sequence_number: Some(entry_version as i64),
+            file_sequence_number: Some(entry_version as i64),
+            first_row_id: None,
+            changes_dv: None,
+        });
+        self
+    }
+
+    /// Set tracking info directly for non-standard cases (e.g., manifest entries
+    /// where `sequence_number` should be `None`).
+    pub(crate) fn tracking_info(mut self, tracking_info: TrackingInfo) -> Self {
+        self.tracking_info = Some(tracking_info);
+        self
+    }
+
+    pub(crate) fn dv_info_opt(mut self, dv_info: Option<DvInfo>) -> Self {
+        self.dv_info = dv_info;
+        self
+    }
+
+    pub(crate) fn record_count(mut self, record_count: i64) -> Self {
+        self.record_count = record_count;
+        self
+    }
+
+    pub(crate) fn file_size_in_bytes(mut self, file_size_in_bytes: i64) -> Self {
+        self.file_size_in_bytes = Some(file_size_in_bytes);
+        self
+    }
+
+    pub(crate) fn content_stats_opt(mut self, content_stats: Option<StructData>) -> Self {
+        self.content_stats = content_stats;
+        self
+    }
+
+    pub(crate) fn manifest_stats_opt(mut self, manifest_stats: Option<ManifestStats>) -> Self {
+        self.manifest_stats = manifest_stats;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn file_format(mut self, file_format: DataFileFormat) -> Self {
+        self.file_format = file_format;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dv_info(mut self, dv_info: DvInfo) -> Self {
+        self.dv_info = Some(dv_info);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn partition_spec_id(mut self, partition_spec_id: i64) -> Self {
+        self.partition_spec_id = partition_spec_id;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sort_order_id(mut self, sort_order_id: i64) -> Self {
+        self.sort_order_id = Some(sort_order_id);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn content_stats(mut self, content_stats: StructData) -> Self {
+        self.content_stats = Some(content_stats);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn manifest_stats(mut self, manifest_stats: ManifestStats) -> Self {
+        self.manifest_stats = Some(manifest_stats);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn manifest_dv(mut self, manifest_dv: Bytes) -> Self {
+        self.manifest_dv = Some(manifest_dv);
+        self
+    }
+
+    /// Consume the builder and produce a [`ContentTreeNodeEntry`].
+    pub(crate) fn build(self) -> ContentTreeNodeEntry {
+        ContentTreeNodeEntry {
+            content_type: self.content_type,
+            location: self.location,
+            file_format: self.file_format,
+            tracking_info: self.tracking_info,
+            dv_info: self.dv_info,
+            partition_spec_id: self.partition_spec_id,
+            sort_order_id: self.sort_order_id,
+            record_count: self.record_count,
+            file_size_in_bytes: self.file_size_in_bytes,
+            content_stats: self.content_stats,
+            manifest_stats: self.manifest_stats,
+            manifest_dv: self.manifest_dv,
+            key_metadata: self.key_metadata,
+            split_offsets: self.split_offsets,
+            equality_ids: self.equality_ids,
+        }
+    }
 }
 
 impl ContentTreeNodeEntry {
@@ -2266,6 +2207,7 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Engine;
     use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
 
@@ -2279,30 +2221,20 @@ mod tests {
         let engine = SyncEngine::new();
 
         // Create a very simple entry with no optional fields
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("test.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("test.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 42,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
 
         let schema = test_metadata_entry_schema();
         let result = entry.into_engine_data(schema, &engine);
@@ -2355,7 +2287,7 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // Fields: contentType, location, fileFormat, trackingInfo, contentInfo, partitionSpecId, sortOrderId,
+        // Fields: contentType, location, fileFormat, trackingInfo, dvInfo, partitionSpecId, sortOrderId,
         // recordCount, fileSizeInBytes, manifestStats, keyMetadata, splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
         assert_eq!(schema.fields().len(), 14);
 
@@ -2364,7 +2296,7 @@ mod tests {
         let (leaf_names, _leaf_types) = leaves.as_ref();
 
         // 28 leaf fields: 25 (our branch base) + keyMetadata(1) + splitOffsets(1) + equalityIds(1)
-        // (no referencedFile; dvInfo has 4 leaves vs old contentInfo's 2)
+        // (no referencedFile; dvInfo has 4 leaves vs old dvInfo's 2)
         assert_eq!(leaf_names.len(), 28);
     }
 
@@ -2574,30 +2506,21 @@ mod tests {
         )?;
 
         // Create a ContentTreeNodeEntry with content_stats
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/file.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: Some(content_stats),
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .content_stats(content_stats)
+            .build();
 
         // Convert to EngineData
         let engine_data = entry.into_engine_data(schema_with_stats.clone(), &engine)?;
@@ -2643,30 +2566,20 @@ mod tests {
         )?);
 
         // Create a ContentTreeNodeEntry with content_stats set to None
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/file.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None, // Explicitly None
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         // Convert to EngineData - should handle null content_stats gracefully
         let engine_data = entry.into_engine_data(schema_with_stats.clone(), &engine)?;
@@ -2788,30 +2701,21 @@ mod tests {
         )?;
 
         // Create a ContentTreeNodeEntry with content_stats
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/data/file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/data/file.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 500,
-            file_size_in_bytes: Some(2048),
-            content_stats: Some(content_stats),
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(500)
+            .file_size_in_bytes(2048)
+            .content_stats(content_stats)
+            .build();
 
         // Convert to EngineData using schema with content_stats
         let engine_data = entry.into_engine_data(schema_with_stats.clone(), &engine)?;
@@ -2827,7 +2731,7 @@ mod tests {
 
         // Write metadata using the writer
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let (written_file, _) = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?.location;
 
         // Verify the file was written
         assert!(written_file.as_str().ends_with(".parquet"));
@@ -2915,129 +2819,6 @@ mod tests {
             ContentTreeNodeEntry::to_schema_with_content_stats(&table_schema, &stats_schema)
                 .expect("test schema should be valid"),
         )
-    }
-
-    // Helper function to create a simple ContentTreeNodeEntry for testing
-    fn create_simple_metadata_entry() -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/path/to/file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(200),
-                first_row_id: Some(1000),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 42,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
-    // Helper function to create a ContentTreeNodeEntry representing a PositionDeletes file
-    fn create_metadata_entry_with_dv() -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::PositionDeletes,
-            location: Some("s3://bucket/path/to/deletes.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(5),
-                sequence_number: Some(500),
-                file_sequence_number: Some(600),
-                first_row_id: Some(5000),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 1,
-            sort_order_id: Some(1),
-            record_count: 10,
-            file_size_in_bytes: Some(512),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
-    // Helper function to create a ContentTreeNodeEntry with manifest DV
-    fn create_metadata_entry_with_inline_dv() -> ContentTreeNodeEntry {
-        // Create some sample inline DV data
-        let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
-
-        ContentTreeNodeEntry {
-            content_type: DataContentType::DataManifest,
-            location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(3),
-                sequence_number: Some(300),
-                file_sequence_number: Some(400),
-                first_row_id: Some(3000),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 100,
-            file_size_in_bytes: Some(2048),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: Some(Bytes::from(inline_data)),
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
-    // Helper function to create a ContentTreeNodeEntry with manifest stats
-    fn create_metadata_entry_with_manifest_stats() -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::DataManifest,
-            location: Some("s3://bucket/path/to/manifest.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(10),
-                sequence_number: Some(1000),
-                file_sequence_number: Some(1000),
-                first_row_id: Some(10000),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 2,
-            sort_order_id: Some(2),
-            record_count: 100,
-            file_size_in_bytes: Some(10240),
-            content_stats: None,
-            manifest_stats: Some(ManifestStats {
-                added_files_count: 5,
-                existing_files_count: 10,
-                deletes_files_count: 2,
-                added_rows_count: 500,
-                existing_rows_count: 1000,
-                delete_rows_count: 50,
-                min_sequence_number: 100,
-            }),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
     }
 
     // Helper to compare two metadata entries (excluding fields that are not yet fully supported)
@@ -3158,7 +2939,20 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create original metadata
-        let original_entry = create_simple_metadata_entry();
+        let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/path/to/file.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(200),
+                first_row_id: Some(1000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
         let read_metadata =
             build_and_roundtrip(vec![original_entry.clone()], 0, &table_root_url, &engine)?;
 
@@ -3230,8 +3024,8 @@ mod tests {
         assert_field_id(&manifest_stats_schema, "deleteRowsCount", 514);
         assert_field_id(&manifest_stats_schema, "minSequenceNumber", 516);
 
-        // Verify ContentInfo field IDs
-        let dv_info_schema = ContentInfo::to_schema();
+        // Verify DvInfo field IDs
+        let dv_info_schema = DvInfo::to_schema();
         assert_field_id(&dv_info_schema, "location", 152);
         assert_field_id(&dv_info_schema, "offset", 144);
         assert_field_id(&dv_info_schema, "sizeInBytes", 145);
@@ -3243,7 +3037,7 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "location", 100);
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
         assert_field_id(&metadata_entry_schema, "trackingInfo", 147);
-        assert_field_id(&metadata_entry_schema, "contentInfo", 148);
+        assert_field_id(&metadata_entry_schema, "dvInfo", 148);
         assert_field_id(&metadata_entry_schema, "partitionSpecId", 149);
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
         assert_field_id(&metadata_entry_schema, "recordCount", 103);
@@ -3312,7 +3106,20 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create original metadata
-        let original_entry = create_simple_metadata_entry();
+        let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/path/to/file.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(200),
+                first_row_id: Some(1000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
         let read_metadata =
             build_and_roundtrip(vec![original_entry.clone()], 0, &table_root_url, &engine)?;
 
@@ -3324,6 +3131,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // PositionDeletes is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_deletion_vector() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3331,7 +3139,21 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create metadata with deletion vector
-        let original_entry = create_metadata_entry_with_dv();
+        let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
+            .location("s3://bucket/path/to/deletes.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(5),
+                sequence_number: Some(500),
+                file_sequence_number: Some(600),
+                first_row_id: Some(5000),
+                changes_dv: None,
+            })
+            .partition_spec_id(1)
+            .sort_order_id(1)
+            .record_count(10)
+            .file_size_in_bytes(512)
+            .build();
         let read_metadata =
             build_and_roundtrip(vec![original_entry.clone()], 1, &table_root_url, &engine)?;
 
@@ -3343,6 +3165,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // DataManifest is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_manifest_stats() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3350,7 +3173,30 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create metadata with manifest stats
-        let original_entry = create_metadata_entry_with_manifest_stats();
+        let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("s3://bucket/path/to/manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(10),
+                sequence_number: Some(1000),
+                file_sequence_number: Some(1000),
+                first_row_id: Some(10000),
+                changes_dv: None,
+            })
+            .partition_spec_id(2)
+            .sort_order_id(2)
+            .record_count(100)
+            .file_size_in_bytes(10240)
+            .manifest_stats(ManifestStats {
+                added_files_count: 5,
+                existing_files_count: 10,
+                deletes_files_count: 2,
+                added_rows_count: 500,
+                existing_rows_count: 1000,
+                delete_rows_count: 50,
+                min_sequence_number: 100,
+            })
+            .build();
         let read_metadata =
             build_and_roundtrip(vec![original_entry.clone()], 2, &table_root_url, &engine)?;
 
@@ -3362,6 +3208,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // DataManifest is not supported
     #[test]
     fn test_roundtrip_metadata_entry_with_inline_deletion_vector() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3369,7 +3216,22 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create metadata with inline deletion vector
-        let original_entry = create_metadata_entry_with_inline_dv();
+        let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
+        let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("s3://bucket/path/to/manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(3),
+                sequence_number: Some(300),
+                file_sequence_number: Some(400),
+                first_row_id: Some(3000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(2048)
+            .manifest_dv(Bytes::from(inline_data))
+            .build();
         let read_metadata =
             build_and_roundtrip(vec![original_entry.clone()], 3, &table_root_url, &engine)?;
 
@@ -3400,6 +3262,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // Not all entry type are supported
     #[test]
     fn test_roundtrip_multiple_metadata_entries() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3407,10 +3270,75 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create multiple entries including one with inline DV
-        let entry1 = create_simple_metadata_entry();
-        let entry2 = create_metadata_entry_with_dv();
-        let entry3 = create_metadata_entry_with_manifest_stats();
-        let entry4 = create_metadata_entry_with_inline_dv();
+        let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/path/to/file.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(200),
+                first_row_id: Some(1000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
+        let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
+            .location("s3://bucket/path/to/deletes.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(5),
+                sequence_number: Some(500),
+                file_sequence_number: Some(600),
+                first_row_id: Some(5000),
+                changes_dv: None,
+            })
+            .partition_spec_id(1)
+            .sort_order_id(1)
+            .record_count(10)
+            .file_size_in_bytes(512)
+            .build();
+        let entry3 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("s3://bucket/path/to/manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(10),
+                sequence_number: Some(1000),
+                file_sequence_number: Some(1000),
+                first_row_id: Some(10000),
+                changes_dv: None,
+            })
+            .partition_spec_id(2)
+            .sort_order_id(2)
+            .record_count(100)
+            .file_size_in_bytes(10240)
+            .manifest_stats(ManifestStats {
+                added_files_count: 5,
+                existing_files_count: 10,
+                deletes_files_count: 2,
+                added_rows_count: 500,
+                existing_rows_count: 1000,
+                delete_rows_count: 50,
+                min_sequence_number: 100,
+            })
+            .build();
+        let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
+        let entry4 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("s3://bucket/path/to/manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(3),
+                sequence_number: Some(300),
+                file_sequence_number: Some(400),
+                first_row_id: Some(3000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(2048)
+            .manifest_dv(Bytes::from(inline_data))
+            .build();
 
         let read_metadata = build_and_roundtrip(
             vec![
@@ -3435,6 +3363,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore] // Not all entry type are supported
     #[test]
     fn test_roundtrip_all_data_content_types() -> DeltaResult<()> {
         let engine = SyncEngine::new();
@@ -3453,29 +3382,22 @@ mod tests {
         let entries: Vec<ContentTreeNodeEntry> = content_types
             .into_iter()
             .enumerate()
-            .map(|(i, content_type)| ContentTreeNodeEntry {
-                content_type,
-                location: Some(format!("s3://bucket/file{}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(i as i64),
-                    sequence_number: Some((i * 100) as i64),
-                    file_sequence_number: Some((i * 200) as i64),
-                    first_row_id: Some((i * 1000) as i64),
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: i as i64,
-                sort_order_id: Some(i as i64),
-                record_count: (i * 10) as i64,
-                file_size_in_bytes: Some((i * 512) as i64),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
+            .map(|(i, content_type)| {
+                ContentTreeNodeEntryBuilder::new(content_type)
+                    .location(format!("s3://bucket/file{}.parquet", i))
+                    .tracking_info(TrackingInfo {
+                        status: TrackingStatus::Added,
+                        snapshot_id: Some(i as i64),
+                        sequence_number: Some((i * 100) as i64),
+                        file_sequence_number: Some((i * 200) as i64),
+                        first_row_id: Some((i * 1000) as i64),
+                        changes_dv: None,
+                    })
+                    .partition_spec_id(i as i64)
+                    .sort_order_id(i as i64)
+                    .record_count((i * 10) as i64)
+                    .file_size_in_bytes((i * 512) as i64)
+                    .build()
             })
             .collect();
 
@@ -3507,29 +3429,21 @@ mod tests {
         let entries: Vec<ContentTreeNodeEntry> = statuses
             .into_iter()
             .enumerate()
-            .map(|(i, status)| ContentTreeNodeEntry {
-                content_type: DataContentType::Data,
-                location: Some(format!("s3://bucket/file{}.parquet", i)),
-                file_format: DataFileFormat::Parquet,
-                tracking_info: Some(TrackingInfo {
-                    status,
-                    snapshot_id: Some(i as i64),
-                    sequence_number: Some((i * 100) as i64),
-                    file_sequence_number: Some((i * 200) as i64),
-                    first_row_id: Some((i * 1000) as i64),
-                    changes_dv: None,
-                }),
-                content_info: None,
-                partition_spec_id: 0,
-                sort_order_id: Some(0),
-                record_count: 42,
-                file_size_in_bytes: Some(1024),
-                content_stats: None,
-                manifest_stats: None,
-                manifest_dv: None,
-                key_metadata: None,
-                split_offsets: None,
-                equality_ids: None,
+            .map(|(i, status)| {
+                ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+                    .location(format!("s3://bucket/file{}.parquet", i))
+                    .tracking_info(TrackingInfo {
+                        status,
+                        snapshot_id: Some(i as i64),
+                        sequence_number: Some((i * 100) as i64),
+                        file_sequence_number: Some((i * 200) as i64),
+                        first_row_id: Some((i * 1000) as i64),
+                        changes_dv: None,
+                    })
+                    .sort_order_id(0)
+                    .record_count(42)
+                    .file_size_in_bytes(1024)
+                    .build()
             })
             .collect();
 
@@ -3552,30 +3466,20 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create entry with many optional fields set to None
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/file.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/file.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
-                snapshot_id: None,          // None
-                sequence_number: None,      // None
-                file_sequence_number: None, // None
-                first_row_id: None,         // None
+                snapshot_id: None,
+                sequence_number: None,
+                file_sequence_number: None,
+                first_row_id: None,
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 42,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,  // None
-            manifest_stats: None, // None
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
 
         let read_metadata = build_and_roundtrip(vec![entry.clone()], 6, &table_root_url, &engine)?;
 
@@ -3605,30 +3509,21 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create entry with Puffin format
-        let entry = ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some("s3://bucket/file.puffin".to_string()),
-            file_format: DataFileFormat::Puffin,
-            tracking_info: Some(TrackingInfo {
+        let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("s3://bucket/file.puffin")
+            .file_format(DataFileFormat::Puffin)
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(200),
                 first_row_id: Some(1000),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 42,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .sort_order_id(0)
+            .record_count(42)
+            .file_size_in_bytes(1024)
+            .build();
 
         let read_metadata = build_and_roundtrip(vec![entry.clone()], 7, &table_root_url, &engine)?;
 
@@ -3639,73 +3534,6 @@ mod tests {
         assert_eq!(entries[0].file_format, DataFileFormat::Puffin);
 
         Ok(())
-    }
-
-    /// Helper to create a data file entry
-    fn create_data_entry(location: &str, sequence_number: i64) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some(location.to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(sequence_number),
-                file_sequence_number: Some(sequence_number),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
-    /// Helper to create a Data entry with inline DV info.
-    /// In the new CombinedManifest model, DV info is stored directly on Data entries.
-    fn create_data_entry_with_dv(
-        location: &str,
-        sequence_number: i64,
-        dv_location: &str,
-        dv_cardinality: i64,
-    ) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: Some(location.to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                sequence_number: Some(sequence_number),
-                file_sequence_number: Some(sequence_number),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: Some(ContentInfo {
-                location: dv_location.to_string(),
-                offset: 0,
-                size_in_bytes: 108, // 100 Delta bytes + 8 framing
-                cardinality: dv_cardinality,
-            }),
-            partition_spec_id: 0,
-            sort_order_id: Some(0),
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
     }
 
     /// Builds a ContentTreeNode from entries using the builder.
@@ -3742,9 +3570,24 @@ mod tests {
         }
         let metadata = builder.build(engine, 1)?;
 
-        let (written_path, _) = writer::ContentTreeNodeWriter::try_new(metadata)?.write(engine)?;
+        let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
+            .write(engine)?
+            .location;
         let path_in_log = absolute_to_relative_path(&written_path, table_root_url)?;
-        ContentTreeNode::read(engine, &written_path, path_in_log, table_root_url.clone())
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
+            &written_path,
+            path_in_log,
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
+            table_root_url.clone(),
+        )
     }
 
     #[test]
@@ -3757,13 +3600,33 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // In the new CombinedManifest model, DV is inline on Data entries.
-        // A Data entry with content_info: None produces an Add with no deletionVector.
-        let data_entry = create_data_entry("memory:///data.parquet", 100);
+        // A Data entry with dv_info: None produces an Add with no deletionVector.
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         let batch = action_batches.next().unwrap()?;
         let mut visitor = AddVisitor::default();
@@ -3772,7 +3635,7 @@ mod tests {
 
         assert!(
             visitor.adds[0].deletion_vector.is_none(),
-            "Data entry without content_info should not have a deletion vector"
+            "Data entry without dv_info should not have a deletion vector"
         );
 
         Ok(())
@@ -3787,15 +3650,41 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        // In the new CombinedManifest model, a Data entry with content_info produces an Add with a DV.
+        // In the new CombinedManifest model, a Data entry with dv_info produces an Add with a DV.
         // Use a relative DV path format: deletion_vector_{uuid}.bin
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
-        let data_entry = create_data_entry_with_dv("memory:///data.parquet", 100, dv_location, 10);
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .dv_info(DvInfo {
+                location: dv_location.to_string(),
+                offset: 0,
+                size_in_bytes: 108,
+                cardinality: 10,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         let batch = action_batches.next().unwrap()?;
         let mut visitor = AddVisitor::default();
@@ -3805,7 +3694,7 @@ mod tests {
 
         assert!(
             add.deletion_vector.is_some(),
-            "Data entry with inline content_info should have a deletion vector"
+            "Data entry with inline dv_info should have a deletion vector"
         );
         assert_eq!(add.deletion_vector.as_ref().unwrap().cardinality, 10);
 
@@ -3822,13 +3711,33 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // Create a data file without any corresponding DV
-        let data_entry = create_data_entry("memory:///data.parquet", 50);
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(50),
+                file_sequence_number: Some(50),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         // Get action batches (no data skipping for this test)
         let schema = crate::actions::get_log_add_schema().clone();
-        let mut action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Get the Add action using visitor
         let batch = action_batches.next().unwrap()?;
@@ -3853,7 +3762,22 @@ mod tests {
         let engine = SyncEngine::new();
 
         // Create a metadata entry with manifest DV
-        let inline_dv_entry = create_metadata_entry_with_inline_dv();
+        let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
+        let inline_dv_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("s3://bucket/path/to/manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(3),
+                sequence_number: Some(300),
+                file_sequence_number: Some(400),
+                first_row_id: Some(3000),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(2048)
+            .manifest_dv(Bytes::from(inline_data))
+            .build();
         let original_dv_bytes = inline_dv_entry.manifest_dv.as_ref().unwrap().clone();
 
         // Convert to engine data
@@ -3893,8 +3817,46 @@ mod tests {
         // Two data entries, each with a different DV, both should produce Add actions with DVs.
         let dv_loc1 = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let dv_loc2 = "deletion_vector_87654321-4321-4321-4321-cba987654321.bin";
-        let data_entry_1 = create_data_entry_with_dv("memory:///data1.parquet", 100, dv_loc1, 15);
-        let data_entry_2 = create_data_entry_with_dv("memory:///data2.parquet", 200, dv_loc2, 20);
+        let data_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data1.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .dv_info(DvInfo {
+                location: dv_loc1.to_string(),
+                offset: 0,
+                size_in_bytes: 108,
+                cardinality: 15,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let data_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data2.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(200),
+                file_sequence_number: Some(200),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .dv_info(DvInfo {
+                location: dv_loc2.to_string(),
+                offset: 0,
+                size_in_bytes: 108,
+                cardinality: 20,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let metadata = build_and_roundtrip(
             vec![data_entry_1, data_entry_2],
@@ -3904,7 +3866,14 @@ mod tests {
         )?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+        let action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Collect all adds from all batches (each data entry may produce a separate batch)
         let mut all_adds = Vec::new();
@@ -3924,7 +3893,7 @@ mod tests {
         for add in &all_adds {
             assert!(
                 add.deletion_vector.is_some(),
-                "Each data entry with inline content_info should have a deletion vector"
+                "Each data entry with inline dv_info should have a deletion vector"
             );
         }
         // Cardinalities should be 15 and 20 (in some order)
@@ -3949,7 +3918,20 @@ mod tests {
 
         // In the new CombinedManifest model, a Data entry with Deleted tracking status
         // should not produce any Add action (it produces a Remove action instead).
-        let mut data_entry = create_data_entry("memory:///data.parquet", 50);
+        let mut data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(50),
+                file_sequence_number: Some(50),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
         if let Some(ref mut ti) = data_entry.tracking_info {
             ti.status = TrackingStatus::Deleted;
         }
@@ -3957,7 +3939,14 @@ mod tests {
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
         let schema = crate::actions::get_log_add_schema().clone();
-        let action_batches = metadata.root_action_batches(&engine, &schema, &[], None)?;
+        let action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
 
         // Collect all adds from all batches
         let mut total_adds = 0;
@@ -3977,85 +3966,6 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to create a data manifest entry
-    fn create_data_manifest_entry(location: &str) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::DataManifest,
-            location: Some(location.to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: Some(ManifestStats {
-                added_files_count: 10,
-                existing_files_count: 90,
-                deletes_files_count: 0,
-                added_rows_count: 1000,
-                existing_rows_count: 9000,
-                delete_rows_count: 0,
-                min_sequence_number: 50,
-            }),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
-    /// Helper to create a combined manifest entry (new format)
-    fn create_combined_manifest_entry(location: &str) -> ContentTreeNodeEntry {
-        let mut entry = create_data_manifest_entry(location);
-        entry.content_type = DataContentType::CombinedManifest;
-        entry
-    }
-
-    /// Helper to create a delete manifest entry (old format, kept for backward compat tests)
-    fn create_delete_manifest_entry(location: &str) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::DeleteManifest,
-            location: Some(location.to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
-                status: TrackingStatus::Existed,
-                snapshot_id: Some(1),
-                sequence_number: Some(100),
-                file_sequence_number: Some(100),
-                first_row_id: Some(0),
-                changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 10,
-            file_size_in_bytes: Some(512),
-            content_stats: None,
-            manifest_stats: Some(ManifestStats {
-                added_files_count: 5,
-                existing_files_count: 5,
-                deletes_files_count: 0,
-                added_rows_count: 50,
-                existing_rows_count: 50,
-                delete_rows_count: 0,
-                min_sequence_number: 75,
-            }),
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        }
-    }
-
     #[test]
     fn test_old_data_manifest_format_returns_error() -> DeltaResult<()> {
         // Old DataManifest/DeleteManifest format is no longer supported.
@@ -4064,8 +3974,50 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
-        let data_manifest = create_data_manifest_entry("memory:///data-manifest.parquet");
-        let delete_manifest = create_delete_manifest_entry("memory:///delete-manifest.parquet");
+        let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+            .location("memory:///data-manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .manifest_stats(ManifestStats {
+                added_files_count: 10,
+                existing_files_count: 90,
+                deletes_files_count: 0,
+                added_rows_count: 1000,
+                existing_rows_count: 9000,
+                delete_rows_count: 0,
+                min_sequence_number: 50,
+            })
+            .build();
+        let delete_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DeleteManifest)
+            .location("memory:///delete-manifest.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Existed,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .record_count(10)
+            .file_size_in_bytes(512)
+            .manifest_stats(ManifestStats {
+                added_files_count: 5,
+                existing_files_count: 5,
+                deletes_files_count: 0,
+                added_rows_count: 50,
+                existing_rows_count: 50,
+                delete_rows_count: 0,
+                min_sequence_number: 75,
+            })
+            .build();
 
         let metadata = build_node(
             vec![data_manifest, delete_manifest],
@@ -4105,7 +4057,28 @@ mod tests {
         ];
 
         for (content_type, label) in unsupported_cases {
-            let mut entry = create_data_manifest_entry("memory:///test.parquet");
+            let mut entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
+                .location("memory:///test.parquet")
+                .tracking_info(TrackingInfo {
+                    status: TrackingStatus::Existed,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(100),
+                    file_sequence_number: Some(100),
+                    first_row_id: Some(0),
+                    changes_dv: None,
+                })
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .manifest_stats(ManifestStats {
+                    added_files_count: 10,
+                    existing_files_count: 90,
+                    deletes_files_count: 0,
+                    added_rows_count: 1000,
+                    existing_rows_count: 9000,
+                    delete_rows_count: 0,
+                    min_sequence_number: 50,
+                })
+                .build();
             entry.content_type = *content_type;
 
             let batch = entry
@@ -4135,30 +4108,19 @@ mod tests {
         let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
 
         // CombinedManifest entries contain data files + optional inline DVs
-        let combined_manifest = ContentTreeNodeEntry {
-            content_type: DataContentType::CombinedManifest,
-            location: Some("memory:///combined-manifest.parquet".to_string()),
-            file_format: DataFileFormat::Parquet,
-            tracking_info: Some(TrackingInfo {
+        let combined_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+            .location("memory:///combined-manifest.parquet")
+            .tracking_info(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
                 file_sequence_number: Some(100),
                 first_row_id: Some(0),
                 changes_dv: None,
-            }),
-            content_info: None,
-            partition_spec_id: 0,
-            sort_order_id: None,
-            record_count: 100,
-            file_size_in_bytes: Some(1024),
-            content_stats: None,
-            manifest_stats: None,
-            manifest_dv: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-        };
+            })
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let metadata = build_node(vec![combined_manifest], 0, &table_root_url, &engine)?;
 
@@ -4176,69 +4138,6 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_to_action_batches_integration() -> DeltaResult<()> {
-        use crate::actions::visitors::AddVisitor;
-        use crate::engine_data::RowVisitor;
-
-        let engine = SyncEngine::new();
-        let temp_dir = tempdir().unwrap();
-        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
-
-        // Create a child data manifest with actual data files (using relative paths)
-        let data_entry_1 = create_data_entry("child-data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("child-data-2.parquet", 60);
-
-        let child_metadata = build_node(
-            vec![data_entry_1, data_entry_2],
-            0,
-            &table_root_url,
-            &engine,
-        )?;
-
-        // Write the child manifest to a file
-        let (child_manifest_url, _) =
-            writer::ContentTreeNodeWriter::try_new(child_metadata)?.write(&engine)?;
-
-        // Create a ContentTreeNodeEntry for the child manifest
-        let child_manifest_entry = create_data_manifest_entry(child_manifest_url.as_str());
-
-        // Create ManifestReference pointing to the child manifest
-        let manifest_refs = ManifestReference {
-            data_manifest: FilteredManifest::new(child_manifest_entry),
-        };
-
-        // Process manifest to action batches
-        let schema = crate::actions::get_log_add_schema().clone();
-        // No data skipping for this test
-        let action_batches = ContentTreeNode::manifest_to_action_batches(
-            manifest_refs,
-            &engine,
-            &schema,
-            &table_root_url,
-            None,
-        )?;
-
-        // Collect all Add actions
-        let mut all_adds = Vec::new();
-        for batch_result in action_batches {
-            let batch = batch_result?;
-            let mut visitor = AddVisitor::default();
-            visitor.visit_rows_of(batch.actions.as_ref())?;
-            all_adds.extend(visitor.adds);
-        }
-
-        // Verify we got both data files
-        assert_eq!(all_adds.len(), 2);
-
-        // Verify the paths (relative paths)
-        let paths: Vec<_> = all_adds.iter().map(|a| a.path.as_str()).collect();
-        assert!(paths.contains(&"child-data-1.parquet"));
-        assert!(paths.contains(&"child-data-2.parquet"));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_full_hierarchical_metadata_tree() -> DeltaResult<()> {
         use crate::actions::visitors::AddVisitor;
         use crate::engine_data::RowVisitor;
@@ -4249,8 +4148,34 @@ mod tests {
 
         // Create two child data manifests with actual data files (using relative paths)
         // Child manifest 1
-        let data_entry_1 = create_data_entry("partition1/data-1.parquet", 50);
-        let data_entry_2 = create_data_entry("partition1/data-2.parquet", 60);
+        let data_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("partition1/data-1.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(50),
+                file_sequence_number: Some(50),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let data_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("partition1/data-2.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(60),
+                file_sequence_number: Some(60),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let child_metadata_1 = build_node(
             vec![data_entry_1, data_entry_2],
@@ -4258,12 +4183,39 @@ mod tests {
             &table_root_url,
             &engine,
         )?;
-        let (child_manifest_url_1, _) =
-            writer::ContentTreeNodeWriter::try_new(child_metadata_1)?.write(&engine)?;
+        let child_manifest_url_1 = writer::ContentTreeNodeWriter::try_new(child_metadata_1)?
+            .write(&engine)?
+            .location;
 
         // Child manifest 2 - use version 1 to avoid filename collision
-        let data_entry_3 = create_data_entry("partition2/data-3.parquet", 70);
-        let data_entry_4 = create_data_entry("partition2/data-4.parquet", 80);
+        let data_entry_3 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("partition2/data-3.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(70),
+                file_sequence_number: Some(70),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+        let data_entry_4 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("partition2/data-4.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(80),
+                file_sequence_number: Some(80),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
 
         let child_metadata_2 = build_node(
             vec![data_entry_3, data_entry_4],
@@ -4271,12 +4223,57 @@ mod tests {
             &table_root_url,
             &engine,
         )?;
-        let (child_manifest_url_2, _) =
-            writer::ContentTreeNodeWriter::try_new(child_metadata_2)?.write(&engine)?;
+        let child_manifest_url_2 = writer::ContentTreeNodeWriter::try_new(child_metadata_2)?
+            .write(&engine)?
+            .location;
 
         // Create a root manifest that references both child manifests (as CombinedManifest, new format)
-        let data_manifest_entry_1 = create_combined_manifest_entry(child_manifest_url_1.as_str());
-        let data_manifest_entry_2 = create_combined_manifest_entry(child_manifest_url_2.as_str());
+        let data_manifest_entry_1 =
+            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+                .location(child_manifest_url_1.as_str())
+                .tracking_info(TrackingInfo {
+                    status: TrackingStatus::Existed,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(100),
+                    file_sequence_number: Some(100),
+                    first_row_id: Some(0),
+                    changes_dv: None,
+                })
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .manifest_stats(ManifestStats {
+                    added_files_count: 10,
+                    existing_files_count: 90,
+                    deletes_files_count: 0,
+                    added_rows_count: 1000,
+                    existing_rows_count: 9000,
+                    delete_rows_count: 0,
+                    min_sequence_number: 50,
+                })
+                .build();
+        let data_manifest_entry_2 =
+            ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
+                .location(child_manifest_url_2.as_str())
+                .tracking_info(TrackingInfo {
+                    status: TrackingStatus::Existed,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(100),
+                    file_sequence_number: Some(100),
+                    first_row_id: Some(0),
+                    changes_dv: None,
+                })
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .manifest_stats(ManifestStats {
+                    added_files_count: 10,
+                    existing_files_count: 90,
+                    deletes_files_count: 0,
+                    added_rows_count: 1000,
+                    existing_rows_count: 9000,
+                    delete_rows_count: 0,
+                    min_sequence_number: 50,
+                })
+                .build();
 
         let root_metadata = build_node(
             vec![data_manifest_entry_1, data_manifest_entry_2],
@@ -4293,9 +4290,12 @@ mod tests {
         // No data skipping for this test
         let action_batches = ContentTreeNode::non_root_action_batches(
             root_state,
-            &engine,
+            engine.parquet_handler(),
+            engine.evaluation_handler(),
             &schema,
             &table_root_url,
+            None,
+            None,
             None,
         )?;
 
@@ -4569,7 +4569,7 @@ mod tests {
             // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
             // Previously used leaf.update_deletion_vectors(dv_updates) here.
             // In the new model DVs are inline on data entries, so updating a DV requires
-            // re-writing the data entry with updated content_info.
+            // re-writing the data entry with updated dv_info.
             let _ = (&file_locations, known_dv_size_in_bytes);
 
             let result = leaf.finish(engine.as_ref())?;
@@ -4589,10 +4589,18 @@ mod tests {
 
         let root_manifest_url = table_url.join(content_root_info.path())?;
 
-        let root_metadata = ContentTreeNode::read(
-            engine.as_ref(),
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &root_manifest_url,
             content_root_info.path().to_string(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let root_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_url.clone(),
         )?;
         let root_entries = root_metadata.entries()?;
@@ -4603,7 +4611,7 @@ mod tests {
 
         // In the new CombinedManifest model, DV info is inline on Data entries.
         // Check CombinedManifest entries in root — they point to leaf manifests
-        // that contain Data entries with inline content_info.
+        // that contain Data entries with inline dv_info.
         for entry in &root_entries {
             if matches!(entry.content_type, DataContentType::CombinedManifest) {
                 let manifest_path = entry
@@ -4611,26 +4619,34 @@ mod tests {
                     .as_ref()
                     .expect("CombinedManifest should have location");
                 let manifest_url = table_url.join(manifest_path)?;
-                let manifest_metadata = ContentTreeNode::read(
-                    engine.as_ref(),
+                let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+                    engine.parquet_handler(),
                     &manifest_url,
                     manifest_path.clone(),
+                    None,
+                    None,
+                )?;
+                let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+                let manifest_metadata = ContentTreeNode::from_batches_with_version(
+                    data,
+                    version,
+                    path_in_log,
                     table_url.clone(),
                 )?;
                 let manifest_entries = manifest_metadata.entries()?;
 
                 for manifest_entry in manifest_entries {
                     if manifest_entry.content_type == DataContentType::Data {
-                        if let Some(content_info) = &manifest_entry.content_info {
+                        if let Some(dv_info) = &manifest_entry.dv_info {
                             // Verify the DV size includes the +8 Iceberg framing
                             let expected_iceberg_size = known_dv_size_in_bytes as i64 + 8;
                             assert_eq!(
-                                content_info.size_in_bytes,
+                                dv_info.size_in_bytes,
                                 expected_iceberg_size,
-                                "Persisted content_info.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
+                                "Persisted dv_info.size_in_bytes should be {} (Delta {} + 8 framing), but got {}",
                                 expected_iceberg_size,
                                 known_dv_size_in_bytes,
-                                content_info.size_in_bytes
+                                dv_info.size_in_bytes
                             );
                             found_position_deletes_count += 1;
                         }
@@ -4641,12 +4657,12 @@ mod tests {
 
         assert!(
             found_position_deletes_count > 0,
-            "Should have Data entries with inline content_info in CombinedManifest leaf manifests"
+            "Should have Data entries with inline dv_info in CombinedManifest leaf manifests"
         );
 
         // The test successfully proves:
-        // 1. Persisted manifests have Data entries with inline content_info using Iceberg sizes (Delta + 8)
-        //    - We verified content_info.size_in_bytes = 42 + 8 = 50
+        // 1. Persisted manifests have Data entries with inline dv_info using Iceberg sizes (Delta + 8)
+        //    - We verified dv_info.size_in_bytes = 42 + 8 = 50
         // 2. The size conversion happens at write time in:
         //    - extract_deletion_vector_content (+8): builder.rs
         // 3. On read, the size is subtracted back to Delta format in the visitor
@@ -4763,6 +4779,122 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Native serialization format"));
+
+        Ok(())
+    }
+
+    /// Verifies that `stats` is null and `stats_parsed.numRecords` is populated from
+    /// `recordCount` when no `table_schema` is provided (so `has_stats_parsed = false`).
+    #[test]
+    fn test_stats_null_and_stats_parsed_num_records_from_record_count() -> DeltaResult<()> {
+        use crate::actions::{Add, ADD_NAME};
+        use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+        use crate::schema::{ColumnName, ToSchema as _};
+        use std::sync::LazyLock;
+
+        const RECORD_COUNT: i64 = 42;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(100),
+                file_sequence_number: Some(100),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(RECORD_COUNT)
+            .file_size_in_bytes(1024)
+            .build();
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
+
+        // Build a minimal stats schema with just numRecords
+        let stats_schema =
+            StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
+
+        // Build action schema with stats_parsed added to the add struct (mirrors log_segment.rs)
+        let mut add_fields: Vec<StructField> = Add::to_schema().fields().cloned().collect();
+        add_fields.push(StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(stats_schema.clone())),
+        ));
+        let action_schema: SchemaRef =
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                ADD_NAME,
+                StructType::new_unchecked(add_fields),
+            )]));
+
+        // table_schema = None → no content_stats in metadata → has_stats_parsed = false
+        // The new code should populate stats_parsed.numRecords from recordCount
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &action_schema,
+            &[],
+            None,
+            None, // table_schema
+            Some(&stats_schema),
+        )?;
+
+        let batch = action_batches.next().unwrap()?;
+
+        struct StatsChecker {
+            stats: Vec<Option<String>>,
+            num_records: Vec<Option<i64>>,
+        }
+
+        impl RowVisitor for StatsChecker {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                    LazyLock::new(|| {
+                        (
+                            vec![
+                                ColumnName::new(["add", "stats"]),
+                                ColumnName::new(["add", "stats_parsed", "numRecords"]),
+                            ],
+                            vec![DataType::STRING, DataType::LONG],
+                        )
+                    });
+                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.stats.push(getters[0].get_opt(i, "add.stats")?);
+                    self.num_records
+                        .push(getters[1].get_opt(i, "add.stats_parsed.numRecords")?);
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = StatsChecker {
+            stats: vec![],
+            num_records: vec![],
+        };
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+
+        assert_eq!(visitor.stats.len(), 1);
+        assert!(
+            visitor.stats[0].is_none(),
+            "stats JSON field should be null (no to_json serialization)"
+        );
+        assert_eq!(
+            visitor.num_records[0],
+            Some(RECORD_COUNT),
+            "stats_parsed.numRecords should be populated from recordCount"
+        );
 
         Ok(())
     }

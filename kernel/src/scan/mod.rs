@@ -433,8 +433,6 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
             StructField::nullable("dataManifestPath", DataType::STRING),
             StructField::nullable("dataManifestPosition", DataType::LONG),
-            StructField::nullable("deleteManifestPath", DataType::STRING),
-            StructField::nullable("deleteManifestPosition", DataType::LONG),
         ]),
     )])
     .into()
@@ -683,8 +681,6 @@ impl Scan {
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                     StructField::nullable("dataManifestPath", DataType::STRING),
                     StructField::nullable("dataManifestPosition", DataType::LONG),
-                    StructField::nullable("deleteManifestPath", DataType::STRING),
-                    StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             )])
         });
@@ -1095,9 +1091,8 @@ impl Scan {
 ///      clusteringProvider: string,
 ///      dataManifestPath: string,
 ///      dataManifestPosition: long,
-///      deleteManifestPath: string,
-///      deleteManifestPosition: long,
-///    }
+///    },
+///    numRecords: long,
 /// }
 /// ```
 pub fn scan_row_schema() -> SchemaRef {

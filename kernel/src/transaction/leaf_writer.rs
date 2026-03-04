@@ -136,8 +136,6 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         column_name!("fileConstantValues.defaultRowCommitVersion"),
         column_name!("fileConstantValues.dataManifestPath"),
         column_name!("fileConstantValues.dataManifestPosition"),
-        column_name!("fileConstantValues.deleteManifestPath"),
-        column_name!("fileConstantValues.deleteManifestPosition"),
     ];
     let types = vec![
         DataType::STRING,
@@ -158,8 +156,6 @@ static BASE_SCAN_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         DataType::LONG,
         DataType::STRING,
         DataType::LONG,
-        DataType::STRING,
-        DataType::LONG,
     ];
     (names, types)
 });
@@ -172,8 +168,7 @@ impl<'a> RowVisitor for ScanRowVisitor<'a> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         // Fixed getter indices for all columns (all primitive leaf values):
         // Layout: path, size, modificationTime, stats, + 5 DV fields, partitionValues,
-        //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition,
-        //         deleteManifestPath, deleteManifestPosition
+        //         baseRowId, defaultRowCommitVersion, dataManifestPath, dataManifestPosition
         // Note: stats_parsed is pre-extracted into self.stats_per_row before visit() is called.
         // Note: tags is intentionally skipped (not extracted) as it has nullable values
         //       which are not yet supported in the scan API
@@ -759,10 +754,9 @@ mod tests {
                     StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                     StructField::nullable("dataManifestPath", DataType::STRING),
                     StructField::nullable("dataManifestPosition", DataType::LONG),
-                    StructField::nullable("deleteManifestPath", DataType::STRING),
-                    StructField::nullable("deleteManifestPosition", DataType::LONG),
                 ]),
             ),
+            StructField::nullable("numRecords", DataType::LONG),
         ]))
     }
 
@@ -1283,36 +1277,37 @@ mod tests {
             .expect("Manifest should have location");
 
         // Read back the manifest file to verify contents
-        use crate::content_tree::reader::ContentTreeNodeEntryVisitor;
         use crate::content_tree::ContentTreeNode;
 
         // manifest_location is now a relative path, join with table_root
         let manifest_url = table_root.join(manifest_location)?;
-        let manifest_metadata = ContentTreeNode::read(
-            engine.as_ref(),
+        let (iter, version, path_in_log) = ContentTreeNode::open_stream(
+            engine.parquet_handler(),
             &manifest_url,
             manifest_location.to_string(),
+            None,
+            None,
+        )?;
+        let data = iter.collect::<DeltaResult<Vec<_>>>()?;
+        let manifest_metadata = ContentTreeNode::from_batches_with_version(
+            data,
+            version,
+            path_in_log,
             table_root.clone(),
         )?;
-
-        // Use ContentTreeNodeEntryVisitor to extract all entries
-        let mut visitor = ContentTreeNodeEntryVisitor::default();
-        for engine_data in manifest_metadata.data() {
-            visitor.visit_rows_of(engine_data.as_ref())?;
-        }
+        let entries = manifest_metadata.entries()?;
 
         // The manifest should contain exactly 2 entries
         assert_eq!(
-            visitor.entries.len(),
+            entries.len(),
             2,
             "Manifest should contain exactly 2 files (selected rows 0 and 2), but found {}",
-            visitor.entries.len()
+            entries.len()
         );
 
         // Extract the location (file path) from the entries
         // These are now relative paths, so we can use them directly
-        let paths: Vec<String> = visitor
-            .entries
+        let paths: Vec<String> = entries
             .iter()
             .filter_map(|entry| {
                 entry.location.as_ref().map(|loc| {

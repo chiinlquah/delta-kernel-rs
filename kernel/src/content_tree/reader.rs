@@ -6,14 +6,14 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use super::{
-    ContentInfo, ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestStats,
-    TrackingInfo, TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, DvInfo, ManifestStats, TrackingInfo,
+    TrackingStatus,
 };
 
 /// Visitor that extracts ContentTreeNodeEntry structs from EngineData
 #[derive(Default)]
-pub struct ContentTreeNodeEntryVisitor {
-    pub entries: Vec<ContentTreeNodeEntry>,
+pub(super) struct ContentTreeNodeEntryVisitor {
+    pub(super) entries: Vec<ContentTreeNodeEntry>,
 }
 
 impl RowVisitor for ContentTreeNodeEntryVisitor {
@@ -55,7 +55,7 @@ fn visit_metadata_entry_at<'a>(
     // 1: location
     // 2: file_format
     // 3-8: tracking_info fields (status, snapshot_id, sequence_number, file_sequence_number, first_row_id, changes_dv)
-    // 9-12: content_info fields (location, offset, size_in_bytes, cardinality)
+    // 9-12: dv_info fields (location, offset, size_in_bytes, cardinality)
     // 13: partition_spec_id
     // 14: sort_order_id
     // 15: record_count
@@ -126,14 +126,14 @@ fn visit_metadata_entry_at<'a>(
         changes_dv: tracking_changes_dv_bytes,
     });
 
-    // Extract content_info fields (location, offset, size_in_bytes, cardinality)
-    let dv_location: Option<String> = getters[9].get_opt(row_index, "content_info.location")?;
-    let content_info = dv_location
-        .map(|location| -> DeltaResult<ContentInfo> {
-            let offset: i64 = getters[10].get(row_index, "content_info.offset")?;
-            let size_in_bytes: i64 = getters[11].get(row_index, "content_info.size_in_bytes")?;
-            let cardinality: i64 = getters[12].get(row_index, "content_info.cardinality")?;
-            Ok(ContentInfo {
+    // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
+    let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;
+    let dv_info = dv_location
+        .map(|location| -> DeltaResult<DvInfo> {
+            let offset: i64 = getters[10].get(row_index, "dv_info.offset")?;
+            let size_in_bytes: i64 = getters[11].get(row_index, "dv_info.size_in_bytes")?;
+            let cardinality: i64 = getters[12].get(row_index, "dv_info.cardinality")?;
+            Ok(DvInfo {
                 location,
                 offset,
                 size_in_bytes,
@@ -191,7 +191,7 @@ fn visit_metadata_entry_at<'a>(
         location,
         file_format,
         tracking_info,
-        content_info,
+        dv_info,
         partition_spec_id,
         sort_order_id,
         record_count,
