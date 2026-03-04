@@ -1004,7 +1004,6 @@ impl ContentTreeNodeBuilder {
                 if let Some(ref mut tracking_info) = entry.tracking_info {
                     tracking_info.status = TrackingStatus::Deleted;
                     tracking_info.snapshot_id = Some(snapshot_id);
-                    tracking_info.sequence_number = Some(version as i64);
                 } else {
                     // Create new tracking info if it doesn't exist
                     entry.tracking_info = Some(TrackingInfo {
