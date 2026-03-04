@@ -6,6 +6,10 @@ pub(crate) mod reader;
 pub(crate) mod stats;
 pub(crate) mod writer;
 
+#[cfg(test)]
+#[path = "tests/snaps_and_seqs.rs"]
+mod snaps_and_seqs_tests;
+
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ADD_NAME, REMOVE_NAME};
@@ -1838,6 +1842,16 @@ pub(super) struct ContentTreeNodeEntry {
     /// DV that applies to the manifest linked to from this entry.
     #[field_id = 151]
     pub(crate) manifest_dv: Option<Bytes>,
+}
+
+impl ContentTreeNodeEntry {
+    /// Returns a copy of this entry with the tracking status updated.
+    pub(crate) fn with_status(mut self, status: TrackingStatus) -> Self {
+        if let Some(ref mut tracking_info) = self.tracking_info {
+            tracking_info.status = status;
+        }
+        self
+    }
 }
 
 /// Builder for [`ContentTreeNodeEntry`] that eliminates boilerplate by providing
