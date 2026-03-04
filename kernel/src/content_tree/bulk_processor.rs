@@ -92,6 +92,9 @@ struct ManifestProcessingState {
 
     /// Add evaluators (per-manifest: embed the manifest path as a literal)
     add_evaluators: ManifestAddEvaluators,
+
+    /// Whether we're still on the first batch for this manifest (for span tracking)
+    is_first_batch: bool,
 }
 
 /// Streaming processor with parallel IO optimization.
@@ -360,6 +363,7 @@ impl BulkManifestStreamProcessor {
             current_file_path,
             manifest_dv_applicator,
             add_evaluators,
+            is_first_batch: true,
         });
 
         Ok(true)
@@ -432,6 +436,20 @@ impl Iterator for BulkManifestStreamProcessor {
                 self.current_manifest_state = None;
                 continue;
             }
+
+            // Track the first batch per manifest with a span
+            let _first_batch_guard = if state.is_first_batch {
+                state.is_first_batch = false;
+                Some(
+                    tracing::info_span!(
+                        "content_tree.load_leaf_first_batch",
+                        manifest = %state.current_file_path,
+                    )
+                    .entered(),
+                )
+            } else {
+                None
+            };
 
             // Consume the batch (we already peeked, so this must succeed)
             let batch = match self.data_batch_iter.next() {
