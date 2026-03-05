@@ -57,7 +57,6 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
-    small_file_threshold: Option<u64>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -153,7 +152,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
-            small_file_threshold: None,
         }
     }
 
@@ -162,17 +160,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
-        self
-    }
-
-    /// Sets the file size threshold in bytes. Files whose [`FileMeta`] size is known (> 0) and
-    /// at most this threshold are fetched entirely into memory before parquet parsing, which
-    /// avoids multiple round-trip range requests. Files with size 0 (unknown) always use the
-    /// normal streaming path.
-    ///
-    /// Defaults to `None` (disabled).
-    pub fn with_small_file_threshold(mut self, threshold: u64) -> Self {
-        self.small_file_threshold = Some(threshold);
         self
     }
 
@@ -265,7 +252,6 @@ async fn read_parquet_files_impl(
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    small_file_threshold: Option<u64>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -306,7 +292,6 @@ async fn read_parquet_files_impl(
                 None,
                 super::DEFAULT_BATCH_SIZE,
                 file,
-                small_file_threshold,
             )
             .await
         }
@@ -334,7 +319,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
-            self.small_file_threshold,
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
@@ -349,7 +333,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         // This ensures any blocking I/O during iterator creation happens asynchronously
         let store = self.store.clone();
         let task_executor = self.task_executor.clone();
-        let small_file_threshold = self.small_file_threshold;
 
         self.task_executor.block_on(async move {
             // Create all futures upfront
@@ -361,7 +344,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                         group,
                         physical_schema.clone(),
                         predicate.clone(),
-                        small_file_threshold,
                     )
                 })
                 .collect();
@@ -469,51 +451,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 }
 
-/// Parses an in-memory parquet file into a stream of record batches. Used both for presigned
-/// URLs and for small files fetched via the small-file threshold optimization.
-fn parse_parquet_bytes(
-    bytes: bytes::Bytes,
-    table_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    limit: Option<usize>,
-    batch_size: usize,
-    file_location: String,
-) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-    let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
-    let parquet_schema = metadata.schema();
-    let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let options = ArrowReaderOptions::new();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)?;
-    if let Some(mask) = generate_mask(
-        &table_schema,
-        parquet_schema,
-        builder.parquet_schema(),
-        &indices,
-    ) {
-        builder = builder.with_projection(mask)
-    }
-    let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-    }
-    if let Some(limit) = limit {
-        builder = builder.with_limit(limit)
-    }
-    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = futures::stream::iter(builder.with_batch_size(batch_size).build()?);
-    Ok(stream
-        .map(move |rbr| {
-            fixup_parquet_read(
-                rbr?,
-                &requested_ordering,
-                row_indexes.as_mut(),
-                Some(&file_location),
-            )
-        })
-        .boxed())
-}
-
 /// Opens a Parquet file and returns a stream of record batches
 async fn open_parquet_file(
     store: Arc<DynObjectStore>,
@@ -522,24 +459,9 @@ async fn open_parquet_file(
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
-    small_file_threshold: Option<u64>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
     let file_location = file_meta.location.to_string();
     let path = Path::from_url_path(file_meta.location.path())?;
-
-    if let Some(threshold) = small_file_threshold {
-        if file_meta.size > 0 && file_meta.size <= threshold {
-            let bytes = store.get(&path).await?.bytes().await?;
-            return parse_parquet_bytes(
-                bytes,
-                table_schema,
-                predicate,
-                limit,
-                batch_size,
-                file_location,
-            );
-        }
-    }
 
     let mut reader = {
         use object_store::ObjectStoreScheme;
@@ -639,15 +561,50 @@ impl FileOpener for PresignedUrlOpener {
         let file_location = file_meta.location.to_string();
 
         Ok(Box::pin(async move {
-            let bytes = client.get(&file_location).send().await?.bytes().await?;
-            parse_parquet_bytes(
-                bytes,
-                table_schema,
-                predicate,
-                limit,
-                batch_size,
-                file_location,
-            )
+            // fetch the file from the interweb
+            let reader = client.get(&file_location).send().await?.bytes().await?;
+            let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
+            let parquet_schema = metadata.schema();
+            let (indices, requested_ordering) =
+                get_requested_indices(&table_schema, parquet_schema)?;
+
+            let options = ArrowReaderOptions::new();
+            let mut builder =
+                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)?;
+            if let Some(mask) = generate_mask(
+                &table_schema,
+                parquet_schema,
+                builder.parquet_schema(),
+                &indices,
+            ) {
+                builder = builder.with_projection(mask)
+            }
+
+            // Only create RowIndexBuilder if row indexes are actually needed
+            let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
+                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+
+            // Filter row groups and row indexes if a predicate is provided
+            if let Some(ref predicate) = predicate {
+                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+            }
+            if let Some(limit) = limit {
+                builder = builder.with_limit(limit)
+            }
+
+            let reader = builder.with_batch_size(batch_size).build()?;
+
+            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+            let stream = futures::stream::iter(reader);
+            let stream = stream.map(move |rbr| {
+                fixup_parquet_read(
+                    rbr?,
+                    &requested_ordering,
+                    row_indexes.as_mut(),
+                    Some(&file_location),
+                )
+            });
+            Ok(stream.boxed())
         }))
     }
 }
@@ -726,64 +683,6 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
-    }
-
-    #[tokio::test]
-    async fn test_read_parquet_files_small_file_threshold() {
-        let store = Arc::new(LocalFileSystem::new());
-
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
-        )).unwrap();
-        let url = url::Url::from_file_path(path).unwrap();
-        let location = Path::from_url_path(url.path()).unwrap();
-        let meta = store.head(&location).await.unwrap();
-
-        let reader = ParquetObjectReader::new(store.clone(), location);
-        let physical_schema: SchemaRef = Arc::new(
-            ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .unwrap()
-                .schema()
-                .clone()
-                .try_into_kernel()
-                .unwrap(),
-        );
-        let files = &[FileMeta {
-            location: url.clone(),
-            last_modified: meta.last_modified.timestamp(),
-            size: meta.size,
-        }];
-
-        let new_handler = |threshold| {
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()))
-                .with_small_file_threshold(threshold)
-        };
-        let read_rows =
-            |handler: DefaultParquetHandler<TokioBackgroundExecutor>, f: &[FileMeta]| -> usize {
-                let data: Vec<RecordBatch> = handler
-                    .read_parquet_files(f, physical_schema.clone(), None)
-                    .unwrap()
-                    .map(into_record_batch)
-                    .try_collect()
-                    .unwrap();
-                assert_eq!(data.len(), 1);
-                data[0].num_rows()
-            };
-
-        // threshold above file size: fetches entire file
-        assert_eq!(read_rows(new_handler(meta.size + 1), files), 10);
-        // threshold at file size: also fetches entire file
-        assert_eq!(read_rows(new_handler(meta.size), files), 10);
-        // threshold below file size: uses normal streaming path
-        assert_eq!(read_rows(new_handler(meta.size / 2), files), 10);
-        // size=0 (unknown): skips bytes path even when threshold is max
-        let files_zero_size = &[FileMeta {
-            location: url.clone(),
-            last_modified: meta.last_modified.timestamp(),
-            size: 0,
-        }];
-        assert_eq!(read_rows(new_handler(u64::MAX), files_zero_size), 10);
     }
 
     #[test]

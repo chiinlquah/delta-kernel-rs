@@ -131,9 +131,11 @@ enum Scenario {
 #[cfg(feature = "trace-spans")]
 fn setup_span_capture(path: &str) -> impl Drop {
     use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{filter::LevelFilter, prelude::*};
     let (chrome_layer, guard) = ChromeLayerBuilder::new().file(path).build();
-    tracing_subscriber::registry().with(chrome_layer).init();
+    tracing_subscriber::registry()
+        .with(chrome_layer.with_filter(LevelFilter::INFO))
+        .init();
     guard
 }
 
@@ -157,7 +159,6 @@ async fn setup_table_and_engine(
         args.uc_endpoint.as_deref(),
         args.uc_token.as_deref(),
         operation,
-        Some(500_000),
     )
     .await?;
 

@@ -32,7 +32,7 @@ impl SyncEngine {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler::new()),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }
@@ -65,7 +65,7 @@ fn read_files<F, I>(
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(u64, File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>, String) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>, String) -> DeltaResult<I>
         + Send
         + 'static,
 {
@@ -80,14 +80,12 @@ where
         // Produces Iterator<DeltaResult<Iterator<DeltaResult<ArrowEngineData>>>>
         .map(move |file| {
             let location_string = file.location.to_string();
-            let file_size = file.size;
             let location = file.location;
             debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
             let path = location
                 .to_file_path()
                 .map_err(|_| Error::generic("can only read local files"))?;
             try_create_from_file(
-                file_size,
                 File::open(path)?,
                 schema.clone(),
                 arrow_schema.clone(),

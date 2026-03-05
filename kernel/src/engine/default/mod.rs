@@ -240,16 +240,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         }
     }
 
-    /// Sets the small-file threshold on the parquet handler (see
-    /// [`DefaultParquetHandler::with_small_file_threshold`]).
-    pub fn with_parquet_small_file_threshold(mut self, threshold: u64) -> Self {
-        self.parquet = Arc::new(
-            DefaultParquetHandler::new(self.object_store.clone(), self.task_executor.clone())
-                .with_small_file_threshold(threshold),
-        );
-        self
-    }
-
     /// Enter the runtime context of the executor associated with this engine.
     ///
     /// # Panics

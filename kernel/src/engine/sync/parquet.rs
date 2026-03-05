@@ -1,11 +1,10 @@
 use std::fs::File;
-use std::io::Read as _;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use url::Url;
 
 use super::read_files;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -16,44 +15,24 @@ use crate::engine::default::parquet::build_writer_properties;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::file::reader::ChunkReader;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     PredicateRef,
 };
 
-pub(crate) struct SyncParquetHandler {
-    small_file_threshold: Option<u64>,
-}
+pub(crate) struct SyncParquetHandler;
 
-impl SyncParquetHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            small_file_threshold: None,
-        }
-    }
-
-    /// Sets the file size threshold in bytes. Files whose [`FileMeta`] size is known (> 0) and
-    /// at most this threshold are fetched entirely into memory before parquet parsing, which
-    /// avoids repeated seeks. Files with size 0 (unknown) always use the normal path.
-    ///
-    /// Defaults to `None` (disabled).
-    pub(crate) fn with_small_file_threshold(mut self, threshold: u64) -> Self {
-        self.small_file_threshold = Some(threshold);
-        self
-    }
-}
-
-fn try_create_from_parquet<C: ChunkReader + Send + 'static>(
-    reader: C,
+fn try_create_from_parquet(
+    file: File,
     schema: SchemaRef,
+    _arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static>> {
-    let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(reader)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
@@ -70,14 +49,14 @@ fn try_create_from_parquet<C: ChunkReader + Send + 'static>(
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
-    Ok(Box::new(stream.map(move |rbr| {
+    Ok(stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
         )
-    })))
+    }))
 }
 
 impl ParquetHandler for SyncParquetHandler {
@@ -87,21 +66,7 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let threshold = self.small_file_threshold;
-        read_files(
-            files,
-            schema,
-            predicate,
-            move |file_size, mut file, schema, _arrow_schema, predicate, location| {
-                if threshold.is_some_and(|t| file_size > 0 && file_size <= t) {
-                    let mut buf = Vec::with_capacity(file_size as usize);
-                    file.read_to_end(&mut buf)?;
-                    try_create_from_parquet(Bytes::from(buf), schema, predicate, location)
-                } else {
-                    try_create_from_parquet(file, schema, predicate, location)
-                }
-            },
-        )
+        read_files(files, schema, predicate, try_create_from_parquet)
     }
 
     fn read_parquet_file_groups(
@@ -210,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -295,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_sync_read_parquet_footer() -> DeltaResult<()> {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
         ))?;
@@ -316,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_sync_read_parquet_footer_invalid_file() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
 
         let mut temp_path = std::env::temp_dir();
         temp_path.push("non_existent_file_for_sync_test.parquet");
@@ -333,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_with_filter() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_filtered.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -417,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_overwrite_true() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_overwrite.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -496,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_always_overwrites() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_no_overwrite.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -575,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -684,7 +649,7 @@ mod tests {
         writer.close().unwrap();
 
         // Read footer and verify schema
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler;
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let url = Url::from_file_path(&file_path).unwrap();
 
@@ -712,86 +677,6 @@ mod tests {
                 .get_config_value(&ColumnMetadataKey::ParquetFieldId)
                 .map(|v| v.to_string()),
             Some("2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_sync_parquet_small_file_threshold() {
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("threshold_test.parquet");
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        // Write a small test file
-        SyncParquetHandler::new()
-            .write_parquet_file(
-                url.clone(),
-                Box::new(std::iter::once(Ok(Box::new(ArrowEngineData::new(
-                    RecordBatch::try_from_iter(vec![(
-                        "id",
-                        Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-                    )])
-                    .unwrap(),
-                ))
-                    as Box<dyn crate::EngineData>))),
-                &Default::default(),
-            )
-            .unwrap();
-
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let schema: SchemaRef = {
-            let file = File::open(&file_path).unwrap();
-            let reader =
-                crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                    .unwrap();
-            Arc::new(reader.schema().clone().try_into_kernel().unwrap())
-        };
-
-        let read_rows = |handler: SyncParquetHandler, size: u64| -> usize {
-            let file_meta = FileMeta {
-                location: url.clone(),
-                last_modified: 0,
-                size,
-            };
-            let mut iter = handler
-                .read_parquet_files(&[file_meta], schema.clone(), None)
-                .unwrap();
-            let batch =
-                ArrowEngineData::try_from_engine_data(iter.next().unwrap().unwrap()).unwrap();
-            assert!(iter.next().is_none());
-            batch.record_batch().num_rows()
-        };
-
-        // threshold above file size: uses bytes path
-        assert_eq!(
-            read_rows(
-                SyncParquetHandler::new().with_small_file_threshold(file_size + 1),
-                file_size
-            ),
-            3
-        );
-        // threshold equal to file size: also uses bytes path
-        assert_eq!(
-            read_rows(
-                SyncParquetHandler::new().with_small_file_threshold(file_size),
-                file_size
-            ),
-            3
-        );
-        // threshold below file size: uses normal file path
-        assert_eq!(
-            read_rows(
-                SyncParquetHandler::new().with_small_file_threshold(file_size - 1),
-                file_size
-            ),
-            3
-        );
-        // size=0 (unknown): skips bytes path even when threshold is max
-        assert_eq!(
-            read_rows(
-                SyncParquetHandler::new().with_small_file_threshold(u64::MAX),
-                0
-            ),
-            3
         );
     }
 }

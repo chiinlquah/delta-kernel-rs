@@ -172,10 +172,6 @@ pub async fn create_engine_with_uc_credentials(
 /// - `uc_endpoint`: Optional Unity Catalog endpoint URL
 /// - `uc_token`: Optional Unity Catalog authentication token
 /// - `operation`: The operation type (Read, Write, ReadWrite) for UC credentials
-/// - `parquet_small_file_threshold`: Optional byte threshold below which parquet files are
-///   fetched entirely into memory before parsing (see
-///   [`DefaultEngine::with_parquet_small_file_threshold`]).
-///
 /// # Returns
 ///
 /// A `TableSetup` struct containing:
@@ -186,7 +182,6 @@ pub async fn setup_table_access(
     uc_endpoint: Option<&str>,
     uc_token: Option<&str>,
     operation: Operation,
-    parquet_small_file_threshold: Option<u64>,
 ) -> Result<TableSetup, Box<dyn std::error::Error + Send + Sync>> {
     let using_uc = uc_endpoint.is_some() && uc_token.is_some();
 
@@ -214,15 +209,6 @@ pub async fn setup_table_access(
         let (engine, table_url, path_prefix) =
             create_engine_with_uc_credentials(&uc_config, &table_info, operation).await?;
 
-        let engine = if let Some(threshold) = parquet_small_file_threshold {
-            // Safe: the Arc was just created with a single reference
-            let inner =
-                Arc::try_unwrap(engine).unwrap_or_else(|_| unreachable!("engine Arc just created"));
-            Arc::new(inner.with_parquet_small_file_threshold(threshold))
-        } else {
-            engine
-        };
-
         Ok(TableSetup {
             table_url,
             engine,
@@ -240,12 +226,9 @@ pub async fn setup_table_access(
         );
 
         let build_engine = |store, executor: Arc<_>| {
-            let engine =
-                delta_kernel::engine::default::DefaultEngine::new_with_executor(store, executor);
-            match parquet_small_file_threshold {
-                Some(threshold) => Arc::new(engine.with_parquet_small_file_threshold(threshold)),
-                None => Arc::new(engine),
-            }
+            Arc::new(
+                delta_kernel::engine::default::DefaultEngine::new_with_executor(store, executor),
+            )
         };
 
         let (table_url, engine) = if let Ok(url) = Url::parse(table_path) {
