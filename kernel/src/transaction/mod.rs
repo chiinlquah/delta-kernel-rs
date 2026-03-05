@@ -236,7 +236,7 @@ pub struct Transaction<S = ExistingTable> {
     // Aggregated manifest deletion vectors from all leaf writers
     aggregated_manifest_dvs: HashMap<String, roaring::RoaringTreemap>,
     // Aggregated unreconciled files from all leaf writers (detects conflicts)
-    aggregated_unreconciled: HashSet<(String, crate::transaction::leaf_writer::DVUniqueId)>,
+    aggregated_unreconciled: HashSet<String>,
     // Aggregated root DV actions to remove from root DV manifest
     aggregated_root_dv_actions: HashSet<String>,
     // Leaf manifest entries to include in root
@@ -670,7 +670,7 @@ impl<S> Transaction<S> {
 
             // Remove files that were moved to leaves from the root manifest entirely
             // This handles files that lacked metadata when added to leaf
-            for (file_path, _) in &self.aggregated_unreconciled {
+            for file_path in &self.aggregated_unreconciled {
                 metadata_builder.remove_data_file(file_path.as_str())?;
             }
 
@@ -1041,17 +1041,12 @@ impl<S> Transaction<S> {
     ) -> DeltaResult<()> {
         // Aggregate root entries to remove
         // These are file paths from the root manifest that have been moved to leaf manifests
-        for file_path in leaf_result.root_entries_to_remove {
-            // Track files that have been moved to leaves to prevent re-adding to root
-            // Use empty string for DVUniqueId since these are data files
-            self.aggregated_unreconciled
-                .insert((file_path, String::new()));
-        }
+        self.aggregated_unreconciled
+            .extend(leaf_result.root_entries_to_remove);
 
         // Aggregate root DV entries to remove
-        for dv_path in leaf_result.root_dv_entries_to_remove {
-            self.aggregated_root_dv_actions.insert(dv_path);
-        }
+        self.aggregated_root_dv_actions
+            .extend(leaf_result.root_dv_entries_to_remove);
 
         // Aggregate manifest DVs (union roaring bitmaps)
         for (manifest_url, row_indices) in leaf_result.manifest_dvs {
