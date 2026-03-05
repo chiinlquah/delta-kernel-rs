@@ -43,6 +43,8 @@ pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
 pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
+pub(crate) const ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL: &str =
+    "delta.enableIcebergNativeV4Experimental";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
 pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
 pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
@@ -141,6 +143,9 @@ pub struct TableProperties {
     /// Whether Iceberg compatibility V2 is enabled for this table. When enabled, Delta Lake
     /// ensures compatibility with Apache Iceberg V2 table format.
     pub enable_iceberg_compat_v2: Option<bool>,
+
+    /// Whether native Iceberg v4 interop (experimental) is enabled for this table.
+    pub enable_iceberg_native_v4_experimental: Option<bool>,
 
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
@@ -345,6 +350,10 @@ mod tests {
         assert_eq!(ENABLE_TYPE_WIDENING, "delta.enableTypeWidening");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
+        assert_eq!(
+            ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL,
+            "delta.enableIcebergNativeV4Experimental"
+        );
         assert_eq!(ISOLATION_LEVEL, "delta.isolationLevel");
         assert_eq!(LOG_RETENTION_DURATION, "delta.logRetentionDuration");
         assert_eq!(ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup");
@@ -422,6 +431,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_iceberg_native_v4_experimental() {
+        let properties = HashMap::from([(
+            ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL.to_string(),
+            "true".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(
+            table_properties.enable_iceberg_native_v4_experimental,
+            Some(true)
+        );
+
+        let properties = HashMap::from([(
+            ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL.to_string(),
+            "false".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(
+            table_properties.enable_iceberg_native_v4_experimental,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -470,6 +502,7 @@ mod tests {
             (ENABLE_TYPE_WIDENING, "true"),
             (ENABLE_ICEBERG_COMPAT_V1, "true"),
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
             (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
@@ -507,6 +540,7 @@ mod tests {
             enable_type_widening: Some(true),
             enable_iceberg_compat_v1: Some(true),
             enable_iceberg_compat_v2: Some(true),
+            enable_iceberg_native_v4_experimental: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),

@@ -1186,13 +1186,20 @@ impl<S> Transaction<S> {
 
     /// Returns true if this commit will be handled as a batch commit (content tree update).
     /// When true, add/remove actions are recorded in the content tree rather than the delta log.
+    ///
+    /// Batch commit is active when:
+    /// - The caller explicitly opted in via `with_batch_commit()` and the
+    ///   `metadataTree-experimental` writer feature is present, OR
+    /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
     fn is_batch_commit_active(&self) -> bool {
-        let can_batch_commit = self.batch_commit
-            && self
-                .read_snapshot
-                .table_configuration()
-                .protocol()
+        let table_config = self.read_snapshot.table_configuration();
+        let protocol = table_config.protocol();
+        let explicitly_requested = self.batch_commit
+            && protocol
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
+        let iceberg_native_v4 = protocol
+            .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
+        let can_batch_commit = explicitly_requested || iceberg_native_v4;
         let has_work_to_do = !self.add_files_metadata.is_empty()
             || !self.remove_files_metadata.is_empty()
             || !self.leaf_manifests.is_empty()
@@ -3832,6 +3839,144 @@ mod tests {
         for col in expected_partition_cols {
             assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
         }
+        Ok(())
+    }
+
+    /// Test that icebergNativeV4 forces batch commit without explicit with_batch_commit()
+    #[test]
+    fn test_iceberg_native_v4_forces_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::Array as _;
+        use crate::engine::sync::SyncEngine;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir()?;
+        let canonical_path = std::fs::canonicalize(temp_dir.path())?;
+        let table_root = Url::from_directory_path(canonical_path).unwrap();
+
+        // Create a table with icebergNativeV4 (and its dependencies) in the protocol
+        use serde_json::json;
+        use std::fs::{create_dir_all, write};
+        use uuid::Uuid;
+
+        let table_id = Uuid::new_v4().to_string();
+        let schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {
+                        "PARQUET:field_id": 1,
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "id"
+                    }
+                }
+            ]
+        });
+
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping", "metadataTree-experimental"],
+                "writerFeatures": [
+                    "columnMapping",
+                    "domainMetadata",
+                    "metadataTree-experimental",
+                    "icebergNativeV4-experimental"
+                ]
+            }
+        });
+
+        let metadata = json!({
+            "metaData": {
+                "id": table_id,
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "id",
+                    "delta.enableIcebergNativeV4Experimental": "true"
+                },
+                "createdTime": 1677811175819u64
+            }
+        });
+
+        let data = [
+            serde_json::to_vec(&protocol)?,
+            b"\n".to_vec(),
+            serde_json::to_vec(&metadata)?,
+        ]
+        .concat();
+
+        let delta_log_path = table_root
+            .join("_delta_log/")?
+            .to_file_path()
+            .map_err(|_| Error::generic("Cannot convert URL to file path"))?;
+        create_dir_all(&delta_log_path)?;
+        let file_path = delta_log_path.join("00000000000000000000.json");
+        write(&file_path, data)?;
+
+        // Create a transaction without calling with_batch_commit()
+        let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("test".to_string());
+
+        assert!(!txn.batch_commit);
+        assert!(
+            !txn.is_batch_commit_active(),
+            "batch commit should not be active without work to do"
+        );
+
+        // Add a dummy file to trigger has_work_to_do.
+        // Use the mandatory schema (path, partitionValues, size, modificationTime etc)
+        let add_schema = mandatory_add_file_schema();
+        let paths = Arc::new(StringArray::from(vec!["part-00000.parquet"]));
+        let keys = Arc::new(StringArray::new_null(0));
+        let values = Arc::new(StringArray::new_null(0));
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                keys as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
+                values as ArrayRef,
+            ),
+        ]);
+        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0, 0].into());
+        let partition_values = Arc::new(MapArray::new(
+            Arc::new(ArrowField::new(
+                "key_value",
+                entries.data_type().clone(),
+                false,
+            )),
+            offsets,
+            entries,
+            None,
+            false,
+        ));
+        let sizes = Arc::new(Int64Array::from(vec![1000]));
+        let mod_times = Arc::new(Int64Array::from(vec![1234567890]));
+
+        let arrow_schema: crate::arrow::datatypes::SchemaRef = Arc::new(
+            crate::engine::arrow_conversion::TryIntoArrow::try_into_arrow(add_schema.as_ref())?,
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![paths, partition_values, sizes, mod_times],
+        )?;
+        let add_data = Box::new(ArrowEngineData::new(batch));
+        txn.add_files(add_data);
+
+        assert!(
+            txn.is_batch_commit_active(),
+            "icebergNativeV4 should force batch commit even without with_batch_commit()"
+        );
+
         Ok(())
     }
 }
