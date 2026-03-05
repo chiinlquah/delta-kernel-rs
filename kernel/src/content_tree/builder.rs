@@ -19,6 +19,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, FilteredEngineData, Version}
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
+use tracing::instrument;
 use url::Url;
 
 /// Magic number for the Roaring bitmap portable format, stored as big-endian bytes.
@@ -302,6 +303,12 @@ impl ContentTreeNodeBuilder {
     /// * `table_root` - The root URL of the table
     /// * `table_schema` - The table schema with PARQUET:field_id metadata for stats conversion
     /// * `new_version` - The version number for the new metadata being built
+    #[instrument(
+        name = "content_tree.read_root_for_txn",
+        skip_all,
+        fields(path = %content_root.path),
+        err
+    )]
     pub(crate) fn from_content_root(
         engine: &dyn Engine,
         content_root: &crate::actions::ContentRoot,
@@ -1111,6 +1118,7 @@ impl ContentTreeNodeBuilder {
     /// # Returns
     /// * `Ok(ContentTreeNodeEntry)` - A manifest entry referencing the written leaf file
     /// * `Err` if there was an error building or writing the metadata
+    #[instrument(name = "content_tree.write_leaf", skip_all, err)]
     pub(crate) fn write_leaf(
         &mut self,
         engine: &dyn crate::Engine,

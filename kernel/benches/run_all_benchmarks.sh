@@ -10,7 +10,7 @@ NC='\033[0m' # No Color
 
 # Default configuration
 DATASETS_DIR=""
-RESULTS_DIR="benchmark_results"
+RESULTS_DIR=""
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 UC_MODE=false
 UC_ENDPOINT="https://e2-dogfood.staging.cloud.databricks.com"
@@ -18,6 +18,7 @@ UC_TOKEN=""
 TABLE_PREFIX=""
 CLEAN_BEFORE_BACKFILL=false
 FLAMEGRAPH_MODE=false
+SPANS_MODE=false
 
 # Parse command line arguments
 usage() {
@@ -34,6 +35,8 @@ OPTIONS (for Unity Catalog mode):
     --clean-before-backfill        Regenerate UC tables before running benchmarks
     --flamegraph                   Generate a flamegraph SVG for each benchmark scenario
                                    (requires cargo-flamegraph; uses --no-inline and debuginfo)
+    --spans                        Capture trace spans JSON for each benchmark
+                                   (requires trace-spans feature; outputs .trace.json files)
     -h, --help                     Show this help message
 
 ARGUMENTS:
@@ -83,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             FLAMEGRAPH_MODE=true
             shift
             ;;
+        --spans)
+            SPANS_MODE=true
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -119,6 +126,7 @@ else
     DATASETS_DIR="${DATASETS_DIR:-datasets}"
 fi
 
+RESULTS_DIR="${RESULTS_DIR:-benchmark_results}"
 RUN_DIR="${RESULTS_DIR}/run_${TIMESTAMP}"
 
 # Ensure we're in the kernel directory
@@ -170,6 +178,9 @@ mkdir -p "${RUN_DIR}"
 
 # Features to build with
 FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
+if [ "$SPANS_MODE" = true ]; then
+    FEATURES="${FEATURES} trace-spans"
+fi
 
 # Build benchmark-runner once
 echo -e "${BLUE}Building benchmark-runner...${NC}"
@@ -284,6 +295,9 @@ _run_benchmark_cmd() {
         (cd "${KERNEL_DIR}" && AWS_LC_SYS_CMAKE_BUILDER=1 CARGO_PROFILE_RELEASE_DEBUG=true \
             cargo flamegraph "${flamegraph_args[@]}" "$@") \
             > "${output_file}" 2>"${svg_file%.svg}.log"
+    elif [ "$SPANS_MODE" = true ]; then
+        local trace_file="${output_file%.json}.trace.json"
+        ${BENCHMARK_RUNNER} --trace-file "${trace_file}" "$@" > "${output_file}" 2>&1
     else
         ${BENCHMARK_RUNNER} "$@" > "${output_file}" 2>&1
     fi
@@ -514,7 +528,7 @@ process_dataset() {
 
     FIRST_FILE=true
     for result_file in "${dataset_dir}"/*.json; do
-        if [ -f "${result_file}" ]; then
+        if [ -f "${result_file}" ] && [[ "${result_file}" != *.trace.json ]]; then
             filename=$(basename "${result_file}" .json)
 
             if [ "${FIRST_FILE}" = true ]; then
@@ -569,7 +583,7 @@ for dataset in "${DATASETS[@]}"; do
         echo "----------------------------------------" >> "${SUMMARY_TXT}"
 
         for result_file in "${RUN_DIR}/${dataset}"/*.json; do
-            if [ -f "${result_file}" ]; then
+            if [ -f "${result_file}" ] && [[ "${result_file}" != *.trace.json ]]; then
                 filename=$(basename "${result_file}" .json)
 
                 # Extract key metrics using jq if available

@@ -53,8 +53,10 @@ pub fn scan(
     let start = Instant::now();
 
     // Load snapshot
-    let snapshot =
-        delta_kernel::snapshot::Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = {
+        let _span = tracing::info_span!("benchmark.scan.load_snapshot").entered();
+        delta_kernel::snapshot::Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+    };
 
     // Save whether predicate is present before moving it
     let has_predicate = predicate.is_some();
@@ -64,10 +66,20 @@ pub fn scan(
 
     // Measure time to first task
     let first_task_start = Instant::now();
-    let mut metadata_iter = scan.scan_metadata(engine.as_ref())?;
 
-    let first_task = metadata_iter.next();
-    let time_to_first_task = first_task_start.elapsed();
+    let (first_task, time_to_first_task, metadata_iter) = {
+        let _span = tracing::info_span!("benchmark.scan.time_to_first_file").entered();
+        let mut iter = {
+            let _span = tracing::info_span!("benchmark.scan.scan_metadata_setup").entered();
+            scan.scan_metadata(engine.as_ref())?
+        };
+        let first = {
+            let _span = tracing::info_span!("benchmark.scan.first_next").entered();
+            iter.next()
+        };
+        let elapsed = first_task_start.elapsed();
+        (first, elapsed, iter)
+    };
 
     // Count first task if it exists using visit_scan_files callback
     let mut num_tasks = if first_task.is_some() { 1 } else { 0 };
@@ -82,10 +94,13 @@ pub fn scan(
     }
 
     // Enumerate remaining tasks and visit files using callback pattern
-    for result in metadata_iter {
-        let metadata = result?;
-        num_tasks += 1;
-        context = metadata.visit_scan_files(context, count_scan_file)?;
+    {
+        let _span = tracing::info_span!("benchmark.scan.enumerate_remaining_files").entered();
+        for result in metadata_iter {
+            let metadata = result?;
+            num_tasks += 1;
+            context = metadata.visit_scan_files(context, count_scan_file)?;
+        }
     }
 
     let time_to_enumerate_all = first_task_start.elapsed();
@@ -241,16 +256,17 @@ pub fn write(
     let start = Instant::now();
 
     // Load or create snapshot
-    let snapshot = match delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
-        .build(engine.as_ref())
-    {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            // Table doesn't exist, would need to create it
-            // For now, return an error
-            return Err(delta_kernel::Error::generic(
-                "Table does not exist. Bulk write to new tables not yet implemented.",
-            ));
+    let snapshot = {
+        let _span = tracing::info_span!("benchmark.write.load_snapshot").entered();
+        match delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Err(delta_kernel::Error::generic(
+                    "Table does not exist. Bulk write to new tables not yet implemented.",
+                ));
+            }
         }
     };
 
@@ -270,24 +286,34 @@ pub fn write(
 
     let add_files_schema = txn.add_files_schema();
 
-    let mut batches = Vec::new();
     let num_batches = num_files / batch_size;
-    for batch_idx in 0..num_batches {
-        let start_index = batch_idx * batch_size;
-        batches.push(create_add_files_metadata(
-            add_files_schema,
-            batch_size,
-            start_index,
-        )?);
+    let batches = {
+        let _span =
+            tracing::info_span!("benchmark.write.build_batches", num_batches, batch_size).entered();
+        let mut batches = Vec::new();
+        for batch_idx in 0..num_batches {
+            batches.push(create_add_files_metadata(
+                add_files_schema,
+                batch_size,
+                batch_idx * batch_size,
+            )?);
+        }
+        batches
+    };
+
+    {
+        let _span = tracing::info_span!("benchmark.write.add_to_txn", bulk_mode).entered();
+        add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
     }
 
-    add_batches_to_txn(&mut txn, batches, bulk_mode, engine.clone())?;
-
     // Commit transaction
-    match txn.commit(engine.as_ref())? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(_) => {}
-        _ => {
-            return Err(delta_kernel::Error::generic("Commit failed"));
+    {
+        let _span = tracing::info_span!("benchmark.write.commit").entered();
+        match txn.commit(engine.as_ref())? {
+            delta_kernel::transaction::CommitResult::CommittedTransaction(_) => {}
+            _ => {
+                return Err(delta_kernel::Error::generic("Commit failed"));
+            }
         }
     }
 
@@ -362,8 +388,10 @@ pub fn vacuum_delete(
     let start = Instant::now();
 
     // Load snapshot
-    let snapshot =
-        delta_kernel::snapshot::Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = {
+        let _span = tracing::info_span!("benchmark.vacuum_delete.load_snapshot").entered();
+        delta_kernel::snapshot::Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+    };
 
     // Create scan without predicate to get all files
     let scan = snapshot.clone().scan_builder().build()?;
@@ -371,13 +399,17 @@ pub fn vacuum_delete(
     let mut batches_to_delete = Vec::new();
     let mut files_collected = 0;
 
-    let mut total_files = 0;
-    let mut all_batches = Vec::new();
-    for result in scan.scan_metadata(engine.as_ref())? {
-        let metadata = result?;
-        total_files += metadata.scan_files.data().len();
-        all_batches.push(metadata.scan_files);
-    }
+    let (total_files, all_batches) = {
+        let _span = tracing::info_span!("benchmark.vacuum_delete.scan_all_files").entered();
+        let mut total_files = 0;
+        let mut all_batches = Vec::new();
+        for result in scan.scan_metadata(engine.as_ref())? {
+            let metadata = result?;
+            total_files += metadata.scan_files.data().len();
+            all_batches.push(metadata.scan_files);
+        }
+        (total_files, all_batches)
+    };
 
     let files_to_delete = (total_files as f64 * partition_threshold as f64 / 100.0) as usize;
 
@@ -440,26 +472,30 @@ pub fn vacuum_delete(
 
     let txn_start = Instant::now();
 
-    // Create transaction
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("benchmark-runner")
-        .with_operation("DELETE".to_string())
-        .with_data_change(true);
+    {
+        let _span = tracing::info_span!("benchmark.vacuum_delete.commit", bulk_mode).entered();
 
-    if bulk_mode {
-        txn = txn.with_batch_commit();
-    }
+        // Create transaction
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_engine_info("benchmark-runner")
+            .with_operation("DELETE".to_string())
+            .with_data_change(true);
 
-    for batch in batches_to_delete {
-        txn.remove_files(batch);
-    }
+        if bulk_mode {
+            txn = txn.with_batch_commit();
+        }
 
-    match txn.commit(engine.as_ref())? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(_) => {}
-        _ => {
-            return Err(delta_kernel::Error::generic("Commit failed"));
+        for batch in batches_to_delete {
+            txn.remove_files(batch);
+        }
+
+        match txn.commit(engine.as_ref())? {
+            delta_kernel::transaction::CommitResult::CommittedTransaction(_) => {}
+            _ => {
+                return Err(delta_kernel::Error::generic("Commit failed"));
+            }
         }
     }
 

@@ -9,6 +9,7 @@ use crate::log_replay::ActionsBatch;
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, EngineData, EvaluationHandler, ParquetHandler, PredicateRef, Version};
 use std::sync::Arc;
+use tracing::instrument;
 use url::Url;
 
 /// Lazy iterator that defers content root metadata construction until data is requested.
@@ -75,6 +76,12 @@ impl LazyContentRootIterator {
     /// - `skip_leaf_manifests`: When true, only read root manifest
     /// - `stats_schema`: Optional stats schema (from table configuration or predicate columns)
     /// - `table_schema`: Optional table physical schema (with field IDs) for AMT content_stats reading
+    #[instrument(
+        name = "content_tree.open_root",
+        skip_all,
+        fields(path = %content_root_url),
+        err
+    )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_content_root(
         parquet_handler: Arc<dyn ParquetHandler>,
@@ -139,11 +146,14 @@ impl Iterator for LazyContentRootIterator {
                     context,
                 } => {
                     // Lazily construct the ContentTreeNode object on first access
-                    let data: Vec<Box<dyn EngineData>> =
+                    let data: Vec<Box<dyn EngineData>> = {
+                        let _span =
+                            tracing::info_span!("content_tree.collect_root_batches").entered();
                         match parquet_batches.collect::<DeltaResult<Vec<_>>>() {
                             Ok(d) => d,
                             Err(e) => return Some(Err(e)),
-                        };
+                        }
+                    };
 
                     // Construct metadata from collected batches with the parsed version.
                     // This also validates that the root only contains supported entry types.
@@ -162,6 +172,7 @@ impl Iterator for LazyContentRootIterator {
                     self.leaf_state = if context.skip_leaf_manifests {
                         None
                     } else {
+                        let _span = tracing::info_span!("content_tree.get_leaves").entered();
                         // Lazily read leaf manifests now that root is exhausted
                         // Construct manifest batch schema with filtered content_stats for data skipping
                         let manifest_batch_schema = context

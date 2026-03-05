@@ -52,6 +52,8 @@ strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
 # only for structured logging
 tracing = { version = "0.1", features = ["log"] }
+tracing-chrome = { version = "0.7", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
@@ -118,6 +120,9 @@ catalog-managed = []
 
 # Schema diffing functionality (experimental)
 schema-diff = []
+
+# Enables Chrome trace span capture for benchmarks (outputs .trace.json files)
+trace-spans = ["dep:tracing-chrome", "dep:tracing-subscriber"]
 
 # WARNING: experimental feature, still under active development
 # enables write support for clustered tables
