@@ -138,7 +138,7 @@ impl ParquetHandler for SyncParquetHandler {
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
         write_config: &crate::ParquetWriterConfig,
-    ) -> DeltaResult<u64> {
+    ) -> DeltaResult<crate::ParquetWriteResult> {
         // Convert URL to file path
         let path = location
             .to_file_path()
@@ -174,7 +174,9 @@ impl ParquetHandler for SyncParquetHandler {
 
         // finish() writes the footer; bytes_written() is accurate only after finish()
         writer.finish()?;
-        Ok(writer.bytes_written() as u64)
+        Ok(crate::ParquetWriteResult {
+            size_in_bytes: writer.bytes_written() as u64,
+        })
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {

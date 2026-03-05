@@ -175,6 +175,7 @@ fi
 
 # Create results directory
 mkdir -p "${RUN_DIR}"
+RUN_DIR="$(cd "${RUN_DIR}" && pwd)"
 
 # Features to build with
 FEATURES="arrow default-engine-rustls rand clap internal-api uc-client"
@@ -652,3 +653,24 @@ echo "================================================"
 echo -e "${BLUE}Running benchmark analysis...${NC}"
 echo "================================================"
 bash "${SCRIPT_DIR}/analyze_benchmark_results.sh" "${RESULTS_DIR}" "run_${TIMESTAMP}"
+
+# Print scp commands to copy span/flamegraph files from remote host
+if [ "$SPANS_MODE" = true ]; then
+    echo ""
+    echo "================================================"
+    echo -e "${BLUE}Span files (copy from arca.ssh with scp):${NC}"
+    echo "================================================"
+    while IFS= read -r trace_file; do
+        echo "scp arca.ssh:${trace_file} ."
+    done < <(find "${RUN_DIR}" -name "*.trace.json" | sort)
+fi
+
+if [ "$FLAMEGRAPH_MODE" = true ]; then
+    echo ""
+    echo "================================================"
+    echo -e "${BLUE}Flamegraph files (copy from arca.ssh with scp):${NC}"
+    echo "================================================"
+    while IFS= read -r svg_file; do
+        echo "scp arca.ssh:${svg_file} ."
+    done < <(find "${RUN_DIR}" -name "*.svg" | sort)
+fi

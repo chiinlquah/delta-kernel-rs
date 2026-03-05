@@ -401,7 +401,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
         write_config: &crate::ParquetWriterConfig,
-    ) -> DeltaResult<u64> {
+    ) -> DeltaResult<crate::ParquetWriteResult> {
         let store = self.store.clone();
         let props = build_writer_properties(write_config);
 
@@ -432,7 +432,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             // finish() writes the footer; bytes_written() is accurate only after finish()
             writer.finish().await?;
-            Ok(writer.bytes_written() as u64)
+            Ok(crate::ParquetWriteResult {
+                size_in_bytes: writer.bytes_written() as u64,
+            })
         })
     }
 
