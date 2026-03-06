@@ -1174,7 +1174,7 @@ fn build_amt_struct_expr(
         })
         .collect();
 
-    Expression::Struct(exprs, Some(Box::new(amt_schema.clone())), None)
+    Expression::struct_from(exprs)
 }
 
 /// Checks if a nested field path exists in a struct type.
@@ -1258,7 +1258,7 @@ fn build_amt_leaf_expr(
         })
         .collect();
 
-    Expression::Struct(exprs, Some(Box::new(amt_leaf_schema.clone())), None)
+    Expression::struct_from(exprs)
 }
 
 /// Engine-agnostic pre-conversion of a stats column from Delta JSON to AMT format.
@@ -1517,8 +1517,6 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     let mut null_count_exprs = Vec::new();
     let mut min_values_exprs = Vec::new();
     let mut max_values_exprs = Vec::new();
-    let mut null_count_fields = Vec::new();
-    let mut min_max_fields = Vec::new();
 
     collect_stats_expressions_filtered(
         table_schema,
@@ -1530,13 +1528,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         &mut null_count_exprs,
         &mut min_values_exprs,
         &mut max_values_exprs,
-        &mut null_count_fields,
-        &mut min_max_fields,
     )?;
-
-    // Build the stats_parsed struct schema
-    let null_count_schema = StructType::new_unchecked(null_count_fields);
-    let min_max_schema = StructType::new_unchecked(min_max_fields);
 
     // Build nested struct expressions
     let null_count_struct = if null_count_exprs.is_empty() {
@@ -1544,7 +1536,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
             StructType::new_unchecked(Vec::new()),
         ))))
     } else {
-        Expression::struct_from_with_schema(null_count_exprs, null_count_schema.clone())
+        Expression::struct_from(null_count_exprs)
     };
 
     let min_values_struct = if min_values_exprs.is_empty() {
@@ -1552,7 +1544,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
             StructType::new_unchecked(Vec::new()),
         ))))
     } else {
-        Expression::struct_from_with_schema(min_values_exprs.clone(), min_max_schema.clone())
+        Expression::struct_from(min_values_exprs.clone())
     };
 
     let max_values_struct = if max_values_exprs.is_empty() {
@@ -1560,37 +1552,22 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
             StructType::new_unchecked(Vec::new()),
         ))))
     } else {
-        Expression::struct_from_with_schema(max_values_exprs, min_max_schema.clone())
+        Expression::struct_from(max_values_exprs)
     };
 
     // Project numRecords from the manifest entry's recordCount field
     // This expression will be evaluated against the manifest batch data which includes recordCount
     let num_records_expr = Expression::column(["recordCount"]);
 
-    // Build the final stats_parsed struct
-    let stats_parsed_schema = StructType::new_unchecked(vec![
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable("nullCount", DataType::Struct(Box::new(null_count_schema))),
-        StructField::nullable(
-            "minValues",
-            DataType::Struct(Box::new(min_max_schema.clone())),
-        ),
-        StructField::nullable("maxValues", DataType::Struct(Box::new(min_max_schema))),
-        StructField::nullable("tightBounds", DataType::BOOLEAN),
-    ]);
-
-    Ok(Arc::new(Expression::struct_from_with_schema(
-        vec![
-            num_records_expr,
-            null_count_struct,
-            min_values_struct,
-            max_values_struct,
-            // TODO: Finalize this, what is the mapping?
-            // tightBounds: bounds are not tight in iceberg by default.
-            Expression::literal(false),
-        ],
-        stats_parsed_schema,
-    )))
+    Ok(Arc::new(Expression::struct_from([
+        num_records_expr,
+        null_count_struct,
+        min_values_struct,
+        max_values_struct,
+        // TODO: Finalize this, what is the mapping?
+        // tightBounds: bounds are not tight in iceberg by default.
+        Expression::literal(false),
+    ])))
 }
 
 /// Builds a map from physical column names (with "." for nested) to field IDs.
@@ -1636,8 +1613,6 @@ fn collect_stats_expressions_filtered(
     null_count_exprs: &mut Vec<ExpressionRef>,
     min_values_exprs: &mut Vec<ExpressionRef>,
     max_values_exprs: &mut Vec<ExpressionRef>,
-    null_count_fields: &mut Vec<StructField>,
-    min_max_fields: &mut Vec<StructField>,
 ) -> DeltaResult<()> {
     // Collect unique column names across all three stat categories
     let mut col_names: Vec<&str> = Vec::new();
@@ -1673,8 +1648,6 @@ fn collect_stats_expressions_filtered(
                 let mut nested_null_count_exprs = Vec::new();
                 let mut nested_min_values_exprs = Vec::new();
                 let mut nested_max_values_exprs = Vec::new();
-                let mut nested_null_count_fields = Vec::new();
-                let mut nested_min_max_fields = Vec::new();
 
                 collect_stats_expressions_filtered(
                     table_nested,
@@ -1686,37 +1659,18 @@ fn collect_stats_expressions_filtered(
                     &mut nested_null_count_exprs,
                     &mut nested_min_values_exprs,
                     &mut nested_max_values_exprs,
-                    &mut nested_null_count_fields,
-                    &mut nested_min_max_fields,
                 )?;
 
                 if !nested_null_count_exprs.is_empty() {
-                    let nested_null_count_schema =
-                        StructType::new_unchecked(nested_null_count_fields);
-                    null_count_exprs.push(Arc::new(Expression::struct_from_with_schema(
-                        nested_null_count_exprs,
-                        nested_null_count_schema.clone(),
-                    )));
-                    null_count_fields.push(StructField::nullable(
-                        table_field.name(),
-                        DataType::Struct(Box::new(nested_null_count_schema)),
-                    ));
+                    null_count_exprs
+                        .push(Arc::new(Expression::struct_from(nested_null_count_exprs)));
                 }
 
                 if !nested_min_values_exprs.is_empty() {
-                    let nested_min_max_schema = StructType::new_unchecked(nested_min_max_fields);
-                    min_values_exprs.push(Arc::new(Expression::struct_from_with_schema(
-                        nested_min_values_exprs,
-                        nested_min_max_schema.clone(),
-                    )));
-                    max_values_exprs.push(Arc::new(Expression::struct_from_with_schema(
-                        nested_max_values_exprs,
-                        nested_min_max_schema.clone(),
-                    )));
-                    min_max_fields.push(StructField::nullable(
-                        table_field.name(),
-                        DataType::Struct(Box::new(nested_min_max_schema)),
-                    ));
+                    min_values_exprs
+                        .push(Arc::new(Expression::struct_from(nested_min_values_exprs)));
+                    max_values_exprs
+                        .push(Arc::new(Expression::struct_from(nested_max_values_exprs)));
                 }
             }
             _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
@@ -1729,30 +1683,20 @@ fn collect_stats_expressions_filtered(
                         &field_path,
                         crate::content_tree::NULL_COUNT_FIELD_NAME,
                     ]))));
-                    null_count_fields
-                        .push(StructField::nullable(table_field.name(), DataType::LONG));
                 }
-                let has_min = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
-                let has_max = max_vals_cols.is_some_and(|s| s.field(col_name).is_some());
-                if has_min {
+                if min_vals_cols.is_some_and(|s| s.field(col_name).is_some()) {
                     min_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
                         "lower_bound",
                     ]))));
                 }
-                if has_max {
+                if max_vals_cols.is_some_and(|s| s.field(col_name).is_some()) {
                     max_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
                         "upper_bound",
                     ]))));
-                }
-                if has_min || has_max {
-                    min_max_fields.push(StructField::nullable(
-                        table_field.name(),
-                        table_field.data_type().clone(),
-                    ));
                 }
             }
             _ => {}

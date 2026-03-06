@@ -57,19 +57,27 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            1,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                1,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     // Should error because content root exists but protocol doesn't support it
@@ -135,19 +143,27 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            1,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                1,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     // Pass existing protocol - should skip content root search entirely
@@ -206,19 +222,27 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            1,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                1,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     let (metadata, protocol, content_root) =
@@ -294,20 +318,31 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 2),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            2,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    2,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                2,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     let (metadata, protocol, content_root) =
@@ -385,20 +420,31 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 2),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            2,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    2,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                2,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     let (metadata, protocol, content_root) =
@@ -480,20 +526,31 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 2),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            2,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    2,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                2,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     let (metadata, protocol, content_root) = log_segment
@@ -573,20 +630,31 @@ fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
         checkpoint_version: None,
         log_root: log_root.clone(),
         table_root: Url::parse("memory:///").unwrap(),
-        ascending_commit_files: vec![
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 0),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 1),
-            ParsedLogPath::create_parsed_published_commit(&Url::parse("memory:///").unwrap(), 2),
-        ],
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        latest_crc_file: None,
-        latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
-            &Url::parse("memory:///").unwrap(),
-            2,
-        )),
+        listed: crate::log_segment_files::LogSegmentFiles {
+            ascending_commit_files: vec![
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    0,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    1,
+                ),
+                ParsedLogPath::create_parsed_published_commit(
+                    &Url::parse("memory:///").unwrap(),
+                    2,
+                ),
+            ],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: Some(ParsedLogPath::create_parsed_published_commit(
+                &Url::parse("memory:///").unwrap(),
+                2,
+            )),
+            max_published_version: None,
+        },
         checkpoint_schema: None,
-        max_published_version: None,
     };
 
     let (metadata, protocol, content_root) =

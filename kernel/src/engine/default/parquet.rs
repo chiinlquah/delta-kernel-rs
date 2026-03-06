@@ -513,13 +513,16 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
+    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
+            Some(&arrow_schema),
         )
+        .map(Into::into)
     });
     Ok(stream.boxed())
 }
@@ -593,6 +596,7 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -600,7 +604,9 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
+                    Some(&arrow_schema),
                 )
+                .map(Into::into)
             });
             Ok(stream.boxed())
         }))
@@ -903,6 +909,7 @@ mod tests {
 
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -913,7 +920,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -930,46 +937,6 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
         assert_eq!(data[0].num_columns(), 2);
-    }
-
-    #[test]
-    fn test_read_parquet_footer() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
-        ))
-        .unwrap();
-        let file_size = std::fs::metadata(&path).unwrap().len();
-        let url = Url::from_file_path(path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta).unwrap();
-        crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
-    }
-
-    #[test]
-    fn test_read_parquet_footer_invalid_file() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
-        let mut temp_path = std::env::temp_dir();
-        temp_path.push("non_existent_file_for_test.parquet");
-        let url = Url::from_file_path(temp_path).unwrap();
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: 0,
-        };
-
-        let result = handler.read_parquet_footer(&file_meta);
-        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[tokio::test]
@@ -1091,6 +1058,7 @@ mod tests {
 
         // Read it back
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1101,7 +1069,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url.clone(),
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler

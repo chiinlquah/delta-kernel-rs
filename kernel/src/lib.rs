@@ -148,7 +148,7 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
-pub(crate) mod listed_log_files;
+pub(crate) mod log_segment_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
@@ -160,9 +160,6 @@ pub(crate) mod content_tree;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 // Export metadata types needed for testing
 pub use content_tree::{DataContentType, TrackingInfo, TrackingStatus};
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -702,6 +699,12 @@ pub trait StorageHandler: AsAny {
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
+    /// Write data to the specified path.
+    ///
+    /// If `overwrite` is false and the file already exists, this must return
+    /// `Err(Error::FileAlreadyExists)`.
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
+
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
@@ -736,6 +739,8 @@ pub trait JsonHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines may not merge engine data across file boundaries.
     ///
     /// # Parameters
     ///
@@ -943,6 +948,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines must not merge engine data across file boundaries.
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(

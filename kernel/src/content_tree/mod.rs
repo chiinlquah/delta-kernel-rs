@@ -340,7 +340,7 @@ impl ContentTreeNode {
                 use crate::schema::ToSchema;
                 let dv_schema = <DeletionVectorDescriptor as ToSchema>::to_schema();
                 if has_dv_columns {
-                    Expression::Struct(
+                    Expression::struct_with_nullability_from(
                         vec![
                             Arc::new(Expression::column(["dv_storageType"])),
                             Arc::new(Expression::column(["dv_pathOrInlineDv"])),
@@ -348,10 +348,7 @@ impl ContentTreeNode {
                             Arc::new(Expression::column(["dv_sizeInBytes"])),
                             Arc::new(Expression::column(["dv_cardinality"])),
                         ],
-                        Some(Box::new(dv_schema)),
-                        Some(Arc::new(Expression::Predicate(Box::new(
-                            Expression::column(["dv_storageType"]).is_not_null(),
-                        )))),
+                        Expression::from_pred(Expression::column(["dv_storageType"]).is_not_null()),
                     )
                 } else {
                     Expression::null_literal(DataType::Struct(Box::new(dv_schema)))
@@ -391,7 +388,7 @@ impl ContentTreeNode {
                             }
                         })
                         .collect();
-                    Expression::struct_from_with_schema(field_exprs, stats_struct.as_ref().clone())
+                    Expression::struct_from(field_exprs)
                 }
             }
 
@@ -440,32 +437,24 @@ impl ContentTreeNode {
             field_exprs.push(Arc::new(expr));
         }
 
-        let action_struct_expr =
-            Expression::struct_from_with_schema(field_exprs, (**action_struct_type).clone());
+        let action_struct_expr = Expression::struct_from(field_exprs);
 
-        // Wrap action struct in top-level schema
-        let top_level_expr =
-            Self::wrap_action_in_top_level(action_name, action_struct_expr, action_struct_type);
+        // Build a top-level struct matching the full output_schema. The action field is populated
+        // from the expression; all other fields are null literals. This ensures the evaluated
+        // batch always has the same schema as output_schema regardless of which action type is
+        // being produced, so downstream visitors can access add.* and remove.* uniformly.
+        let top_level_exprs: Vec<Arc<Expression>> = action_schema
+            .fields()
+            .map(|f| {
+                if f.name() == action_name {
+                    Arc::new(action_struct_expr.clone())
+                } else {
+                    Arc::new(Expression::null_literal(f.data_type().clone()))
+                }
+            })
+            .collect();
 
-        Ok(Arc::new(top_level_expr))
-    }
-
-    /// Helper to wrap an action struct expression in a top-level schema with the action name.
-    /// Returns the wrapped expression.
-    fn wrap_action_in_top_level(
-        action_name: &str,
-        action_expr: crate::expressions::Expression,
-        action_struct_type: &StructType,
-    ) -> crate::expressions::Expression {
-        use crate::expressions::Expression;
-
-        let top_level_schema = StructType::new_unchecked(vec![StructField::new(
-            action_name,
-            DataType::Struct(Box::new(action_struct_type.clone())),
-            true,
-        )]);
-
-        Expression::struct_from_with_schema([action_expr], top_level_schema)
+        Ok(Arc::new(Expression::struct_from(top_level_exprs)))
     }
 
     /// Appends 5 flat DV columns extracted directly from `dvInfo.*` on each Data entry.
@@ -2135,8 +2124,7 @@ impl ContentTreeNodeEntry {
         };
 
         // Create struct expression with all fields
-        let augment_expr =
-            Expression::struct_from_with_schema(field_exprs, (*augmented_output_schema).clone());
+        let augment_expr = Expression::struct_from(field_exprs);
 
         // Create evaluator
         Ok(Some(evaluation_handler.new_expression_evaluator(
@@ -4891,6 +4879,97 @@ mod tests {
             Some(RECORD_COUNT),
             "stats_parsed.numRecords should be populated from recordCount"
         );
+
+        Ok(())
+    }
+
+    /// Verifies that when the output schema contains both "add" and "remove" fields, the
+    /// evaluator produces batches where each action type has its field populated and the
+    /// other field is null — ensuring a uniform schema across add and remove batches.
+    #[test]
+    fn test_add_and_remove_actions_have_matching_output_schema() -> DeltaResult<()> {
+        use crate::actions::{
+            visitors::AddVisitor, visitors::RemoveVisitor, ADD_NAME, REMOVE_NAME,
+        };
+        use crate::actions::{Add, Remove};
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ToSchema as _;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let add_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///add-file.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+                changes_dv: None,
+            })
+            .record_count(10)
+            .file_size_in_bytes(512)
+            .build();
+
+        let remove_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///remove-file.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Deleted,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                first_row_id: None,
+                changes_dv: None,
+            })
+            .record_count(5)
+            .file_size_in_bytes(256)
+            .build();
+
+        let metadata =
+            build_and_roundtrip(vec![add_entry, remove_entry], 1, &table_root_url, &engine)?;
+
+        // Build output schema with both add and remove fields.
+        let action_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        ]));
+
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &action_schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
+
+        let mut add_paths: Vec<String> = vec![];
+        let mut remove_paths: Vec<String> = vec![];
+
+        for batch_result in &mut action_batches {
+            let batch = batch_result?;
+
+            // Visit add paths — uses add.path column
+            let mut add_visitor = AddVisitor::default();
+            add_visitor.visit_rows_of(batch.actions.as_ref())?;
+            for add in add_visitor.adds {
+                add_paths.push(add.path);
+            }
+
+            // Visit remove paths — uses remove.path column. This requires the remove field
+            // to be present in the batch schema even when the batch came from the add evaluator
+            // (it should be null). Both add and remove batches must carry the full schema.
+            let mut remove_visitor = RemoveVisitor::default();
+            remove_visitor.visit_rows_of(batch.actions.as_ref())?;
+            for remove in remove_visitor.removes {
+                remove_paths.push(remove.path);
+            }
+        }
+
+        assert_eq!(add_paths, vec!["memory:///add-file.parquet"]);
+        assert_eq!(remove_paths, vec!["memory:///remove-file.parquet"]);
 
         Ok(())
     }

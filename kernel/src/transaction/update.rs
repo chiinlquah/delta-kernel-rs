@@ -9,13 +9,16 @@
 //! - Deletion vector updates
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
 use tracing::instrument;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::generate_snapshot_id;
 use crate::actions::get_log_add_schema;
+use crate::committer::Committer;
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
@@ -24,7 +27,9 @@ use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
-use crate::table_features::TableFeature;
+use crate::snapshot::SnapshotRef;
+use crate::table_features::{Operation, TableFeature};
+use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor, SchemaTransform};
 use delta_kernel_derive::internal_api;
 
@@ -34,6 +39,68 @@ use super::Transaction;
 // Update table transactions only
 // =============================================================================
 impl Transaction {
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
+    /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
+    /// to read the current state of the table (e.g. to read the current version).
+    ///
+    /// Instead of using this API, the more typical (user-facing) API is
+    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
+    /// a snapshot.
+    pub(crate) fn try_new_existing_table(
+        snapshot: impl Into<SnapshotRef>,
+        committer: Box<dyn Committer>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Self> {
+        let read_snapshot = snapshot.into();
+
+        // important! before writing to the table we must check it is supported
+        read_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Write)?;
+
+        // Read clustering columns from snapshot (returns None if clustering not enabled)
+        let clustering_columns = read_snapshot.get_clustering_columns_physical(engine)?;
+
+        let commit_timestamp = current_time_ms()?;
+
+        let span = tracing::info_span!(
+            "txn",
+            path = %read_snapshot.table_root(),
+            read_version = read_snapshot.version(),
+        );
+
+        Ok(Transaction {
+            span,
+            read_snapshot,
+            committer,
+            operation: None,
+            engine_info: None,
+            add_files_metadata: vec![],
+            remove_files_metadata: vec![],
+            set_transactions: vec![],
+            commit_timestamp,
+            user_domain_metadata_additions: vec![],
+            system_domain_metadata_additions: vec![],
+            user_domain_removals: vec![],
+            data_change: true,
+            batch_commit: false,
+            is_blind_append: false,
+            dv_matched_files: vec![],
+            aggregated_manifest_dvs: HashMap::new(),
+            aggregated_unreconciled: HashSet::new(),
+            aggregated_root_dv_actions: HashSet::new(),
+            leaf_manifests: vec![],
+            snapshot_id: generate_snapshot_id(),
+            root_released: false,
+            cached_root_manifest_url: std::cell::OnceCell::new(),
+            clustering_columns_physical: clustering_columns,
+            _state: PhantomData,
+        })
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
