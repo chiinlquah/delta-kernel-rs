@@ -3845,8 +3845,8 @@ mod tests {
     /// Test that icebergNativeV4 forces batch commit without explicit with_batch_commit()
     #[test]
     fn test_iceberg_native_v4_forces_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::Array as _;
         use crate::engine::sync::SyncEngine;
+        use crate::expressions::{MapData, Scalar};
         use tempfile::tempdir;
 
         let engine = SyncEngine::new();
@@ -3931,45 +3931,24 @@ mod tests {
             "batch commit should not be active without work to do"
         );
 
-        // Add a dummy file to trigger has_work_to_do.
-        // Use the mandatory schema (path, partitionValues, size, modificationTime etc)
+        // Add a dummy file to trigger has_work_to_do
         let add_schema = mandatory_add_file_schema();
-        let paths = Arc::new(StringArray::from(vec!["part-00000.parquet"]));
-        let keys = Arc::new(StringArray::new_null(0));
-        let values = Arc::new(StringArray::new_null(0));
-        let entries = StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                keys as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                values as ArrayRef,
-            ),
-        ]);
-        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0, 0].into());
-        let partition_values = Arc::new(MapArray::new(
-            Arc::new(ArrowField::new(
-                "key_value",
-                entries.data_type().clone(),
-                false,
-            )),
-            offsets,
-            entries,
-            None,
-            false,
-        ));
-        let sizes = Arc::new(Int64Array::from(vec![1000]));
-        let mod_times = Arc::new(Int64Array::from(vec![1234567890]));
-
-        let arrow_schema: crate::arrow::datatypes::SchemaRef = Arc::new(
-            crate::engine::arrow_conversion::TryIntoArrow::try_into_arrow(add_schema.as_ref())?,
+        let empty_map = Scalar::Map(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                Vec::<(Scalar, Scalar)>::new(),
+            )
+            .unwrap(),
         );
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![paths, partition_values, sizes, mod_times],
-        )?;
-        let add_data = Box::new(ArrowEngineData::new(batch));
+        let row: &[Scalar] = &[
+            Scalar::String("part-00000.parquet".to_string()),
+            empty_map,
+            Scalar::Long(1000),
+            Scalar::Long(1234567890),
+        ];
+        let add_data = engine
+            .evaluation_handler()
+            .create_many(add_schema.clone(), &[row])?;
         txn.add_files(add_data);
 
         assert!(

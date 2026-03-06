@@ -1583,6 +1583,115 @@ mod test {
         );
     }
 
+    /// Helper to create a TableConfiguration for icebergNativeV4 tests.
+    /// Uses a schema with column mapping annotations and builds the protocol/metadata directly.
+    fn create_iceberg_native_v4_config(
+        column_mapping_mode: &str,
+        features: &[TableFeature],
+    ) -> TableConfiguration {
+        use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL};
+
+        let schema = schema_with_column_mapping();
+        let mut props = HashMap::new();
+        props.insert(
+            COLUMN_MAPPING_MODE.to_string(),
+            column_mapping_mode.to_string(),
+        );
+        props.insert(
+            ENABLE_ICEBERG_NATIVE_V4_EXPERIMENTAL.to_string(),
+            "true".to_string(),
+        );
+
+        let metadata =
+            crate::actions::Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+
+        let reader_features: Vec<_> = features
+            .iter()
+            .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+            .cloned()
+            .collect();
+        let protocol = crate::actions::Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features.iter()),
+            Some(features.iter()),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_requires_column_mapping_id_mode() {
+        // IcebergNativeV4 with ColumnMapping in 'name' mode should fail
+        let config = create_iceberg_native_v4_config(
+            "name",
+            &[
+                TableFeature::ColumnMapping,
+                TableFeature::DomainMetadata,
+                TableFeature::MetadataTreeExperimental,
+                TableFeature::IcebergNativeV4Experimental,
+            ],
+        );
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "IcebergNativeV4 requires Column Mapping in 'id' mode",
+        );
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_requires_domain_metadata() {
+        // IcebergNativeV4 without DomainMetadata should fail
+        let config = create_iceberg_native_v4_config(
+            "id",
+            &[
+                TableFeature::ColumnMapping,
+                TableFeature::MetadataTreeExperimental,
+                TableFeature::IcebergNativeV4Experimental,
+            ],
+        );
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "icebergNativeV4-experimental requires domainMetadata to be supported",
+        );
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_requires_metadata_tree() {
+        // IcebergNativeV4 without MetadataTreeExperimental should fail
+        let config = create_iceberg_native_v4_config(
+            "id",
+            &[
+                TableFeature::ColumnMapping,
+                TableFeature::DomainMetadata,
+                TableFeature::IcebergNativeV4Experimental,
+            ],
+        );
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "icebergNativeV4-experimental requires metadataTree-experimental to be supported",
+        );
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_all_requirements_satisfied() {
+        // IcebergNativeV4 with all requirements met should succeed
+        let config = create_iceberg_native_v4_config(
+            "id",
+            &[
+                TableFeature::ColumnMapping,
+                TableFeature::DomainMetadata,
+                TableFeature::MetadataTreeExperimental,
+                TableFeature::IcebergNativeV4Experimental,
+            ],
+        );
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_ok(),
+            "IcebergNativeV4 with all requirements satisfied should be supported"
+        );
+    }
+
     #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_writes() {
