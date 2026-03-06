@@ -105,6 +105,10 @@ pub(crate) enum TableFeature {
     IcebergCompatV1,
     /// Iceberg compatibility support
     IcebergCompatV2,
+    /// Native Iceberg v4 interop (experimental)
+    #[strum(serialize = "icebergNativeV4-experimental")]
+    #[serde(rename = "icebergNativeV4-experimental")]
+    IcebergNativeV4Experimental,
     /// The Clustered Table feature facilitates the physical clustering of rows
     /// that share similar values on a predefined set of clustering columns.
     #[strum(serialize = "clustering")]
@@ -444,6 +448,31 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+#[allow(dead_code)]
+static ICEBERG_NATIVE_V4_EXPERIMENTAL_INFO: FeatureInfo = FeatureInfo {
+    name: "icebergNativeV4-experimental",
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
+    feature_type: FeatureType::WriterOnly,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            if properties.column_mapping_mode != Some(ColumnMappingMode::Id) {
+                return Err(Error::generic(
+                    "IcebergNativeV4 requires Column Mapping in 'id' mode",
+                ));
+            }
+            Ok(())
+        }),
+        FeatureRequirement::Supported(TableFeature::DomainMetadata),
+        FeatureRequirement::Supported(TableFeature::MetadataTreeExperimental),
+    ],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::EnabledIf(|props| {
+        props.enable_iceberg_native_v4_experimental == Some(true)
+    }),
+};
+
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
@@ -676,6 +705,7 @@ impl TableFeature {
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
+            | TableFeature::IcebergNativeV4Experimental
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
@@ -699,6 +729,7 @@ impl TableFeature {
             TableFeature::DomainMetadata => Some(&DOMAIN_METADATA_INFO),
             TableFeature::IcebergCompatV1 => Some(&ICEBERG_COMPAT_V1_INFO),
             TableFeature::IcebergCompatV2 => Some(&ICEBERG_COMPAT_V2_INFO),
+            TableFeature::IcebergNativeV4Experimental => Some(&ICEBERG_NATIVE_V4_EXPERIMENTAL_INFO),
             TableFeature::ClusteredTable => Some(&CLUSTERED_TABLE_INFO),
             TableFeature::MaterializePartitionColumns => Some(&MATERIALIZE_PARTITION_COLUMNS_INFO),
 
@@ -838,6 +869,7 @@ mod tests {
                 TableFeature::DomainMetadata => "domainMetadata",
                 TableFeature::IcebergCompatV1 => "icebergCompatV1",
                 TableFeature::IcebergCompatV2 => "icebergCompatV2",
+                TableFeature::IcebergNativeV4Experimental => "icebergNativeV4-experimental",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
                 TableFeature::CatalogManaged => "catalogManaged",
@@ -894,6 +926,10 @@ mod tests {
             (TableFeature::V2Checkpoint, "v2Checkpoint"),
             (TableFeature::IcebergCompatV1, "icebergCompatV1"),
             (TableFeature::IcebergCompatV2, "icebergCompatV2"),
+            (
+                TableFeature::IcebergNativeV4Experimental,
+                "icebergNativeV4-experimental",
+            ),
             (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (TableFeature::ClusteredTable, "clustering"),
             (
