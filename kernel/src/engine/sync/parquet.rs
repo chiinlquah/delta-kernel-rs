@@ -12,7 +12,7 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::default::parquet::build_writer_properties;
+use crate::engine::default::parquet::{build_writer_properties, reader_options, writer_options};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
@@ -29,10 +29,11 @@ fn try_create_from_parquet(
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    let reader_options = reader_options();
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
@@ -127,7 +128,11 @@ impl ParquetHandler for SyncParquetHandler {
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
         let props = build_writer_properties(write_config);
-        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), Some(props))?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            &mut file,
+            first_record_batch.schema(),
+            writer_options().with_properties(props),
+        )?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -149,7 +154,7 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
         let file = File::open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let metadata = ArrowReaderMetadata::load(&file, reader_options())?;
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;
