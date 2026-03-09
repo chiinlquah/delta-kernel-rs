@@ -17,7 +17,7 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -466,14 +466,9 @@ pub enum Expression {
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
-    /// A struct computed from a Vec of expressions with optional schema.
-    /// When schema is provided, field names come from the schema; otherwise they're inferred from context.
+    /// A struct computed from a Vec of expressions.
     /// The optional nullability predicate, if provided and evaluates to false/null, makes the entire struct null.
-    Struct(
-        Vec<ExpressionRef>,
-        Option<Box<StructType>>,
-        Option<ExpressionRef>,
-    ),
+    Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     Transform(Transform),
@@ -503,6 +498,9 @@ pub enum Expression {
     ParsePartitionValues(ParsePartitionValuesExpression),
     /// Convert a typed partition values struct to Map<String, String>.
     PartitionValuesToMap(PartitionValuesToMapExpression),
+    /// Extract keys from a `Map<String, String>` and parse values into a typed struct using
+    /// Delta's partition value serialization rules.
+    MapToStruct(MapToStructExpression),
 }
 
 /// A SQL predicate.
@@ -642,6 +640,31 @@ impl PartitionValuesToMapExpression {
     }
 }
 
+/// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
+/// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
+/// the output struct column: a `key` -> `value` mapping in the map means the struct field named
+/// `key` receives `value`, parsed into the field's target type using Delta's partition value
+/// serialization rules ([`PrimitiveType::parse_scalar`]).
+///
+/// - Missing keys produce null values
+/// - Parse errors are propagated (indicating a broken table)
+/// - Duplicate map keys are resolved by taking the rightmost entry
+///
+/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+}
+
+impl MapToStructExpression {
+    fn new(map_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+        }
+    }
+}
+
 impl JunctionPredicate {
     fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
@@ -682,33 +705,26 @@ impl Expression {
         }
     }
 
-    /// Create a new struct expression without explicit schema (field names inferred from context)
+    /// Create a new struct expression.
+    ///
+    /// The field names and types are supplied by the caller at evaluation time via the
+    /// `result_type` parameter of the expression evaluator. Use this when the schema is
+    /// always available from external context (e.g. the expression is the top-level output
+    /// of [`crate::ExpressionEvaluator`]).
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
-        Self::Struct(exprs.into_iter().map(Into::into).collect(), None, None)
+        Self::Struct(exprs.into_iter().map(Into::into).collect(), None)
     }
 
-    /// Create a new struct expression with explicit schema (field names from schema)
-    pub fn struct_from_with_schema(
+    /// Create a new struct expression with a nullability predicate.
+    ///
+    /// When the predicate evaluates to false or null for a row, the entire struct is null
+    /// for that row.
+    pub fn struct_with_nullability_from(
         exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
-        schema: StructType,
-    ) -> Self {
-        Self::Struct(
-            exprs.into_iter().map(Into::into).collect(),
-            Some(Box::new(schema)),
-            None,
-        )
-    }
-
-    /// Create a new struct expression with explicit schema and nullability predicate.
-    /// If the nullability predicate evaluates to false or null, the entire struct becomes null.
-    pub fn struct_from_with_nullability(
-        exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
-        schema: StructType,
         nullability_predicate: impl Into<Arc<Self>>,
     ) -> Self {
         Self::Struct(
             exprs.into_iter().map(Into::into).collect(),
-            Some(Box::new(schema)),
             Some(nullability_predicate.into()),
         )
     }
@@ -825,6 +841,13 @@ impl Expression {
     /// struct back to a Map<String, String>.
     pub fn partition_values_to_map(struct_expr: impl Into<Expression>) -> Self {
         Self::PartitionValuesToMap(PartitionValuesToMapExpression::new(struct_expr))
+    }
+
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using
+    /// Delta's partition value serialization rules. The output struct schema is determined by the
+    /// evaluator's `result_type`.
+    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr))
     }
 }
 
@@ -1042,7 +1065,7 @@ impl Display for Expression {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
-            Struct(exprs, _, _) => write!(f, "Struct({})", format_child_list(exprs)),
+            Struct(exprs, _) => write!(f, "Struct({})", format_child_list(exprs)),
             Transform(transform) => {
                 write!(f, "Transform(")?;
                 let mut sep = "";
@@ -1099,6 +1122,7 @@ impl Display for Expression {
             PartitionValuesToMap(p) => {
                 write!(f, "PARTITION_VALUES_TO_MAP({})", p.struct_expr)
             }
+            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
         }
     }
 }
@@ -1496,6 +1520,18 @@ mod tests {
         fn test_expression_unknown_roundtrip() {
             let expr = Expression::unknown("some_unknown_function()");
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_map_to_struct_expression_roundtrip() {
+            let cases: Vec<Expression> = vec![
+                Expression::map_to_struct(column_expr!("pv")),
+                Expression::map_to_struct(Expression::literal("ignored")),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
         }
 
         // ==================== Predicate Tests ====================

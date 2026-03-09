@@ -234,6 +234,13 @@ fn test_two_commits_move_to_leaf_tracking_info() -> Result<(), Box<dyn std::erro
     assert_eq!(manifest_info.status, TrackingStatus::Added);
     assert_eq!(manifest_info.snapshot_id, Some(3));
 
+    // Verify min_sequence_number in manifest_stats
+    let manifest_stats = manifest_entry
+        .manifest_stats
+        .as_ref()
+        .expect("manifest_stats");
+    assert_eq!(manifest_stats.min_sequence_number, 1);
+
     // Read back the leaf entries (pending_entries are preserved after write_leaf)
     let entries = build_and_read_leaf(&mut builder, &engine, 3)?;
     assert_eq!(entries.len(), 2);
@@ -312,8 +319,8 @@ fn test_two_commits_delete_first_tracking_info() -> Result<(), Box<dyn std::erro
     assert_eq!(a_info.status, TrackingStatus::Deleted);
     // snapshot_id updated to deletion snapshot
     assert_eq!(a_info.snapshot_id, Some(3));
-    // sequence_number updated to deletion version
-    assert_eq!(a_info.sequence_number, Some(3));
+    // sequence_number preserved from original add
+    assert_eq!(a_info.sequence_number, Some(1));
     // file_sequence_number preserved from original add
     assert_eq!(a_info.file_sequence_number, Some(1));
 

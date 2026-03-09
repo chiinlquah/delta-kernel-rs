@@ -736,26 +736,20 @@ impl ContentTreeNodeBuilder {
                 "location" => Expression::column(["path"]),
                 "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
                 "trackingInfo" => {
-                    let tracking_struct = match field.data_type() {
-                        DataType::Struct(s) => s.as_ref().clone(),
-                        _ => {
-                            return Err(crate::Error::generic(
-                                "trackingInfo field should be a struct type",
-                            ))
-                        }
-                    };
+                    if !matches!(field.data_type(), DataType::Struct(_)) {
+                        return Err(crate::Error::generic(
+                            "trackingInfo field should be a struct type",
+                        ));
+                    }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-                    Expression::struct_from_with_schema(
-                        [
-                            Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
-                            snapshot_id_expr,
-                            Expression::literal(Scalar::Long(version_i64)),
-                            Expression::literal(Scalar::Long(version_i64)),
-                            Expression::null_literal(DataType::LONG), // firstRowId
-                            Expression::null_literal(DataType::BINARY), // changesDv
-                        ],
-                        tracking_struct,
-                    )
+                    Expression::struct_from([
+                        Expression::literal(Scalar::Integer(TrackingStatus::Added as i32)),
+                        snapshot_id_expr,
+                        Expression::literal(Scalar::Long(version_i64)),
+                        Expression::literal(Scalar::Long(version_i64)),
+                        Expression::null_literal(DataType::LONG), // firstRowId
+                        Expression::null_literal(DataType::BINARY), // changesDv
+                    ])
                 }
                 "dvInfo" => Expression::null_literal(field.data_type().clone()),
                 "partitionSpecId" => Expression::literal(Scalar::Long(0)),
@@ -772,8 +766,7 @@ impl ContentTreeNodeBuilder {
         }
 
         // Create the struct transform expression
-        let transform_expr =
-            Expression::struct_from_with_schema(field_exprs, output_schema.as_ref().clone());
+        let transform_expr = Expression::struct_from(field_exprs);
 
         // Create evaluator and evaluate
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -1011,7 +1004,8 @@ impl ContentTreeNodeBuilder {
                 if let Some(ref mut tracking_info) = entry.tracking_info {
                     tracking_info.status = TrackingStatus::Deleted;
                     tracking_info.snapshot_id = Some(snapshot_id);
-                    tracking_info.sequence_number = Some(version as i64);
+                    // Don't update the sequence number since you can derive from the snapshot
+                    // when it was deleted
                 } else {
                     // Create new tracking info if it doesn't exist
                     entry.tracking_info = Some(TrackingInfo {
@@ -1379,51 +1373,41 @@ impl ContentTreeNodeBuilder {
                 "location" => Expression::column(["path"]),
                 "fileFormat" => Expression::literal(Scalar::String("parquet".into())),
                 "trackingInfo" => {
-                    let tracking_struct = match field.data_type() {
-                        DataType::Struct(s) => s.as_ref().clone(),
-                        _ => {
-                            return Err(crate::Error::generic(
-                                "trackingInfo field should be a struct type",
-                            ))
-                        }
-                    };
+                    if !matches!(field.data_type(), DataType::Struct(_)) {
+                        return Err(crate::Error::generic(
+                            "trackingInfo field should be a struct type",
+                        ));
+                    }
                     let snapshot_id_expr = Expression::literal(Scalar::Long(snapshot_id));
-                    Expression::struct_from_with_schema(
-                        [
-                            Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
-                            snapshot_id_expr,
-                            Expression::literal(Scalar::Long(version_i64)),
-                            Expression::literal(Scalar::Long(version_i64)),
-                            Expression::null_literal(DataType::LONG), // firstRowId
-                            Expression::null_literal(DataType::BINARY), // changesDv
-                        ],
-                        tracking_struct,
-                    )
+                    Expression::struct_from([
+                        Expression::literal(Scalar::Integer(TrackingStatus::Existed as i32)),
+                        snapshot_id_expr,
+                        Expression::literal(Scalar::Long(version_i64)),
+                        Expression::literal(Scalar::Long(version_i64)),
+                        Expression::null_literal(DataType::LONG), // firstRowId
+                        Expression::null_literal(DataType::BINARY), // changesDv
+                    ])
                 }
                 "dvInfo" => {
                     if has_decoded_dv {
                         // Flat decoded DV columns: project into dvInfo struct.
                         // Nullability predicate: null struct for non-DV rows (_dv_location is null).
-                        let dv_info_type = match field.data_type() {
-                            DataType::Struct(s) => s.as_ref().clone(),
-                            _ => {
-                                return Err(crate::Error::generic(
-                                    "dvInfo field should be a struct type",
-                                ))
-                            }
-                        };
+                        if !matches!(field.data_type(), DataType::Struct(_)) {
+                            return Err(crate::Error::generic(
+                                "dvInfo field should be a struct type",
+                            ));
+                        }
                         let nullability =
                             Expression::from_pred(Predicate::is_not_null(Expression::column([
                                 "_dv_location",
                             ])));
-                        Expression::struct_from_with_nullability(
+                        Expression::struct_with_nullability_from(
                             [
                                 Expression::column(["_dv_location"]),
                                 Expression::column(["_dv_offset"]),
                                 Expression::column(["_dv_size_in_bytes"]),
                                 Expression::column(["_dv_cardinality"]),
                             ],
-                            dv_info_type,
                             nullability,
                         )
                     } else {
@@ -1443,8 +1427,7 @@ impl ContentTreeNodeBuilder {
             field_exprs.push(Arc::new(expr));
         }
 
-        let transform_expr =
-            Expression::struct_from_with_schema(field_exprs, output_schema.as_ref().clone());
+        let transform_expr = Expression::struct_from(field_exprs);
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             scan_row_input_schema.clone(),
@@ -1517,17 +1500,14 @@ impl ContentTreeNodeBuilder {
             StructField::nullable("size", DataType::LONG),
             StructField::nullable("stats_parsed", stats_parsed_type),
         ]));
-        let parse_stats_expr = Expression::struct_from_with_schema(
-            [
-                Expression::column(["path"]),
-                Expression::column(["size"]),
-                Expression::coalesce([
-                    Expression::column(["stats_parsed"]),
-                    Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
-                ]),
-            ],
-            stats_augmented_schema.as_ref().clone(),
-        );
+        let parse_stats_expr = Expression::struct_from([
+            Expression::column(["path"]),
+            Expression::column(["size"]),
+            Expression::coalesce([
+                Expression::column(["stats_parsed"]),
+                Expression::parse_json(Expression::column(["stats"]), delta_stats_schema),
+            ]),
+        ]);
         let stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
             step2_input_schema,
             Arc::new(parse_stats_expr),
@@ -1723,16 +1703,10 @@ fn build_content_stats_from_delta_stats_parsed(
                     })
                 })
                 .collect();
-            Ok(Arc::new(Expression::struct_from_with_schema(
-                field_exprs,
-                col_stats_type,
-            )))
+            Ok(Arc::new(Expression::struct_from(field_exprs)))
         })
         .collect::<DeltaResult<Vec<_>>>()?;
-    Ok(Expression::struct_from_with_schema(
-        col_exprs,
-        amt_schema.clone(),
-    ))
+    Ok(Expression::struct_from(col_exprs))
 }
 
 /// Schema for the 4 flat DV columns appended to scan-row data before the final transform.

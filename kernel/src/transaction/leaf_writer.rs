@@ -9,10 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use url::Url;
 
-/// Composite identifier for deletion vectors.
-/// Format: "{data_file_path}#{dv_unique_id}"
-pub(crate) type DVUniqueId = String;
-
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
 ///

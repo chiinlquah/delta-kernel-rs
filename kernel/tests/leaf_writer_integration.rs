@@ -531,7 +531,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             let scan = snapshot_v1
                 .clone()
                 .scan_builder()
-                .include_stats_columns()
+                .include_all_stats_columns()
                 .build()?;
 
             let mut txn = snapshot_v1

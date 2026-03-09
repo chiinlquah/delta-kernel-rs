@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "acceptance",
+    "benchmarks",
     "derive-macros",
     "ffi",
     "kernel",
@@ -29,4 +30,4 @@ license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.85"
-version = "0.19.0"
+version = "0.20.0"

@@ -24,7 +24,7 @@ use delta_kernel::arrow::array::builder::{
 };
 use delta_kernel::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StructArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
-use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::ColumnMetadataKey;
@@ -51,9 +51,13 @@ pub fn write_checkpoint_parquet(
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| {
-        delta_kernel::Error::generic(format!("Failed to create Arrow writer: {}", e))
-    })?;
+    let options = ArrowWriterOptions::new()
+        .with_skip_arrow_metadata(true)
+        .with_properties(props);
+    let mut writer =
+        ArrowWriter::try_new_with_options(file, schema.clone(), options).map_err(|e| {
+            delta_kernel::Error::generic(format!("Failed to create Arrow writer: {}", e))
+        })?;
 
     writer
         .write(&batch)

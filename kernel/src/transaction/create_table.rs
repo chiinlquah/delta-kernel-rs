@@ -179,7 +179,7 @@ impl CreateTableTransaction {
             snapshot_id: crate::actions::generate_snapshot_id(),
             root_released: false,
             cached_root_manifest_url: std::cell::OnceCell::new(),
-            clustering_columns,
+            clustering_columns_physical: clustering_columns,
             _state: PhantomData,
         })
     }
