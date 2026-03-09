@@ -267,24 +267,23 @@ async fn test_transaction_basic_leaf_write() -> Result<(), Box<dyn std::error::E
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_operation("WRITE".to_string())
-            .with_batch_commit();
-
-        // Step 2: Create leaf and add files
-        let mut leaf = txn.new_leaf_node_writer(&engine)?;
+            .with_operation("WRITE".to_string());
         let add_files_schema = txn.add_files_schema();
-        let metadata = create_add_files_metadata(
-            add_files_schema,
-            vec![
-                ("part-001.parquet", 2048, 1000000, 50),
-                ("part-002.parquet", 3072, 1000001, 75),
-            ],
-        )?;
-        leaf.add_files(&engine, metadata)?;
 
-        // Step 3: Finish leaf and add to transaction
-        let result = leaf.finish(&engine)?;
-        txn.add_leaf(result)?;
+        // Step 2-3: Create leaf, add files, and add to batch
+        {
+            let batch = txn.with_batch_commit();
+            let mut leaf = batch.new_leaf_node_writer(&engine)?;
+            let metadata = create_add_files_metadata(
+                add_files_schema,
+                vec![
+                    ("part-001.parquet", 2048, 1000000, 50),
+                    ("part-002.parquet", 3072, 1000001, 75),
+                ],
+            )?;
+            leaf.add_files(&engine, metadata)?;
+            batch.add_leaf(leaf.finish(&engine)?)?;
+        }
 
         // Step 4: Commit
         let committed = match txn.commit(&engine)? {
@@ -320,34 +319,32 @@ async fn test_transaction_multiple_leaves() -> Result<(), Box<dyn std::error::Er
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_operation("WRITE".to_string())
-            .with_batch_commit();
-
+            .with_operation("WRITE".to_string());
         let add_files_schema = txn.add_files_schema();
 
         // Create and add 3 leaves with different files
-        for i in 0..3 {
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
-            let files = vec![
-                (
-                    format!("leaf{}_file1.parquet", i).leak() as &str,
-                    1024 + i * 100,
-                    1000000 + i,
-                    10 + i,
-                ),
-                (
-                    format!("leaf{}_file2.parquet", i).leak() as &str,
-                    2048 + i * 100,
-                    1000010 + i,
-                    20 + i,
-                ),
-            ];
-            let metadata = create_add_files_metadata(add_files_schema, files)?;
-            leaf.add_files(&engine, metadata)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+        {
+            let batch = txn.with_batch_commit();
+            for i in 0..3 {
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let files = vec![
+                    (
+                        format!("leaf{}_file1.parquet", i).leak() as &str,
+                        1024 + i * 100,
+                        1000000 + i,
+                        10 + i,
+                    ),
+                    (
+                        format!("leaf{}_file2.parquet", i).leak() as &str,
+                        2048 + i * 100,
+                        1000010 + i,
+                        20 + i,
+                    ),
+                ];
+                let metadata = create_add_files_metadata(add_files_schema, files)?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
         }
 
         // Commit
@@ -385,21 +382,21 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_operation("WRITE".to_string())
-                .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
-            let metadata = create_add_files_metadata(
-                txn.add_files_schema(),
-                vec![
-                    ("fileA.parquet", 1024, 1000000, 10),
-                    ("fileB.parquet", 2048, 1000001, 20),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+                .with_operation("WRITE".to_string());
+            let add_files_schema = txn.add_files_schema();
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("fileA.parquet", 1024, 1000000, 10),
+                        ("fileB.parquet", 2048, 1000001, 20),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
                 other => panic!("Expected success, got {:?}", other),
@@ -411,21 +408,21 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_operation("WRITE".to_string())
-                .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
-            let metadata = create_add_files_metadata(
-                txn.add_files_schema(),
-                vec![
-                    ("fileC.parquet", 3072, 1000002, 30),
-                    ("fileD.parquet", 4096, 1000003, 40),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+                .with_operation("WRITE".to_string());
+            let add_files_schema = txn.add_files_schema();
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("fileC.parquet", 3072, 1000002, 30),
+                        ("fileD.parquet", 4096, 1000003, 40),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
                 other => panic!("Expected success, got {:?}", other),
@@ -437,21 +434,21 @@ async fn test_transaction_sequential_commits() -> Result<(), Box<dyn std::error:
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_operation("WRITE".to_string())
-                .with_batch_commit();
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
-            let metadata = create_add_files_metadata(
-                txn.add_files_schema(),
-                vec![
-                    ("fileE.parquet", 5120, 1000004, 50),
-                    ("fileF.parquet", 6144, 1000005, 60),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+                .with_operation("WRITE".to_string());
+            let add_files_schema = txn.add_files_schema();
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("fileE.parquet", 5120, 1000004, 50),
+                        ("fileF.parquet", 6144, 1000005, 60),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
             let _committed = match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => c,
                 other => panic!("Expected success, got {:?}", other),
@@ -495,23 +492,21 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_operation("WRITE".to_string())
-                .with_batch_commit();
-
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
+                .with_operation("WRITE".to_string());
             let add_files_schema = txn.add_files_schema();
-            let metadata = create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("fileA.parquet", 2048, 1000000, 50),
-                    ("fileB.parquet", 3072, 1000001, 75),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("fileA.parquet", 2048, 1000000, 50),
+                        ("fileB.parquet", 3072, 1000001, 75),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(_) => {}
@@ -537,8 +532,7 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
             let mut txn = snapshot_v1
                 .clone()
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_operation("OPTIMIZE".to_string())
-                .with_batch_commit(); // Enable batch commit to use leaf writer
+                .with_operation("OPTIMIZE".to_string());
 
             let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
 
@@ -547,14 +541,13 @@ async fn test_move_files_from_leaf_to_leaf() -> Result<(), Box<dyn std::error::E
                 .next()
                 .expect("Should have scan metadata")?;
 
-            // Create new leaf (leaf B) and move files from leaf A
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
-
-            leaf.add_existing_actions(&engine, scan_metadata.scan_files)?;
-
-            // Finish leaf and add to transaction
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                let batch = txn.with_batch_commit();
+                // Create new leaf (leaf B) and move files from leaf A
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                leaf.add_existing_actions(&engine, scan_metadata.scan_files)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             // Commit
             let _committed = match txn.commit(&engine)? {

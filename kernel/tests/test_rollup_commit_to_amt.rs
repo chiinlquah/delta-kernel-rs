@@ -61,9 +61,8 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
         snapshot.version()
     );
 
-    let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_batch_commit();
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    txn.with_batch_commit();
     let _first_commit_result = txn.commit(engine.as_ref())?;
 
     // Verify content root was created
@@ -81,9 +80,8 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
 
     // Now call batch commit again with no new data
     // This should be a no-op since content_root.version == snapshot.version
-    let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_batch_commit();
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    txn.with_batch_commit();
     let result = txn.commit(engine.as_ref())?;
 
     let new_commit_version =

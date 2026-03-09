@@ -4415,10 +4415,8 @@ mod tests {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-                .with_operation("WRITE".to_string())
-                .with_batch_commit();
+                .with_operation("WRITE".to_string());
 
-            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
             let add_files_schema = txn.add_files_schema();
 
             // Create add files metadata inline using arrow
@@ -4492,7 +4490,7 @@ mod tests {
             }
             let stats_struct = StructArray::from(stats_fields);
 
-            let batch = RecordBatch::try_new(
+            let record_batch = RecordBatch::try_new(
                 std::sync::Arc::new(arrow_schema),
                 vec![
                     std::sync::Arc::new(path_array) as ArrayRef,
@@ -4504,11 +4502,13 @@ mod tests {
             )?;
 
             let metadata_engine_data: Box<dyn crate::EngineData> =
-                Box::new(ArrowEngineData::new(batch));
-            leaf.add_files(engine.as_ref(), metadata_engine_data)?;
-
-            let result = leaf.finish(engine.as_ref())?;
-            txn.add_leaf(result)?;
+                Box::new(ArrowEngineData::new(record_batch));
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+                leaf.add_files(engine.as_ref(), metadata_engine_data)?;
+                batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+            }
 
             match txn.commit(engine.as_ref())? {
                 CommitResult::CommittedTransaction(_) => {}
@@ -4545,19 +4545,20 @@ mod tests {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-                .with_operation("UPDATE".to_string())
-                .with_batch_commit();
+                .with_operation("UPDATE".to_string());
 
-            let leaf = txn.new_leaf_node_writer(engine.as_ref())?;
+            {
+                let batch = txn.with_batch_commit();
+                let leaf = batch.new_leaf_node_writer(engine.as_ref())?;
 
-            // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
-            // Previously used leaf.update_deletion_vectors(dv_updates) here.
-            // In the new model DVs are inline on data entries, so updating a DV requires
-            // re-writing the data entry with updated dv_info.
-            let _ = (&file_locations, known_dv_size_in_bytes);
+                // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
+                // Previously used leaf.update_deletion_vectors(dv_updates) here.
+                // In the new model DVs are inline on data entries, so updating a DV requires
+                // re-writing the data entry with updated dv_info.
+                let _ = (&file_locations, known_dv_size_in_bytes);
 
-            let result = leaf.finish(engine.as_ref())?;
-            txn.add_leaf(result)?;
+                batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+            }
 
             match txn.commit(engine.as_ref())? {
                 CommitResult::CommittedTransaction(_) => {}

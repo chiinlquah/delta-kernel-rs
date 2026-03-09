@@ -36,22 +36,21 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         // v1: Batch commit adds file1, file2
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
-
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
-            let metadata = create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("file1.parquet", 2048, 1000000, 100),
-                    ("file2.parquet", 1024, 1000001, 50),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("file1.parquet", 2048, 1000000, 100),
+                        ("file2.parquet", 1024, 1000001, 50),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
@@ -64,9 +63,8 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         // v2: Batch commit creates root manifest
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
@@ -162,20 +160,19 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
         // v5: Batch commit creates NEW root (rolling up log) + adds file5
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
-
-            // Add file5 as part of the new root creation
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
-            let metadata = create_add_files_metadata(
-                add_files_schema,
-                vec![("file5.parquet", 2048, 1000004, 100)],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                // Add file5 as part of the new root creation
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![("file5.parquet", 2048, 1000004, 100)],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
@@ -224,9 +221,8 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         // v1: Batch commit with files DIRECTLY in root (no leaf)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -326,9 +322,8 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
         // v3: Batch commit adds file5 and creates new root
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -384,24 +379,23 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
         // v1: Batch commit with 4 files via leaf writer (creates root manifest)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
-
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
-            let metadata = create_add_files_metadata(
-                add_files_schema,
-                vec![
-                    ("file1.parquet", 2048, 1000000, 100),
-                    ("file2.parquet", 1024, 1000001, 50),
-                    ("file3.parquet", 3072, 1000002, 150),
-                    ("file4.parquet", 1536, 1000003, 75),
-                ],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![
+                        ("file1.parquet", 2048, 1000000, 100),
+                        ("file2.parquet", 1024, 1000001, 50),
+                        ("file3.parquet", 3072, 1000002, 150),
+                        ("file4.parquet", 1536, 1000003, 75),
+                    ],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
@@ -491,20 +485,19 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
         // v3: Batch commit creates NEW root + adds file5
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
-
-            // Add file5 via leaf writer as part of new root creation
-            let mut leaf = txn.new_leaf_node_writer(&engine)?;
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
             let add_files_schema = txn.add_files_schema();
-            let metadata = create_add_files_metadata(
-                add_files_schema,
-                vec![("file5.parquet", 1024, 1000004, 50)],
-            )?;
-            leaf.add_files(&engine, metadata)?;
-            let result = leaf.finish(&engine)?;
-            txn.add_leaf(result)?;
+            {
+                // Add file5 via leaf writer as part of new root creation
+                let batch = txn.with_batch_commit();
+                let mut leaf = batch.new_leaf_node_writer(&engine)?;
+                let metadata = create_add_files_metadata(
+                    add_files_schema,
+                    vec![("file5.parquet", 1024, 1000004, 50)],
+                )?;
+                leaf.add_files(&engine, metadata)?;
+                batch.add_leaf(leaf.finish(&engine)?)?;
+            }
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {
@@ -562,9 +555,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         // v1: Batch commit - add file1 to root (no DV)
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let mut txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             let add_files_schema = txn.add_files_schema();
             let metadata = create_add_files_metadata(
@@ -595,8 +587,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
             let mut txn = snapshot
                 .clone()
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             // Scan to get file1
             let scan = snapshot.clone().scan_builder().build()?;
@@ -718,9 +710,8 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
         // v4: Batch commit - create new root and verify DV rollup
         {
             let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            let txn = snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-                .with_batch_commit();
+            let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            txn.with_batch_commit();
 
             match txn.commit(&engine)? {
                 CommitResult::CommittedTransaction(c) => {

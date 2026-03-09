@@ -37,9 +37,11 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
+pub mod batch_state;
 pub mod leaf_writer;
 
 // Re-export types needed for public API
+pub use batch_state::BatchState;
 pub use leaf_writer::LeafNodeWriterResult;
 
 #[cfg(feature = "internal-api")]
@@ -226,29 +228,16 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
-    // Whether this transaction should batch commit to the metadata tree
-    batch_commit: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
-    // Aggregated manifest deletion vectors from all leaf writers
-    aggregated_manifest_dvs: HashMap<String, roaring::RoaringTreemap>,
-    // Aggregated unreconciled files from all leaf writers (detects conflicts)
-    aggregated_unreconciled: HashSet<String>,
-    // Aggregated root DV actions to remove from root DV manifest
-    aggregated_root_dv_actions: HashSet<String>,
-    // Leaf manifest entries to include in root
-    leaf_manifests: Vec<crate::content_tree::ContentTreeNodeEntry>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
-    /// Whether the root has been released to the client via release_root_and_delta_actions().
-    /// When true, leaf writers will not track root entries for removal.
-    root_released: bool,
-    /// Cached root manifest URL to avoid repeated lookups when creating leaf writers.
-    /// Initialized lazily on first access.
-    cached_root_manifest_url: std::cell::OnceCell<Option<Url>>,
+    // Batch (content-tree) commit state. `Some` when the caller has opted in via
+    // `with_batch_commit()`. `None` for standard incremental commits.
+    batch_state: Option<BatchState>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -553,7 +542,7 @@ impl<S> Transaction<S> {
 
             // If root was released to client control, clear all root data and DV entries
             // The client will add them back via leaf manifests
-            if self.root_released {
+            if self.batch_state.as_ref().is_some_and(|b| b.root_released) {
                 metadata_builder.clear_root_data_and_dv_entries();
 
                 // TODO: Process incremental removes from delta log and mark them as DELETED
@@ -607,31 +596,8 @@ impl<S> Transaction<S> {
                 )?;
             }
 
-            // Add leaf manifests collected via add_leaf() to the ContentRoot
-            for leaf_manifest_entry in &self.leaf_manifests {
-                metadata_builder.add_entry(leaf_manifest_entry.clone());
-            }
-
-            // Remove files that were moved to leaves from the root manifest entirely
-            // This handles files that lacked metadata when added to leaf
-            for file_path in &self.aggregated_unreconciled {
-                metadata_builder.remove_data_file(file_path.as_str())?;
-            }
-
-            // Remove DVs that were moved to leaves from the root DV manifest
-            for dv_path in &self.aggregated_root_dv_actions {
-                metadata_builder.remove_dv(dv_path.as_str())?;
-            }
-
-            // Apply aggregated manifest DVs from leaf writers
-            // These mark entries in leaf manifests as deleted (e.g., when files are moved between leaves)
-            // set_changes_dv=false because this is leaf reorganization, not actual user-facing deletion
-            for (manifest_path, entry_indices) in &self.aggregated_manifest_dvs {
-                metadata_builder.delete_multiple_from_leaf(
-                    manifest_path,
-                    entry_indices,
-                    false, // Don't set changes_dv for leaf reorganization
-                )?;
+            if let Some(b) = &self.batch_state {
+                b.apply_to_builder(&mut metadata_builder)?;
             }
 
             // In batch mode, process ALL remove actions and mark entries as DELETED in the ContentRoot
@@ -800,212 +766,48 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Set whether the transaction should use batch commit mode (commit directly to the metadata tree).
-    /// When not set, the transaction writes incremental commits to the log.
+    /// Initialize batch (content-tree) commit mode and return a mutable reference to the
+    /// [`BatchState`].
     ///
-    /// Any incremental actions accumulated since the last batch commit will automatically
-    /// be added to the tree root on commit.
+    /// Calling this method opts the transaction into the batch commit path: on
+    /// [`Transaction::commit`], add/remove actions are recorded in the metadata content tree
+    /// rather than written to the delta log directly.
     ///
-    /// Requires preview feature preview-adaptive-metadata-tree be turned on for the table.
-    /// TODO: add the feature option.
-    /// TODO: Add option to replay incremental actions and add them to leaves.
-    pub fn with_batch_commit(mut self) -> Self {
-        self.batch_commit = true;
-        self
-    }
-
-    /// Returns a Scan that replays actions from both the root manifest (if present) and delta log.
+    /// Any incremental actions accumulated since the last batch commit will automatically be added
+    /// to the tree root on commit.
     ///
-    /// After calling this method, the transaction records that the root has been "released" to the
-    /// client. Any subsequent LeafNodeWriter instances created via `new_leaf_node_writer()` will NOT
-    /// track root entries for removal, since the client is now responsible for managing which
-    /// actions move from root to leaves.
+    /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
-    /// This is useful for partition-aware compaction workflows where the client wants to:
-    /// 1. Read all actions from root + delta log
-    /// 2. Process and partition them according to custom logic
-    /// 3. Write partitioned actions to leaf manifests
-    /// 4. Commit the transaction with only the leaf manifests (root stays unchanged)
-    ///
-    /// # Returns
-    ///
-    /// A Scan that will return all Add actions from:
-    /// - The root manifest (if present in the checkpoint) - entries where `dataManifestPath` is NULL
-    /// - All delta log files since the checkpoint - entries where `dataManifestPath` is NULL
-    ///
-    /// Note: The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is non-NULL)
-    /// using an internal skip mechanism.
+    /// The returned `&mut BatchState` provides tree-manipulation methods
+    /// ([`BatchState::release_root_and_delta_actions`], [`BatchState::new_leaf_node_writer`],
+    /// [`BatchState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
+    /// other `&mut Transaction` methods.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let txn = snapshot.transaction(committer)?;
-    /// txn = txn.with_batch_commit();
+    /// let mut txn = snapshot.transaction(committer, engine)?
+    ///     .with_data_change(true);
     ///
-    /// // Get all actions from root + delta
-    /// let scan = txn.release_root_and_delta_actions()?;
+    /// {
+    ///     let batch = txn.with_batch_commit();
+    ///     let scan = batch.release_root_and_delta_actions()?;
+    ///     // ...process scan...
+    ///     let mut leaf = batch.new_leaf_node_writer(engine)?;
+    ///     leaf.add_files(engine, metadata)?;
+    ///     batch.add_leaf(leaf.finish(engine)?)?;
+    /// } // batch borrow released
     ///
-    /// // Process actions and partition them
-    /// for action_batch in scan.scan_metadata(engine)? {
-    ///     let actions = process_and_partition(action_batch)?;
-    ///
-    ///     // Write to leaf manifests
-    ///     let mut leaf = txn.new_leaf_node_writer(engine)?;
-    ///     for action in actions {
-    ///         leaf.add_existing_actions(engine, action)?;
-    ///     }
-    ///     let leaf_result = leaf.finish(engine)?;
-    ///     txn.add_leaf(leaf_result)?;
-    /// }
-    ///
-    /// // Commit the transaction
     /// txn.commit(engine)?;
     /// ```
-    pub fn release_root_and_delta_actions(&mut self) -> DeltaResult<crate::scan::Scan> {
-        // Validation: must be in batch commit mode
-        if !self.batch_commit {
-            return Err(Error::generic(
-                "release_root_and_delta_actions() requires batch_commit mode. Call with_batch_commit() first."
-            ));
-        }
-
-        // Validation: can only be called once
-        if self.root_released {
-            return Err(Error::generic(
-                "release_root_and_delta_actions() can only be called once per transaction",
-            ));
-        }
-
-        // Mark root as released
-        self.root_released = true;
-
-        // TODO: we need custom replay here to:
-        // 1. Add it any currently added/removed actions to the log replay.
-        // 2. Do leaf book-keeping for incrementally add/removed files (primarily DV updates).
-        //
-        // Create a scan that ONLY reads root + delta log (excluding leaf manifests)
-        // Include stats columns so that parsed stats are available for AMT leaf population
-        let scan_builder = crate::scan::ScanBuilder::new(self.read_snapshot.clone());
-        let scan = scan_builder
-            .skip_leaf_manifests(true)
-            .include_all_stats_columns()
-            .build()?;
-
-        Ok(scan)
-    }
-
-    /// Create a new leaf node writer for this transaction.
-    ///
-    /// The writer can be used to add files to a leaf manifest, which will be written
-    /// and incorporated into the root manifest when the transaction commits.
-    ///
-    /// # Arguments
-    /// * `engine` - The engine to use for fetching the root manifest URL (only on first call)
-    ///
-    /// # Returns
-    /// A new LeafNodeWriter initialized with the transaction's table root, version, timestamp,
-    /// and root manifest URL. The root manifest URL is cached after the first lookup.
-    pub fn new_leaf_node_writer(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<crate::transaction::leaf_writer::LeafNodeWriter> {
-        // Get or fetch the root manifest URL (cached after first access)
-        let root_manifest_url = if let Some(url) = self.cached_root_manifest_url.get() {
-            url.clone()
-        } else {
-            let url = self.root_manifest_url(engine)?;
-            let _ = self.cached_root_manifest_url.set(url.clone());
-            url
-        };
-
-        let track_root_removals = !self.root_released;
-
-        // Compute root manifest path once here and pass it through
-        let root_manifest_path = root_manifest_url
-            .as_ref()
-            .map(|url| {
-                crate::content_tree::absolute_to_relative_path(url, self.read_snapshot.table_root())
-            })
-            .transpose()?;
-
-        // Get physical schema with PARQUET:field_id for adaptive metadata tree
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
-        let physical_schema = Arc::new(
-            self.read_snapshot
-                .schema()
-                .as_ref()
-                .make_physical(column_mapping_mode),
-        );
-
-        let writer = crate::transaction::leaf_writer::LeafNodeWriter::new(
-            self.read_snapshot.table_root().clone(),
-            self.read_snapshot.version() + 1,
-            self.snapshot_id,
-            physical_schema,
-            track_root_removals,
-            root_manifest_path,
-        );
-
-        Ok(writer)
-    }
-
-    /// Get the root manifest URL from the latest content root, if it exists.
-    ///
-    /// # Arguments
-    /// * `engine` - The engine to use for reading the log segment
-    ///
-    /// # Returns
-    /// * `Ok(Some(Url))` - The URL of the root manifest
-    /// * `Ok(None)` - No content root exists yet
-    /// * `Err` - Error reading the log segment
-    pub fn root_manifest_url(&self, _engine: &dyn Engine) -> DeltaResult<Option<Url>> {
-        let content_root = self.read_snapshot.content_root();
-        let table_root = self.read_snapshot.table_root();
-        Ok(content_root.and_then(|cr| table_root.join(&cr.path).ok()))
-    }
-
-    /// Incorporate leaf writer results into this transaction.
-    ///
-    /// This method:
-    /// - Checks for duplicate unreconciled files across leaves (returns error if found)
-    /// - Aggregates manifest deletion vectors (unions roaring bitmaps)
-    /// - Collects leaf manifest entries to include in root
-    ///
-    /// # Arguments
-    /// * `leaf_result` - The result from calling finish() on a LeafNodeWriter
-    ///
-    /// # Returns
-    /// Ok(()) on success.
-    pub fn add_leaf(
-        &mut self,
-        leaf_result: crate::transaction::leaf_writer::LeafNodeWriterResult,
-    ) -> DeltaResult<()> {
-        // Aggregate root entries to remove
-        // These are file paths from the root manifest that have been moved to leaf manifests
-        self.aggregated_unreconciled
-            .extend(leaf_result.root_entries_to_remove);
-
-        // Aggregate root DV entries to remove
-        self.aggregated_root_dv_actions
-            .extend(leaf_result.root_dv_entries_to_remove);
-
-        // Aggregate manifest DVs (union roaring bitmaps)
-        for (manifest_url, row_indices) in leaf_result.manifest_dvs {
-            let entry = self
-                .aggregated_manifest_dvs
-                .entry(manifest_url)
-                .or_default();
-            *entry |= row_indices;
-        }
-
-        // Collect leaf manifests
-        if let Some(data_manifest) = leaf_result.data_file_manifest_written {
-            self.leaf_manifests.push(data_manifest);
-        }
-        Ok(())
+    pub fn with_batch_commit(&mut self) -> &mut BatchState {
+        self.batch_state.get_or_insert_with(|| {
+            BatchState::new(
+                self.read_snapshot.version().wrapping_add(1),
+                self.snapshot_id,
+                self.read_snapshot.clone(),
+            )
+        })
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -1130,6 +932,11 @@ impl<S> Transaction<S> {
 
     /// Returns true if this commit will be handled as a batch commit (content tree update).
     /// When true, add/remove actions are recorded in the content tree rather than the delta log.
+    /// Returns `true` if `with_batch_commit()` has been called on this transaction.
+    fn is_batch_transaction(&self) -> bool {
+        self.batch_state.is_some()
+    }
+
     ///
     /// Batch commit is active when:
     /// - The caller explicitly opted in via `with_batch_commit()` and the
@@ -1138,15 +945,19 @@ impl<S> Transaction<S> {
     fn is_batch_commit_active(&self) -> bool {
         let table_config = self.read_snapshot.table_configuration();
         let protocol = table_config.protocol();
-        let explicitly_requested = self.batch_commit
+        let explicitly_requested = self.is_batch_transaction()
             && protocol
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
         let iceberg_native_v4 = protocol
             .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
         let can_batch_commit = explicitly_requested || iceberg_native_v4;
+        let leaf_manifests_empty = self
+            .batch_state
+            .as_ref()
+            .is_none_or(|b| b.leaf_manifests.is_empty());
         let has_work_to_do = !self.add_files_metadata.is_empty()
             || !self.remove_files_metadata.is_empty()
-            || !self.leaf_manifests.is_empty()
+            || !leaf_manifests_empty
             || self
                 .read_snapshot
                 .content_root()
@@ -2036,14 +1847,39 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        // Test that with_batch_commit returns self correctly
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_batch_commit()
+            .with_engine_info("test engine");
+        txn.with_batch_commit();
+
+        // Verify batch state is initialized
+        assert!(txn.is_batch_transaction());
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_batch_commit_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
 
-        // Verify batch_commit flag is set
-        assert!(txn.batch_commit);
+        // First call creates batch state; mutate it to confirm state is preserved
+        txn.with_batch_commit().root_released = true;
+
+        // Second call must return the same BatchState without reinitializing it
+        assert!(
+            txn.with_batch_commit().root_released,
+            "second call to with_batch_commit should preserve existing state"
+        );
         Ok(())
     }
 
@@ -2058,9 +1894,9 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        // Test that batch_commit defaults to false
+        // Verify batch state defaults to None
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        assert!(!txn.batch_commit);
+        assert!(txn.batch_state.is_none());
         Ok(())
     }
 
@@ -2671,8 +2507,8 @@ mod tests {
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
-            .with_batch_commit()
             .with_operation("DELETE".to_string());
+        txn.with_batch_commit();
 
         // Remove file at row index 2 within the scan batch
         // With batched EngineData creation, all files are now in a single batch
@@ -2758,8 +2594,8 @@ mod tests {
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
-            .with_batch_commit()
             .with_operation("DELETE".to_string());
+        txn.with_batch_commit();
 
         let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
         if let Some(res) = scan_metadata_iter.next() {
@@ -2907,8 +2743,8 @@ mod tests {
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
-            .with_batch_commit()
             .with_operation("DELETE".to_string());
+        txn.with_batch_commit();
 
         // Remove file at row index 2 (file-2.parquet which has a DV)
         // With batched EngineData creation, all files are now in a single batch
@@ -3190,15 +3026,20 @@ mod tests {
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
-            .with_batch_commit()
             .with_operation("CREATE_CONTENT_ROOT".to_string());
 
-        // Step 3: Release root and delta actions
-        let scan = txn.release_root_and_delta_actions()?;
-
-        // Step 4: Create leaf writers and add files
-        let mut leaf1 = txn.new_leaf_node_writer(&engine)?;
-        let mut leaf2 = txn.new_leaf_node_writer(&engine)?;
+        // Step 3-4: Initialize batch state and create scan + leaf writers
+        let scan;
+        let mut leaf1;
+        let mut leaf2;
+        {
+            let batch = txn.with_batch_commit();
+            // Step 3: Release root and delta actions
+            scan = batch.release_root_and_delta_actions()?;
+            // Step 4: Create leaf writers
+            leaf1 = batch.new_leaf_node_writer(&engine)?;
+            leaf2 = batch.new_leaf_node_writer(&engine)?;
+        }
 
         // Helper to create add metadata for testing
         // Note: stats are set to null (empty struct) because proper content_stats requires
@@ -3307,9 +3148,12 @@ mod tests {
             create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
         leaf2.add_files(&engine, leaf2_metadata)?;
 
-        // Step 5: Finish leaf writers and add to transaction
-        txn.add_leaf(leaf1.finish(&engine)?)?;
-        txn.add_leaf(leaf2.finish(&engine)?)?;
+        // Step 5: Finish leaf writers and add to batch
+        {
+            let batch = txn.with_batch_commit();
+            batch.add_leaf(leaf1.finish(&engine)?)?;
+            batch.add_leaf(leaf2.finish(&engine)?)?;
+        }
 
         // Exhaust the scan (required before commit)
         for _ in scan.scan_metadata(&engine)? {}
@@ -3928,7 +3772,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("test".to_string());
 
-        assert!(!txn.batch_commit);
+        assert!(txn.batch_state.is_none());
         assert!(
             !txn.is_batch_commit_active(),
             "batch commit should not be active without work to do"

@@ -9,7 +9,7 @@
 //! - Deletion vector updates
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
@@ -86,16 +86,10 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
-            batch_commit: false,
             is_blind_append: false,
             dv_matched_files: vec![],
-            aggregated_manifest_dvs: HashMap::new(),
-            aggregated_unreconciled: HashSet::new(),
-            aggregated_root_dv_actions: HashSet::new(),
-            leaf_manifests: vec![],
             snapshot_id: generate_snapshot_id(),
-            root_released: false,
-            cached_root_manifest_url: std::cell::OnceCell::new(),
+            batch_state: None,
             clustering_columns_physical: clustering_columns,
             _state: PhantomData,
         })

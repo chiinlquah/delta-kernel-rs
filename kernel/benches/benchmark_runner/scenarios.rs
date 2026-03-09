@@ -281,7 +281,7 @@ pub fn write(
         .with_data_change(true);
 
     if bulk_mode {
-        txn = txn.with_batch_commit();
+        txn.with_batch_commit();
     }
 
     let add_files_schema = txn.add_files_schema();
@@ -347,12 +347,14 @@ fn add_batches_to_txn(
     if bulk_mode {
         use std::thread;
 
+        let batch = txn.with_batch_commit();
+
         // Create leaf writers for each batch and spawn threads to finish them
         let mut handles = Vec::new();
 
-        for batch in batches {
-            let mut leaf = txn.new_leaf_node_writer(engine.as_ref())?;
-            leaf.add_files(engine.as_ref(), batch)?;
+        for data in batches {
+            let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+            leaf.add_files(engine.as_ref(), data)?;
 
             // Clone engine for thread
             let engine_clone = engine.clone();
@@ -367,12 +369,11 @@ fn add_batches_to_txn(
             let result = handle
                 .join()
                 .map_err(|_| delta_kernel::Error::generic("Thread panicked"))?;
-            let leaf_result = result?;
-            txn.add_leaf(leaf_result)?;
+            batch.add_leaf(result?)?;
         }
     } else {
-        for batch in batches {
-            txn.add_files(batch);
+        for data in batches {
+            txn.add_files(data);
         }
     }
     Ok(())
@@ -484,7 +485,7 @@ pub fn vacuum_delete(
             .with_data_change(true);
 
         if bulk_mode {
-            txn = txn.with_batch_commit();
+            txn.with_batch_commit();
         }
 
         for batch in batches_to_delete {

@@ -460,11 +460,11 @@ async fn batch_write_data_and_check_result_and_stats(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let txn = snapshot
+    let mut txn = snapshot
         .clone()
         .transaction(committer, engine.as_ref())?
-        .with_data_change(true)
-        .with_batch_commit();
+        .with_data_change(true);
+    txn.with_batch_commit();
     append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
         .await
 }
@@ -2197,10 +2197,10 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
         setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("batch commit test")
-            .with_batch_commit();
+            .with_engine_info("batch commit test");
+        txn.with_batch_commit();
 
         // Commit without adding any add files
         // Note: batch_commit flag is currently a placeholder for future metadata tree writing
@@ -2238,8 +2238,8 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("batch commit test")
-            .with_batch_commit()
             .with_data_change(true);
+        txn.with_batch_commit();
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -3011,7 +3011,7 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
 
         // Conditionally enable batch commit mode
         if use_batch_commit {
-            txn = txn.with_batch_commit();
+            txn.with_batch_commit();
         }
 
         // Create a new scan to get file metadata for removal
@@ -3139,7 +3139,7 @@ async fn remove_files_with_modified_selection_vector_impl(
 
         // Conditionally enable batch commit mode
         if use_batch_commit {
-            txn = txn.with_batch_commit();
+            txn.with_batch_commit();
         }
 
         // First batch: Remove only the first file
@@ -3503,9 +3503,9 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         let mut batch_txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_batch_commit()
             .with_engine_info("batch commit test")
             .with_operation("BATCH_COMMIT".to_string());
+        batch_txn.with_batch_commit();
 
         // Add data in the batch commit
         add_files_to_transaction(&mut batch_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
@@ -3590,10 +3590,10 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
         let mut txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_batch_commit() // Enable batch commit mode
             .with_engine_info("test engine")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
+        txn.with_batch_commit();
 
         // Create a new scan to get file metadata for removal
         // Process all scan batches in case files are spread across multiple batches
