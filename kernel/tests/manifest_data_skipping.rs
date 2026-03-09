@@ -36,6 +36,8 @@ struct TestFileStats<'a> {
     num_records: i64,
     min_id: i64,
     max_id: i64,
+    min_row_id: i64,
+    max_row_id: i64,
 }
 
 /// Helper to create a field with column mapping metadata
@@ -58,6 +60,7 @@ fn create_test_schema_with_field_ids() -> Arc<StructType> {
         StructType::try_new(vec![
             field_with_metadata("id", DataType::LONG, 1),
             field_with_metadata("name", DataType::STRING, 2),
+            field_with_metadata("_row_id", DataType::LONG, 2147483540),
         ])
         .unwrap(),
     )
@@ -94,6 +97,39 @@ fn build_stats_struct_field(
     Ok(Arc::new(StructArray::from(fields)))
 }
 
+fn build_min_max_values_field(
+    field: &Field,
+    id_array: &Int64Array,
+    row_id_array: &Int64Array,
+    num_files: usize,
+) -> DeltaResult<ArrayRef> {
+    let ArrowDataType::Struct(schema) = field.data_type() else {
+        return Err(delta_kernel::Error::generic(format!(
+            "{} should be a struct",
+            field.name()
+        )));
+    };
+
+    let fields: Vec<_> = schema
+        .iter()
+        .map(|f| {
+            let array = if f.name() == "id" {
+                Arc::new(id_array.clone()) as ArrayRef
+            } else if f.name() == "_row_id" {
+                Arc::new(row_id_array.clone()) as ArrayRef
+            } else {
+                Arc::new(delta_kernel::arrow::array::new_null_array(
+                    f.data_type(),
+                    num_files,
+                ))
+            };
+            (f.clone(), array)
+        })
+        .collect();
+
+    Ok(Arc::new(StructArray::from(fields)))
+}
+
 /// Creates add file metadata with stats for testing
 fn create_add_files_with_stats(
     add_files_schema: &Arc<StructType>,
@@ -109,6 +145,8 @@ fn create_add_files_with_stats(
         Int64Array::from(files.iter().map(|f| f.num_records).collect::<Vec<_>>());
     let min_id_array = Int64Array::from(files.iter().map(|f| f.min_id).collect::<Vec<_>>());
     let max_id_array = Int64Array::from(files.iter().map(|f| f.max_id).collect::<Vec<_>>());
+    let min_row_id_array = Int64Array::from(files.iter().map(|f| f.min_row_id).collect::<Vec<_>>());
+    let max_row_id_array = Int64Array::from(files.iter().map(|f| f.max_row_id).collect::<Vec<_>>());
 
     // Create empty partition values map
     let partition_values_array = Arc::new(MapArray::new(
@@ -156,8 +194,12 @@ fn create_add_files_with_stats(
             let array: ArrayRef = match field.name().as_str() {
                 "numRecords" => Arc::new(num_records_array.clone()),
                 "tightBounds" => Arc::new(BooleanArray::from(vec![Some(true); num_files])),
-                "minValues" => build_stats_struct_field(field, &min_id_array, num_files)?,
-                "maxValues" => build_stats_struct_field(field, &max_id_array, num_files)?,
+                "minValues" => {
+                    build_min_max_values_field(field, &min_id_array, &min_row_id_array, num_files)?
+                }
+                "maxValues" => {
+                    build_min_max_values_field(field, &max_id_array, &max_row_id_array, num_files)?
+                }
                 "nullCount" => build_stats_struct_field(
                     field,
                     &Int64Array::from(vec![0i64; num_files]),
@@ -190,12 +232,12 @@ fn create_add_files_with_stats(
 /// Helper to verify stats in add file data
 fn verify_stats(
     data: &dyn EngineData,
-    expected: &HashMap<String, (i64, i64, i64)>, // path -> (num_records, min_id, max_id)
+    expected: &HashMap<String, (i64, i64, i64, i64, i64)>, // path -> (num_records, min_id, max_id, min_row_id, max_row_id)
 ) -> DeltaResult<()> {
     use delta_kernel::expressions::ColumnName;
 
     struct StatsVisitor<'a> {
-        expected: &'a HashMap<String, (i64, i64, i64)>,
+        expected: &'a HashMap<String, (i64, i64, i64, i64, i64)>,
         verified: usize,
     }
 
@@ -208,11 +250,15 @@ fn verify_stats(
                     ColumnName::new(["stats", "numRecords"]),
                     ColumnName::new(["stats", "minValues", "id"]),
                     ColumnName::new(["stats", "maxValues", "id"]),
+                    ColumnName::new(["stats", "minValues", "_row_id"]),
+                    ColumnName::new(["stats", "maxValues", "_row_id"]),
                 ]
             });
             static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
                 vec![
                     DataType::STRING,
+                    DataType::LONG,
+                    DataType::LONG,
                     DataType::LONG,
                     DataType::LONG,
                     DataType::LONG,
@@ -228,17 +274,26 @@ fn verify_stats(
         ) -> DeltaResult<()> {
             for i in 0..row_count {
                 let path: String = getters[0].get(i, "path")?;
-                let (expected_records, expected_min, expected_max) =
-                    self.expected.get(&path).ok_or_else(|| {
-                        delta_kernel::Error::generic(format!("Unexpected file: {}", path))
-                    })?;
+                let (
+                    expected_records,
+                    expected_min,
+                    expected_max,
+                    expected_min_row_id,
+                    expected_max_row_id,
+                ) = self.expected.get(&path).ok_or_else(|| {
+                    delta_kernel::Error::generic(format!("Unexpected file: {}", path))
+                })?;
 
                 let num_records: i64 = getters[1].get(i, "stats.numRecords")?;
                 let min_id: i64 = getters[2].get(i, "stats.minValues.id")?;
                 let max_id: i64 = getters[3].get(i, "stats.maxValues.id")?;
+                let min_row_id: i64 = getters[4].get(i, "stats.minValues._row_id")?;
+                let max_row_id: i64 = getters[5].get(i, "stats.maxValues._row_id")?;
                 assert_eq!(num_records, *expected_records);
                 assert_eq!(min_id, *expected_min);
                 assert_eq!(max_id, *expected_max);
+                assert_eq!(min_row_id, *expected_min_row_id);
+                assert_eq!(max_row_id, *expected_max_row_id);
                 self.verified += 1;
             }
             Ok(())
@@ -350,6 +405,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
                 num_records: 100,
                 min_id: 1,
                 max_id: 100,
+                min_row_id: 5,
+                max_row_id: 20,
             },
             TestFileStats {
                 path: file2,
@@ -357,6 +414,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
                 num_records: 200,
                 min_id: 101,
                 max_id: 200,
+                min_row_id: 105,
+                max_row_id: 120,
             },
         ],
     )?;
@@ -371,6 +430,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
             num_records: 100,
             min_id: 201,
             max_id: 300,
+            min_row_id: 205,
+            max_row_id: 220,
         }],
     )?;
 
@@ -384,6 +445,8 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
                 num_records: 100,
                 min_id: 1,
                 max_id: 100,
+                min_row_id: 5,
+                max_row_id: 20,
             },
             TestFileStats {
                 path: file2,
@@ -391,14 +454,16 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
                 num_records: 200,
                 min_id: 101,
                 max_id: 200,
+                min_row_id: 105,
+                max_row_id: 120,
             },
         ],
     )?;
     verify_stats(
         leaf1_data.as_ref(),
         &HashMap::from([
-            (file1.to_string(), (100, 1, 100)),
-            (file2.to_string(), (200, 101, 200)),
+            (file1.to_string(), (100, 1, 100, 5, 20)),
+            (file2.to_string(), (200, 101, 200, 105, 120)),
         ]),
     )?;
 
@@ -411,11 +476,13 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
             num_records: 400,
             min_id: 301,
             max_id: 400,
+            min_row_id: 305,
+            max_row_id: 320,
         }],
     )?;
     verify_stats(
         root_file_data.as_ref(),
-        &HashMap::from([(file4.to_string(), (400, 301, 400))]),
+        &HashMap::from([(file4.to_string(), (400, 301, 400, 305, 320))]),
     )?;
     txn.add_files(root_file_data);
 
@@ -433,6 +500,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     // Test scan with filtering (id < 50)
     let predicate = Arc::new(Pred::lt(column_expr!("id"), Expr::literal(50i64)));
     let scan = snapshot
+        .clone()
         .scan_builder()
         .with_predicate(predicate.clone())
         .build()?;
@@ -468,7 +536,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         "Without filter: 3 batches (2 leaves + root), 4 files"
     );
 
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let filtered_scan = snapshot.scan_builder().with_predicate(predicate).build()?;
     let (filtered_batches, filtered_files) =
         count_scan_metadata_and_files(filtered_scan, engine.as_ref())?;
@@ -482,6 +550,64 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
         (filtered_batches, filtered_files),
         (1, 1),
         "All data skipping works: only file1 (IDs 1-100) overlaps with id < 50"
+    );
+
+    // Test scan with filtering on metadata column (_row_id < 10)
+    let metadata_predicate = Arc::new(Pred::lt(column_expr!("_row_id"), Expr::literal(10i64)));
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let metadata_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(metadata_predicate.clone())
+        .build()?;
+
+    // Collect scanned files
+    let mut scanned_files = std::collections::HashSet::new();
+    for metadata in metadata_scan.scan_metadata(engine.as_ref())? {
+        scanned_files = metadata?.visit_scan_files(
+            scanned_files,
+            |files: &mut std::collections::HashSet<_>, file| {
+                files.insert(file.path.to_string());
+            },
+        )?;
+    }
+
+    // Verify filtering with _row_id < 10:
+    // - file1 (row IDs 5-20): INCLUDED (overlaps with <10)
+    // - file2 (row IDs 105-120): FILTERED OUT by file-level skipping (min=105 > 10)
+    // - file3 (row IDs 205-220): FILTERED OUT by manifest-level skipping (leaf2 filtered)
+    // - file4 (row IDs 305-320): FILTERED OUT by file-level skipping (min=305 > 50)
+    let expected_files: std::collections::HashSet<_> = [file1.to_string()].into_iter().collect();
+    assert_eq!(scanned_files, expected_files);
+
+    // Verify using multi-phase scan planning counts
+    // TODO: Replace metadata batch count with ManifestReferences count once exposed in multi-phase planning API
+    let unfiltered_metadata_scan = snapshot.clone().scan_builder().build()?;
+    let (unfiltered_metadata_batches, unfiltered_files) =
+        count_scan_metadata_and_files(unfiltered_metadata_scan, engine.as_ref())?;
+    assert_eq!(
+        (unfiltered_metadata_batches, unfiltered_files),
+        (3, 4),
+        "Without filter: 3 batches (2 leaves + root), 4 files"
+    );
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let filtered_scan = snapshot
+        .scan_builder()
+        .with_predicate(metadata_predicate)
+        .build()?;
+    let (filtered_batches, filtered_files) =
+        count_scan_metadata_and_files(filtered_scan, engine.as_ref())?;
+
+    // With predicate _row_id < 10:
+    // - 1 batch: leaf1 (only file1 after filtering)
+    // - leaf2 filtered at manifest level (min=205 > 10)
+    // - file2 filtered at file level (min=105 > 10)
+    // - file4 filtered at file level (min=305 > 10)
+    assert_eq!(
+        (filtered_batches, filtered_files),
+        (1, 1),
+        "All data skipping works: only file1 (row IDs 5-20) overlaps with _row_id < 10"
     );
 
     Ok(())
