@@ -821,6 +821,12 @@ pub struct ParquetWriterConfig {
     pub compression: ParquetCompression,
 }
 
+/// The result of writing a parquet file via [`ParquetHandler::write_parquet_file`].
+pub struct ParquetWriteResult {
+    /// The number of bytes written to the parquet file.
+    pub size_in_bytes: u64,
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -1027,13 +1033,13 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// A [`DeltaResult`] containing a [`ParquetWriteResult`] with metadata about the written file.
     fn write_parquet_file(
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
         write_config: &ParquetWriterConfig,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<ParquetWriteResult>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///

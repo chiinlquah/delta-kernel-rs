@@ -2719,7 +2719,7 @@ mod tests {
 
         // Write metadata using the writer
         let writer = writer::ContentTreeNodeWriter::try_new(metadata)?;
-        let written_file = writer.write(&engine)?;
+        let written_file = writer.write(&engine)?.location;
 
         // Verify the file was written
         assert!(written_file.as_str().ends_with(".parquet"));
@@ -3558,7 +3558,9 @@ mod tests {
         }
         let metadata = builder.build(engine, 1)?;
 
-        let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?.write(engine)?;
+        let written_path = writer::ContentTreeNodeWriter::try_new(metadata)?
+            .write(engine)?
+            .location;
         let path_in_log = absolute_to_relative_path(&written_path, table_root_url)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
@@ -4169,8 +4171,9 @@ mod tests {
             &table_root_url,
             &engine,
         )?;
-        let child_manifest_url_1 =
-            writer::ContentTreeNodeWriter::try_new(child_metadata_1)?.write(&engine)?;
+        let child_manifest_url_1 = writer::ContentTreeNodeWriter::try_new(child_metadata_1)?
+            .write(&engine)?
+            .location;
 
         // Child manifest 2 - use version 1 to avoid filename collision
         let data_entry_3 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
@@ -4208,8 +4211,9 @@ mod tests {
             &table_root_url,
             &engine,
         )?;
-        let child_manifest_url_2 =
-            writer::ContentTreeNodeWriter::try_new(child_metadata_2)?.write(&engine)?;
+        let child_manifest_url_2 = writer::ContentTreeNodeWriter::try_new(child_metadata_2)?
+            .write(&engine)?
+            .location;
 
         // Create a root manifest that references both child manifests (as CombinedManifest, new format)
         let data_manifest_entry_1 =

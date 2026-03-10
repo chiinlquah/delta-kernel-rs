@@ -14,7 +14,7 @@ use crate::actions::{
     SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-use crate::content_tree::writer::ContentTreeNodeWriter;
+use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
 use crate::engine_data::{FilteredEngineData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::ColumnName;
@@ -720,8 +720,10 @@ impl<S> Transaction<S> {
             }
 
             let new_metadata = metadata_builder.build(engine, snapshot_id)?;
-            let content_metadata_path =
-                ContentTreeNodeWriter::try_new(new_metadata)?.write(engine)?;
+            let ContentTreeWriteResult {
+                location: content_metadata_path,
+                size_in_bytes,
+            } = ContentTreeNodeWriter::try_new(new_metadata)?.write(engine)?;
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
@@ -731,8 +733,7 @@ impl<S> Transaction<S> {
             let new_commit_version = self.read_snapshot.version() + 1;
             let content_root_action = ContentRoot {
                 path,
-                // TODO: set size_in_bytes
-                size_in_bytes: 0,
+                size_in_bytes,
                 version: new_commit_version,
             };
 
@@ -2488,7 +2489,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+            .write(&engine)?
+            .location;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
@@ -2584,7 +2587,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(leaf_manifest_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+            .write(&engine)?
+            .location;
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 3: Batch-commit a remove (v2)
@@ -2724,7 +2729,9 @@ mod tests {
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         root_builder.add_entry(data_leaf_entry);
         let root_metadata = root_builder.build(&engine, 1)?;
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(&engine)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+            .write(&engine)?
+            .location;
 
         // Step 3: Write ContentRoot action (v1)
         write_content_root_action(&table_root, root_url.as_str(), 1)?;
@@ -3232,6 +3239,30 @@ mod tests {
                         "ContentRoot action should reference version 1 root manifest, got: {}",
                         path
                     );
+
+                    // sizeInBytes should match the actual file size on disk
+                    let reported_size = content_root
+                        .get("sizeInBytes")
+                        .and_then(|s| s.as_u64())
+                        .expect("ContentRoot sizeInBytes should be present");
+                    let manifest_file = table_root
+                        .join(path)
+                        .expect("should join path")
+                        .to_file_path()
+                        .expect("should be a local path");
+                    let disk_size = manifest_file
+                        .metadata()
+                        .expect("manifest file should exist")
+                        .len();
+                    assert!(
+                        reported_size > 0,
+                        "ContentRoot sizeInBytes should be non-zero"
+                    );
+                    assert_eq!(
+                        reported_size, disk_size,
+                        "ContentRoot sizeInBytes should match actual file size"
+                    );
+
                     found_content_root = true;
                     break;
                 }

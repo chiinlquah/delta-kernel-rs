@@ -19,6 +19,9 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
+/// Note: This function must match the signature expected by `read_files` helper function.
+/// The `_predicate` and `_file_location` parameters are unused here but required
+/// to satisfy the shared function signature.
 fn try_create_from_json(
     file: File,
     schema: SchemaRef,

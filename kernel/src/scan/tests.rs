@@ -611,7 +611,7 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
 
         let metadata = builder.build(engine.as_ref(), 1).unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
-        writer.write(engine.as_ref()).unwrap()
+        writer.write(engine.as_ref()).unwrap().location
     };
 
     // Create commit files: versions 1, 2, 3, 4, 5
@@ -1010,7 +1010,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
 
         let metadata = builder.build(engine.as_ref(), 1).unwrap();
         let writer = ContentTreeNodeWriter::try_new(metadata).unwrap();
-        writer.write(engine.as_ref()).unwrap()
+        writer.write(engine.as_ref()).unwrap().location
     };
 
     // Create commit files: versions 1, 2, 5, 10, 15, 20

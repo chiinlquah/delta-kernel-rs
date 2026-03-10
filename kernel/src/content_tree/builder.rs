@@ -1120,7 +1120,9 @@ impl ContentTreeNodeBuilder {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?
+            .write(engine)?
+            .location;
         let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
 
         // Calculate aggregate stats from pending entries
@@ -1959,7 +1961,9 @@ mod tests {
     ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
         let root_metadata = builder.build(engine, snapshot_id)?;
         let table_root = root_metadata.table_root.clone();
-        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
+        let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+            .write(engine)?
+            .location;
         let root_path = crate::content_tree::absolute_to_relative_path(&root_url, &table_root)?;
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),

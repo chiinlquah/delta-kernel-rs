@@ -74,7 +74,9 @@ fn write_root_manifest(
     snapshot_id: i64,
 ) -> DeltaResult<String> {
     let root = builder.build(engine, snapshot_id)?;
-    let root_url = ContentTreeNodeWriter::try_new(root)?.write(engine)?;
+    let root_url = ContentTreeNodeWriter::try_new(root)?
+        .write(engine)?
+        .location;
     absolute_to_relative_path(&root_url, table_root)
 }
 
@@ -86,7 +88,9 @@ fn build_and_read_root(
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
     let root_metadata = builder.build(engine, snapshot_id)?;
     let table_root = root_metadata.table_root.clone();
-    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?.write(engine)?;
+    let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
+        .write(engine)?
+        .location;
     let root_path = absolute_to_relative_path(&root_url, &table_root)?;
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &root_url, root_path, None, None)?;
@@ -103,7 +107,9 @@ fn build_and_read_leaf(
 ) -> DeltaResult<Vec<ContentTreeNodeEntry>> {
     let leaf_metadata = builder.build_leaf(engine, snapshot_id)?;
     let table_root = leaf_metadata.table_root.clone();
-    let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+    let leaf_url = ContentTreeNodeWriter::try_new(leaf_metadata)?
+        .write(engine)?
+        .location;
     let leaf_path = absolute_to_relative_path(&leaf_url, &table_root)?;
     let (iter, version, path_in_log) =
         ContentTreeNode::open_stream(engine.parquet_handler(), &leaf_url, leaf_path, None, None)?;

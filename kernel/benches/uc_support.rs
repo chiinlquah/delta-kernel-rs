@@ -172,7 +172,6 @@ pub async fn create_engine_with_uc_credentials(
 /// - `uc_endpoint`: Optional Unity Catalog endpoint URL
 /// - `uc_token`: Optional Unity Catalog authentication token
 /// - `operation`: The operation type (Read, Write, ReadWrite) for UC credentials
-///
 /// # Returns
 ///
 /// A `TableSetup` struct containing:
@@ -226,16 +225,16 @@ pub async fn setup_table_access(
             ),
         );
 
+        let build_engine = |store, executor: Arc<_>| {
+            Arc::new(
+                delta_kernel::engine::default::DefaultEngine::new_with_executor(store, executor),
+            )
+        };
+
         let (table_url, engine) = if let Ok(url) = Url::parse(table_path) {
             // Valid URL - use store_from_url for all URLs
             let store = delta_kernel::engine::default::storage::store_from_url(&url)?;
-            let engine = Arc::new(
-                delta_kernel::engine::default::DefaultEngine::new_with_executor(
-                    store,
-                    executor.clone(),
-                ),
-            );
-            (url, engine)
+            (url.clone(), build_engine(store, executor))
         } else {
             // Try to parse as a local file path
             let path = std::path::Path::new(table_path);
@@ -245,13 +244,7 @@ pub async fn setup_table_access(
 
             // Use store_from_url for consistency
             let store = delta_kernel::engine::default::storage::store_from_url(&table_url)?;
-            let engine = Arc::new(
-                delta_kernel::engine::default::DefaultEngine::new_with_executor(
-                    store,
-                    executor.clone(),
-                ),
-            );
-            (table_url, engine)
+            (table_url.clone(), build_engine(store, executor))
         };
 
         // For direct paths, the store is already rooted correctly, so path_prefix is empty
