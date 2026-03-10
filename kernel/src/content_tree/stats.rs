@@ -4,7 +4,7 @@
 //! which are used in the AMT format for storing per-column statistics.
 
 use crate::content_tree::NULL_COUNT_FIELD_NAME;
-use crate::expressions::{Expression, ExpressionRef, Scalar, StructData, Transform};
+use crate::expressions::{Expression, ExpressionRef, Predicate, Scalar, StructData, Transform};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, PrimitiveType,
@@ -1517,6 +1517,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     let mut null_count_exprs = Vec::new();
     let mut min_values_exprs = Vec::new();
     let mut max_values_exprs = Vec::new();
+    let mut exact_bounds_exprs = Vec::new();
 
     collect_stats_expressions_filtered(
         table_schema,
@@ -1528,6 +1529,7 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         &mut null_count_exprs,
         &mut min_values_exprs,
         &mut max_values_exprs,
+        &mut exact_bounds_exprs,
     )?;
 
     // Build nested struct expressions
@@ -1559,14 +1561,24 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
     // This expression will be evaluated against the manifest batch data which includes recordCount
     let num_records_expr = Expression::column(["recordCount"]);
 
+    // tightBounds: AND of all columns' exact_bounds from content_stats
+    // bounds are tight only if tight for every column (to match Delta semantics).
+    let tight_bounds_expr = if exact_bounds_exprs.is_empty() {
+        Expression::literal(Scalar::Boolean(true))
+    } else {
+        let preds: Vec<Predicate> = exact_bounds_exprs
+            .into_iter()
+            .map(|e| Predicate::BooleanExpression((*e).clone()))
+            .collect();
+        Expression::from_pred(Predicate::and_from(preds))
+    };
+
     Ok(Arc::new(Expression::struct_from([
         num_records_expr,
         null_count_struct,
         min_values_struct,
         max_values_struct,
-        // TODO: Finalize this, what is the mapping?
-        // tightBounds: bounds are not tight in iceberg by default.
-        Expression::literal(false),
+        tight_bounds_expr,
     ])))
 }
 
@@ -1613,6 +1625,7 @@ fn collect_stats_expressions_filtered(
     null_count_exprs: &mut Vec<ExpressionRef>,
     min_values_exprs: &mut Vec<ExpressionRef>,
     max_values_exprs: &mut Vec<ExpressionRef>,
+    exact_bounds_exprs: &mut Vec<ExpressionRef>,
 ) -> DeltaResult<()> {
     // Collect unique column names across all three stat categories
     let mut col_names: Vec<&str> = Vec::new();
@@ -1648,6 +1661,7 @@ fn collect_stats_expressions_filtered(
                 let mut nested_null_count_exprs = Vec::new();
                 let mut nested_min_values_exprs = Vec::new();
                 let mut nested_max_values_exprs = Vec::new();
+                let mut nested_exact_bounds_exprs = Vec::new();
 
                 collect_stats_expressions_filtered(
                     table_nested,
@@ -1659,6 +1673,7 @@ fn collect_stats_expressions_filtered(
                     &mut nested_null_count_exprs,
                     &mut nested_min_values_exprs,
                     &mut nested_max_values_exprs,
+                    &mut nested_exact_bounds_exprs,
                 )?;
 
                 if !nested_null_count_exprs.is_empty() {
@@ -1672,11 +1687,14 @@ fn collect_stats_expressions_filtered(
                     max_values_exprs
                         .push(Arc::new(Expression::struct_from(nested_max_values_exprs)));
                 }
+                exact_bounds_exprs.extend(nested_exact_bounds_exprs);
             }
             _ if matches!(table_field.data_type(), DataType::Primitive(_)) => {
                 if !column_to_field_id.contains_key(&field_path) {
                     continue;
                 }
+                let has_min_values = min_vals_cols.is_some_and(|s| s.field(col_name).is_some());
+                let has_max_values = max_vals_cols.is_some_and(|s| s.field(col_name).is_some());
                 if null_count_cols.is_some_and(|s| s.field(col_name).is_some()) {
                     null_count_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
@@ -1684,19 +1702,30 @@ fn collect_stats_expressions_filtered(
                         crate::content_tree::NULL_COUNT_FIELD_NAME,
                     ]))));
                 }
-                if min_vals_cols.is_some_and(|s| s.field(col_name).is_some()) {
+                if has_min_values {
                     min_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
                         "lower_bound",
                     ]))));
                 }
-                if max_vals_cols.is_some_and(|s| s.field(col_name).is_some()) {
+                if has_max_values {
                     max_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
                         "upper_bound",
                     ]))));
+                }
+                if has_min_values || has_max_values {
+                    // coalesce to true to match delta semantics
+                    exact_bounds_exprs.push(Arc::new(Expression::coalesce([
+                        Expression::Column(ColumnName::new([
+                            crate::content_tree::CONTENT_STATS_FIELD_NAME,
+                            &field_path,
+                            "exact_bounds",
+                        ])),
+                        Expression::literal(Scalar::Boolean(true)),
+                    ])));
                 }
             }
             _ => {}
@@ -2819,5 +2848,127 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
         field_stats_struct.clone()
+    }
+
+    /// Verifies that tightBounds in the stats_parsed expression is not hardcoded to false when
+    /// the table has stat columns. It should be derived from content_stats.exact_bounds.
+    #[test]
+    fn test_create_content_stats_to_stats_parsed_expr_tight_bounds_not_literal_false() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("value", DataType::LONG, false, 2),
+        ]);
+        let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
+
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("should build expression");
+
+        // Output is a struct: [numRecords, nullCount, minValues, maxValues, tightBounds]
+        let output = expr.as_ref();
+        let exprs = match output {
+            Expression::Struct(inner, _) => inner,
+            _ => panic!("expected Struct expression, got {:?}", output),
+        };
+        assert_eq!(exprs.len(), 5, "stats_parsed struct should have 5 fields");
+        let tight_bounds_expr = exprs[4].as_ref();
+        assert!(
+            !matches!(tight_bounds_expr, Expression::Literal(Scalar::Boolean(false))),
+            "tightBounds must not be hardcoded to false; should be derived from content_stats.exact_bounds"
+        );
+        // With two columns in stats, it should be an AND of two coalesce expressions (Predicate)
+        assert!(
+            matches!(tight_bounds_expr, Expression::Predicate(_)),
+            "tightBounds should be Predicate(AND(...)) when columns have stats"
+        );
+    }
+
+    /// When no columns appear in the stats schema (empty minValues/maxValues/nullCount),
+    /// tightBounds should default to literal true.
+    #[test]
+    fn test_create_content_stats_to_stats_parsed_expr_tight_bounds_literal_true_when_no_stat_columns(
+    ) {
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+        // Stats schema with empty structs for nullCount/minValues/maxValues (no column names)
+        let empty_struct = StructType::new_unchecked(vec![]);
+        let stats_schema = StructType::new_unchecked(vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(
+                "nullCount",
+                DataType::Struct(Box::new(empty_struct.clone())),
+            ),
+            StructField::nullable(
+                "minValues",
+                DataType::Struct(Box::new(empty_struct.clone())),
+            ),
+            StructField::nullable("maxValues", DataType::Struct(Box::new(empty_struct))),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("should build expression");
+
+        let output = expr.as_ref();
+        let exprs = match output {
+            Expression::Struct(inner, _) => inner,
+            _ => panic!("expected Struct expression"),
+        };
+        let tight_bounds_expr = exprs[4].as_ref();
+        assert!(
+            matches!(
+                tight_bounds_expr,
+                Expression::Literal(Scalar::Boolean(true))
+            ),
+            "tightBounds should default to true when no stat columns are available"
+        );
+    }
+
+    #[test]
+    fn test_tight_bounds_roundtrip_data_and_expression_consistency() {
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+        let stats_json_true =
+            r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"tightBounds":true}"#;
+        let stats_json_false =
+            r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"tightBounds":false}"#;
+
+        let content_true = delta_json_stats_to_content_stats(Some(stats_json_true), &table_schema)
+            .expect("convert")
+            .expect("some");
+        let content_false =
+            delta_json_stats_to_content_stats(Some(stats_json_false), &table_schema)
+                .expect("convert")
+                .expect("some");
+
+        assert_eq!(
+            get_column_stat(&content_true, "id", "exact_bounds"),
+            Some(&Scalar::Boolean(true))
+        );
+        assert_eq!(
+            get_column_stat(&content_false, "id", "exact_bounds"),
+            Some(&Scalar::Boolean(false))
+        );
+
+        // Expression should AND exact_bounds from columns; for one column that's just coalesce(cs.id.exact_bounds, true).
+        // So when evaluated with content_true we'd get true, with content_false we'd get false.
+        let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("build expr");
+        // Output is a struct: [numRecords, nullCount, minValues, maxValues, tightBounds]
+        let output = expr.as_ref();
+        let exprs = match output {
+            Expression::Struct(inner, _) => inner,
+            _ => panic!("expected Struct expression, got {:?}", output),
+        };
+        assert_eq!(exprs.len(), 5, "stats_parsed struct should have 5 fields");
+        let tight_bounds_expr = exprs[4].as_ref();
+        assert!(
+            !matches!(tight_bounds_expr, Expression::Literal(Scalar::Boolean(false))),
+            "tightBounds must not be hardcoded to false; should be derived from content_stats.exact_bounds"
+        );
+        assert!(
+            matches!(tight_bounds_expr, Expression::Predicate(_)),
+            "tightBounds should be Predicate(AND(...)) when columns have stats"
+        );
     }
 }
