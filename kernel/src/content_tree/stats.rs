@@ -444,7 +444,11 @@ struct DeltaJsonStats {
 
 impl DeltaJsonStats {
     /// Parse a JSON stats string from Delta Protocol format.
-    fn parse(json_str: &str) -> Option<Self> {
+    ///
+    /// When `tightBounds` is absent or null in the JSON, uses `tight_bounds_when_null` if provided
+    /// (e.g. `Some(false)` when the file has a deletion vector, so bounds are treated as not tight);
+    /// otherwise defaults to `true` for backwards compatibility.
+    fn parse(json_str: &str, tight_bounds_when_null: Option<bool>) -> Option<Self> {
         // TODO: We should delegate this to the engine.. at some point...
         let parsed: JsonValue = serde_json::from_str(json_str).ok()?;
         let obj = parsed.as_object()?;
@@ -479,12 +483,13 @@ impl DeltaJsonStats {
             })
             .unwrap_or_default();
 
-        // tightBounds defaults to true when not present (for backwards compatibility).
-        // When false, the bounds may be wider than the actual data (e.g., due to deletion vectors).
+        // tightBounds: when present and boolean, use it. When absent or null, use
+        // tight_bounds_when_null if provided (e.g. Some(false) when file has a deletion vector),
+        // otherwise default to true for backwards compatibility.
         let tight_bounds = obj
             .get("tightBounds")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or_else(|| tight_bounds_when_null.unwrap_or(true));
 
         Some(Self {
             num_records,
@@ -1047,6 +1052,9 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 ///
 /// * `stats_json` - The JSON stats string from the Add action's `stats` field
 /// * `table_schema` - The table's data schema (used to determine column types)
+/// * `tight_bounds_when_null` - When the Add has a deletion vector, pass `Some(false)` so that
+///   absent or null `tightBounds` in the JSON is treated as not tight (safe for data skipping).
+///   Pass `None` to keep default behaviour (absent/null -> true).
 ///
 /// # Returns
 ///
@@ -1057,17 +1065,18 @@ fn and_boolean_scalars(scalars: &[&Scalar]) -> Scalar {
 ///
 /// ```ignore
 /// let stats_json = r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":100},"nullCount":{"id":0}}"#;
-/// let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?;
+/// let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)?;
 /// ```
 pub(crate) fn delta_json_stats_to_content_stats(
     stats_json: Option<&str>,
     table_schema: &StructType,
+    tight_bounds_when_null: Option<bool>,
 ) -> DeltaResult<Option<StructData>> {
     let Some(json_str) = stats_json else {
         return Ok(None);
     };
 
-    let Some(delta_stats) = DeltaJsonStats::parse(json_str) else {
+    let Some(delta_stats) = DeltaJsonStats::parse(json_str, tight_bounds_when_null) else {
         return Ok(None);
     };
 
@@ -2210,9 +2219,10 @@ mod tests {
             "nullCount": {"id": 0, "name": 5}
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // AMT format has one field per column: {id: {...}, name: {...}}
         assert_eq!(content_stats.fields().len(), 2);
@@ -2265,7 +2275,7 @@ mod tests {
 
         // None input should return None
         let result =
-            delta_json_stats_to_content_stats(None, &table_schema).expect("should not error");
+            delta_json_stats_to_content_stats(None, &table_schema, None).expect("should not error");
         assert!(result.is_none());
     }
 
@@ -2275,7 +2285,7 @@ mod tests {
             StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
 
         // Invalid JSON should return None (graceful handling)
-        let result = delta_json_stats_to_content_stats(Some("not valid json"), &table_schema)
+        let result = delta_json_stats_to_content_stats(Some("not valid json"), &table_schema, None)
             .expect("should not error");
         assert!(result.is_none());
     }
@@ -2288,9 +2298,10 @@ mod tests {
 
         let stats_json = r#"{"numRecords": 50}"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // AMT format has one field per column
         assert_eq!(content_stats.fields().len(), 1);
@@ -2325,9 +2336,10 @@ mod tests {
             "maxValues": {"int_col": 100, "short_col": 10, "byte_col": 1, "double_col": 99.9, "float_col": 9.9}
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // AMT format: one field per column
         assert_eq!(content_stats.fields().len(), 5);
@@ -2367,9 +2379,10 @@ mod tests {
             "tightBounds": true
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
@@ -2393,9 +2406,10 @@ mod tests {
             "tightBounds": false
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
@@ -2418,9 +2432,10 @@ mod tests {
             "nullCount": {"value": 0}
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // In AMT format, exact_bounds defaults to true when tightBounds is absent
         assert_eq!(
@@ -2428,6 +2443,44 @@ mod tests {
             Some(&Scalar::Boolean(true)),
             "exact_bounds should default to true when tightBounds is absent"
         );
+    }
+
+    #[test]
+    fn test_delta_json_stats_tight_bounds_null_with_deletion_vector() {
+        // When tightBounds is null or absent and the file has a deletion vector, treat as not tight
+        // so data skipping does not over-skip (bounds may be wider than logical data after DV).
+        let table_schema =
+            StructType::new_unchecked([field_with_id("value", DataType::LONG, false, 1)]);
+
+        let stats_json_no_tight_bounds = r#"{
+            "numRecords": 10,
+            "minValues": {"value": 0},
+            "maxValues": {"value": 9},
+            "nullCount": {"value": 0}
+        }"#;
+        let stats_json_null_tight_bounds = r#"{
+            "numRecords": 10,
+            "minValues": {"value": 0},
+            "maxValues": {"value": 9},
+            "nullCount": {"value": 0},
+            "tightBounds": null
+        }"#;
+
+        for stats_json in [stats_json_no_tight_bounds, stats_json_null_tight_bounds] {
+            let content_stats = delta_json_stats_to_content_stats(
+                Some(stats_json),
+                &table_schema,
+                Some(false), // has deletion vector -> treat null/absent as not tight
+            )
+            .expect("should convert stats")
+            .expect("should have stats");
+
+            assert_eq!(
+                get_column_stat(&content_stats, "value", "exact_bounds"),
+                Some(&Scalar::Boolean(false)),
+                "exact_bounds should be false when tight_bounds_when_null is Some(false) (DV present)"
+            );
+        }
     }
 
     #[test]
@@ -2444,9 +2497,10 @@ mod tests {
             "nullCount": {"ts": 0}
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // Get timestamp from lower_bound in AMT format
         let min_ts = get_column_stat(&content_stats, "ts", "lower_bound")
@@ -2481,9 +2535,10 @@ mod tests {
             "nullCount": {"date_col": 0}
         }"#;
 
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
-            .expect("should convert stats")
-            .expect("should have stats");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert stats")
+                .expect("should have stats");
 
         // Get date from lower_bound and upper_bound in AMT format
         let min_date = get_column_stat(&content_stats, "date_col", "lower_bound")
@@ -2523,7 +2578,7 @@ mod tests {
             "maxValues": {"id": 50, "name": "mike"},
             "nullCount": {"id": 0, "name": 5}
         }"#;
-        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2534,7 +2589,7 @@ mod tests {
             "maxValues": {"id": 100, "name": "zoe"},
             "nullCount": {"id": 0, "name": 10}
         }"#;
-        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2597,7 +2652,7 @@ mod tests {
             "minValues": {"id": 1},
             "maxValues": {"id": 50}
         }"#;
-        let stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)
+        let stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2647,7 +2702,7 @@ mod tests {
             "maxValues": {"value": 50},
             "tightBounds": true
         }"#;
-        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2658,7 +2713,7 @@ mod tests {
             "maxValues": {"value": 100},
             "tightBounds": false
         }"#;
-        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2686,7 +2741,7 @@ mod tests {
             "maxValues": {"value": 50},
             "tightBounds": true
         }"#;
-        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2696,7 +2751,7 @@ mod tests {
             "maxValues": {"value": 100},
             "tightBounds": true
         }"#;
-        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2732,7 +2787,7 @@ mod tests {
             "maxValues": {"outer.nested_id": 50, "outer.nested_name": "mike"},
             "nullCount": {"outer.nested_name": 5}
         }"#;
-        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)
+        let stats1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2742,7 +2797,7 @@ mod tests {
             "maxValues": {"outer.nested_id": 100, "outer.nested_name": "zoe"},
             "nullCount": {"outer.nested_name": 10}
         }"#;
-        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)
+        let stats2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema, None)
             .expect("should convert")
             .expect("should have stats");
 
@@ -2932,11 +2987,12 @@ mod tests {
         let stats_json_false =
             r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"tightBounds":false}"#;
 
-        let content_true = delta_json_stats_to_content_stats(Some(stats_json_true), &table_schema)
-            .expect("convert")
-            .expect("some");
+        let content_true =
+            delta_json_stats_to_content_stats(Some(stats_json_true), &table_schema, None)
+                .expect("convert")
+                .expect("some");
         let content_false =
-            delta_json_stats_to_content_stats(Some(stats_json_false), &table_schema)
+            delta_json_stats_to_content_stats(Some(stats_json_false), &table_schema, None)
                 .expect("convert")
                 .expect("some");
 

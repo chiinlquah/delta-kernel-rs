@@ -581,9 +581,13 @@ impl ContentTreeNodeBuilder {
             .unwrap_or(0);
 
         // TODO: Check if parsed_stats is set and prefer that over the JSON blob
-        // Convert Delta JSON stats to content_stats
-        let content_stats =
-            delta_json_stats_to_content_stats(add.stats.as_deref(), &self.table_schema)?;
+        // Convert Delta JSON stats to content_stats. When the file has a deletion vector and
+        // tightBounds is null/absent, treat bounds as not tight (safe for data skipping).
+        let content_stats = delta_json_stats_to_content_stats(
+            add.stats.as_deref(),
+            &self.table_schema,
+            add.deletion_vector.is_some().then_some(false),
+        )?;
 
         let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location(add.path.clone())
@@ -2234,8 +2238,9 @@ mod tests {
 
         // Verify content_stats is populated by directly checking the conversion function
         // (The builder uses this function internally)
-        let content_stats = delta_json_stats_to_content_stats(Some(stats_json), &table_schema)?
-            .expect("content_stats should be populated");
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)?
+                .expect("content_stats should be populated");
 
         // Helper function to get a field's value from a StructData by field name
         fn get_struct_field<'a>(
@@ -2384,7 +2389,8 @@ mod tests {
 
         // Create content_stats for file 1: id=[1, 50], name=["alice", "mike"]
         let stats1_json = r#"{"numRecords":100,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":50,"name":"mike"},"nullCount":{"id":0,"name":5}}"#;
-        let content_stats_1 = delta_json_stats_to_content_stats(Some(stats1_json), &table_schema)?;
+        let content_stats_1 =
+            delta_json_stats_to_content_stats(Some(stats1_json), &table_schema, None)?;
 
         let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data/part-00000.parquet")
@@ -2396,7 +2402,8 @@ mod tests {
 
         // Create content_stats for file 2: id=[40, 100], name=["bob", "zoe"]
         let stats2_json = r#"{"numRecords":150,"minValues":{"id":40,"name":"bob"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":10}}"#;
-        let content_stats_2 = delta_json_stats_to_content_stats(Some(stats2_json), &table_schema)?;
+        let content_stats_2 =
+            delta_json_stats_to_content_stats(Some(stats2_json), &table_schema, None)?;
 
         let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("data/part-00001.parquet")
