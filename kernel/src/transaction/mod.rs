@@ -3763,6 +3763,7 @@ mod tests {
                     "columnMapping",
                     "domainMetadata",
                     "metadataTree-experimental",
+                    "rowTracking",
                     "icebergNativeV4-experimental"
                 ]
             }

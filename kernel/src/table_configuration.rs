@@ -1729,6 +1729,7 @@ mod test {
                 TableFeature::ColumnMapping,
                 TableFeature::DomainMetadata,
                 TableFeature::MetadataTreeExperimental,
+                TableFeature::RowTracking,
                 TableFeature::IcebergNativeV4Experimental,
             ],
         );

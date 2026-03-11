@@ -469,6 +469,7 @@ static ICEBERG_NATIVE_V4_EXPERIMENTAL_INFO: FeatureInfo = FeatureInfo {
         }),
         FeatureRequirement::Supported(TableFeature::DomainMetadata),
         FeatureRequirement::Supported(TableFeature::MetadataTreeExperimental),
+        FeatureRequirement::Supported(TableFeature::RowTracking),
     ],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
