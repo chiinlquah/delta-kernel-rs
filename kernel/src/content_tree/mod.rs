@@ -37,6 +37,14 @@ pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
 /// This field contains the count of null values for a column.
 pub(crate) const NULL_COUNT_FIELD_NAME: &str = "null_value_count";
 
+/// Delta JSON stats field names. These are the keys used in the `stats` JSON string of Add actions
+/// and in the `stats_parsed` struct produced by parsing that JSON.
+pub(crate) const DELTA_STATS_NUM_RECORDS: &str = "numRecords";
+pub(crate) const DELTA_STATS_NULL_COUNT: &str = "nullCount";
+pub(crate) const DELTA_STATS_MIN_VALUES: &str = "minValues";
+pub(crate) const DELTA_STATS_MAX_VALUES: &str = "maxValues";
+pub(crate) const DELTA_STATS_TIGHT_BOUNDS: &str = "tightBounds";
+
 /// Type alias for the iterator returned by `open_stream`.
 type ParquetStreamResult = (
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
@@ -381,7 +389,7 @@ impl ContentTreeNode {
                     let field_exprs: Vec<_> = stats_struct
                         .fields()
                         .map(|f| {
-                            if f.name() == "numRecords" {
+                            if f.name() == DELTA_STATS_NUM_RECORDS {
                                 Expression::column(["recordCount"])
                             } else {
                                 Expression::null_literal(f.data_type().clone())
@@ -2793,7 +2801,7 @@ mod tests {
         }
         let min_values = StructType::new_unchecked(min_values_fields(table_schema));
         StructType::new_unchecked([StructField::nullable(
-            "minValues",
+            DELTA_STATS_MIN_VALUES,
             DataType::Struct(Box::new(min_values)),
         )])
     }
@@ -4484,8 +4492,8 @@ mod tests {
             let mut stats_fields = Vec::new();
             for field in stats_arrow_schema.iter() {
                 let array: ArrayRef = match field.name().as_str() {
-                    "numRecords" => std::sync::Arc::new(num_records_array.clone()),
-                    "tightBounds" => {
+                    DELTA_STATS_NUM_RECORDS => std::sync::Arc::new(num_records_array.clone()),
+                    DELTA_STATS_TIGHT_BOUNDS => {
                         std::sync::Arc::new(BooleanArray::from(vec![Some(true); num_files]))
                     }
                     _ => std::sync::Arc::new(new_null_array(field.data_type(), num_files)),
@@ -4846,7 +4854,7 @@ mod tests {
                         (
                             vec![
                                 ColumnName::new(["add", "stats"]),
-                                ColumnName::new(["add", "stats_parsed", "numRecords"]),
+                                ColumnName::new(["add", "stats_parsed", DELTA_STATS_NUM_RECORDS]),
                             ],
                             vec![DataType::STRING, DataType::LONG],
                         )

@@ -3,7 +3,10 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
-use crate::content_tree::NULL_COUNT_FIELD_NAME;
+use crate::content_tree::{
+    DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
+    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, NULL_COUNT_FIELD_NAME,
+};
 use crate::expressions::{Expression, ExpressionRef, Predicate, Scalar, StructData, Transform};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
 use crate::schema::{
@@ -454,23 +457,23 @@ impl DeltaJsonStats {
         let obj = parsed.as_object()?;
 
         let num_records = obj
-            .get("numRecords")
+            .get(DELTA_STATS_NUM_RECORDS)
             .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
 
         let min_values = obj
-            .get("minValues")
+            .get(DELTA_STATS_MIN_VALUES)
             .and_then(|v| v.as_object())
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
         let max_values = obj
-            .get("maxValues")
+            .get(DELTA_STATS_MAX_VALUES)
             .and_then(|v| v.as_object())
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
         let null_count = obj
-            .get("nullCount")
+            .get(DELTA_STATS_NULL_COUNT)
             .and_then(|v| v.as_object())
             .map(|m| {
                 m.iter()
@@ -487,7 +490,7 @@ impl DeltaJsonStats {
         // tight_bounds_when_null if provided (e.g. Some(false) when file has a deletion vector),
         // otherwise default to true for backwards compatibility.
         let tight_bounds = obj
-            .get("tightBounds")
+            .get(DELTA_STATS_TIGHT_BOUNDS)
             .and_then(|v| v.as_bool())
             .unwrap_or_else(|| tight_bounds_when_null.unwrap_or(true));
 
@@ -723,7 +726,10 @@ pub(crate) fn aggregate_content_stats<'a>(
     let template = stats_vec[0];
 
     // Check if this is Delta JSON format (has numRecords field)
-    let is_delta_json_format = template.fields().iter().any(|f| f.name() == "numRecords");
+    let is_delta_json_format = template
+        .fields()
+        .iter()
+        .any(|f| f.name() == DELTA_STATS_NUM_RECORDS);
 
     if is_delta_json_format {
         aggregate_delta_json_stats(&stats_vec)
@@ -743,11 +749,11 @@ fn aggregate_delta_json_stats(stats_vec: &[&StructData]) -> Option<StructData> {
         let field_values: Vec<&Scalar> = stats_vec.iter().map(|s| &s.values()[field_idx]).collect();
 
         let aggregated = match field_name {
-            "numRecords" => sum_long_scalars(&field_values),
-            "tightBounds" => and_boolean_scalars(&field_values),
-            "nullCount" => aggregate_struct_by_sum(&field_values, field.data_type()),
-            "minValues" => aggregate_struct_by_min(&field_values, field.data_type()),
-            "maxValues" => aggregate_struct_by_max(&field_values, field.data_type()),
+            DELTA_STATS_NUM_RECORDS => sum_long_scalars(&field_values),
+            DELTA_STATS_TIGHT_BOUNDS => and_boolean_scalars(&field_values),
+            DELTA_STATS_NULL_COUNT => aggregate_struct_by_sum(&field_values, field.data_type()),
+            DELTA_STATS_MIN_VALUES => aggregate_struct_by_min(&field_values, field.data_type()),
+            DELTA_STATS_MAX_VALUES => aggregate_struct_by_max(&field_values, field.data_type()),
             _ => Scalar::Null(field.data_type().clone()),
         };
         aggregated_values.push(aggregated);
@@ -1097,7 +1103,7 @@ fn is_delta_json_stats_schema(schema: &StructType, stats_column_name: &str) -> b
             DataType::Struct(s) => Some(s),
             _ => None,
         })
-        .is_some_and(|s| s.field("numRecords").is_some())
+        .is_some_and(|s| s.field(DELTA_STATS_NUM_RECORDS).is_some())
 }
 
 /// Builds a Transform expression that replaces a Delta JSON stats column with AMT format.
@@ -1239,26 +1245,28 @@ fn build_amt_leaf_expr(
         .fields()
         .map(|field| {
             let expr = match field.name().as_str() {
-                "value_count" if field_exists("numRecords", &[]) => {
-                    Expression::column([stats_col, "numRecords"])
+                "value_count" if field_exists(DELTA_STATS_NUM_RECORDS, &[]) => {
+                    Expression::column([stats_col, DELTA_STATS_NUM_RECORDS])
                 }
-                name if name == NULL_COUNT_FIELD_NAME && field_exists("nullCount", col_path) => {
-                    let mut path: Vec<&str> = vec![stats_col, "nullCount"];
+                name if name == NULL_COUNT_FIELD_NAME
+                    && field_exists(DELTA_STATS_NULL_COUNT, col_path) =>
+                {
+                    let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_NULL_COUNT];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "lower_bound" if field_exists("minValues", col_path) => {
-                    let mut path: Vec<&str> = vec![stats_col, "minValues"];
+                "lower_bound" if field_exists(DELTA_STATS_MIN_VALUES, col_path) => {
+                    let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_MIN_VALUES];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "upper_bound" if field_exists("maxValues", col_path) => {
-                    let mut path: Vec<&str> = vec![stats_col, "maxValues"];
+                "upper_bound" if field_exists(DELTA_STATS_MAX_VALUES, col_path) => {
+                    let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_MAX_VALUES];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "exact_bounds" if field_exists("tightBounds", &[]) => {
-                    Expression::column([stats_col, "tightBounds"])
+                "exact_bounds" if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
+                    Expression::column([stats_col, DELTA_STATS_TIGHT_BOUNDS])
                 }
                 // Field not in Delta JSON stats or not present in known schema → null literal
                 _ => Expression::null_literal(field.data_type().clone()),
@@ -1494,9 +1502,9 @@ pub(crate) fn filtered_stats_schema(
 ) -> DeltaResult<StructType> {
     let fields = filtered_stats_schema_fields(
         table_schema,
-        get_struct_sub_schema(stats_schema, "nullCount"),
-        get_struct_sub_schema(stats_schema, "minValues"),
-        get_struct_sub_schema(stats_schema, "maxValues"),
+        get_struct_sub_schema(stats_schema, DELTA_STATS_NULL_COUNT),
+        get_struct_sub_schema(stats_schema, DELTA_STATS_MIN_VALUES),
+        get_struct_sub_schema(stats_schema, DELTA_STATS_MAX_VALUES),
     )?;
     Ok(StructType::new_unchecked(fields))
 }
@@ -1519,9 +1527,9 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
 
     // Build expressions for each stat type independently, using only the columns present
     // in each Delta stat category (nullCount, minValues, maxValues).
-    let null_count_cols = get_struct_sub_schema(stats_schema, "nullCount");
-    let min_vals_cols = get_struct_sub_schema(stats_schema, "minValues");
-    let max_vals_cols = get_struct_sub_schema(stats_schema, "maxValues");
+    let null_count_cols = get_struct_sub_schema(stats_schema, DELTA_STATS_NULL_COUNT);
+    let min_vals_cols = get_struct_sub_schema(stats_schema, DELTA_STATS_MIN_VALUES);
+    let max_vals_cols = get_struct_sub_schema(stats_schema, DELTA_STATS_MAX_VALUES);
 
     let mut null_count_exprs = Vec::new();
     let mut min_values_exprs = Vec::new();
@@ -1582,13 +1590,24 @@ pub(crate) fn create_content_stats_to_stats_parsed_expr(
         Expression::from_pred(Predicate::and_from(preds))
     };
 
-    Ok(Arc::new(Expression::struct_from([
-        num_records_expr,
-        null_count_struct,
-        min_values_struct,
-        max_values_struct,
-        tight_bounds_expr,
-    ])))
+    // Build the output struct with only the fields present in stats_schema.
+    // stats_schema may omit nullCount, minValues, or maxValues when no eligible columns exist
+    // (e.g. boolean/binary columns are excluded from min/max stats). The expression field count
+    // must match the schema field count exactly for the expression evaluator.
+    let mut field_exprs: Vec<ExpressionRef> = vec![Arc::new(num_records_expr)];
+    if stats_schema.field(DELTA_STATS_NULL_COUNT).is_some() {
+        field_exprs.push(Arc::new(null_count_struct));
+    }
+    if stats_schema.field(DELTA_STATS_MIN_VALUES).is_some() {
+        field_exprs.push(Arc::new(min_values_struct));
+    }
+    if stats_schema.field(DELTA_STATS_MAX_VALUES).is_some() {
+        field_exprs.push(Arc::new(max_values_struct));
+    }
+    if stats_schema.field(DELTA_STATS_TIGHT_BOUNDS).is_some() {
+        field_exprs.push(Arc::new(tight_bounds_expr));
+    }
+    Ok(Arc::new(Expression::struct_from(field_exprs)))
 }
 
 /// Builds a map from physical column names (with "." for nested) to field IDs.
@@ -2947,17 +2966,20 @@ mod tests {
         // Stats schema with empty structs for nullCount/minValues/maxValues (no column names)
         let empty_struct = StructType::new_unchecked(vec![]);
         let stats_schema = StructType::new_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(DELTA_STATS_NUM_RECORDS, DataType::LONG),
             StructField::nullable(
-                "nullCount",
+                DELTA_STATS_NULL_COUNT,
                 DataType::Struct(Box::new(empty_struct.clone())),
             ),
             StructField::nullable(
-                "minValues",
+                DELTA_STATS_MIN_VALUES,
                 DataType::Struct(Box::new(empty_struct.clone())),
             ),
-            StructField::nullable("maxValues", DataType::Struct(Box::new(empty_struct))),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(
+                DELTA_STATS_MAX_VALUES,
+                DataType::Struct(Box::new(empty_struct)),
+            ),
+            StructField::nullable(DELTA_STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
@@ -3025,6 +3047,43 @@ mod tests {
         assert!(
             matches!(tight_bounds_expr, Expression::Predicate(_)),
             "tightBounds should be Predicate(AND(...)) when columns have stats"
+        );
+    }
+
+    #[test]
+    fn test_create_content_stats_to_stats_parsed_expr_no_min_max_in_schema() {
+        // When stats_schema omits minValues/maxValues entirely (e.g. boolean/binary-only tables
+        // where no columns are min/max eligible), the output expression must not include those
+        // fields. The field count must match the schema exactly for the expression evaluator.
+        let table_schema =
+            StructType::new_unchecked([field_with_id("flag", DataType::BOOLEAN, true, 1)]);
+
+        // Simulate the data-skipping stats schema for a boolean-only table:
+        // MinMaxStatsTransform produces no eligible columns, so minValues/maxValues are absent.
+        let null_count_schema =
+            StructType::new_unchecked([StructField::nullable("flag", DataType::LONG)]);
+        let stats_schema = StructType::new_unchecked(vec![
+            StructField::nullable(DELTA_STATS_NUM_RECORDS, DataType::LONG),
+            StructField::nullable(
+                DELTA_STATS_NULL_COUNT,
+                DataType::Struct(Box::new(null_count_schema)),
+            ),
+            // No minValues, no maxValues
+            StructField::nullable(DELTA_STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+
+        let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
+            .expect("should build expression without error for boolean-only table");
+
+        let exprs = match expr.as_ref() {
+            Expression::Struct(inner, _) => inner,
+            _ => panic!("expected Struct expression"),
+        };
+        // Output must have exactly 3 fields matching the stats_schema (numRecords, nullCount, tightBounds)
+        assert_eq!(
+            exprs.len(),
+            3,
+            "expression field count must match stats_schema when minValues/maxValues are absent"
         );
     }
 }

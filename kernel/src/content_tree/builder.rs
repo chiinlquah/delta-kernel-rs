@@ -4,7 +4,9 @@ use crate::content_tree::stats::{aggregate_content_stats, delta_json_stats_to_co
 use crate::content_tree::writer::ContentTreeNodeWriter;
 use crate::content_tree::{
     absolute_to_relative_path, ContentTreeNode, ContentTreeNodeEntry, ContentTreeNodeEntryBuilder,
-    DataContentType, DvInfo, TrackingInfo, TrackingStatus,
+    DataContentType, DvInfo, TrackingInfo, TrackingStatus, DELTA_STATS_MAX_VALUES,
+    DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT, DELTA_STATS_NUM_RECORDS,
+    DELTA_STATS_TIGHT_BOUNDS,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 
@@ -1363,7 +1365,7 @@ impl ContentTreeNodeBuilder {
         // stats_parsed is always present (added by step 2 in add_from_existing_scan_rows, Delta format).
         // record_count reads numRecords directly; content_stats converts Delta→AMT via expressions.
         let record_count_expr = Expression::coalesce([
-            Expression::column(["stats_parsed", "numRecords"]),
+            Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS]),
             Expression::literal(Scalar::Long(0)),
         ]);
         let content_stats_expr =
@@ -1637,20 +1639,20 @@ pub(crate) fn build_delta_stats_schema(
     // Field order must match `expected_stats_schema` in scan/data_skipping/stats_schema/mod.rs,
     // which is also the order written to parquet checkpoints/sidecars.
     StructType::new_unchecked(vec![
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(DELTA_STATS_NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "nullCount",
+            DELTA_STATS_NULL_COUNT,
             DataType::Struct(Box::new(StructType::new_unchecked(null_count_fields))),
         ),
         StructField::nullable(
-            "minValues",
+            DELTA_STATS_MIN_VALUES,
             DataType::Struct(Box::new(StructType::new_unchecked(value_fields.clone()))),
         ),
         StructField::nullable(
-            "maxValues",
+            DELTA_STATS_MAX_VALUES,
             DataType::Struct(Box::new(StructType::new_unchecked(value_fields))),
         ),
-        StructField::nullable("tightBounds", DataType::BOOLEAN),
+        StructField::nullable(DELTA_STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
     ])
 }
 
@@ -1686,21 +1688,29 @@ fn build_content_stats_from_delta_stats_parsed(
                 .fields()
                 .map(|f| {
                     Arc::new(match f.name().as_str() {
-                        "value_count" => Expression::column(["stats_parsed", "numRecords"]),
-                        crate::content_tree::NULL_COUNT_FIELD_NAME => {
-                            Expression::column(["stats_parsed", "nullCount", col_name.as_str()])
+                        "value_count" => {
+                            Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS])
                         }
+                        crate::content_tree::NULL_COUNT_FIELD_NAME => Expression::column([
+                            "stats_parsed",
+                            DELTA_STATS_NULL_COUNT,
+                            col_name.as_str(),
+                        ]),
                         "nan_value_count" => Expression::null_literal(DataType::LONG),
                         "avg_value_size" => Expression::null_literal(DataType::INTEGER),
                         "max_value_size" => Expression::null_literal(DataType::INTEGER),
-                        "lower_bound" => {
-                            Expression::column(["stats_parsed", "minValues", col_name.as_str()])
-                        }
-                        "upper_bound" => {
-                            Expression::column(["stats_parsed", "maxValues", col_name.as_str()])
-                        }
+                        "lower_bound" => Expression::column([
+                            "stats_parsed",
+                            DELTA_STATS_MIN_VALUES,
+                            col_name.as_str(),
+                        ]),
+                        "upper_bound" => Expression::column([
+                            "stats_parsed",
+                            DELTA_STATS_MAX_VALUES,
+                            col_name.as_str(),
+                        ]),
                         "exact_bounds" => Expression::coalesce([
-                            Expression::column(["stats_parsed", "tightBounds"]),
+                            Expression::column(["stats_parsed", DELTA_STATS_TIGHT_BOUNDS]),
                             Expression::literal(Scalar::Boolean(true)),
                         ]),
                         _ => Expression::null_literal(f.data_type().clone()),
