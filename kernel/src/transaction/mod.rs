@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -15,7 +15,7 @@ use crate::actions::{
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
-use crate::engine_data::{FilteredEngineData, TypedGetData};
+use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -38,7 +38,10 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 pub mod batch_state;
+mod content_tree;
 pub mod leaf_writer;
+
+use content_tree::ScanMetadataRemoveVisitor;
 
 // Re-export types needed for public API
 pub use batch_state::BatchState;
@@ -507,6 +510,17 @@ impl<S> Transaction<S> {
                 .content_root()
                 .map(|cr| (cr.clone(), cr.version));
 
+            // Removes in batch mode require an existing content root so that every file
+            // carries a data_manifest_path and data_manifest_position (row ID). Without
+            // a root the scan metadata lacks those fields and we cannot locate entries.
+            // TODO: revisit whether removes should be supported for the first batch commit
+            // (e.g. by treating files with no manifest path as root deletions by path).
+            if latest_content_root.is_none() && !self.remove_files_metadata.is_empty() {
+                return Err(Error::invalid_transaction_state(
+                    "remove_files is not supported in batch commit mode without an existing content root",
+                ));
+            }
+
             let table_schema = self.read_snapshot.schema().as_ref().clone();
             // Convert to physical schema with PARQUET:field_id metadata for stats mapping
             let physical_table_schema = table_schema.make_physical(column_mapping_mode);
@@ -604,116 +618,24 @@ impl<S> Transaction<S> {
             // The ContentRoot manages all file state, so any removes should be reflected there
             // This applies whether we loaded from an existing ContentRoot or built from snapshot
             if !self.remove_files_metadata.is_empty() {
-                use crate::actions::visitors::RemoveVisitor;
-                use crate::engine_data::GetData;
-                use crate::RowVisitor;
-
-                // Custom visitor that only collects selected Remove actions based on selection vector
-                struct SelectionFilteredRemoveVisitor<'a> {
-                    removes: Vec<crate::actions::Remove>,
-                    selection_vector: &'a [bool],
-                }
-
-                impl<'a> SelectionFilteredRemoveVisitor<'a> {
-                    fn new(selection_vector: &'a [bool]) -> Self {
-                        Self {
-                            removes: Vec::new(),
-                            selection_vector,
-                        }
-                    }
-                }
-
-                impl<'a> RowVisitor for SelectionFilteredRemoveVisitor<'a> {
-                    fn selected_column_names_and_types(
-                        &self,
-                    ) -> (&'static [ColumnName], &'static [DataType]) {
-                        RemoveVisitor::names_and_types()
-                    }
-
-                    fn visit<'b>(
-                        &mut self,
-                        row_count: usize,
-                        getters: &[&'b dyn GetData<'b>],
-                    ) -> DeltaResult<()> {
-                        for i in 0..row_count {
-                            // Check if this row is selected (true if index >= selection_vector.len() or selection_vector[index] is true)
-                            let is_selected =
-                                i >= self.selection_vector.len() || self.selection_vector[i];
-                            if !is_selected {
-                                continue;
-                            }
-
-                            // Since path column is required, use it to detect presence of a Remove action
-                            if let Some(path) = getters[0].get_opt(i, "remove.path")? {
-                                let remove = RemoveVisitor::visit_remove(i, path, getters)?;
-                                self.removes.push(remove);
-                            }
-                        }
-                        Ok(())
-                    }
-                }
-
-                // Accumulate leaf deletions per manifest path to batch into a single
-                // delete_multiple_from_leaf call per leaf (avoids repeated bitmap |= per file).
-                let mut leaf_deletions: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-
-                // Process each remove batch and mark all files as deleted in the ContentRoot
-                for remove_action_result in
-                    self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?
-                {
-                    let remove_action = remove_action_result?;
-                    // Get the selection vector to pass to visitor
-                    let selection_vector = remove_action.selection_vector();
-                    let mut visitor = SelectionFilteredRemoveVisitor::new(selection_vector);
-                    // Visit the data, filtering by selection vector during visit
-                    visitor.visit_rows_of(remove_action.data())?;
-
-                    // Mark all removes as deleted in the ContentRoot
-                    for remove in visitor.removes.iter() {
-                        // Check if this remove is in a leaf manifest (CombinedManifest).
-                        // In the flat structure DVs are inline on the data entry, so there
-                        // is no separate delete manifest — only data_manifest_path matters.
-                        let data_in_leaf = remove
-                            .data_manifest_path
-                            .as_ref()
-                            .filter(|path| {
-                                // Check if path is not the root manifest
-                                root_manifest_path.as_ref() != Some(path)
-                            })
-                            .is_some()
-                            && remove.data_manifest_position.is_some();
-
-                        // Accumulate leaf manifest deletions to batch later
-                        if data_in_leaf {
-                            if let (Some(manifest_path), Some(position)) = (
-                                remove.data_manifest_path.as_ref(),
-                                remove.data_manifest_position,
-                            ) {
-                                leaf_deletions
-                                    .entry(manifest_path.clone())
-                                    .or_default()
-                                    .insert(position as u64);
-                            }
-                        }
-
-                        // Use mark_deleted for entries in root manifest (not in a leaf)
-                        if !data_in_leaf {
-                            let dv_path: Option<&str> = remove
-                                .deletion_vector
-                                .as_ref()
-                                .map(|dv| dv.path_or_inline_dv.as_str());
-
+                let leaf_deletions = {
+                    let mut visitor = ScanMetadataRemoveVisitor::new(
+                        root_manifest_path.as_deref(),
+                        |path, dv_path| {
                             metadata_builder.mark_deleted(
-                                Some(remove.path.as_str()),
+                                Some(path),
                                 dv_path,
                                 commit_version,
                                 snapshot_id,
-                            )?;
-                        }
+                            )
+                        },
+                    );
+                    for batch in self.remove_files_metadata.iter() {
+                        visitor.selection_vector = batch.selection_vector();
+                        visitor.visit_rows_of(batch.data())?;
                     }
-                }
-
-                // Flush accumulated leaf deletions: one bulk call per leaf instead of one per file
+                    visitor.leaf_deletions
+                };
                 for (manifest_path, indices) in &leaf_deletions {
                     metadata_builder.delete_multiple_from_leaf(manifest_path, indices, true)?;
                 }

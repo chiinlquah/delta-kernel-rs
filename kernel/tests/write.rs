@@ -25,7 +25,7 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use tempfile::TempDir;
 
 use test_utils::set_json_value;
@@ -3560,11 +3560,16 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
-async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that remove_files works correctly in batch commit mode.
-    // It should behave the same as non-batch mode for removes without root manifest paths.
-
+/// Stages a batch remove-all-files transaction for each test table and passes the ready
+/// transaction, engine, and table URL to `on_commit` for the caller to commit and assert.
+async fn batch_remove_all_files_impl(
+    with_existing_root: bool,
+    mut on_commit: impl FnMut(
+        Transaction,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Url,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
@@ -3573,20 +3578,30 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
         setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let engine = Arc::new(engine);
-        // First, add some files to the table
-        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+
+        if with_existing_root {
+            // Establish a content root via a batch write.
+            batch_write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                1,
+            )
             .await?;
+        } else {
+            // Add files via a non-batch commit — no content root established.
+            write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                1,
+            )
+            .await?;
+        }
 
-        // Get initial file count
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let scan = snapshot.clone().scan_builder().build()?;
-        let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
-        let (_, selection_vector) = scan_metadata.scan_files.into_parts();
-        let initial_file_count = selection_vector.iter().filter(|&x| *x).count();
+        assert_eq!(snapshot.content_root().is_some(), with_existing_root);
 
-        assert!(initial_file_count > 0);
-
-        // Now create a transaction with batch_commit enabled
         let mut txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -3595,37 +3610,56 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
             .with_data_change(true);
         txn.with_batch_commit();
 
-        // Create a new scan to get file metadata for removal
-        // Process all scan batches in case files are spread across multiple batches
-        let scan2 = snapshot.scan_builder().build()?;
-        let total_file_remove_count = remove_all_scan_files(&mut txn, scan2, engine.as_ref())?;
-        assert!(total_file_remove_count > 0);
+        let removed =
+            remove_all_scan_files(&mut txn, snapshot.scan_builder().build()?, engine.as_ref())?;
+        assert!(removed > 0);
 
-        // Commit the transaction
-        let result = txn.commit(engine.as_ref());
-
-        match result? {
-            CommitResult::CommittedTransaction(committed) => {
-                assert_eq!(committed.commit_version(), 2);
-
-                // Verify the new snapshot has no files
-                let new_snapshot = Snapshot::builder_for(table_url.clone())
-                    .at_version(2)
-                    .build(engine.as_ref())?;
-
-                let new_scan = new_snapshot.scan_builder().build()?;
-                let mut new_file_count = 0;
-                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
-                    new_file_count += new_metadata?.scan_files.data().len();
-                }
-
-                // All files were removed, so new_file_count should be zero
-                assert_eq!(new_file_count, 0);
-            }
-            _ => panic!("Transaction did not succeed."),
-        }
+        on_commit(txn, engine, table_url)?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // Verify that remove_files in batch commit mode is rejected when no content root exists.
+    batch_remove_all_files_impl(false, |txn, engine, _url| {
+        assert!(
+            txn.commit(engine.as_ref()).is_err(),
+            "expected error when removing files in batch commit mode without a content root"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_remove_files_batch_commit_mode_with_existing_root(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Verify that remove_files in batch commit mode succeeds when a content root exists.
+    batch_remove_all_files_impl(true, |txn, engine, table_url| {
+        match txn.commit(engine.as_ref())? {
+            CommitResult::CommittedTransaction(committed) => {
+                let new_snapshot = Snapshot::builder_for(table_url)
+                    .at_version(committed.commit_version())
+                    .build(engine.as_ref())?;
+                let mut file_count = 0;
+                for metadata in new_snapshot
+                    .scan_builder()
+                    .build()?
+                    .scan_metadata(engine.as_ref())?
+                {
+                    file_count += metadata?.scan_files.data().len();
+                }
+                assert_eq!(
+                    file_count, 0,
+                    "all files should be removed after batch remove commit"
+                );
+            }
+            _ => panic!("expected committed transaction"),
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
