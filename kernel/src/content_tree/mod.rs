@@ -329,7 +329,7 @@ impl ContentTreeNode {
             ),
             "stats" => Expression::null_literal(DataType::STRING),
             "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
-            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "snapshotId"]),
+            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "sequenceNumber"]),
             "partitionValues" => {
                 let empty_map = MapData::try_new(
                     MapType::new(DataType::STRING, DataType::STRING, false),
