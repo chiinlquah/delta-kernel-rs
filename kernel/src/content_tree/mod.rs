@@ -329,7 +329,7 @@ impl ContentTreeNode {
             ),
             "stats" => Expression::null_literal(DataType::STRING),
             "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
-            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "snapshotId"]),
+            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "sequenceNumber"]),
             "partitionValues" => {
                 let empty_map = MapData::try_new(
                     MapType::new(DataType::STRING, DataType::STRING, false),
@@ -3632,6 +3632,60 @@ mod tests {
         assert!(
             visitor.adds[0].deletion_vector.is_none(),
             "Data entry without dv_info should not have a deletion vector"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_row_commit_version_maps_to_sequence_number() -> DeltaResult<()> {
+        use crate::actions::visitors::AddVisitor;
+        use crate::engine_data::RowVisitor;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_root_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        // Use different values for snapshot_id and sequence_number to verify that
+        // defaultRowCommitVersion maps to sequenceNumber (42), not snapshotId (1).
+        let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
+            .location("memory:///data.parquet")
+            .tracking_info(TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                sequence_number: Some(42),
+                file_sequence_number: Some(42),
+                first_row_id: Some(0),
+                changes_dv: None,
+            })
+            .sort_order_id(0)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build();
+
+        let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
+
+        let schema = crate::actions::get_log_add_schema().clone();
+        let mut action_batches = metadata.root_action_batches_with_handler(
+            engine.evaluation_handler().as_ref(),
+            &schema,
+            &[],
+            None,
+            None,
+            None,
+        )?;
+
+        let batch = action_batches.next().unwrap()?;
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.actions.as_ref())?;
+        assert_eq!(visitor.adds.len(), 1);
+        let add = &visitor.adds[0];
+
+        assert_eq!(add.base_row_id, Some(0));
+        assert_eq!(
+            add.default_row_commit_version,
+            Some(42),
+            "defaultRowCommitVersion should map to sequenceNumber, not snapshotId"
         );
 
         Ok(())
