@@ -850,7 +850,7 @@ mod tests {
                 .expect("StructArray");
             assert_eq!(
                 id_struct
-                    .column_by_name("lower_bound")
+                    .column_by_name(crate::content_tree::LOWER_BOUND)
                     .expect("lower_bound")
                     .as_any()
                     .downcast_ref::<Int32Array>()
@@ -861,7 +861,7 @@ mod tests {
             );
             assert_eq!(
                 id_struct
-                    .column_by_name("upper_bound")
+                    .column_by_name(crate::content_tree::UPPER_BOUND)
                     .expect("upper_bound")
                     .as_any()
                     .downcast_ref::<Int32Array>()
@@ -878,7 +878,7 @@ mod tests {
                 .expect("StructArray");
             assert_eq!(
                 val_struct
-                    .column_by_name("lower_bound")
+                    .column_by_name(crate::content_tree::LOWER_BOUND)
                     .expect("lower_bound")
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -889,7 +889,7 @@ mod tests {
             );
             assert_eq!(
                 val_struct
-                    .column_by_name("upper_bound")
+                    .column_by_name(crate::content_tree::UPPER_BOUND)
                     .expect("upper_bound")
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -900,7 +900,7 @@ mod tests {
             );
             assert_eq!(
                 val_struct
-                    .column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                    .column_by_name(crate::content_tree::NULL_VALUE_COUNT)
                     .expect("null_count")
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -1047,7 +1047,7 @@ mod tests {
 
             // Verify id.value_count
             let id_value_count = id_struct
-                .column_by_name("value_count")
+                .column_by_name(crate::content_tree::VALUE_COUNT)
                 .expect("id.value_count should exist");
             let id_vc_array = id_value_count
                 .as_any()
@@ -1057,7 +1057,7 @@ mod tests {
 
             // Verify id.lower_bound
             let id_lower = id_struct
-                .column_by_name("lower_bound")
+                .column_by_name(crate::content_tree::LOWER_BOUND)
                 .expect("id.lower_bound should exist");
             let id_lb_array = id_lower
                 .as_any()
@@ -1067,7 +1067,7 @@ mod tests {
 
             // Verify id.upper_bound
             let id_upper = id_struct
-                .column_by_name("upper_bound")
+                .column_by_name(crate::content_tree::UPPER_BOUND)
                 .expect("id.upper_bound should exist");
             let id_ub_array = id_upper
                 .as_any()
@@ -1077,7 +1077,7 @@ mod tests {
 
             // Verify id.exact_bounds
             let id_exact = id_struct
-                .column_by_name("exact_bounds")
+                .column_by_name(crate::content_tree::EXACT_BOUNDS)
                 .expect("id.exact_bounds should exist");
             let id_eb_array = id_exact
                 .as_any()
@@ -1099,7 +1099,7 @@ mod tests {
 
             // Verify value.value_count
             let value_value_count = value_struct
-                .column_by_name("value_count")
+                .column_by_name(crate::content_tree::VALUE_COUNT)
                 .expect("value.value_count should exist");
             let value_vc_array = value_value_count
                 .as_any()
@@ -1113,7 +1113,7 @@ mod tests {
 
             // Verify value.null_count
             let value_null_count = value_struct
-                .column_by_name(crate::content_tree::NULL_COUNT_FIELD_NAME)
+                .column_by_name(crate::content_tree::NULL_VALUE_COUNT)
                 .expect("value.null_count should exist");
             let value_nc_array = value_null_count
                 .as_any()
@@ -1123,7 +1123,7 @@ mod tests {
 
             // Verify value.lower_bound
             let value_lower = value_struct
-                .column_by_name("lower_bound")
+                .column_by_name(crate::content_tree::LOWER_BOUND)
                 .expect("value.lower_bound should exist");
             let value_lb_array = value_lower
                 .as_any()
@@ -1137,7 +1137,7 @@ mod tests {
 
             // Verify value.upper_bound
             let value_upper = value_struct
-                .column_by_name("upper_bound")
+                .column_by_name(crate::content_tree::UPPER_BOUND)
                 .expect("value.upper_bound should exist");
             let value_ub_array = value_upper
                 .as_any()
@@ -1151,7 +1151,7 @@ mod tests {
 
             // Verify value.exact_bounds
             let value_exact = value_struct
-                .column_by_name("exact_bounds")
+                .column_by_name(crate::content_tree::EXACT_BOUNDS)
                 .expect("value.exact_bounds should exist");
             let value_eb_array = value_exact
                 .as_any()

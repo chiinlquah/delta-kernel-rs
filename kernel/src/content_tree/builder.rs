@@ -145,7 +145,7 @@ fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
         if let Scalar::Struct(column_stats) = value {
             // Look for value_count field in the column's stats struct
             for (field, field_value) in column_stats.fields().iter().zip(column_stats.values()) {
-                if field.name() == "value_count" {
+                if field.name() == crate::content_tree::VALUE_COUNT {
                     if let Scalar::Long(count) = field_value {
                         return *count;
                     }
@@ -714,7 +714,11 @@ impl ContentTreeNodeBuilder {
             Some(ss) => {
                 let rc = if let Some(first_col) = ss.fields().next().map(|f| f.name().clone()) {
                     Expression::coalesce([
-                        Expression::column(["stats", first_col.as_str(), "value_count"]),
+                        Expression::column([
+                            "stats",
+                            first_col.as_str(),
+                            crate::content_tree::VALUE_COUNT,
+                        ]),
                         Expression::literal(Scalar::Long(0)),
                     ])
                 } else {
@@ -1688,28 +1692,34 @@ fn build_content_stats_from_delta_stats_parsed(
                 .fields()
                 .map(|f| {
                     Arc::new(match f.name().as_str() {
-                        "value_count" => {
+                        crate::content_tree::VALUE_COUNT => {
                             Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS])
                         }
-                        crate::content_tree::NULL_COUNT_FIELD_NAME => Expression::column([
+                        crate::content_tree::NULL_VALUE_COUNT => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_NULL_COUNT,
                             col_name.as_str(),
                         ]),
-                        "nan_value_count" => Expression::null_literal(DataType::LONG),
-                        "avg_value_size" => Expression::null_literal(DataType::INTEGER),
-                        "max_value_size" => Expression::null_literal(DataType::INTEGER),
-                        "lower_bound" => Expression::column([
+                        crate::content_tree::NAN_VALUE_COUNT => {
+                            Expression::null_literal(DataType::LONG)
+                        }
+                        crate::content_tree::AVG_VALUE_SIZE => {
+                            Expression::null_literal(DataType::INTEGER)
+                        }
+                        crate::content_tree::MAX_VALUE_SIZE => {
+                            Expression::null_literal(DataType::INTEGER)
+                        }
+                        crate::content_tree::LOWER_BOUND => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_MIN_VALUES,
                             col_name.as_str(),
                         ]),
-                        "upper_bound" => Expression::column([
+                        crate::content_tree::UPPER_BOUND => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_MAX_VALUES,
                             col_name.as_str(),
                         ]),
-                        "exact_bounds" => Expression::coalesce([
+                        crate::content_tree::EXACT_BOUNDS => Expression::coalesce([
                             Expression::column(["stats_parsed", DELTA_STATS_TIGHT_BOUNDS]),
                             Expression::literal(Scalar::Boolean(true)),
                         ]),
@@ -2281,15 +2291,15 @@ mod tests {
 
         // Check id stats
         assert_eq!(
-            get_column_stat(&content_stats, "id", "value_count"),
+            get_column_stat(&content_stats, "id", crate::content_tree::VALUE_COUNT),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "lower_bound"),
+            get_column_stat(&content_stats, "id", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "upper_bound"),
+            get_column_stat(&content_stats, "id", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
 
@@ -2298,12 +2308,12 @@ mod tests {
             get_column_stat(
                 &content_stats,
                 "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
+                crate::content_tree::NULL_VALUE_COUNT
             ),
             Some(&Scalar::Long(5))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "name", "lower_bound"),
+            get_column_stat(&content_stats, "name", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
 
@@ -2466,15 +2476,15 @@ mod tests {
 
         // Check id stats: value_count=250, lower_bound=1, upper_bound=100
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "value_count"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::VALUE_COUNT),
             Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "lower_bound"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "upper_bound"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
 
@@ -2483,16 +2493,16 @@ mod tests {
             get_column_stat(
                 aggregated_stats,
                 "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
+                crate::content_tree::NULL_VALUE_COUNT
             ),
             Some(&Scalar::Long(15)) // 5 + 10
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "name", "lower_bound"),
+            get_column_stat(aggregated_stats, "name", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "name", "upper_bound"),
+            get_column_stat(aggregated_stats, "name", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::String("zoe".to_string()))
         );
 
