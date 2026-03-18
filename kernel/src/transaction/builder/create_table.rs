@@ -46,6 +46,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::DomainMetadata,
     // ColumnMapping enables column mapping (name/id mode)
     TableFeature::ColumnMapping,
+    // MetadataTreeExperimental enables content-tree (batch commit) mode
+    TableFeature::MetadataTreeExperimental,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.

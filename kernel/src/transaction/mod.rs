@@ -651,8 +651,10 @@ impl<S> Transaction<S> {
                 self.read_snapshot.table_root(),
             )?;
 
-            // The content root represents the state at the new commit version
-            let new_commit_version = self.read_snapshot.version() + 1;
+            // The content root represents the state at the new commit version.
+            // wrapping_add handles the CREATE TABLE case where read_snapshot.version()
+            // is PRE_COMMIT_VERSION (u64::MAX), which wraps to 0 (the first commit).
+            let new_commit_version = self.read_snapshot.version().wrapping_add(1);
             let content_root_action = ContentRoot {
                 path,
                 size_in_bytes,
