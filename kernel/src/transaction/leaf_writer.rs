@@ -358,7 +358,10 @@ mod tests {
         use object_store::local::LocalFileSystem;
 
         let temp_path = tempfile::tempdir().unwrap().keep();
-        let store = Arc::new(LocalFileSystem::new_with_prefix(&temp_path).unwrap());
+        // Use LocalFileSystem::new() (no prefix) so that absolute URLs passed to write_parquet_file
+        // resolve correctly: Path::from_url_path strips the leading '/', then LocalFileSystem
+        // with no prefix uses the filesystem root, matching the absolute path.
+        let store = Arc::new(LocalFileSystem::new());
         let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
         let table_root = Url::from_directory_path(&temp_path).unwrap();
 
@@ -797,10 +800,12 @@ mod tests {
             .as_ref()
             .expect("Manifest should have location");
         let manifest_url = table_root.join(manifest_location)?;
+        let manifest_path = manifest_url.to_file_path().unwrap();
+        let manifest_file_size = std::fs::metadata(&manifest_path)?.len();
         let file_meta = FileMeta {
             location: manifest_url,
             last_modified: 0,
-            size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
+            size: manifest_file_size,
         };
         let delta_stats = crate::content_tree::builder::build_delta_stats_schema(schema);
         let read_schema = Arc::new(
@@ -982,11 +987,13 @@ mod tests {
         use crate::engine::arrow_data::ArrowEngineData;
         use crate::FileMeta;
 
-        // Create FileMeta for reading (size and last_modified are not critical for reading)
+        // Get actual manifest file size from the filesystem so parquet reader can locate the footer.
+        let manifest_path = manifest_url.to_file_path().unwrap();
+        let manifest_file_size = std::fs::metadata(&manifest_path)?.len();
         let file_meta = FileMeta {
             location: manifest_url.clone(),
             last_modified: 0,
-            size: manifest_entry.file_size_in_bytes.unwrap_or(0) as u64,
+            size: manifest_file_size,
         };
 
         let parquet_handler = engine.parquet_handler();

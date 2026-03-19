@@ -250,7 +250,6 @@ struct BatchAggregates {
     added_file_count: i64,
     existing_file_count: i64,
     total_record_count: i64,
-    total_file_size: i64,
 }
 
 impl std::fmt::Debug for ContentTreeNodeBuilder {
@@ -794,7 +793,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: engine_data.len() as i64,
             existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
 
         Ok((transformed, aggregates))
@@ -1130,18 +1128,14 @@ impl ContentTreeNodeBuilder {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?
-            .write(engine)?
-            .location;
-        let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
+        let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root)?;
+        // Use the actual manifest Parquet file size so bulk_processor can pass it to
+        // ParquetObjectReader::with_file_size when reading the leaf manifest back.
+        let manifest_file_size = write_result.size_in_bytes as i64;
 
         // Calculate aggregate stats from pending entries
         let mut record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
-        let mut file_size_in_bytes: i64 = self
-            .pending_entries
-            .iter()
-            .filter_map(|e| e.file_size_in_bytes)
-            .sum();
 
         // Calculate manifest stats (entry counts by status)
         let mut added_files_count = 0i64;
@@ -1178,7 +1172,6 @@ impl ContentTreeNodeBuilder {
         // Include pre-built batch aggregates
         for agg in &self.pre_built_aggregates {
             record_count += agg.total_record_count;
-            file_size_in_bytes += agg.total_file_size;
             added_files_count += agg.added_file_count;
             existing_files_count += agg.existing_file_count;
             added_rows_count += agg.total_record_count;
@@ -1221,7 +1214,7 @@ impl ContentTreeNodeBuilder {
                     changes_dv: None,
                 })
                 .record_count(record_count)
-                .file_size_in_bytes(file_size_in_bytes)
+                .file_size_in_bytes(manifest_file_size)
                 .content_stats_opt(content_stats)
                 .manifest_stats_opt(manifest_stats)
                 .build(),
@@ -1454,7 +1447,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: 0,
             existing_file_count: engine_data.len() as i64,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
 
         Ok((transformed, aggregates))
@@ -1576,7 +1568,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: 0,
             existing_file_count: filtered.len() as i64,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
         self.pre_built_data.push(filtered);
         self.pre_built_aggregates.push(aggregates);
@@ -1585,13 +1576,11 @@ impl ContentTreeNodeBuilder {
     }
 }
 
-/// Visitor that reads aggregate statistics from the transformed output.
-/// This reads flat `recordCount` and `fileSizeInBytes` columns that were already computed
-/// by the expression evaluator, avoiding the expensive `get_struct()` + `materialize()`
-/// per row that the old approach required.
+/// Visitor that reads aggregate record count from the transformed output.
+/// This reads the flat `recordCount` column that was already computed by the expression
+/// evaluator, avoiding the expensive `get_struct()` + `materialize()` per row.
 #[derive(Default)]
 struct TransformedAggregateVisitor {
-    total_file_size: i64,
     total_record_count: i64,
 }
 
@@ -1599,8 +1588,8 @@ impl RowVisitor for TransformedAggregateVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         use crate::schema::column_name;
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![column_name!("recordCount"), column_name!("fileSizeInBytes")];
-            let types = vec![DataType::LONG, DataType::LONG];
+            let names = vec![column_name!("recordCount")];
+            let types = vec![DataType::LONG];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
@@ -1610,8 +1599,6 @@ impl RowVisitor for TransformedAggregateVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.total_record_count += record_count;
-            let file_size: i64 = getters[1].get(i, "fileSizeInBytes")?;
-            self.total_file_size += file_size;
         }
         Ok(())
     }

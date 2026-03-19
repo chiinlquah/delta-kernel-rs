@@ -440,7 +440,7 @@ mod tests {
                         "size": 0,
                         "modificationTime": 0,
                         "dataChange": false,
-                        "stats": "{\"numRecords\":5}"
+                        "stats": "{\"numRecords\":5,\"nullCount\":null,\"minValues\":null,\"maxValues\":null,\"tightBounds\":null}"
                     }
                 }),
             ];
@@ -617,7 +617,7 @@ mod tests {
 
             // Read the staged commit
             let staged_commit_url = table_url
-                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .join(&format!("_delta_log/_staged_commits/{staged_file_name}"))
                 .unwrap();
             let staged_commit = store
                 .get(&Path::from_url_path(staged_commit_url.path()).unwrap())

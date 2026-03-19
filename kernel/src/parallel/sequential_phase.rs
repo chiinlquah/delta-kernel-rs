@@ -244,8 +244,7 @@ mod tests {
             (sidecars, AfterSequentialScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
-                    "Expected Done but got sidecars {:?}",
-                    sidecars
+                    "Expected Done but got sidecars {sidecars:?}"
                 );
             }
             (expected_sidecars, AfterSequentialScanMetadata::Parallel { files, .. }) => {
