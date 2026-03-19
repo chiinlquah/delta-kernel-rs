@@ -8,10 +8,14 @@
 //!
 //! **Partition values** (controlled by `delta.checkpoint.writeStatsAsStruct`):
 //! - `partitionValues`: String-valued map (always present)
-//! - `partitionValues_parsed`: Native typed struct (only when `writeStatsAsStruct=true`)
+//! - `partitionValues_parsed`: Native typed struct (only when `writeStatsAsStruct=true`),
+//!   computed from `partitionValues` via `MAP_TO_STRUCT`
 //!
-//! This module provides transforms to populate these fields using COALESCE expressions,
-//! ensuring that values are preserved regardless of the source format (commits vs checkpoints).
+//! For statistics, a COALESCE expression is used to preserve values from both commit files
+//! (which have JSON stats) and checkpoint files (which may have `stats_parsed`). For partition
+//! values, `partitionValues_parsed` is always computed from `partitionValues` via `MAP_TO_STRUCT`
+//! rather than reading from checkpoints, because some partition column types (e.g., `binary`) are
+//! not supported by the Arrow JSON reader and would cause failures when reading commit log files.
 
 use std::sync::{Arc, LazyLock};
 
@@ -104,16 +108,13 @@ pub(crate) fn build_checkpoint_transform(
         add_transform = add_transform.with_dropped_field(STATS_PARSED_FIELD);
     }
 
-    // Handle partitionValues_parsed field (only for partitioned tables)
-    if partition_schema.is_some() {
-        if config.write_stats_as_struct {
-            let pv_parsed_expr = build_partition_values_parsed_expr();
-            add_transform =
-                add_transform.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
-        } else {
-            // Drop partitionValues_parsed since it was added to read schema
-            add_transform = add_transform.with_dropped_field(PARTITION_VALUES_PARSED_FIELD);
-        }
+    // Handle partitionValues_parsed field (only for partitioned tables and writeStatsAsStruct=true).
+    // Insert after partitionValues rather than replacing, since partitionValues_parsed is not
+    // included in the read schema (to avoid issues with JSON-incompatible types such as binary).
+    if partition_schema.is_some() && config.write_stats_as_struct {
+        let pv_parsed_expr = build_partition_values_parsed_expr();
+        add_transform =
+            add_transform.with_inserted_field(Some(PARTITION_VALUES_FIELD), pv_parsed_expr);
     }
 
     // Wrap the nested Add transform in a top-level transform that replaces the Add field
@@ -124,54 +125,42 @@ pub(crate) fn build_checkpoint_transform(
     Arc::new(Expression::transform(outer_transform))
 }
 
-/// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
-/// in the Add action.
+/// Builds a read schema that includes `stats_parsed` in the Add action.
 ///
 /// The read schema must be union-compatible across all log segment files (checkpoints and
 /// JSON commits). This means all reads use the same schema even though commits don't have
-/// `stats_parsed` or `partitionValues_parsed` — those columns are read as nulls. This
-/// union-compatible schema ensures log replay can process checkpoint and commit batches
-/// uniformly, and COALESCE expressions can operate correctly across both sources.
+/// `stats_parsed` — that column is read as null from commits. This union-compatible schema
+/// ensures log replay can process checkpoint and commit batches uniformly, and COALESCE
+/// expressions for stats can operate correctly across both sources.
+///
+/// Note: `partitionValues_parsed` is NOT included in the read schema. It is always computed
+/// from `partitionValues` via `MAP_TO_STRUCT` in the transform expression. This avoids issues
+/// with Arrow's JSON reader, which does not support binary (or other non-JSON-compatible) types
+/// that may appear in partition schemas.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The `add` field is not found or is not a struct type
-/// - The `stats_parsed` or `partitionValues_parsed` field already exists in the Add schema
+/// - The `stats_parsed` field already exists in the Add schema
 pub(crate) fn build_checkpoint_read_schema(
     base_schema: &StructType,
     stats_schema: &StructType,
-    partition_schema: Option<&StructType>,
 ) -> DeltaResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
-        // Validate fields aren't already present
+        // Validate field isn't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
             return Err(Error::generic(
                 "stats_parsed field already exists in Add schema",
             ));
         }
-        if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
-                "partitionValues_parsed field already exists in Add schema",
-            ));
-        }
-        let mut result = add_struct.clone().with_field_inserted_after(
+        add_struct.clone().with_field_inserted_after(
             Some(STATS_FIELD),
             StructField::nullable(
                 STATS_PARSED_FIELD,
                 DataType::Struct(Box::new(stats_schema.clone())),
             ),
-        )?;
-        if let Some(pv_schema) = partition_schema {
-            result = result.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
-                StructField::nullable(
-                    PARTITION_VALUES_PARSED_FIELD,
-                    DataType::Struct(Box::new(pv_schema.clone())),
-                ),
-            )?;
-        }
-        Ok(result)
+        )
     })
 }
 
@@ -217,22 +206,26 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     ]))
 }
 
-/// Builds expression: `partitionValues_parsed = COALESCE(partitionValues_parsed,
-///     MAP_TO_STRUCT(partitionValues))`
+/// Builds expression: `partitionValues_parsed = MAP_TO_STRUCT(partitionValues)`
 ///
-/// This expression prefers existing `partitionValues_parsed`, falling back to converting
-/// the string-valued `partitionValues` map into a native typed struct. The target struct
-/// type (field names and data types) is determined by the output schema — `MAP_TO_STRUCT`
+/// Converts the string-valued `partitionValues` map into a native typed struct. The target
+/// struct type (field names and data types) is determined by the output schema — `MAP_TO_STRUCT`
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
 ///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
+///
+/// Note: This always recomputes from `partitionValues` rather than reading any existing
+/// `partitionValues_parsed` from checkpoints. This is necessary because `partitionValues_parsed`
+/// is not included in the read schema (to avoid issues with the Arrow JSON reader, which does
+/// not support binary types in its schema). Since `partitionValues` is always present in both
+/// commit and checkpoint files, `MAP_TO_STRUCT` produces correct results for all partition types.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
-    Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
-        Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),
-    ]))
+    Arc::new(Expression::map_to_struct(Expression::column([
+        ADD_NAME,
+        PARTITION_VALUES_FIELD,
+    ])))
 }
 
 /// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
@@ -408,6 +401,15 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Helper to check if a field has an insertion registered after it.
+    fn has_insertion_after(transform: &Transform, after_field: &str) -> bool {
+        transform
+            .field_transforms
+            .get(after_field)
+            .map(|ft| !ft.is_replace && ft.exprs.len() == 1)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn test_build_transform_with_json_only() {
         // writeStatsAsJson=true, writeStatsAsStruct=false (default)
@@ -518,16 +520,23 @@ mod tests {
 
         let (_, inner) = extract_transforms(&transform_expr);
 
-        // partitionValues_parsed should be replaced with COALESCE expression
+        // partitionValues_parsed is inserted after partitionValues (not a replacement)
         assert!(
-            is_replacement(inner, PARTITION_VALUES_PARSED_FIELD),
-            "partitionValues_parsed should be replaced"
+            has_insertion_after(inner, PARTITION_VALUES_FIELD),
+            "partitionValues_parsed should be inserted after partitionValues"
+        );
+        // partitionValues_parsed itself should not be a field transform (it's not in the read schema)
+        assert!(
+            !inner
+                .field_transforms
+                .contains_key(PARTITION_VALUES_PARSED_FIELD),
+            "partitionValues_parsed should not be directly in field_transforms"
         );
     }
 
     #[test]
     fn test_build_transform_no_partition_values_when_struct_disabled() {
-        // writeStatsAsStruct=false with partitioned table
+        // writeStatsAsStruct=false with partitioned table: no partitionValues_parsed transform
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: false,
@@ -541,10 +550,17 @@ mod tests {
 
         let (_, inner) = extract_transforms(&transform_expr);
 
-        // partitionValues_parsed should be dropped
+        // No partitionValues_parsed transform: it's not in the read schema and not inserted
         assert!(
-            is_drop(inner, PARTITION_VALUES_PARSED_FIELD),
-            "partitionValues_parsed should be dropped"
+            !inner
+                .field_transforms
+                .contains_key(PARTITION_VALUES_PARSED_FIELD),
+            "partitionValues_parsed should not be in field_transforms when struct disabled"
+        );
+        // No insertion after partitionValues either
+        assert!(
+            !has_insertion_after(inner, PARTITION_VALUES_FIELD),
+            "no insertion after partitionValues when writeStatsAsStruct=false"
         );
     }
 
