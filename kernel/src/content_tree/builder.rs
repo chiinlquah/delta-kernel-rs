@@ -342,9 +342,9 @@ impl ContentTreeNodeBuilder {
         let entries = node.entries()?;
         let mut builder = Self::new_for(table_root, new_version, table_schema);
         for entry in entries {
-            let entry = if entry.tracking_info.as_ref().is_some_and(|ti| {
-                ti.status == TrackingStatus::Added && ti.sequence_number != Some(new_version as i64)
-            }) {
+            let entry = if entry.tracking_info.status == TrackingStatus::Added
+                && entry.tracking_info.sequence_number != Some(new_version as i64)
+            {
                 entry.with_status(TrackingStatus::Existed)
             } else {
                 entry
@@ -374,8 +374,6 @@ impl ContentTreeNodeBuilder {
     /// Should be called before building to ensure DVs are properly persisted.
     /// Also updates tracking_info with snapshot_id and sequence numbers based on status.
     fn serialize_dvs_to_entries(&mut self, snapshot_id: i64) -> DeltaResult<()> {
-        let version = self.version as i64;
-
         // Iterate over entries and look up in cache
         for entry in &mut self.pending_entries {
             // Only process manifest entries
@@ -414,37 +412,21 @@ impl ContentTreeNodeBuilder {
                     let cardinality = manifest_dv.len() as i64;
 
                     if cardinality == active_entry_count {
-                        if let Some(ref mut tracking_info) = entry.tracking_info {
-                            tracking_info.status = TrackingStatus::Deleted;
-                        }
+                        entry.tracking_info.status = TrackingStatus::Deleted;
                     }
                 }
             }
 
             // Serialize changes_dv if non-empty
             if !cache.changes_dv.is_empty() {
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
-                }
+                entry.tracking_info.changes_dv =
+                    Some(serialize_roaring_treemap(&cache.changes_dv)?);
             }
 
-            // Initialize or update tracking_info
-            if entry.tracking_info.is_none() {
-                // Initialize tracking_info if not present (new manifest being added)
-                entry.tracking_info = Some(TrackingInfo {
-                    status: TrackingStatus::Added,
-                    snapshot_id: Some(snapshot_id),
-                    sequence_number: Some(version),
-                    file_sequence_number: Some(version),
-                    first_row_id: None,
-                    changes_dv: None,
-                });
-            } else if let Some(ref mut tracking_info) = entry.tracking_info {
-                // Update existing tracking_info based on status
-                // Only update snapshot_id when status is DELETED
-                if tracking_info.status == TrackingStatus::Deleted {
-                    tracking_info.snapshot_id = Some(snapshot_id);
-                }
+            // Update tracking_info based on status
+            // Only update snapshot_id when status is DELETED
+            if entry.tracking_info.status == TrackingStatus::Deleted {
+                entry.tracking_info.snapshot_id = Some(snapshot_id);
             }
         }
 
@@ -857,9 +839,7 @@ impl ContentTreeNodeBuilder {
                 self.dv_cache.insert(location.clone(), cache);
 
                 // Always clear changes_dv from entries (starts empty for new commit)
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.changes_dv = None;
-                }
+                entry.tracking_info.changes_dv = None;
             }
         }
 
@@ -991,7 +971,7 @@ impl ContentTreeNodeBuilder {
         &mut self,
         file_path: Option<&str>,
         dv_path: Option<&str>,
-        version: Version,
+        _version: Version,
         snapshot_id: i64,
     ) -> DeltaResult<()> {
         // TODO: we should make pending entries a HashMap<String, ContentTreeNodeEntry> to make this faster
@@ -1007,22 +987,8 @@ impl ContentTreeNodeBuilder {
 
             if matches {
                 // Update the tracking info to mark as deleted
-                if let Some(ref mut tracking_info) = entry.tracking_info {
-                    tracking_info.status = TrackingStatus::Deleted;
-                    tracking_info.snapshot_id = Some(snapshot_id);
-                    // Don't update the sequence number since you can derive from the snapshot
-                    // when it was deleted
-                } else {
-                    // Create new tracking info if it doesn't exist
-                    entry.tracking_info = Some(TrackingInfo {
-                        status: TrackingStatus::Deleted,
-                        snapshot_id: Some(snapshot_id),
-                        sequence_number: Some(version as i64),
-                        file_sequence_number: Some(version as i64),
-                        first_row_id: None,
-                        changes_dv: None,
-                    });
-                }
+                entry.tracking_info.status = TrackingStatus::Deleted;
+                entry.tracking_info.snapshot_id = Some(snapshot_id);
             }
         }
 
@@ -1149,24 +1115,22 @@ impl ContentTreeNodeBuilder {
         let mut min_sequence_number = i64::MAX;
 
         for entry in &self.pending_entries {
-            if let Some(ref tracking_info) = entry.tracking_info {
-                if let Some(seq) = tracking_info.sequence_number {
-                    min_sequence_number = min_sequence_number.min(seq);
-                }
+            if let Some(seq) = entry.tracking_info.sequence_number {
+                min_sequence_number = min_sequence_number.min(seq);
+            }
 
-                match tracking_info.status {
-                    TrackingStatus::Added => {
-                        added_files_count += 1;
-                        added_rows_count += entry.record_count;
-                    }
-                    TrackingStatus::Existed => {
-                        existing_files_count += 1;
-                        existing_rows_count += entry.record_count;
-                    }
-                    TrackingStatus::Deleted => {
-                        deletes_files_count += 1;
-                        delete_rows_count += entry.record_count;
-                    }
+            match entry.tracking_info.status {
+                TrackingStatus::Added => {
+                    added_files_count += 1;
+                    added_rows_count += entry.record_count;
+                }
+                TrackingStatus::Existed => {
+                    existing_files_count += 1;
+                    existing_rows_count += entry.record_count;
+                }
+                TrackingStatus::Deleted => {
+                    deletes_files_count += 1;
+                    delete_rows_count += entry.record_count;
                 }
             }
         }
@@ -2906,10 +2870,7 @@ mod tests {
             })
             .expect("Leaf manifest should exist");
 
-        assert_eq!(
-            leaf_manifest.tracking_info.as_ref().unwrap().status,
-            TrackingStatus::Deleted
-        );
+        assert_eq!(leaf_manifest.tracking_info.status, TrackingStatus::Deleted);
 
         Ok(())
     }
@@ -3097,7 +3058,7 @@ mod tests {
         // because all ACTIVE entries (3) have been deleted, even though
         // the total entry count (5) includes 2 already-deleted entries
         assert_eq!(
-            leaf_manifest.tracking_info.as_ref().unwrap().status,
+            leaf_manifest.tracking_info.status,
             TrackingStatus::Deleted,
             "Manifest should be marked as deleted when all active entries are deleted, \
              even if some entries were already deleted"
@@ -3173,8 +3134,6 @@ mod tests {
         // Verify changes_dv contains both deletions from this commit (2 and 5)
         let changes_dv_v1 = manifest_v1
             .tracking_info
-            .as_ref()
-            .unwrap()
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3218,8 +3177,6 @@ mod tests {
         // Verify changes_dv ONLY contains NEW deletions from v2 (3 and 7)
         let changes_dv_v2 = manifest_v2
             .tracking_info
-            .as_ref()
-            .unwrap()
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3276,8 +3233,6 @@ mod tests {
         // Verify changes_dv ONLY contains NEW deletion from v3 (8)
         let changes_dv_v3 = manifest_v3
             .tracking_info
-            .as_ref()
-            .unwrap()
             .changes_dv
             .as_ref()
             .expect("changes_dv should exist");
@@ -3343,12 +3298,7 @@ mod tests {
 
         // Verify changes_dv is None since no deletions were made in v4
         assert!(
-            manifest_v4
-                .tracking_info
-                .as_ref()
-                .unwrap()
-                .changes_dv
-                .is_none(),
+            manifest_v4.tracking_info.changes_dv.is_none(),
             "changes_dv should be None when no deletions are made"
         );
 
@@ -3414,12 +3364,7 @@ mod tests {
 
         // Verify changes_dv is NOT set since this was leaf reorganization, not actual deletion
         assert!(
-            manifest
-                .tracking_info
-                .as_ref()
-                .unwrap()
-                .changes_dv
-                .is_none(),
+            manifest.tracking_info.changes_dv.is_none(),
             "changes_dv should NOT be set for leaf reorganization (set_changes_dv=false)"
         );
 

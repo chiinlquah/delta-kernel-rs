@@ -117,14 +117,14 @@ fn visit_metadata_entry_at<'a>(
         getters[8].get_opt(row_index, "tracking_info.changes_dv")?;
     let tracking_changes_dv_bytes = tracking_changes_dv.map(Bytes::copy_from_slice);
 
-    let tracking_info = Some(TrackingInfo {
+    let tracking_info = TrackingInfo {
         status: tracking_status,
         snapshot_id: tracking_snapshot_id,
         sequence_number: tracking_sequence_number,
         file_sequence_number: tracking_file_sequence_number,
         first_row_id: tracking_first_row_id,
         changes_dv: tracking_changes_dv_bytes,
-    });
+    };
 
     // Extract dv_info fields (location, offset, size_in_bytes, cardinality)
     let dv_location: Option<String> = getters[9].get_opt(row_index, "dv_info.location")?;

@@ -1471,29 +1471,26 @@ pub(crate) fn metadata_entry_to_scalars(
             "contentType" => Scalar::from(entry.content_type),
             "location" => Scalar::from(entry.location.clone()),
             "fileFormat" => Scalar::from(entry.file_format),
-            "trackingInfo" => match &entry.tracking_info {
-                Some(ti) => {
-                    // Get struct fields from schema
-                    let struct_fields =
-                        if let crate::schema::DataType::Struct(st) = field.data_type() {
-                            st.fields().cloned().collect::<Vec<_>>()
-                        } else {
-                            return Err(crate::Error::generic(
-                                "trackingInfo field should be a struct",
-                            ));
-                        };
-                    let values = vec![
-                        Scalar::from(ti.status),
-                        Scalar::from(ti.snapshot_id),
-                        Scalar::from(ti.sequence_number),
-                        Scalar::from(ti.file_sequence_number),
-                        Scalar::from(ti.first_row_id),
-                        Scalar::from(ti.changes_dv.clone()),
-                    ];
-                    Scalar::Struct(StructData::new_unchecked(struct_fields, values))
-                }
-                None => Scalar::Null(field.data_type().clone()),
-            },
+            "trackingInfo" => {
+                let ti = &entry.tracking_info;
+                // Get struct fields from schema
+                let struct_fields = if let crate::schema::DataType::Struct(st) = field.data_type() {
+                    st.fields().cloned().collect::<Vec<_>>()
+                } else {
+                    return Err(crate::Error::generic(
+                        "trackingInfo field should be a struct",
+                    ));
+                };
+                let values = vec![
+                    Scalar::from(ti.status),
+                    Scalar::from(ti.snapshot_id),
+                    Scalar::from(ti.sequence_number),
+                    Scalar::from(ti.file_sequence_number),
+                    Scalar::from(ti.first_row_id),
+                    Scalar::from(ti.changes_dv.clone()),
+                ];
+                Scalar::Struct(StructData::new_unchecked(struct_fields, values))
+            }
             "dvInfo" => match &entry.dv_info {
                 Some(dv) => {
                     let struct_fields =
@@ -1782,7 +1779,7 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) file_format: DataFileFormat,
 
     #[field_id = 147]
-    pub tracking_info: Option<TrackingInfo>,
+    pub tracking_info: TrackingInfo,
 
     #[field_id = 148]
     pub(crate) dv_info: Option<DvInfo>,
@@ -1844,9 +1841,7 @@ pub(super) struct ContentTreeNodeEntry {
 impl ContentTreeNodeEntry {
     /// Returns a copy of this entry with the tracking status updated.
     pub(crate) fn with_status(mut self, status: TrackingStatus) -> Self {
-        if let Some(ref mut tracking_info) = self.tracking_info {
-            tracking_info.status = status;
-        }
+        self.tracking_info.status = status;
         self
     }
 }
@@ -1867,7 +1862,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     content_type: DataContentType,
     location: Option<String>,
     file_format: DataFileFormat,
-    tracking_info: Option<TrackingInfo>,
+    tracking_info: TrackingInfo,
     dv_info: Option<DvInfo>,
     partition_spec_id: i64,
     sort_order_id: Option<i64>,
@@ -1890,7 +1885,14 @@ impl ContentTreeNodeEntryBuilder {
             content_type,
             location: None,
             file_format: DataFileFormat::Parquet,
-            tracking_info: None,
+            tracking_info: TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: None,
+                sequence_number: None,
+                file_sequence_number: None,
+                first_row_id: None,
+                changes_dv: None,
+            },
             dv_info: None,
             partition_spec_id: 0,
             sort_order_id: None,
@@ -1923,21 +1925,21 @@ impl ContentTreeNodeEntryBuilder {
         } else {
             TrackingStatus::Existed
         };
-        self.tracking_info = Some(TrackingInfo {
+        self.tracking_info = TrackingInfo {
             status,
             snapshot_id: Some(snapshot_id),
             sequence_number: Some(entry_version as i64),
             file_sequence_number: Some(entry_version as i64),
             first_row_id: None,
             changes_dv: None,
-        });
+        };
         self
     }
 
     /// Set tracking info directly for non-standard cases (e.g., manifest entries
     /// where `sequence_number` should be `None`).
     pub(crate) fn tracking_info(mut self, tracking_info: TrackingInfo) -> Self {
-        self.tracking_info = Some(tracking_info);
+        self.tracking_info = tracking_info;
         self
     }
 
@@ -2830,32 +2832,28 @@ mod tests {
         );
 
         // Compare tracking_info
-        match (&expected.tracking_info, &actual.tracking_info) {
-            (Some(exp_ti), Some(act_ti)) => {
-                assert_eq!(
-                    exp_ti.status, act_ti.status,
-                    "tracking_info.status mismatch"
-                );
-                assert_eq!(
-                    exp_ti.snapshot_id, act_ti.snapshot_id,
-                    "tracking_info.snapshot_id mismatch"
-                );
-                assert_eq!(
-                    exp_ti.sequence_number, act_ti.sequence_number,
-                    "tracking_info.sequence_number mismatch"
-                );
-                assert_eq!(
-                    exp_ti.file_sequence_number, act_ti.file_sequence_number,
-                    "tracking_info.file_sequence_number mismatch"
-                );
-                assert_eq!(
-                    exp_ti.first_row_id, act_ti.first_row_id,
-                    "tracking_info.first_row_id mismatch"
-                );
-            }
-            (None, None) => {}
-            _ => panic!("tracking_info presence mismatch"),
-        }
+        let exp_ti = &expected.tracking_info;
+        let act_ti = &actual.tracking_info;
+        assert_eq!(
+            exp_ti.status, act_ti.status,
+            "tracking_info.status mismatch"
+        );
+        assert_eq!(
+            exp_ti.snapshot_id, act_ti.snapshot_id,
+            "tracking_info.snapshot_id mismatch"
+        );
+        assert_eq!(
+            exp_ti.sequence_number, act_ti.sequence_number,
+            "tracking_info.sequence_number mismatch"
+        );
+        assert_eq!(
+            exp_ti.file_sequence_number, act_ti.file_sequence_number,
+            "tracking_info.file_sequence_number mismatch"
+        );
+        assert_eq!(
+            exp_ti.first_row_id, act_ti.first_row_id,
+            "tracking_info.first_row_id mismatch"
+        );
 
         // Compare manifest_dv and changes_dv
         assert_eq!(
@@ -2863,8 +2861,7 @@ mod tests {
             "manifest_dv mismatch"
         );
         assert_eq!(
-            expected.tracking_info.as_ref().map(|t| &t.changes_dv),
-            actual.tracking_info.as_ref().map(|t| &t.changes_dv),
+            expected.tracking_info.changes_dv, actual.tracking_info.changes_dv,
             "changes_dv mismatch"
         );
 
@@ -3486,7 +3483,7 @@ mod tests {
 
         // Specifically verify the None values
         let actual = &entries[0];
-        let ti = actual.tracking_info.as_ref().unwrap();
+        let ti = &actual.tracking_info;
         assert!(ti.snapshot_id.is_none());
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
@@ -3982,9 +3979,7 @@ mod tests {
             .record_count(100)
             .file_size_in_bytes(1024)
             .build();
-        if let Some(ref mut ti) = data_entry.tracking_info {
-            ti.status = TrackingStatus::Deleted;
-        }
+        data_entry.tracking_info.status = TrackingStatus::Deleted;
 
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
