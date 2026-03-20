@@ -13,7 +13,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(test)]
 use crate::content_tree::ManifestStats;
 use crate::expressions::StructData;
-use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -497,14 +496,10 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
-        self.add_with_dedup(add, version, snapshot_id)
-    }
-
-    /// Add a data file entry with deduplication, accepting pre-computed content_stats.
+    /// Add a data file entry, deduplicating by file path.
     ///
-    /// This method accepts content_stats directly as a StructData, avoiding the need to
-    /// serialize/deserialize JSON stats.
+    /// Accepts pre-computed content_stats directly as a [`StructData`], avoiding the need
+    /// to serialize/deserialize JSON stats.
     ///
     /// # Arguments
     /// * `path` - The file path (relative to table root)
@@ -512,8 +507,8 @@ impl ContentTreeNodeBuilder {
     /// * `content_stats` - Optional content_stats as StructData
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    #[allow(dead_code)]
-    pub(crate) fn add_file_with_dedup(
+    /// * `dv_info` - Optional deletion vector info
+    pub(crate) fn add_file(
         &mut self,
         path: String,
         size: i64,
@@ -544,42 +539,22 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Add an entry with deduplication.
+    /// Add an entry from an [`Add`] action, deduplicating by file path.
+    ///
+    /// Extracts deletion vector content, parses and converts stats from the `Add` action,
+    /// then delegates to [`add_file`](Self::add_file).
     ///
     /// # Arguments
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    pub(crate) fn add_with_dedup(
-        &mut self,
-        add: Add,
-        version: Version,
-        snapshot_id: i64,
-    ) -> DeltaResult<()> {
-        // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(add.path.clone()) {
-            // Already seen this file path - skip it
-            return Ok(());
-        }
-
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
             .as_ref()
             .map(extract_deletion_vector_content)
             .transpose()?;
-
-        // Parse stats to extract record_count
-        // TODO: This might evolve based on https://github.com/delta-io/delta-kernel-rs/pull/1464
-        let record_count = add
-            .stats
-            .as_ref()
-            .and_then(|stats_json| {
-                serde_json::from_str::<Stats>(stats_json)
-                    .ok()
-                    .map(|stats| stats.num_records as i64)
-            })
-            .unwrap_or(0);
 
         // TODO: Check if parsed_stats is set and prefer that over the JSON blob
         // Convert Delta JSON stats to content_stats. When the file has a deletion vector and
@@ -590,17 +565,14 @@ impl ContentTreeNodeBuilder {
             add.deletion_vector.is_some().then_some(false),
         )?;
 
-        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-            .location(add.path.clone())
-            .with_tracking(version, self.version, snapshot_id)
-            .dv_info_opt(dv_content)
-            .record_count(record_count)
-            .file_size_in_bytes(add.size)
-            .content_stats_opt(content_stats)
-            .build();
-
-        self.pending_entries.push(data_file_entry);
-        Ok(())
+        self.add_file(
+            add.path,
+            add.size,
+            content_stats,
+            version,
+            snapshot_id,
+            dv_content,
+        )
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
