@@ -234,7 +234,7 @@ impl ContentTreeNode {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["trackingInfo", "status"]),
+                        ColumnName::new(["tracking", "status"]),
                     ]
                 });
                 static TYPES: &[DataType] = &[DataType::INTEGER, DataType::INTEGER];
@@ -248,7 +248,7 @@ impl ContentTreeNode {
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
                     let content_type_int: i32 = getters[0].get(i, "contentType")?;
-                    let status: i32 = getters[1].get(i, "trackingInfo.status")?;
+                    let status: i32 = getters[1].get(i, "tracking.status")?;
 
                     // Skip DELETED entries (status=3) — filtered out at read time
                     if status == 3 {
@@ -328,8 +328,8 @@ impl ContentTreeNode {
                 ],
             ),
             "stats" => Expression::null_literal(DataType::STRING),
-            "baseRowId" => Expression::column(["trackingInfo", "firstRowId"]),
-            "defaultRowCommitVersion" => Expression::column(["trackingInfo", "sequenceNumber"]),
+            "baseRowId" => Expression::column(["tracking", "firstRowId"]),
+            "defaultRowCommitVersion" => Expression::column(["tracking", "sequenceNumber"]),
             "partitionValues" => {
                 let empty_map = MapData::try_new(
                     MapType::new(DataType::STRING, DataType::STRING, false),
@@ -664,7 +664,7 @@ impl ContentTreeNode {
         )?))
     }
 
-    /// Builds selection vectors for Add vs Remove entries based on trackingInfo.status.
+    /// Builds selection vectors for Add vs Remove entries based on tracking.status.
     ///
     /// Returns (add_selection, remove_selection) where:
     /// - add_selection[i] = true if entry i has status Existed (0) or Added (1)
@@ -689,7 +689,7 @@ impl ContentTreeNode {
                 static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
                     vec![
                         ColumnName::new(["contentType"]),
-                        ColumnName::new(["trackingInfo", "status"]),
+                        ColumnName::new(["tracking", "status"]),
                     ]
                 });
                 static TYPES: &[DataType] = &[DataType::INTEGER, DataType::INTEGER];
@@ -703,7 +703,7 @@ impl ContentTreeNode {
             ) -> DeltaResult<()> {
                 for i in 0..row_count {
                     let content_type: i32 = getters[0].get(i, "contentType")?;
-                    let status: i32 = getters[1].get(i, "trackingInfo.status")?;
+                    let status: i32 = getters[1].get(i, "tracking.status")?;
 
                     // Only process Data entries (contentType=0)
                     // Skip DVs (1), EqualityDeletes (2), and Manifests (3, 4)
@@ -1471,14 +1471,14 @@ pub(crate) fn metadata_entry_to_scalars(
             "contentType" => Scalar::from(entry.content_type),
             "location" => Scalar::from(entry.location.clone()),
             "fileFormat" => Scalar::from(entry.file_format),
-            "trackingInfo" => {
-                let ti = &entry.tracking_info;
+            "tracking" => {
+                let ti = &entry.tracking;
                 // Get struct fields from schema
                 let struct_fields = if let crate::schema::DataType::Struct(st) = field.data_type() {
                     st.fields().cloned().collect::<Vec<_>>()
                 } else {
                     return Err(crate::Error::generic(
-                        "trackingInfo field should be a struct",
+                        "tracking field should be a struct",
                     ));
                 };
                 let values = vec![
@@ -1779,7 +1779,7 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) file_format: DataFileFormat,
 
     #[field_id = 147]
-    pub tracking_info: TrackingInfo,
+    pub tracking: TrackingInfo,
 
     #[field_id = 148]
     pub(crate) dv_info: Option<DvInfo>,
@@ -1841,7 +1841,7 @@ pub(super) struct ContentTreeNodeEntry {
 impl ContentTreeNodeEntry {
     /// Returns a copy of this entry with the tracking status updated.
     pub(crate) fn with_status(mut self, status: TrackingStatus) -> Self {
-        self.tracking_info.status = status;
+        self.tracking.status = status;
         self
     }
 }
@@ -1862,7 +1862,7 @@ pub(crate) struct ContentTreeNodeEntryBuilder {
     content_type: DataContentType,
     location: Option<String>,
     file_format: DataFileFormat,
-    tracking_info: TrackingInfo,
+    tracking: TrackingInfo,
     dv_info: Option<DvInfo>,
     partition_spec_id: i64,
     sort_order_id: Option<i64>,
@@ -1885,7 +1885,7 @@ impl ContentTreeNodeEntryBuilder {
             content_type,
             location: None,
             file_format: DataFileFormat::Parquet,
-            tracking_info: TrackingInfo {
+            tracking: TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: None,
                 sequence_number: None,
@@ -1925,7 +1925,7 @@ impl ContentTreeNodeEntryBuilder {
         } else {
             TrackingStatus::Existed
         };
-        self.tracking_info = TrackingInfo {
+        self.tracking = TrackingInfo {
             status,
             snapshot_id: Some(snapshot_id),
             sequence_number: Some(entry_version as i64),
@@ -1938,8 +1938,8 @@ impl ContentTreeNodeEntryBuilder {
 
     /// Set tracking info directly for non-standard cases (e.g., manifest entries
     /// where `sequence_number` should be `None`).
-    pub(crate) fn tracking_info(mut self, tracking_info: TrackingInfo) -> Self {
-        self.tracking_info = tracking_info;
+    pub(crate) fn tracking(mut self, tracking: TrackingInfo) -> Self {
+        self.tracking = tracking;
         self
     }
 
@@ -2016,7 +2016,7 @@ impl ContentTreeNodeEntryBuilder {
             content_type: self.content_type,
             location: self.location,
             file_format: self.file_format,
-            tracking_info: self.tracking_info,
+            tracking: self.tracking,
             dv_info: self.dv_info,
             partition_spec_id: self.partition_spec_id,
             sort_order_id: self.sort_order_id,
@@ -2221,7 +2221,7 @@ mod tests {
         // Create a very simple entry with no optional fields
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("test.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -2285,7 +2285,7 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // Fields: contentType, location, fileFormat, trackingInfo, dvInfo, partitionSpecId, sortOrderId,
+        // Fields: contentType, location, fileFormat, tracking, dvInfo, partitionSpecId, sortOrderId,
         // recordCount, fileSizeInBytes, manifestStats, keyMetadata, splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
         assert_eq!(schema.fields().len(), 14);
 
@@ -2506,7 +2506,7 @@ mod tests {
         // Create a ContentTreeNodeEntry with content_stats
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -2566,7 +2566,7 @@ mod tests {
         // Create a ContentTreeNodeEntry with content_stats set to None
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -2701,7 +2701,7 @@ mod tests {
         // Create a ContentTreeNodeEntry with content_stats
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/data/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -2831,28 +2831,28 @@ mod tests {
             "file_format mismatch"
         );
 
-        // Compare tracking_info
-        let exp_ti = &expected.tracking_info;
-        let act_ti = &actual.tracking_info;
+        // Compare tracking
+        let exp_ti = &expected.tracking;
+        let act_ti = &actual.tracking;
         assert_eq!(
             exp_ti.status, act_ti.status,
-            "tracking_info.status mismatch"
+            "tracking.status mismatch"
         );
         assert_eq!(
             exp_ti.snapshot_id, act_ti.snapshot_id,
-            "tracking_info.snapshot_id mismatch"
+            "tracking.snapshot_id mismatch"
         );
         assert_eq!(
             exp_ti.sequence_number, act_ti.sequence_number,
-            "tracking_info.sequence_number mismatch"
+            "tracking.sequence_number mismatch"
         );
         assert_eq!(
             exp_ti.file_sequence_number, act_ti.file_sequence_number,
-            "tracking_info.file_sequence_number mismatch"
+            "tracking.file_sequence_number mismatch"
         );
         assert_eq!(
             exp_ti.first_row_id, act_ti.first_row_id,
-            "tracking_info.first_row_id mismatch"
+            "tracking.first_row_id mismatch"
         );
 
         // Compare manifest_dv and changes_dv
@@ -2861,7 +2861,7 @@ mod tests {
             "manifest_dv mismatch"
         );
         assert_eq!(
-            expected.tracking_info.changes_dv, actual.tracking_info.changes_dv,
+            expected.tracking.changes_dv, actual.tracking.changes_dv,
             "changes_dv mismatch"
         );
 
@@ -2934,7 +2934,7 @@ mod tests {
         // Create original metadata
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/path/to/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -2962,7 +2962,7 @@ mod tests {
         use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
 
         // Verify that TrackingInfo::to_schema() has the field_id metadata from #[field_id] annotations
-        let tracking_info_schema = TrackingInfo::to_schema();
+        let tracking_schema = TrackingInfo::to_schema();
 
         // Helper to check field_id metadata
         fn assert_field_id(schema: &StructType, field_name: &str, expected_id: i64) {
@@ -2990,22 +2990,22 @@ mod tests {
 
         // Verify field IDs from TrackingInfo (defined with #[field_id = X] annotations)
         // status: #[field_id = 0]
-        assert_field_id(&tracking_info_schema, "status", 0);
+        assert_field_id(&tracking_schema, "status", 0);
 
         // snapshotId: #[field_id = 1]
-        assert_field_id(&tracking_info_schema, "snapshotId", 1);
+        assert_field_id(&tracking_schema, "snapshotId", 1);
 
         // sequenceNumber: #[field_id = 3]
-        assert_field_id(&tracking_info_schema, "sequenceNumber", 3);
+        assert_field_id(&tracking_schema, "sequenceNumber", 3);
 
         // fileSequenceNumber: #[field_id = 4]
-        assert_field_id(&tracking_info_schema, "fileSequenceNumber", 4);
+        assert_field_id(&tracking_schema, "fileSequenceNumber", 4);
 
         // firstRowId: #[field_id = 142]
-        assert_field_id(&tracking_info_schema, "firstRowId", 142);
+        assert_field_id(&tracking_schema, "firstRowId", 142);
 
         // changesDv: #[field_id = 153]
-        assert_field_id(&tracking_info_schema, "changesDv", 153);
+        assert_field_id(&tracking_schema, "changesDv", 153);
 
         // Verify ManifestStats field IDs
         let manifest_stats_schema = ManifestStats::to_schema();
@@ -3029,7 +3029,7 @@ mod tests {
         assert_field_id(&metadata_entry_schema, "contentType", 134);
         assert_field_id(&metadata_entry_schema, "location", 100);
         assert_field_id(&metadata_entry_schema, "fileFormat", 101);
-        assert_field_id(&metadata_entry_schema, "trackingInfo", 147);
+        assert_field_id(&metadata_entry_schema, "tracking", 147);
         assert_field_id(&metadata_entry_schema, "dvInfo", 148);
         assert_field_id(&metadata_entry_schema, "partitionSpecId", 149);
         assert_field_id(&metadata_entry_schema, "sortOrderId", 140);
@@ -3058,19 +3058,19 @@ mod tests {
         // for nested structs like TrackingInfo
         let schema = test_metadata_entry_schema();
 
-        // Get the trackingInfo field
-        let tracking_info_field = schema
-            .field("trackingInfo")
-            .expect("trackingInfo field should exist");
+        // Get the tracking field
+        let tracking_field = schema
+            .field("tracking")
+            .expect("tracking field should exist");
 
         // Get the nested struct type
-        let tracking_info_struct = match tracking_info_field.data_type() {
+        let tracking_struct = match tracking_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
-            _ => panic!("Expected trackingInfo to be a struct"),
+            _ => panic!("Expected tracking to be a struct"),
         };
 
         // Verify that nested fields have field_id metadata
-        let status_field = tracking_info_struct
+        let status_field = tracking_struct
             .field("status")
             .expect("status field should exist");
         assert!(
@@ -3101,7 +3101,7 @@ mod tests {
         // Create original metadata
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/path/to/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3134,7 +3134,7 @@ mod tests {
         // Create metadata with deletion vector
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
             .location("s3://bucket/path/to/deletes.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(5),
                 sequence_number: Some(500),
@@ -3168,7 +3168,7 @@ mod tests {
         // Create metadata with manifest stats
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
@@ -3212,7 +3212,7 @@ mod tests {
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
         let original_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(3),
                 sequence_number: Some(300),
@@ -3265,7 +3265,7 @@ mod tests {
         // Create multiple entries including one with inline DV
         let entry1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/path/to/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3279,7 +3279,7 @@ mod tests {
             .build();
         let entry2 = ContentTreeNodeEntryBuilder::new(DataContentType::PositionDeletes)
             .location("s3://bucket/path/to/deletes.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(5),
                 sequence_number: Some(500),
@@ -3294,7 +3294,7 @@ mod tests {
             .build();
         let entry3 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(10),
                 sequence_number: Some(1000),
@@ -3319,7 +3319,7 @@ mod tests {
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
         let entry4 = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(3),
                 sequence_number: Some(300),
@@ -3378,7 +3378,7 @@ mod tests {
             .map(|(i, content_type)| {
                 ContentTreeNodeEntryBuilder::new(content_type)
                     .location(format!("s3://bucket/file{}.parquet", i))
-                    .tracking_info(TrackingInfo {
+                    .tracking(TrackingInfo {
                         status: TrackingStatus::Added,
                         snapshot_id: Some(i as i64),
                         sequence_number: Some((i * 100) as i64),
@@ -3425,7 +3425,7 @@ mod tests {
             .map(|(i, status)| {
                 ContentTreeNodeEntryBuilder::new(DataContentType::Data)
                     .location(format!("s3://bucket/file{}.parquet", i))
-                    .tracking_info(TrackingInfo {
+                    .tracking(TrackingInfo {
                         status,
                         snapshot_id: Some(i as i64),
                         sequence_number: Some((i * 100) as i64),
@@ -3461,7 +3461,7 @@ mod tests {
         // Create entry with many optional fields set to None
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: None,
                 sequence_number: None,
@@ -3483,7 +3483,7 @@ mod tests {
 
         // Specifically verify the None values
         let actual = &entries[0];
-        let ti = &actual.tracking_info;
+        let ti = &actual.tracking;
         assert!(ti.snapshot_id.is_none());
         assert!(ti.sequence_number.is_none());
         assert!(ti.file_sequence_number.is_none());
@@ -3505,7 +3505,7 @@ mod tests {
         let entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("s3://bucket/file.puffin")
             .file_format(DataFileFormat::Puffin)
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3596,7 +3596,7 @@ mod tests {
         // A Data entry with dv_info: None produces an Add with no deletionVector.
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3647,7 +3647,7 @@ mod tests {
         // defaultRowCommitVersion maps to sequenceNumber (42), not snapshotId (1).
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(42),
@@ -3702,7 +3702,7 @@ mod tests {
         let dv_location = "deletion_vector_12345678-1234-1234-1234-123456789abc.bin";
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3760,7 +3760,7 @@ mod tests {
         // Create a data file without any corresponding DV
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(50),
@@ -3812,7 +3812,7 @@ mod tests {
         let inline_data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0xAB, 0xCD, 0xEF];
         let inline_dv_entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("s3://bucket/path/to/manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(3),
                 sequence_number: Some(300),
@@ -3866,7 +3866,7 @@ mod tests {
         let dv_loc2 = "deletion_vector_87654321-4321-4321-4321-cba987654321.bin";
         let data_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data1.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -3886,7 +3886,7 @@ mod tests {
             .build();
         let data_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data2.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(200),
@@ -3967,7 +3967,7 @@ mod tests {
         // should not produce any Add action (it produces a Remove action instead).
         let mut data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(50),
@@ -3979,7 +3979,7 @@ mod tests {
             .record_count(100)
             .file_size_in_bytes(1024)
             .build();
-        data_entry.tracking_info.status = TrackingStatus::Deleted;
+        data_entry.tracking.status = TrackingStatus::Deleted;
 
         let metadata = build_and_roundtrip(vec![data_entry], 0, &table_root_url, &engine)?;
 
@@ -4021,7 +4021,7 @@ mod tests {
 
         let data_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
             .location("memory:///data-manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -4043,7 +4043,7 @@ mod tests {
             .build();
         let delete_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::DeleteManifest)
             .location("memory:///delete-manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -4104,7 +4104,7 @@ mod tests {
         for (content_type, label) in unsupported_cases {
             let mut entry = ContentTreeNodeEntryBuilder::new(DataContentType::DataManifest)
                 .location("memory:///test.parquet")
-                .tracking_info(TrackingInfo {
+                .tracking(TrackingInfo {
                     status: TrackingStatus::Existed,
                     snapshot_id: Some(1),
                     sequence_number: Some(100),
@@ -4155,7 +4155,7 @@ mod tests {
         // CombinedManifest entries contain data files + optional inline DVs
         let combined_manifest = ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
             .location("memory:///combined-manifest.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Existed,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -4195,7 +4195,7 @@ mod tests {
         // Child manifest 1
         let data_entry_1 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("partition1/data-1.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(50),
@@ -4209,7 +4209,7 @@ mod tests {
             .build();
         let data_entry_2 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("partition1/data-2.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(60),
@@ -4235,7 +4235,7 @@ mod tests {
         // Child manifest 2 - use version 1 to avoid filename collision
         let data_entry_3 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("partition2/data-3.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(70),
@@ -4249,7 +4249,7 @@ mod tests {
             .build();
         let data_entry_4 = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("partition2/data-4.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(80),
@@ -4276,7 +4276,7 @@ mod tests {
         let data_manifest_entry_1 =
             ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
                 .location(child_manifest_url_1.as_str())
-                .tracking_info(TrackingInfo {
+                .tracking(TrackingInfo {
                     status: TrackingStatus::Existed,
                     snapshot_id: Some(1),
                     sequence_number: Some(100),
@@ -4299,7 +4299,7 @@ mod tests {
         let data_manifest_entry_2 =
             ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
                 .location(child_manifest_url_2.as_str())
-                .tracking_info(TrackingInfo {
+                .tracking(TrackingInfo {
                     status: TrackingStatus::Existed,
                     snapshot_id: Some(1),
                     sequence_number: Some(100),
@@ -4846,7 +4846,7 @@ mod tests {
 
         let data_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///data.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(100),
@@ -4963,7 +4963,7 @@ mod tests {
 
         let add_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///add-file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(1),
                 sequence_number: Some(1),
@@ -4977,7 +4977,7 @@ mod tests {
 
         let remove_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
             .location("memory:///remove-file.parquet")
-            .tracking_info(TrackingInfo {
+            .tracking(TrackingInfo {
                 status: TrackingStatus::Deleted,
                 snapshot_id: Some(1),
                 sequence_number: Some(1),
