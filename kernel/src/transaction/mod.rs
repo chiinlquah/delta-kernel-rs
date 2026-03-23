@@ -630,7 +630,6 @@ impl<S> Transaction<S> {
                             metadata_builder.mark_deleted(
                                 Some(path),
                                 dv_path,
-                                commit_version,
                                 snapshot_id,
                             )
                         },
