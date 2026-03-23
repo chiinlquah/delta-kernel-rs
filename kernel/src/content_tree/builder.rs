@@ -417,8 +417,7 @@ impl ContentTreeNodeBuilder {
 
             // Serialize changes_dv if non-empty
             if !cache.changes_dv.is_empty() {
-                entry.tracking.changes_dv =
-                    Some(serialize_roaring_treemap(&cache.changes_dv)?);
+                entry.tracking.changes_dv = Some(serialize_roaring_treemap(&cache.changes_dv)?);
             }
 
             // Update tracking based on status
