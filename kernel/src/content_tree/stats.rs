@@ -4,8 +4,9 @@
 //! which are used in the AMT format for storing per-column statistics.
 
 use crate::content_tree::{
-    DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
-    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, NULL_COUNT_FIELD_NAME,
+    AVG_VALUE_SIZE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
+    DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, EXACT_BOUNDS, LOWER_BOUND, MAX_VALUE_SIZE,
+    NAN_VALUE_COUNT, NULL_VALUE_COUNT, UPPER_BOUND, VALUE_COUNT,
 };
 use crate::expressions::{Expression, ExpressionRef, Predicate, Scalar, StructData, Transform};
 use crate::schema::visitor::{visit_struct, SchemaVisitor};
@@ -310,7 +311,7 @@ fn build_primitive_stats_struct(
 
     // value_count: always present
     fields.push(field_with_id(
-        "value_count",
+        VALUE_COUNT,
         DataType::LONG,
         true,
         base_field_id + STATS_OFFSET_VALUE_COUNT,
@@ -319,7 +320,7 @@ fn build_primitive_stats_struct(
     // null_value_count: only if the field is nullable
     if nullable {
         fields.push(field_with_id(
-            crate::content_tree::NULL_COUNT_FIELD_NAME,
+            NULL_VALUE_COUNT,
             DataType::LONG,
             true,
             base_field_id + STATS_OFFSET_NULL_VALUE_COUNT,
@@ -329,7 +330,7 @@ fn build_primitive_stats_struct(
     // nan_value_count: only for float/double types
     if has_nan_count {
         fields.push(field_with_id(
-            "nan_value_count",
+            NAN_VALUE_COUNT,
             DataType::LONG,
             true,
             base_field_id + STATS_OFFSET_NAN_VALUE_COUNT,
@@ -339,14 +340,14 @@ fn build_primitive_stats_struct(
     // avg_value_size/max_value_size: only for variable-length types (e.g. string/binary)
     if has_size_stats {
         fields.push(field_with_id(
-            "avg_value_size",
+            AVG_VALUE_SIZE,
             DataType::INTEGER,
             true,
             base_field_id + STATS_OFFSET_AVG_VALUE_SIZE,
         ));
 
         fields.push(field_with_id(
-            "max_value_size",
+            MAX_VALUE_SIZE,
             DataType::INTEGER,
             true,
             base_field_id + STATS_OFFSET_MAX_VALUE_SIZE,
@@ -355,7 +356,7 @@ fn build_primitive_stats_struct(
 
     // lower_bound: same type as the field
     fields.push(field_with_id(
-        "lower_bound",
+        LOWER_BOUND,
         data_type.clone(),
         true,
         base_field_id + STATS_OFFSET_LOWER_BOUND,
@@ -363,7 +364,7 @@ fn build_primitive_stats_struct(
 
     // upper_bound: same type as the field
     fields.push(field_with_id(
-        "upper_bound",
+        UPPER_BOUND,
         data_type.clone(),
         true,
         base_field_id + STATS_OFFSET_UPPER_BOUND,
@@ -371,7 +372,7 @@ fn build_primitive_stats_struct(
 
     // exact_bounds: always present
     fields.push(field_with_id(
-        "exact_bounds",
+        EXACT_BOUNDS,
         DataType::BOOLEAN,
         true,
         base_field_id + STATS_OFFSET_EXACT_BOUNDS,
@@ -583,16 +584,14 @@ fn build_column_stats(
 
     for stats_field in &fields {
         let scalar = match stats_field.name().as_str() {
-            "value_count" => num_records.map(Scalar::Long),
-            field if field == crate::content_tree::NULL_COUNT_FIELD_NAME => {
-                null_count.map(Scalar::Long)
-            }
-            "nan_value_count" => None, // Not available in Delta JSON stats
-            "avg_value_size" => None,  // Not available in Delta JSON stats
-            "max_value_size" => None,  // Not available in Delta JSON stats
-            "lower_bound" => min_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
-            "upper_bound" => max_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
-            "exact_bounds" => {
+            VALUE_COUNT => num_records.map(Scalar::Long),
+            field if field == NULL_VALUE_COUNT => null_count.map(Scalar::Long),
+            NAN_VALUE_COUNT => None, // Not available in Delta JSON stats
+            AVG_VALUE_SIZE => None,  // Not available in Delta JSON stats
+            MAX_VALUE_SIZE => None,  // Not available in Delta JSON stats
+            LOWER_BOUND => min_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            UPPER_BOUND => max_value.and_then(|v| json_value_to_scalar(v, field.data_type())),
+            EXACT_BOUNDS => {
                 // exact_bounds reflects Delta's tightBounds field:
                 // - true: bounds are exact (all rows in file satisfy min <= value <= max)
                 // - false: bounds may be wider (e.g., deletion vectors have removed some rows)
@@ -873,7 +872,7 @@ fn aggregate_column_stats(field: &StructField, values: &[&Scalar]) -> Scalar {
     match field.data_type() {
         DataType::Struct(inner_struct) => {
             // Check if this looks like a primitive stats struct (has lower_bound field)
-            if inner_struct.field("lower_bound").is_some() {
+            if inner_struct.field(LOWER_BOUND).is_some() {
                 // This is a primitive column's stats struct - aggregate the stats fields
                 aggregate_primitive_stats(inner_struct.as_ref(), values)
             } else {
@@ -936,20 +935,18 @@ fn aggregate_primitive_stats(stats_struct: &StructType, values: &[&Scalar]) -> S
 
         let aggregated = match field_name {
             // Sum fields
-            "value_count" | "nan_value_count" => sum_long_scalars(&field_scalars),
-            field if field == crate::content_tree::NULL_COUNT_FIELD_NAME => {
-                sum_long_scalars(&field_scalars)
-            }
+            VALUE_COUNT | NAN_VALUE_COUNT => sum_long_scalars(&field_scalars),
+            field if field == NULL_VALUE_COUNT => sum_long_scalars(&field_scalars),
             // Max fields
-            "max_value_size" => max_scalar(&field_scalars, &DataType::INTEGER),
+            MAX_VALUE_SIZE => max_scalar(&field_scalars, &DataType::INTEGER),
             // Min bound
-            "lower_bound" => min_scalar(&field_scalars, field.data_type()),
+            LOWER_BOUND => min_scalar(&field_scalars, field.data_type()),
             // Max bound
-            "upper_bound" => max_scalar(&field_scalars, field.data_type()),
+            UPPER_BOUND => max_scalar(&field_scalars, field.data_type()),
             // AND of all exact_bounds
-            "exact_bounds" => and_boolean_scalars(&field_scalars),
+            EXACT_BOUNDS => and_boolean_scalars(&field_scalars),
             // Skip avg_value_size (would need weighted average, not straightforward)
-            "avg_value_size" => Scalar::Null(field.data_type().clone()),
+            AVG_VALUE_SIZE => Scalar::Null(field.data_type().clone()),
             // Unknown field - preserve as null
             _ => Scalar::Null(field.data_type().clone()),
         };
@@ -1245,27 +1242,27 @@ fn build_amt_leaf_expr(
         .fields()
         .map(|field| {
             let expr = match field.name().as_str() {
-                "value_count" if field_exists(DELTA_STATS_NUM_RECORDS, &[]) => {
+                VALUE_COUNT if field_exists(DELTA_STATS_NUM_RECORDS, &[]) => {
                     Expression::column([stats_col, DELTA_STATS_NUM_RECORDS])
                 }
-                name if name == NULL_COUNT_FIELD_NAME
+                name if name == NULL_VALUE_COUNT
                     && field_exists(DELTA_STATS_NULL_COUNT, col_path) =>
                 {
                     let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_NULL_COUNT];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "lower_bound" if field_exists(DELTA_STATS_MIN_VALUES, col_path) => {
+                LOWER_BOUND if field_exists(DELTA_STATS_MIN_VALUES, col_path) => {
                     let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_MIN_VALUES];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "upper_bound" if field_exists(DELTA_STATS_MAX_VALUES, col_path) => {
+                UPPER_BOUND if field_exists(DELTA_STATS_MAX_VALUES, col_path) => {
                     let mut path: Vec<&str> = vec![stats_col, DELTA_STATS_MAX_VALUES];
                     path.extend_from_slice(col_path);
                     Expression::column(path)
                 }
-                "exact_bounds" if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
+                EXACT_BOUNDS if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
                     Expression::column([stats_col, DELTA_STATS_TIGHT_BOUNDS])
                 }
                 // Field not in Delta JSON stats or not present in known schema → null literal
@@ -1727,21 +1724,21 @@ fn collect_stats_expressions_filtered(
                     null_count_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
-                        crate::content_tree::NULL_COUNT_FIELD_NAME,
+                        NULL_VALUE_COUNT,
                     ]))));
                 }
                 if has_min_values {
                     min_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
-                        "lower_bound",
+                        LOWER_BOUND,
                     ]))));
                 }
                 if has_max_values {
                     max_values_exprs.push(Arc::new(Expression::Column(ColumnName::new([
                         crate::content_tree::CONTENT_STATS_FIELD_NAME,
                         &field_path,
-                        "upper_bound",
+                        UPPER_BOUND,
                     ]))));
                 }
                 if has_min_values || has_max_values {
@@ -1750,7 +1747,7 @@ fn collect_stats_expressions_filtered(
                         Expression::Column(ColumnName::new([
                             crate::content_tree::CONTENT_STATS_FIELD_NAME,
                             &field_path,
-                            "exact_bounds",
+                            EXACT_BOUNDS,
                         ])),
                         Expression::literal(Scalar::Boolean(true)),
                     ])));
@@ -1860,16 +1857,14 @@ mod tests {
 
         // Should have: value_count, lower_bound, upper_bound, exact_bounds
         assert_eq!(id_stats_struct.fields().count(), 4);
-        assert!(id_stats_struct.field("value_count").is_some());
-        assert!(id_stats_struct
-            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-            .is_none()); // not nullable
-        assert!(id_stats_struct.field("nan_value_count").is_none()); // not float/double
-        assert!(id_stats_struct.field("avg_value_size").is_none()); // fixed-length
-        assert!(id_stats_struct.field("max_value_size").is_none()); // fixed-length
-        assert!(id_stats_struct.field("lower_bound").is_some());
-        assert!(id_stats_struct.field("upper_bound").is_some());
-        assert!(id_stats_struct.field("exact_bounds").is_some());
+        assert!(id_stats_struct.field(VALUE_COUNT).is_some());
+        assert!(id_stats_struct.field(NULL_VALUE_COUNT).is_none()); // not nullable
+        assert!(id_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
+        assert!(id_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
+        assert!(id_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
+        assert!(id_stats_struct.field(LOWER_BOUND).is_some());
+        assert!(id_stats_struct.field(UPPER_BOUND).is_some());
+        assert!(id_stats_struct.field(EXACT_BOUNDS).is_some());
 
         // Check field IDs: base is 10_200 (field_id 1 -> 10_000 + 200*1)
         assert_stats_field_ids(id_stats_struct, 10_200, &field);
@@ -1897,10 +1892,8 @@ mod tests {
 
         // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
         assert_eq!(name_stats_struct.fields().count(), 7);
-        assert!(name_stats_struct
-            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-            .is_some()); // nullable
-        assert!(name_stats_struct.field("nan_value_count").is_none()); // not float/double
+        assert!(name_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
+        assert!(name_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
 
         // Check field IDs: base is 10_400
         assert_stats_field_ids(name_stats_struct, 10_400, &field);
@@ -1915,49 +1908,45 @@ mod tests {
 
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
         assert_eq!(
-            get_field_id(stats_struct.field("value_count").unwrap()),
+            get_field_id(stats_struct.field(VALUE_COUNT).unwrap()),
             Some(base_id + STATS_OFFSET_VALUE_COUNT)
         );
 
         if field.is_nullable() {
             assert_eq!(
-                get_field_id(
-                    stats_struct
-                        .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-                        .unwrap()
-                ),
+                get_field_id(stats_struct.field(NULL_VALUE_COUNT).unwrap()),
                 Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
             );
         }
 
         if field.data_type.eq(&DataType::FLOAT) || field.data_type.eq(&DataType::DOUBLE) {
             assert_eq!(
-                get_field_id(stats_struct.field("nan_value_count").unwrap()),
+                get_field_id(stats_struct.field(NAN_VALUE_COUNT).unwrap()),
                 Some(base_id + STATS_OFFSET_NAN_VALUE_COUNT)
             );
         }
 
         if field.data_type.eq(&DataType::STRING) || field.data_type.eq(&DataType::BINARY) {
             assert_eq!(
-                get_field_id(stats_struct.field("avg_value_size").unwrap()),
+                get_field_id(stats_struct.field(AVG_VALUE_SIZE).unwrap()),
                 Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE)
             );
             assert_eq!(
-                get_field_id(stats_struct.field("max_value_size").unwrap()),
+                get_field_id(stats_struct.field(MAX_VALUE_SIZE).unwrap()),
                 Some(base_id + STATS_OFFSET_MAX_VALUE_SIZE)
             );
         }
 
         assert_eq!(
-            get_field_id(stats_struct.field("lower_bound").unwrap()),
+            get_field_id(stats_struct.field(LOWER_BOUND).unwrap()),
             Some(base_id + STATS_OFFSET_LOWER_BOUND)
         );
         assert_eq!(
-            get_field_id(stats_struct.field("upper_bound").unwrap()),
+            get_field_id(stats_struct.field(UPPER_BOUND).unwrap()),
             Some(base_id + STATS_OFFSET_UPPER_BOUND)
         );
         assert_eq!(
-            get_field_id(stats_struct.field("exact_bounds").unwrap()),
+            get_field_id(stats_struct.field(EXACT_BOUNDS).unwrap()),
             Some(base_id + STATS_OFFSET_EXACT_BOUNDS)
         );
     }
@@ -1977,12 +1966,10 @@ mod tests {
         };
 
         assert_eq!(score_stats_struct.fields().count(), 6);
-        assert!(score_stats_struct
-            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-            .is_some()); // nullable
-        assert!(score_stats_struct.field("nan_value_count").is_some()); // double
-        assert!(score_stats_struct.field("avg_value_size").is_none()); // fixed-length
-        assert!(score_stats_struct.field("max_value_size").is_none()); // fixed-length
+        assert!(score_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
+        assert!(score_stats_struct.field(NAN_VALUE_COUNT).is_some()); // double
+        assert!(score_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
+        assert!(score_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
 
         // Check field IDs: base is 11_000
         assert_stats_field_ids(score_stats_struct, 11_000, &field)
@@ -2003,12 +1990,10 @@ mod tests {
         };
 
         assert_eq!(value_stats_struct.fields().count(), 5);
-        assert!(value_stats_struct
-            .field(crate::content_tree::NULL_COUNT_FIELD_NAME)
-            .is_none()); // not nullable
-        assert!(value_stats_struct.field("nan_value_count").is_some()); // float
-        assert!(value_stats_struct.field("avg_value_size").is_none()); // fixed-length
-        assert!(value_stats_struct.field("max_value_size").is_none()); // fixed-length
+        assert!(value_stats_struct.field(NULL_VALUE_COUNT).is_none()); // not nullable
+        assert!(value_stats_struct.field(NAN_VALUE_COUNT).is_some()); // float
+        assert!(value_stats_struct.field(AVG_VALUE_SIZE).is_none()); // fixed-length
+        assert!(value_stats_struct.field(MAX_VALUE_SIZE).is_none()); // fixed-length
         assert_stats_field_ids(value_stats_struct, 30_000, &field)
     }
 
@@ -2048,8 +2033,8 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        let lower = amount_stats_struct.field("lower_bound").unwrap();
-        let upper = amount_stats_struct.field("upper_bound").unwrap();
+        let lower = amount_stats_struct.field(LOWER_BOUND).unwrap();
+        let upper = amount_stats_struct.field(UPPER_BOUND).unwrap();
         assert_eq!(lower.data_type(), &DataType::LONG);
         assert_eq!(upper.data_type(), &DataType::LONG);
         assert_stats_field_ids(amount_stats_struct, 18_400, &field)
@@ -2197,8 +2182,8 @@ mod tests {
 
         // 'c' is a non-nullable int, should have 4 stats fields
         assert_eq!(c_struct.fields().count(), 4);
-        assert!(c_struct.field("value_count").is_some());
-        assert!(c_struct.field("lower_bound").is_some());
+        assert!(c_struct.field(VALUE_COUNT).is_some());
+        assert!(c_struct.field(LOWER_BOUND).is_some());
     }
 
     /// Helper function to get a field's value from a StructData by field name
@@ -2248,41 +2233,37 @@ mod tests {
 
         // Check id column stats (non-nullable LONG, so no null_value_count)
         assert_eq!(
-            get_column_stat(&content_stats, "id", "value_count"),
+            get_column_stat(&content_stats, "id", VALUE_COUNT),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "lower_bound"),
+            get_column_stat(&content_stats, "id", LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "upper_bound"),
+            get_column_stat(&content_stats, "id", UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "exact_bounds"),
+            get_column_stat(&content_stats, "id", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
 
         // Check name column stats (nullable STRING, so has null_value_count)
         assert_eq!(
-            get_column_stat(&content_stats, "name", "value_count"),
+            get_column_stat(&content_stats, "name", VALUE_COUNT),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(
-                &content_stats,
-                "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
-            ),
+            get_column_stat(&content_stats, "name", NULL_VALUE_COUNT),
             Some(&Scalar::Long(5))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "name", "lower_bound"),
+            get_column_stat(&content_stats, "name", LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "name", "upper_bound"),
+            get_column_stat(&content_stats, "name", UPPER_BOUND),
             Some(&Scalar::String("zoe".to_string()))
         );
     }
@@ -2327,13 +2308,13 @@ mod tests {
 
         // value_count should be populated from numRecords
         assert_eq!(
-            get_column_stat(&content_stats, "id", "value_count"),
+            get_column_stat(&content_stats, "id", VALUE_COUNT),
             Some(&Scalar::Long(50))
         );
 
         // exact_bounds should default to true
         assert_eq!(
-            get_column_stat(&content_stats, "id", "exact_bounds"),
+            get_column_stat(&content_stats, "id", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
     }
@@ -2365,21 +2346,21 @@ mod tests {
 
         // Verify int_col lower/upper bounds
         assert_eq!(
-            get_column_stat(&content_stats, "int_col", "lower_bound"),
+            get_column_stat(&content_stats, "int_col", LOWER_BOUND),
             Some(&Scalar::Integer(-100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "int_col", "upper_bound"),
+            get_column_stat(&content_stats, "int_col", UPPER_BOUND),
             Some(&Scalar::Integer(100))
         );
 
         // Verify double_col lower/upper bounds
         assert_eq!(
-            get_column_stat(&content_stats, "double_col", "lower_bound"),
+            get_column_stat(&content_stats, "double_col", LOWER_BOUND),
             Some(&Scalar::Double(0.5))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "double_col", "upper_bound"),
+            get_column_stat(&content_stats, "double_col", UPPER_BOUND),
             Some(&Scalar::Double(99.9))
         );
     }
@@ -2405,7 +2386,7 @@ mod tests {
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_column_stat(&content_stats, "value", "exact_bounds"),
+            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true)),
             "exact_bounds should be true"
         );
@@ -2432,7 +2413,7 @@ mod tests {
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_column_stat(&content_stats, "value", "exact_bounds"),
+            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
             Some(&Scalar::Boolean(false)),
             "exact_bounds should be false"
         );
@@ -2458,7 +2439,7 @@ mod tests {
 
         // In AMT format, exact_bounds defaults to true when tightBounds is absent
         assert_eq!(
-            get_column_stat(&content_stats, "value", "exact_bounds"),
+            get_column_stat(&content_stats, "value", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true)),
             "exact_bounds should default to true when tightBounds is absent"
         );
@@ -2495,7 +2476,7 @@ mod tests {
             .expect("should have stats");
 
             assert_eq!(
-                get_column_stat(&content_stats, "value", "exact_bounds"),
+                get_column_stat(&content_stats, "value", EXACT_BOUNDS),
                 Some(&Scalar::Boolean(false)),
                 "exact_bounds should be false when tight_bounds_when_null is Some(false) (DV present)"
             );
@@ -2522,7 +2503,7 @@ mod tests {
                 .expect("should have stats");
 
         // Get timestamp from lower_bound in AMT format
-        let min_ts = get_column_stat(&content_stats, "ts", "lower_bound")
+        let min_ts = get_column_stat(&content_stats, "ts", LOWER_BOUND)
             .expect("should have lower_bound for ts");
 
         // Verify it's a valid timestamp
@@ -2560,9 +2541,9 @@ mod tests {
                 .expect("should have stats");
 
         // Get date from lower_bound and upper_bound in AMT format
-        let min_date = get_column_stat(&content_stats, "date_col", "lower_bound")
+        let min_date = get_column_stat(&content_stats, "date_col", LOWER_BOUND)
             .expect("should have lower_bound for date_col");
-        let max_date = get_column_stat(&content_stats, "date_col", "upper_bound")
+        let max_date = get_column_stat(&content_stats, "date_col", UPPER_BOUND)
             .expect("should have upper_bound for date_col");
 
         // 2023-01-15 is 19372 days since 1970-01-01
@@ -2626,36 +2607,32 @@ mod tests {
         // - name.upper_bound: max("mike", "zoe") = "zoe"
 
         assert_eq!(
-            get_column_stat(&aggregated, "id", "value_count"),
+            get_column_stat(&aggregated, "id", VALUE_COUNT),
             Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "id", "lower_bound"),
+            get_column_stat(&aggregated, "id", LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "id", "upper_bound"),
+            get_column_stat(&aggregated, "id", UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
 
         assert_eq!(
-            get_column_stat(&aggregated, "name", "value_count"),
+            get_column_stat(&aggregated, "name", VALUE_COUNT),
             Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_column_stat(
-                &aggregated,
-                "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
-            ),
+            get_column_stat(&aggregated, "name", NULL_VALUE_COUNT),
             Some(&Scalar::Long(15))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "name", "lower_bound"),
+            get_column_stat(&aggregated, "name", LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "name", "upper_bound"),
+            get_column_stat(&aggregated, "name", UPPER_BOUND),
             Some(&Scalar::String("zoe".to_string()))
         );
     }
@@ -2681,15 +2658,15 @@ mod tests {
 
         // Should have the same values as the single input
         assert_eq!(
-            get_column_stat(&aggregated, "id", "value_count"),
+            get_column_stat(&aggregated, "id", VALUE_COUNT),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "id", "lower_bound"),
+            get_column_stat(&aggregated, "id", LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(&aggregated, "id", "upper_bound"),
+            get_column_stat(&aggregated, "id", UPPER_BOUND),
             Some(&Scalar::Long(50))
         );
     }
@@ -2742,7 +2719,7 @@ mod tests {
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_column_stat(&aggregated, "value", "exact_bounds"),
+            get_column_stat(&aggregated, "value", EXACT_BOUNDS),
             Some(&Scalar::Boolean(false)),
             "exact_bounds should be false when any input is false"
         );
@@ -2779,7 +2756,7 @@ mod tests {
 
         // In AMT format, exact_bounds is per-column
         assert_eq!(
-            get_column_stat(&aggregated, "value", "exact_bounds"),
+            get_column_stat(&aggregated, "value", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true)),
             "exact_bounds should be true when all inputs are true"
         );
@@ -2836,15 +2813,15 @@ mod tests {
                 get_struct_field(outer_stats, "nested_id")
             {
                 assert_eq!(
-                    get_struct_field(nested_id_stats, "value_count"),
+                    get_struct_field(nested_id_stats, VALUE_COUNT),
                     Some(&Scalar::Long(250))
                 );
                 assert_eq!(
-                    get_struct_field(nested_id_stats, "lower_bound"),
+                    get_struct_field(nested_id_stats, LOWER_BOUND),
                     Some(&Scalar::Long(1))
                 );
                 assert_eq!(
-                    get_struct_field(nested_id_stats, "upper_bound"),
+                    get_struct_field(nested_id_stats, UPPER_BOUND),
                     Some(&Scalar::Long(100))
                 );
             }
@@ -2854,18 +2831,15 @@ mod tests {
                 get_struct_field(outer_stats, "nested_name")
             {
                 assert_eq!(
-                    get_struct_field(
-                        nested_name_stats,
-                        crate::content_tree::NULL_COUNT_FIELD_NAME
-                    ),
+                    get_struct_field(nested_name_stats, NULL_VALUE_COUNT),
                     Some(&Scalar::Long(15))
                 );
                 assert_eq!(
-                    get_struct_field(nested_name_stats, "lower_bound"),
+                    get_struct_field(nested_name_stats, LOWER_BOUND),
                     Some(&Scalar::String("alice".to_string()))
                 );
                 assert_eq!(
-                    get_struct_field(nested_name_stats, "upper_bound"),
+                    get_struct_field(nested_name_stats, UPPER_BOUND),
                     Some(&Scalar::String("zoe".to_string()))
                 );
             }
@@ -3019,11 +2993,11 @@ mod tests {
                 .expect("some");
 
         assert_eq!(
-            get_column_stat(&content_true, "id", "exact_bounds"),
+            get_column_stat(&content_true, "id", EXACT_BOUNDS),
             Some(&Scalar::Boolean(true))
         );
         assert_eq!(
-            get_column_stat(&content_false, "id", "exact_bounds"),
+            get_column_stat(&content_false, "id", EXACT_BOUNDS),
             Some(&Scalar::Boolean(false))
         );
 

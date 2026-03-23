@@ -33,9 +33,15 @@ use url::Url;
 /// This field contains per-column statistics in AMT format.
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
 
-/// Field name for the null_value_count field within content_stats.
-/// This field contains the count of null values for a column.
-pub(crate) const NULL_COUNT_FIELD_NAME: &str = "null_value_count";
+/// Field names for the different fields within content_stats.
+pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
+pub(crate) const VALUE_COUNT: &str = "value_count";
+pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
+pub(crate) const AVG_VALUE_SIZE: &str = "avg_value_size";
+pub(crate) const MAX_VALUE_SIZE: &str = "max_value_size";
+pub(crate) const LOWER_BOUND: &str = "lower_bound";
+pub(crate) const UPPER_BOUND: &str = "upper_bound";
+pub(crate) const EXACT_BOUNDS: &str = "exact_bounds";
 
 /// Delta JSON stats field names. These are the keys used in the `stats` JSON string of Add actions
 /// and in the `stats_parsed` struct produced by parsing that JSON.
@@ -2355,14 +2361,14 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected id stats to be a struct"),
         };
-        assert!(id_stats.field("value_count").is_some());
-        assert!(id_stats.field("null_value_count").is_none()); // not nullable
-        assert!(id_stats.field("nan_value_count").is_none()); // not float/double
-        assert!(id_stats.field("lower_bound").is_some());
-        assert!(id_stats.field("upper_bound").is_some());
-        assert!(id_stats.field("exact_bounds").is_some());
+        assert!(id_stats.field(VALUE_COUNT).is_some());
+        assert!(id_stats.field(NULL_VALUE_COUNT).is_none()); // not nullable
+        assert!(id_stats.field(NAN_VALUE_COUNT).is_none()); // not float/double
+        assert!(id_stats.field(LOWER_BOUND).is_some());
+        assert!(id_stats.field(UPPER_BOUND).is_some());
+        assert!(id_stats.field(EXACT_BOUNDS).is_some());
         assert_eq!(
-            id_stats.field("lower_bound").unwrap().data_type(),
+            id_stats.field(LOWER_BOUND).unwrap().data_type(),
             &DataType::INTEGER
         );
 
@@ -2371,16 +2377,16 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
         };
-        assert!(name_stats.field("value_count").is_some());
-        assert!(name_stats.field("null_value_count").is_some()); // nullable
-        assert!(name_stats.field("nan_value_count").is_none()); // not float/double
-        assert!(name_stats.field("avg_value_size").is_some()); // string has size stats
-        assert!(name_stats.field("max_value_size").is_some()); // string has size stats
-        assert!(name_stats.field("lower_bound").is_some());
-        assert!(name_stats.field("upper_bound").is_some());
-        assert!(name_stats.field("exact_bounds").is_some());
+        assert!(name_stats.field(VALUE_COUNT).is_some());
+        assert!(name_stats.field(NULL_VALUE_COUNT).is_some()); // nullable
+        assert!(name_stats.field(NAN_VALUE_COUNT).is_none()); // not float/double
+        assert!(name_stats.field(AVG_VALUE_SIZE).is_some()); // string has size stats
+        assert!(name_stats.field(MAX_VALUE_SIZE).is_some()); // string has size stats
+        assert!(name_stats.field(LOWER_BOUND).is_some());
+        assert!(name_stats.field(UPPER_BOUND).is_some());
+        assert!(name_stats.field(EXACT_BOUNDS).is_some());
         assert_eq!(
-            name_stats.field("lower_bound").unwrap().data_type(),
+            name_stats.field(LOWER_BOUND).unwrap().data_type(),
             &DataType::STRING
         );
 
@@ -2389,14 +2395,14 @@ mod tests {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
         };
-        assert!(value_stats.field("value_count").is_some());
-        assert!(value_stats.field("null_value_count").is_some()); // nullable
-        assert!(value_stats.field("nan_value_count").is_some()); // double has nan count
-        assert!(value_stats.field("lower_bound").is_some());
-        assert!(value_stats.field("upper_bound").is_some());
-        assert!(value_stats.field("exact_bounds").is_some());
+        assert!(value_stats.field(VALUE_COUNT).is_some());
+        assert!(value_stats.field(NULL_VALUE_COUNT).is_some()); // nullable
+        assert!(value_stats.field(NAN_VALUE_COUNT).is_some()); // double has nan count
+        assert!(value_stats.field(LOWER_BOUND).is_some());
+        assert!(value_stats.field(UPPER_BOUND).is_some());
+        assert!(value_stats.field(EXACT_BOUNDS).is_some());
         assert_eq!(
-            value_stats.field("lower_bound").unwrap().data_type(),
+            value_stats.field(LOWER_BOUND).unwrap().data_type(),
             &DataType::DOUBLE
         );
 
@@ -2443,10 +2449,10 @@ mod tests {
         // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
         let id_stats = StructData::try_new(
             vec![
-                StructField::nullable("value_count", DataType::LONG),
-                StructField::nullable("lower_bound", DataType::INTEGER),
-                StructField::nullable("upper_bound", DataType::INTEGER),
-                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                StructField::nullable(VALUE_COUNT, DataType::LONG),
+                StructField::nullable(LOWER_BOUND, DataType::INTEGER),
+                StructField::nullable(UPPER_BOUND, DataType::INTEGER),
+                StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
             ],
             vec![
                 Scalar::Long(100),
@@ -2459,12 +2465,12 @@ mod tests {
         // Build value stats struct (nullable DOUBLE, so has null_value_count and nan_value_count)
         let value_stats = StructData::try_new(
             vec![
-                StructField::nullable("value_count", DataType::LONG),
-                StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
-                StructField::nullable("nan_value_count", DataType::LONG),
-                StructField::nullable("lower_bound", DataType::DOUBLE),
-                StructField::nullable("upper_bound", DataType::DOUBLE),
-                StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                StructField::nullable(VALUE_COUNT, DataType::LONG),
+                StructField::nullable(NULL_VALUE_COUNT, DataType::LONG),
+                StructField::nullable(NAN_VALUE_COUNT, DataType::LONG),
+                StructField::nullable(LOWER_BOUND, DataType::DOUBLE),
+                StructField::nullable(UPPER_BOUND, DataType::DOUBLE),
+                StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
             ],
             vec![
                 Scalar::Long(100),
@@ -2482,21 +2488,21 @@ mod tests {
                 StructField::nullable(
                     "id",
                     DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("value_count", DataType::LONG),
-                        StructField::nullable("lower_bound", DataType::INTEGER),
-                        StructField::nullable("upper_bound", DataType::INTEGER),
-                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                        StructField::nullable(VALUE_COUNT, DataType::LONG),
+                        StructField::nullable(LOWER_BOUND, DataType::INTEGER),
+                        StructField::nullable(UPPER_BOUND, DataType::INTEGER),
+                        StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
                     ]))),
                 ),
                 StructField::nullable(
                     "value",
                     DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("value_count", DataType::LONG),
-                        StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
-                        StructField::nullable("nan_value_count", DataType::LONG),
-                        StructField::nullable("lower_bound", DataType::DOUBLE),
-                        StructField::nullable("upper_bound", DataType::DOUBLE),
-                        StructField::nullable("exact_bounds", DataType::BOOLEAN),
+                        StructField::nullable(VALUE_COUNT, DataType::LONG),
+                        StructField::nullable(NULL_VALUE_COUNT, DataType::LONG),
+                        StructField::nullable(NAN_VALUE_COUNT, DataType::LONG),
+                        StructField::nullable(LOWER_BOUND, DataType::DOUBLE),
+                        StructField::nullable(UPPER_BOUND, DataType::DOUBLE),
+                        StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
                     ]))),
                 ),
             ],
@@ -2644,10 +2650,10 @@ mod tests {
 
         // Build id stats struct (non-nullable INTEGER, so no null_value_count)
         let id_stats_fields = vec![
-            StructField::nullable("value_count", DataType::LONG),
-            StructField::nullable("lower_bound", DataType::INTEGER),
-            StructField::nullable("upper_bound", DataType::INTEGER),
-            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            StructField::nullable(VALUE_COUNT, DataType::LONG),
+            StructField::nullable(LOWER_BOUND, DataType::INTEGER),
+            StructField::nullable(UPPER_BOUND, DataType::INTEGER),
+            StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
         ];
         let id_stats = StructData::try_new(
             id_stats_fields.clone(),
@@ -2661,13 +2667,13 @@ mod tests {
 
         // Build name stats struct (nullable STRING, so has null_value_count and size stats)
         let name_stats_fields = vec![
-            StructField::nullable("value_count", DataType::LONG),
-            StructField::nullable(NULL_COUNT_FIELD_NAME, DataType::LONG),
-            StructField::nullable("avg_value_size", DataType::INTEGER),
-            StructField::nullable("max_value_size", DataType::INTEGER),
-            StructField::nullable("lower_bound", DataType::STRING),
-            StructField::nullable("upper_bound", DataType::STRING),
-            StructField::nullable("exact_bounds", DataType::BOOLEAN),
+            StructField::nullable(VALUE_COUNT, DataType::LONG),
+            StructField::nullable(NULL_VALUE_COUNT, DataType::LONG),
+            StructField::nullable(AVG_VALUE_SIZE, DataType::INTEGER),
+            StructField::nullable(MAX_VALUE_SIZE, DataType::INTEGER),
+            StructField::nullable(LOWER_BOUND, DataType::STRING),
+            StructField::nullable(UPPER_BOUND, DataType::STRING),
+            StructField::nullable(EXACT_BOUNDS, DataType::BOOLEAN),
         ];
         let name_stats = StructData::try_new(
             name_stats_fields.clone(),

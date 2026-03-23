@@ -81,7 +81,11 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
     };
 
     // Should error because content root exists but protocol doesn't support it
-    let result = log_segment.protocol_and_metadata_and_content_root(engine.as_ref(), None);
+    let result = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        None,
+        &LazyCrc::new(None),
+    );
 
     assert!(
         result.is_err(),
@@ -167,8 +171,11 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
     };
 
     // Pass existing protocol - should skip content root search entirely
-    let (metadata, protocol, content_root) = log_segment
-        .protocol_and_metadata_and_content_root(engine.as_ref(), Some(&existing_protocol))?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        Some(&existing_protocol),
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_none(), "Should not find new protocol");
@@ -245,8 +252,11 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) =
-        log_segment.protocol_and_metadata_and_content_root(engine.as_ref(), None)?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        None,
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -345,8 +355,11 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) =
-        log_segment.protocol_and_metadata_and_content_root(engine.as_ref(), None)?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        None,
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -447,8 +460,11 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) =
-        log_segment.protocol_and_metadata_and_content_root(engine.as_ref(), None)?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        None,
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -553,8 +569,11 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment
-        .protocol_and_metadata_and_content_root(engine.as_ref(), Some(&existing_protocol))?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        Some(&existing_protocol),
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(
@@ -657,8 +676,11 @@ fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) =
-        log_segment.protocol_and_metadata_and_content_root(engine.as_ref(), None)?;
+    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
+        engine.as_ref(),
+        None,
+        &LazyCrc::new(None),
+    )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");

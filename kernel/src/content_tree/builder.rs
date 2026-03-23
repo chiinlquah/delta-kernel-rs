@@ -13,7 +13,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(test)]
 use crate::content_tree::ManifestStats;
 use crate::expressions::StructData;
-use crate::scan::state::Stats;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 #[cfg(test)]
 use crate::utils::try_parse_uri;
@@ -145,7 +144,7 @@ fn extract_record_count_from_stats(content_stats: Option<&StructData>) -> i64 {
         if let Scalar::Struct(column_stats) = value {
             // Look for value_count field in the column's stats struct
             for (field, field_value) in column_stats.fields().iter().zip(column_stats.values()) {
-                if field.name() == "value_count" {
+                if field.name() == crate::content_tree::VALUE_COUNT {
                     if let Scalar::Long(count) = field_value {
                         return *count;
                     }
@@ -250,7 +249,6 @@ struct BatchAggregates {
     added_file_count: i64,
     existing_file_count: i64,
     total_record_count: i64,
-    total_file_size: i64,
 }
 
 impl std::fmt::Debug for ContentTreeNodeBuilder {
@@ -480,14 +478,10 @@ impl ContentTreeNodeBuilder {
         Ok(absolute_url.to_string())
     }
 
-    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
-        self.add_with_dedup(add, version, snapshot_id)
-    }
-
-    /// Add a data file entry with deduplication, accepting pre-computed content_stats.
+    /// Add a data file entry, deduplicating by file path.
     ///
-    /// This method accepts content_stats directly as a StructData, avoiding the need to
-    /// serialize/deserialize JSON stats.
+    /// Accepts pre-computed content_stats directly as a [`StructData`], avoiding the need
+    /// to serialize/deserialize JSON stats.
     ///
     /// # Arguments
     /// * `path` - The file path (relative to table root)
@@ -495,8 +489,8 @@ impl ContentTreeNodeBuilder {
     /// * `content_stats` - Optional content_stats as StructData
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    #[allow(dead_code)]
-    pub(crate) fn add_file_with_dedup(
+    /// * `dv_info` - Optional deletion vector info
+    pub(crate) fn add_file(
         &mut self,
         path: String,
         size: i64,
@@ -527,42 +521,22 @@ impl ContentTreeNodeBuilder {
         Ok(())
     }
 
-    /// Add an entry with deduplication.
+    /// Add an entry from an [`Add`] action, deduplicating by file path.
+    ///
+    /// Extracts deletion vector content, parses and converts stats from the `Add` action,
+    /// then delegates to [`add_file`](Self::add_file).
     ///
     /// # Arguments
     /// * `add` - The Add action to convert to a ContentTreeNodeEntry
     /// * `version` - The version to use for tracking info
     /// * `snapshot_id` - The snapshot ID for tracking info
-    pub(crate) fn add_with_dedup(
-        &mut self,
-        add: Add,
-        version: Version,
-        snapshot_id: i64,
-    ) -> DeltaResult<()> {
-        // Check for duplicates and skip if already seen
-        if !self.values_seen.insert(add.path.clone()) {
-            // Already seen this file path - skip it
-            return Ok(());
-        }
-
+    pub(crate) fn add(&mut self, add: Add, version: Version, snapshot_id: i64) -> DeltaResult<()> {
         // Extract deletion vector content if present
         let dv_content = add
             .deletion_vector
             .as_ref()
             .map(extract_deletion_vector_content)
             .transpose()?;
-
-        // Parse stats to extract record_count
-        // TODO: This might evolve based on https://github.com/delta-io/delta-kernel-rs/pull/1464
-        let record_count = add
-            .stats
-            .as_ref()
-            .and_then(|stats_json| {
-                serde_json::from_str::<Stats>(stats_json)
-                    .ok()
-                    .map(|stats| stats.num_records as i64)
-            })
-            .unwrap_or(0);
 
         // TODO: Check if parsed_stats is set and prefer that over the JSON blob
         // Convert Delta JSON stats to content_stats. When the file has a deletion vector and
@@ -573,17 +547,14 @@ impl ContentTreeNodeBuilder {
             add.deletion_vector.is_some().then_some(false),
         )?;
 
-        let data_file_entry = ContentTreeNodeEntryBuilder::new(DataContentType::Data)
-            .location(add.path.clone())
-            .with_tracking(version, self.version, snapshot_id)
-            .dv_info_opt(dv_content)
-            .record_count(record_count)
-            .file_size_in_bytes(add.size)
-            .content_stats_opt(content_stats)
-            .build();
-
-        self.pending_entries.push(data_file_entry);
-        Ok(())
+        self.add_file(
+            add.path,
+            add.size,
+            content_stats,
+            version,
+            snapshot_id,
+            dv_content,
+        )
     }
 
     /// Adds write metadata from `EngineData` to the metadata using columnar transformation.
@@ -696,7 +667,11 @@ impl ContentTreeNodeBuilder {
             Some(ss) => {
                 let rc = if let Some(first_col) = ss.fields().next().map(|f| f.name().clone()) {
                     Expression::coalesce([
-                        Expression::column(["stats", first_col.as_str(), "value_count"]),
+                        Expression::column([
+                            "stats",
+                            first_col.as_str(),
+                            crate::content_tree::VALUE_COUNT,
+                        ]),
                         Expression::literal(Scalar::Long(0)),
                     ])
                 } else {
@@ -772,7 +747,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: engine_data.len() as i64,
             existing_file_count: 0,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
 
         Ok((transformed, aggregates))
@@ -1092,18 +1066,14 @@ impl ContentTreeNodeBuilder {
         // Build the leaf metadata with a UUID
         let leaf_metadata = self.build_leaf(engine, snapshot_id)?;
 
-        let content_metadata_path = ContentTreeNodeWriter::try_new(leaf_metadata)?
-            .write(engine)?
-            .location;
-        let manifest_path = absolute_to_relative_path(&content_metadata_path, &self.table_root)?;
+        let write_result = ContentTreeNodeWriter::try_new(leaf_metadata)?.write(engine)?;
+        let manifest_path = absolute_to_relative_path(&write_result.location, &self.table_root)?;
+        // Use the actual manifest Parquet file size so bulk_processor can pass it to
+        // ParquetObjectReader::with_file_size when reading the leaf manifest back.
+        let manifest_file_size = write_result.size_in_bytes as i64;
 
         // Calculate aggregate stats from pending entries
         let mut record_count: i64 = self.pending_entries.iter().map(|e| e.record_count).sum();
-        let mut file_size_in_bytes: i64 = self
-            .pending_entries
-            .iter()
-            .filter_map(|e| e.file_size_in_bytes)
-            .sum();
 
         // Calculate manifest stats (entry counts by status)
         let mut added_files_count = 0i64;
@@ -1138,7 +1108,6 @@ impl ContentTreeNodeBuilder {
         // Include pre-built batch aggregates
         for agg in &self.pre_built_aggregates {
             record_count += agg.total_record_count;
-            file_size_in_bytes += agg.total_file_size;
             added_files_count += agg.added_file_count;
             existing_files_count += agg.existing_file_count;
             added_rows_count += agg.total_record_count;
@@ -1181,7 +1150,7 @@ impl ContentTreeNodeBuilder {
                     changes_dv: None,
                 })
                 .record_count(record_count)
-                .file_size_in_bytes(file_size_in_bytes)
+                .file_size_in_bytes(manifest_file_size)
                 .content_stats_opt(content_stats)
                 .manifest_stats_opt(manifest_stats)
                 .build(),
@@ -1414,7 +1383,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: 0,
             existing_file_count: engine_data.len() as i64,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
 
         Ok((transformed, aggregates))
@@ -1536,7 +1504,6 @@ impl ContentTreeNodeBuilder {
             added_file_count: 0,
             existing_file_count: filtered.len() as i64,
             total_record_count: agg_visitor.total_record_count,
-            total_file_size: agg_visitor.total_file_size,
         };
         self.pre_built_data.push(filtered);
         self.pre_built_aggregates.push(aggregates);
@@ -1545,13 +1512,11 @@ impl ContentTreeNodeBuilder {
     }
 }
 
-/// Visitor that reads aggregate statistics from the transformed output.
-/// This reads flat `recordCount` and `fileSizeInBytes` columns that were already computed
-/// by the expression evaluator, avoiding the expensive `get_struct()` + `materialize()`
-/// per row that the old approach required.
+/// Visitor that reads aggregate record count from the transformed output.
+/// This reads the flat `recordCount` column that was already computed by the expression
+/// evaluator, avoiding the expensive `get_struct()` + `materialize()` per row.
 #[derive(Default)]
 struct TransformedAggregateVisitor {
-    total_file_size: i64,
     total_record_count: i64,
 }
 
@@ -1559,8 +1524,8 @@ impl RowVisitor for TransformedAggregateVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         use crate::schema::column_name;
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let names = vec![column_name!("recordCount"), column_name!("fileSizeInBytes")];
-            let types = vec![DataType::LONG, DataType::LONG];
+            let names = vec![column_name!("recordCount")];
+            let types = vec![DataType::LONG];
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
@@ -1570,8 +1535,6 @@ impl RowVisitor for TransformedAggregateVisitor {
         for i in 0..row_count {
             let record_count: i64 = getters[0].get(i, "recordCount")?;
             self.total_record_count += record_count;
-            let file_size: i64 = getters[1].get(i, "fileSizeInBytes")?;
-            self.total_file_size += file_size;
         }
         Ok(())
     }
@@ -1652,28 +1615,34 @@ fn build_content_stats_from_delta_stats_parsed(
                 .fields()
                 .map(|f| {
                     Arc::new(match f.name().as_str() {
-                        "value_count" => {
+                        crate::content_tree::VALUE_COUNT => {
                             Expression::column(["stats_parsed", DELTA_STATS_NUM_RECORDS])
                         }
-                        crate::content_tree::NULL_COUNT_FIELD_NAME => Expression::column([
+                        crate::content_tree::NULL_VALUE_COUNT => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_NULL_COUNT,
                             col_name.as_str(),
                         ]),
-                        "nan_value_count" => Expression::null_literal(DataType::LONG),
-                        "avg_value_size" => Expression::null_literal(DataType::INTEGER),
-                        "max_value_size" => Expression::null_literal(DataType::INTEGER),
-                        "lower_bound" => Expression::column([
+                        crate::content_tree::NAN_VALUE_COUNT => {
+                            Expression::null_literal(DataType::LONG)
+                        }
+                        crate::content_tree::AVG_VALUE_SIZE => {
+                            Expression::null_literal(DataType::INTEGER)
+                        }
+                        crate::content_tree::MAX_VALUE_SIZE => {
+                            Expression::null_literal(DataType::INTEGER)
+                        }
+                        crate::content_tree::LOWER_BOUND => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_MIN_VALUES,
                             col_name.as_str(),
                         ]),
-                        "upper_bound" => Expression::column([
+                        crate::content_tree::UPPER_BOUND => Expression::column([
                             "stats_parsed",
                             DELTA_STATS_MAX_VALUES,
                             col_name.as_str(),
                         ]),
-                        "exact_bounds" => Expression::coalesce([
+                        crate::content_tree::EXACT_BOUNDS => Expression::coalesce([
                             Expression::column(["stats_parsed", DELTA_STATS_TIGHT_BOUNDS]),
                             Expression::literal(Scalar::Boolean(true)),
                         ]),
@@ -2245,15 +2214,15 @@ mod tests {
 
         // Check id stats
         assert_eq!(
-            get_column_stat(&content_stats, "id", "value_count"),
+            get_column_stat(&content_stats, "id", crate::content_tree::VALUE_COUNT),
             Some(&Scalar::Long(100))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "lower_bound"),
+            get_column_stat(&content_stats, "id", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "id", "upper_bound"),
+            get_column_stat(&content_stats, "id", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
 
@@ -2262,12 +2231,12 @@ mod tests {
             get_column_stat(
                 &content_stats,
                 "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
+                crate::content_tree::NULL_VALUE_COUNT
             ),
             Some(&Scalar::Long(5))
         );
         assert_eq!(
-            get_column_stat(&content_stats, "name", "lower_bound"),
+            get_column_stat(&content_stats, "name", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
 
@@ -2430,15 +2399,15 @@ mod tests {
 
         // Check id stats: value_count=250, lower_bound=1, upper_bound=100
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "value_count"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::VALUE_COUNT),
             Some(&Scalar::Long(250))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "lower_bound"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::Long(1))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "id", "upper_bound"),
+            get_column_stat(aggregated_stats, "id", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::Long(100))
         );
 
@@ -2447,16 +2416,16 @@ mod tests {
             get_column_stat(
                 aggregated_stats,
                 "name",
-                crate::content_tree::NULL_COUNT_FIELD_NAME
+                crate::content_tree::NULL_VALUE_COUNT
             ),
             Some(&Scalar::Long(15)) // 5 + 10
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "name", "lower_bound"),
+            get_column_stat(aggregated_stats, "name", crate::content_tree::LOWER_BOUND),
             Some(&Scalar::String("alice".to_string()))
         );
         assert_eq!(
-            get_column_stat(aggregated_stats, "name", "upper_bound"),
+            get_column_stat(aggregated_stats, "name", crate::content_tree::UPPER_BOUND),
             Some(&Scalar::String("zoe".to_string()))
         );
 
