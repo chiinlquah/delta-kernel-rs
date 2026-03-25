@@ -494,7 +494,7 @@ async fn test_manifest_level_data_skipping_e2e() -> Result<(), Box<dyn std::erro
     ));
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(
-        snapshot.content_root().is_some(),
+        snapshot.checkpoint_action().is_some(),
         "Content root should exist"
     );
 

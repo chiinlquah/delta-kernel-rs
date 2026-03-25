@@ -173,12 +173,12 @@ impl BatchState {
     /// # Returns
     ///
     /// * `Ok(Some(Url))` - The URL of the root manifest.
-    /// * `Ok(None)` - No content root exists yet.
+    /// * `Ok(None)` - No checkpoint action exists yet.
     /// * `Err` - Error constructing the URL.
     pub fn root_manifest_url(&self, _engine: &dyn Engine) -> DeltaResult<Option<Url>> {
-        let content_root = self.read_snapshot.content_root();
+        let checkpoint_action = self.read_snapshot.checkpoint_action();
         let table_root = self.read_snapshot.table_root();
-        Ok(content_root.and_then(|cr| table_root.join(&cr.path).ok()))
+        Ok(checkpoint_action.and_then(|ca| table_root.join(&ca.content_root.path).ok()))
     }
 
     /// Incorporate leaf writer results into this batch.

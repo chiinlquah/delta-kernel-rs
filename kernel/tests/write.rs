@@ -2285,19 +2285,19 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // With batch_commit, JSON log should contain: commit_info + contentRoot
+        // With batch_commit, JSON log should contain: commit_info + checkpoint action
         // No add actions should be in the JSON log
         assert_eq!(
             parsed_actions.len(),
             2,
-            "Expected commit info and contentRoot actions, got {}. Actions: {:?}",
+            "Expected commit info and checkpoint actions, got {}. Actions: {:?}",
             parsed_actions.len(),
             parsed_actions
         );
         assert!(parsed_actions[0].get("commitInfo").is_some());
         assert!(
-            parsed_actions[1].get("contentRoot").is_some(),
-            "Second action should be contentRoot, but got: {:?}",
+            parsed_actions[1].get("checkpoint").is_some(),
+            "Second action should be checkpoint, but got: {:?}",
             parsed_actions[1]
         );
 
@@ -3459,11 +3459,11 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Test that batch commits create a ContentRoot action that is properly detected
+/// Test that batch commits create a checkpoint action that is properly detected
 /// during log replay. This test verifies:
 /// 1. Creates a table with initial data
-/// 2. Performs a batch commit (which writes a ContentRoot action)
-/// 3. Verifies the ContentRoot action is written to the commit file
+/// 2. Performs a batch commit (which writes a checkpoint action)
+/// 3. Verifies the checkpoint action is written to the commit file
 /// 4. Creates a fresh Snapshot and verifies it builds successfully
 #[tokio::test]
 async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn std::error::Error>>
@@ -3487,7 +3487,7 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         assert_eq!(snapshot1.version(), 1);
 
         // Step 2: Perform a batch commit (commit 2)
-        // This should create a ContentRoot action pointing to a metadata tree
+        // This should create a checkpoint action pointing to a metadata tree
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut batch_txn = snapshot
             .clone()
@@ -3530,14 +3530,14 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         );
 
         // Step 4: Create a fresh Snapshot (simulating a new reader)
-        // This should detect the ContentRoot from commit 2 during log replay
+        // This should detect the checkpoint action from commit 2 during log replay
         let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
         // Verify we're at the expected version
         assert_eq!(fresh_snapshot.version(), 2);
 
         // Step 5: Verify the snapshot can access the log segment
-        // This tests that the content root detection during log segment building works
+        // This tests that the checkpoint action detection during log segment building works
         let log_segment = fresh_snapshot.log_segment();
         assert_eq!(log_segment.end_version, 2);
         assert_eq!(log_segment.listed.ascending_commit_files.len(), 3); // commits 0, 1, 2
@@ -3569,7 +3569,7 @@ async fn batch_remove_all_files_impl(
         let engine = Arc::new(engine);
 
         if with_existing_root {
-            // Establish a content root via a batch write.
+            // Establish a checkpoint action via a batch write.
             batch_write_data_and_check_result_and_stats(
                 table_url.clone(),
                 schema.clone(),
@@ -3578,7 +3578,7 @@ async fn batch_remove_all_files_impl(
             )
             .await?;
         } else {
-            // Add files via a non-batch commit — no content root established.
+            // Add files via a non-batch commit — no checkpoint action established.
             write_data_and_check_result_and_stats(
                 table_url.clone(),
                 schema.clone(),
@@ -3589,7 +3589,7 @@ async fn batch_remove_all_files_impl(
         }
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        assert_eq!(snapshot.content_root().is_some(), with_existing_root);
+        assert_eq!(snapshot.checkpoint_action().is_some(), with_existing_root);
 
         let mut txn = snapshot
             .clone()
@@ -3610,11 +3610,11 @@ async fn batch_remove_all_files_impl(
 
 #[tokio::test]
 async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
-    // Verify that remove_files in batch commit mode is rejected when no content root exists.
+    // Verify that remove_files in batch commit mode is rejected when no checkpoint action exists.
     batch_remove_all_files_impl(false, |txn, engine, _url| {
         assert!(
             txn.commit(engine.as_ref()).is_err(),
-            "expected error when removing files in batch commit mode without a content root"
+            "expected error when removing files in batch commit mode without a checkpoint action"
         );
         Ok(())
     })
@@ -3624,7 +3624,7 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
 #[tokio::test]
 async fn test_remove_files_batch_commit_mode_with_existing_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Verify that remove_files in batch commit mode succeeds when a content root exists.
+    // Verify that remove_files in batch commit mode succeeds when a checkpoint action exists.
     batch_remove_all_files_impl(true, |txn, engine, table_url| {
         match txn.commit(engine.as_ref())? {
             CommitResult::CommittedTransaction(committed) => {

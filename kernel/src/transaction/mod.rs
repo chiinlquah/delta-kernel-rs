@@ -9,9 +9,9 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_content_root_schema,
-    get_log_remove_schema, get_log_txn_schema, CommitInfo, ContentRoot, DomainMetadata,
-    SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
+    get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
+    CommitInfo, ContentRoot, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::content_tree::writer::{ContentTreeNodeWriter, ContentTreeWriteResult};
@@ -445,7 +445,7 @@ impl<S> Transaction<S> {
     }
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
-    /// domain metadata, and add actions (or content root for batch commits).
+    /// domain metadata, and add actions (or checkpoint action for batch commits).
     fn generate_log_actions(
         &self,
         engine: &dyn Engine,
@@ -509,20 +509,17 @@ impl<S> Transaction<S> {
                 ))
             );
 
-            // Get the cached content root from the snapshot (no I/O needed)
-            let latest_content_root = self
-                .read_snapshot
-                .content_root()
-                .map(|cr| (cr.clone(), cr.version));
+            // Get the cached checkpoint action from the snapshot (no I/O needed)
+            let latest_checkpoint_action = self.read_snapshot.checkpoint_action().cloned();
 
-            // Removes in batch mode require an existing content root so that every file
+            // Removes in batch mode require an existing checkpoint action so that every file
             // carries a data_manifest_path and data_manifest_position (row ID). Without
-            // a root the scan metadata lacks those fields and we cannot locate entries.
+            // a checkpoint action the scan metadata lacks those fields and we cannot locate entries.
             // TODO: revisit whether removes should be supported for the first batch commit
             // (e.g. by treating files with no manifest path as root deletions by path).
-            if latest_content_root.is_none() && !self.remove_files_metadata.is_empty() {
+            if latest_checkpoint_action.is_none() && !self.remove_files_metadata.is_empty() {
                 return Err(Error::invalid_transaction_state(
-                    "remove_files is not supported in batch commit mode without an existing content root",
+                    "remove_files is not supported in batch commit mode without an existing checkpoint action",
                 ));
             }
 
@@ -534,21 +531,21 @@ impl<S> Transaction<S> {
 
             // Load existing metadata and determine the version from which to replay delta log
             let (mut metadata_builder, root_manifest_path, replay_from_version) =
-                if let Some((content_root_action, content_root_version)) = latest_content_root {
+                if let Some(checkpoint_action) = latest_checkpoint_action {
                     // Load metadata from content root directly into the builder
-                    let root_path = content_root_action.path.clone();
+                    let root_path = checkpoint_action.content_root.path.clone();
                     let builder =
                         crate::content_tree::builder::ContentTreeNodeBuilder::from_content_root(
                             engine,
-                            &content_root_action,
+                            &checkpoint_action.content_root,
                             table_root.clone(),
                             physical_table_schema.clone(),
                             commit_version,
                         )?;
-                    // Replay delta log from the version after the content root
-                    (builder, Some(root_path), content_root_version + 1)
+                    // Replay delta log from the version after the checkpoint action
+                    (builder, Some(root_path), checkpoint_action.version + 1)
                 } else {
-                    // No content root found, start with empty metadata
+                    // No checkpoint action found, start with empty metadata
                     // Use commit_version for the new metadata, not the current snapshot version
                     let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                         table_root.clone(),
@@ -566,7 +563,7 @@ impl<S> Transaction<S> {
 
                 // TODO: Process incremental removes from delta log and mark them as DELETED
                 // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the content root version
+                // 1. Scanning delta log for Remove actions since the checkpoint action version
                 // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
                 // 3. Calling metadata_builder.delete_from_leaf() for each removed file
                 // This is deferred to future work as it requires a new delta log processor.
@@ -619,9 +616,9 @@ impl<S> Transaction<S> {
                 b.apply_to_builder(&mut metadata_builder)?;
             }
 
-            // In batch mode, process ALL remove actions and mark entries as DELETED in the ContentRoot
-            // The ContentRoot manages all file state, so any removes should be reflected there
-            // This applies whether we loaded from an existing ContentRoot or built from snapshot
+            // In batch mode, process ALL remove actions and mark entries as DELETED in the content tree.
+            // The content tree manages all file state, so any removes should be reflected there.
+            // This applies whether we loaded from an existing checkpoint action or built from snapshot.
             if !self.remove_files_metadata.is_empty() {
                 let leaf_deletions = {
                     let mut visitor = ScanMetadataRemoveVisitor::new(
@@ -651,21 +648,23 @@ impl<S> Transaction<S> {
                 self.read_snapshot.table_root(),
             )?;
 
-            // The content root represents the state at the new commit version.
+            // The checkpoint action represents the state at the new commit version.
             // wrapping_add handles the CREATE TABLE case where read_snapshot.version()
             // is PRE_COMMIT_VERSION (u64::MAX), which wraps to 0 (the first commit).
             let new_commit_version = self.read_snapshot.version().wrapping_add(1);
-            let content_root_action = ContentRoot {
-                path,
-                size_in_bytes,
+            let checkpoint_action = CheckpointAction {
                 version: new_commit_version,
+                content_root: ContentRoot {
+                    path,
+                    size_in_bytes,
+                },
             };
 
-            // Use the log schema to wrap ContentRoot in a "contentRoot" field
-            let content_root_data =
-                content_root_action.into_engine_data(get_log_content_root_schema().clone(), engine);
+            // Use the log schema to wrap CheckpointAction in a "checkpoint" field
+            let checkpoint_data = checkpoint_action
+                .into_engine_data(get_log_checkpoint_action_schema().clone(), engine);
 
-            actions_vec.push(content_root_data.map(FilteredEngineData::with_all_rows_selected))
+            actions_vec.push(checkpoint_data.map(FilteredEngineData::with_all_rows_selected))
         } else {
             // Normal mode: add actions go in the JSON log
             // Remove actions are added separately in the commit method
@@ -885,9 +884,9 @@ impl<S> Transaction<S> {
             || !leaf_manifests_empty
             || self
                 .read_snapshot
-                .content_root()
-                .map_or(self.read_snapshot.version() > 0, |cr| {
-                    cr.version < self.read_snapshot.version()
+                .checkpoint_action()
+                .map_or(self.read_snapshot.version() > 0, |ca| {
+                    ca.version < self.read_snapshot.version()
                 });
         can_batch_commit && has_work_to_do
     }
@@ -2355,8 +2354,8 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to write a ContentRoot action to a specific version
-    fn write_content_root_action(
+    /// Helper to write a checkpoint action to a specific version
+    fn write_checkpoint_action(
         table_root: &Url,
         content_root_path: &str,
         version: u64,
@@ -2364,15 +2363,17 @@ mod tests {
         use serde_json::json;
         use std::fs::write;
 
-        let content_root = json!({
-            "contentRoot": {
-                "path": content_root_path,
-                "sizeInBytes": 0,
-                "version": version
+        let checkpoint_action = json!({
+            "checkpoint": {
+                "version": version,
+                "contentRoot": {
+                    "path": content_root_path,
+                    "sizeInBytes": 0
+                }
             }
         });
 
-        let data = serde_json::to_vec(&content_root)?;
+        let data = serde_json::to_vec(&checkpoint_action)?;
 
         let delta_log_path = table_root
             .join("_delta_log/")?
@@ -2382,7 +2383,7 @@ mod tests {
         let file_name = format!("{:020}.json", version);
         let file_path = delta_log_path.join(file_name);
         write(&file_path, data)
-            .map_err(|e| Error::generic(format!("Failed to write ContentRoot: {e}")))?;
+            .map_err(|e| Error::generic(format!("Failed to write checkpoint action: {e}")))?;
 
         Ok(())
     }
@@ -2453,13 +2454,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        // Step 3: Write checkpoint action (v1)
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2502,7 +2503,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2535,7 +2536,7 @@ mod tests {
         // Step 1: Create initial table (v0)
         create_initial_table(&table_root, true)?;
 
-        // Step 2: Build a leaf manifest with 5 data files and write a content root (v1)
+        // Step 2: Build a leaf manifest with 5 data files and write a checkpoint action (v1)
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
@@ -2550,7 +2551,7 @@ mod tests {
         let root_url = ContentTreeNodeWriter::try_new(root_metadata)?
             .write(&engine)?
             .location;
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 3: Batch-commit a remove (v2)
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -2693,13 +2694,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
-        write_content_root_action(&table_root, root_url.as_str(), 1)?;
+        // Step 3: Write checkpoint action (v1)
+        write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2742,7 +2743,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2764,7 +2765,7 @@ mod tests {
         // indices in the leaf manifest are deleted, without rewriting the leaf file.
         use crate::content_tree::ContentTreeNode;
 
-        // Read the ContentRoot action from version 2 to get the new manifest path
+        // Read the checkpoint action from version 2 to get the new manifest path
         let delta_log_path = table_root
             .join("_delta_log/")?
             .to_file_path()
@@ -2773,20 +2774,21 @@ mod tests {
         let v2_log_content = std::fs::read_to_string(&v2_log_file)
             .map_err(|e| Error::generic(format!("Failed to read v2 log: {e}")))?;
 
-        // Parse the ContentRoot action to get the manifest path
+        // Parse the checkpoint action to get the manifest path
         let content_root_path: String = v2_log_content
             .lines()
             .find_map(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
                     .ok()
                     .and_then(|v| {
-                        v.get("contentRoot")?
+                        v.get("checkpoint")?
+                            .get("contentRoot")?
                             .get("path")?
                             .as_str()
                             .map(String::from)
                     })
             })
-            .ok_or_else(|| Error::generic("No ContentRoot found in v2"))?;
+            .ok_or_else(|| Error::generic("No checkpoint action found in v2"))?;
 
         // Read the root manifest (path is now relative, so join with table root)
         let root_manifest_url = table_root
@@ -2911,7 +2913,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        // Step 1: Create initial table (v0) with Protocol + Metadata for content root support
+        // Step 1: Create initial table (v0) with Protocol + Metadata for checkpoint action support
         // Create a table with metadataTree-experimental feature and column mapping
         use serde_json::json;
         use std::fs::{create_dir_all, write};
@@ -3177,26 +3179,29 @@ mod tests {
             "Root manifest at version 1 should exist: 00000000000000000001.content.parquet"
         );
 
-        // Step 9: Validate that the ContentRoot action points to the correct root manifest
+        // Step 9: Validate that the checkpoint action points to the correct root manifest
         use serde_json::Value;
         use std::fs::read_to_string;
 
         let commit_1_path = delta_log_path.join("00000000000000000001.json");
         let commit_content = read_to_string(&commit_1_path)?;
 
-        // Parse each line as JSON and find the contentRoot action
-        let mut found_content_root = false;
+        // Parse each line as JSON and find the checkpoint action
+        let mut found_checkpoint_action = false;
         for line in commit_content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let action: Value = serde_json::from_str(line)?;
-            if let Some(content_root) = action.get("contentRoot") {
+            if let Some(checkpoint) = action.get("checkpoint") {
+                let content_root = checkpoint
+                    .get("contentRoot")
+                    .expect("checkpoint should have contentRoot");
                 if let Some(path) = content_root.get("path").and_then(|p| p.as_str()) {
                     // The path should reference the version 1 root manifest
                     assert!(
                         path.contains("00000000000000000001.content.parquet"),
-                        "ContentRoot action should reference version 1 root manifest, got: {}",
+                        "Checkpoint action should reference version 1 root manifest, got: {}",
                         path
                     );
 
@@ -3204,7 +3209,7 @@ mod tests {
                     let reported_size = content_root
                         .get("sizeInBytes")
                         .and_then(|s| s.as_u64())
-                        .expect("ContentRoot sizeInBytes should be present");
+                        .expect("checkpoint contentRoot sizeInBytes should be present");
                     let manifest_file = table_root
                         .join(path)
                         .expect("should join path")
@@ -3216,22 +3221,22 @@ mod tests {
                         .len();
                     assert!(
                         reported_size > 0,
-                        "ContentRoot sizeInBytes should be non-zero"
+                        "Checkpoint contentRoot sizeInBytes should be non-zero"
                     );
                     assert_eq!(
                         reported_size, disk_size,
-                        "ContentRoot sizeInBytes should match actual file size"
+                        "Checkpoint contentRoot sizeInBytes should match actual file size"
                     );
 
-                    found_content_root = true;
+                    found_checkpoint_action = true;
                     break;
                 }
             }
         }
 
         assert!(
-            found_content_root,
-            "ContentRoot action should exist in version 1 commit"
+            found_checkpoint_action,
+            "Checkpoint action should exist in version 1 commit"
         );
 
         Ok(())

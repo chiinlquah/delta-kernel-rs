@@ -739,11 +739,11 @@ fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<(
     // Content root is at version 3, so we should only read commits 4 and 5
     for version in 1..=5 {
         let commit_content = if version == 3 {
-            // Version 3 has the contentRoot action pointing to the content root file
+            // Version 3 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
-                version, content_root_url, version
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+                version, version, content_root_url
             )
         } else {
             format!(
@@ -1138,11 +1138,11 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     let versions = vec![1, 2, 5, 10, 15, 20];
     for version in &versions {
         let commit_content = if *version == 10 {
-            // Version 10 has the contentRoot action pointing to the content root file
+            // Version 10 has the checkpoint action pointing to the content root file
             format!(
                 r#"{{"add":{{"path":"part-v{:05}.parquet","partitionValues":{{}},"size":1024,"modificationTime":1677811178336,"dataChange":true}}}}
-{{"contentRoot":{{"path":"{}","sizeInBytes":1024,"version":{}}}}}"#,
-                version, content_root_url, version
+{{"checkpoint":{{"version":{},"contentRoot":{{"path":"{}","sizeInBytes":1024}}}}}}"#,
+                version, version, content_root_url
             )
         } else {
             format!(

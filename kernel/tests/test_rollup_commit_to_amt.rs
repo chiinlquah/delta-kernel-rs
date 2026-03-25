@@ -68,10 +68,10 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
     // Verify content root was created
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(
-        snapshot.content_root().is_some(),
+        snapshot.checkpoint_action().is_some(),
         "Content root should exist after first batch commit"
     );
-    let content_root_version = snapshot.content_root().unwrap().version();
+    let content_root_version = snapshot.checkpoint_action().unwrap().version();
     println!(
         "After first batch commit - snapshot version: {}, content root version: {}",
         snapshot.version(),
@@ -97,7 +97,7 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
 
     // Check the new snapshot - content root version should not have changed
     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let new_content_root_version = new_snapshot.content_root().map(|cr| cr.version());
+    let new_content_root_version = new_snapshot.checkpoint_action().map(|cr| cr.version());
 
     println!(
         "After second batch commit - snapshot version: {}, content root version: {:?}",

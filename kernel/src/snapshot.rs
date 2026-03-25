@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{ContentRoot, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{CheckpointAction, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -276,13 +276,13 @@ impl Snapshot {
         // Use a temporary LazyCrc since the combined segment's CRC may differ from new_log_segment's.
         let existing_protocol = existing_snapshot.table_configuration().protocol();
         let temp_crc = LazyCrc::new(new_log_segment.listed.latest_crc_file.clone());
-        let (new_metadata, new_protocol, new_content_root) = new_log_segment
-            .protocol_and_metadata_and_content_root(engine, Some(existing_protocol), &temp_crc)?;
+        let (new_metadata, new_protocol, new_checkpoint_action) = new_log_segment
+            .protocol_and_metadata_and_checkpoint(engine, Some(existing_protocol), &temp_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
             new_protocol,
-            new_content_root,
+            new_checkpoint_action,
             new_log_segment.end_version,
         )?;
 
@@ -398,8 +398,8 @@ impl Snapshot {
         // Pass the snapshot's lazy_crc so the CRC is cached on the shared instance.
         let start = Instant::now();
         // No existing protocol for initial snapshot - search will start optimistically
-        let (metadata_opt, protocol_opt, content_root) =
-            log_segment.protocol_and_metadata_and_content_root(engine, None, &lazy_crc)?;
+        let (metadata_opt, protocol_opt, checkpoint_action) =
+            log_segment.protocol_and_metadata_and_checkpoint(engine, None, &lazy_crc)?;
 
         let read_metadata_duration = start.elapsed();
 
@@ -421,7 +421,7 @@ impl Snapshot {
         let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
-            content_root,
+            checkpoint_action,
             location,
             log_segment.end_version,
         )?;
@@ -636,15 +636,15 @@ impl Snapshot {
         &self.table_configuration
     }
 
-    /// Get the [`ContentRoot`] for this snapshot, if present.
+    /// Get the [`CheckpointAction`] for this snapshot, if present.
     ///
-    /// Returns the cached ContentRoot action from the table's commit log.
+    /// Returns the cached checkpoint action from the table's commit log.
     /// This is populated during snapshot creation and does not require additional I/O.
     ///
-    /// Returns `None` if this table has never written a ContentRoot action.
+    /// Returns `None` if this table has never written a checkpoint action.
     #[internal_api]
-    pub(crate) fn content_root(&self) -> Option<&ContentRoot> {
-        self.table_configuration().content_root()
+    pub(crate) fn checkpoint_action(&self) -> Option<&CheckpointAction> {
+        self.table_configuration().checkpoint_action()
     }
 
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.

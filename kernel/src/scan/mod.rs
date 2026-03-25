@@ -890,7 +890,7 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
                 self.physical_predicate(), // Pass predicate for manifest-level skipping
-                self.snapshot.content_root(),
+                self.snapshot.checkpoint_action(),
                 self.skip_leaf_manifests,
                 self.table_schema_for_content_stats(),
             )

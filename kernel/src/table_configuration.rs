@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{ContentRoot, Metadata, Protocol};
+use crate::actions::{CheckpointAction, Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
@@ -87,7 +87,7 @@ pub(crate) struct TableConfiguration {
     /// Physical schema: field names are the physical column names (same as logical when
     /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
     physical_schema: SchemaRef,
-    content_root: Option<ContentRoot>,
+    checkpoint_action: Option<CheckpointAction>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -118,7 +118,7 @@ impl TableConfiguration {
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
-        content_root: Option<ContentRoot>,
+        checkpoint_action: Option<CheckpointAction>,
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
@@ -136,7 +136,7 @@ impl TableConfiguration {
             physical_schema,
             metadata,
             protocol,
-            content_root,
+            checkpoint_action,
             table_properties,
             column_mapping_mode,
             table_root,
@@ -155,11 +155,11 @@ impl TableConfiguration {
         table_configuration: &Self,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-        new_content_root: Option<ContentRoot>,
+        new_checkpoint_action: Option<CheckpointAction>,
         new_version: Version,
     ) -> DeltaResult<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
-        if new_metadata.is_none() && new_protocol.is_none() && new_content_root.is_none() {
+        if new_metadata.is_none() && new_protocol.is_none() && new_checkpoint_action.is_none() {
             return Ok(Self {
                 version: new_version,
                 ..table_configuration.clone()
@@ -172,7 +172,7 @@ impl TableConfiguration {
         Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
-            new_content_root.or(table_configuration.content_root.clone()),
+            new_checkpoint_action.or(table_configuration.checkpoint_action.clone()),
             table_configuration.table_root.clone(),
             new_version,
         )
@@ -461,13 +461,13 @@ impl TableConfiguration {
         self.version
     }
 
-    /// The [`ContentRoot`] of this table at this version, if present.
+    /// The [`CheckpointAction`] of this table at this version, if present.
     ///
-    /// Returns `None` if this table has never written a ContentRoot action.
-    /// Once a ContentRoot is written, it is cached for the lifetime of this snapshot.
+    /// Returns `None` if this table has never written a checkpoint action.
+    /// Once a checkpoint action is written, it is cached for the lifetime of this snapshot.
     #[internal_api]
-    pub(crate) fn content_root(&self) -> Option<&ContentRoot> {
-        self.content_root.as_ref()
+    pub(crate) fn checkpoint_action(&self) -> Option<&CheckpointAction> {
+        self.checkpoint_action.as_ref()
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
