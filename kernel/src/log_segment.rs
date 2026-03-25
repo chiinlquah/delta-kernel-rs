@@ -48,7 +48,7 @@ mod crc_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod tests_content_root_validation;
+mod tests_checkpoint_action_validation;
 
 /// Information about checkpoint reading for data skipping optimization.
 ///
@@ -625,7 +625,7 @@ impl LogSegment {
             None,
             None,
             None,  // No data predicate for manifest-level skipping
-            None,  // No content root available in this context
+            None,  // No checkpoint action available in this context
             false, // Don't skip leaf manifests by default
             None,  // No table schema available in this context
         )?;
@@ -1168,7 +1168,7 @@ impl LogSegment {
 }
 
 impl LogSegment {
-    /// Validate content root compatibility with protocol and update root enabled state.
+    /// Validate checkpoint action compatibility with protocol and update root enabled state.
     ///
     /// When a protocol is discovered, this checks that if the protocol lacks the
     /// MetadataTreeExperimental feature, no checkpoint action should have been found.

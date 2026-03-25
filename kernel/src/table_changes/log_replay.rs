@@ -224,9 +224,9 @@ impl LogReplayScanner {
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let has_protocol_update = protocol_opt.is_some();
             let checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
-            // TODO: disable content root if reader feature is disabled. We should look into validating
-            // that content root version is after the feature option was enabled but that may be too
-            // expensive here.
+            // TODO: disable checkpoint action if reader feature is disabled. We should look into
+            // validating that checkpoint action version is after the feature option was enabled but
+            // that may be too expensive here.
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;

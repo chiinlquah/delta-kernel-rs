@@ -172,7 +172,6 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
 }
 
 /// Returns the log-level schema that wraps a [`CheckpointAction`] in a "checkpoint" field.
-#[allow(dead_code)]
 pub(crate) fn get_log_checkpoint_action_schema() -> &'static SchemaRef {
     &LOG_CHECKPOINT_ACTION_SCHEMA
 }
@@ -939,7 +938,7 @@ pub(crate) struct CheckpointAction {
 }
 
 impl CheckpointAction {
-    /// Get the path of the content root manifest.
+    /// Path to the root manifest file (delegates to the nested [`ContentRoot`]).
     #[allow(dead_code, unreachable_pub)]
     pub fn path(&self) -> &str {
         &self.content_root.path
@@ -951,7 +950,7 @@ impl CheckpointAction {
         self.version
     }
 
-    /// Get the size of the content root manifest file in bytes.
+    /// Size of the root manifest file in bytes (delegates to the nested [`ContentRoot`]).
     #[allow(dead_code, unreachable_pub)]
     pub fn content_root_size_in_bytes(&self) -> FileSize {
         self.content_root.size_in_bytes

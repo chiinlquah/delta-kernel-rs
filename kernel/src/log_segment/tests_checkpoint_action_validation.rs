@@ -1,4 +1,4 @@
-// Tests for content root validation and optimization
+// Tests for checkpoint action validation and optimization
 use super::*;
 use crate::engine::default::DefaultEngine;
 use crate::DeltaResult;
@@ -17,10 +17,10 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 
 /// Test error when protocol lacks feature but checkpoint action exists
 ///
-/// Scenario: Protocol without feature, then content root action in later commit
+/// Scenario: Protocol without feature, then checkpoint action in later commit
 /// Expected: Should error - invalid table state
 #[test]
-fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResult<()> {
+fn test_error_when_protocol_lacks_feature_but_checkpoint_action_exists() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
@@ -28,7 +28,7 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
     let commit0_content = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}
 {"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#;
 
-    // Commit 1: ContentRoot (invalid - protocol doesn't support it)
+    // Commit 1: Checkpoint action (invalid - protocol doesn't support it)
     let commit1_content =
         r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
@@ -102,7 +102,7 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
     Ok(())
 }
 
-/// Test correctness: skip content root search when existing protocol lacks feature
+/// Test correctness: skip checkpoint action search when existing protocol lacks feature
 ///
 /// Scenario: Existing protocol without feature passed in
 /// Expected: Should not search for checkpoint action (feature not supported)
@@ -118,7 +118,7 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
     // Commit 0: Just metadata (no protocol change)
     let commit0_content = r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#;
 
-    // Commit 1: ContentRoot (should not be searched because existing protocol lacks feature)
+    // Commit 1: Checkpoint action (should not be searched because existing protocol lacks feature)
     let commit1_content =
         r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
@@ -170,7 +170,7 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    // Pass existing protocol - should skip content root search entirely
+    // Pass existing protocol - should skip checkpoint action search entirely
     let (metadata, protocol, checkpoint_action) = log_segment
         .protocol_and_metadata_and_checkpoint_action(
             engine.as_ref(),
@@ -190,10 +190,10 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
 
 /// Test happy path: find checkpoint action when protocol supports it
 ///
-/// Scenario: Protocol with feature, content root in later commit
-/// Expected: Should find metadata, protocol, and content root
+/// Scenario: Protocol with feature, checkpoint action in later commit
+/// Expected: Should find metadata, protocol, and checkpoint action
 #[test]
-fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
+fn test_find_checkpoint_action_when_protocol_has_feature() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
@@ -201,7 +201,7 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
     let commit0_content = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["metadataTree-experimental"],"writerFeatures":["metadataTree-experimental"]}}
 {"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#;
 
-    // Commit 1: Content root
+    // Commit 1: Checkpoint action
     let commit1_content =
         r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
@@ -275,7 +275,7 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
 /// Scenario: Started without searching (protocol lacks feature), then protocol
 ///          upgraded to add feature
 /// Expected: Should terminate early once new protocol is found (feature was just
-///          turned on, no content root written yet)
+///          turned on, no checkpoint action written yet)
 #[test]
 fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -375,8 +375,8 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
 /// Test continued searching when started with searching enabled
 ///
 /// Scenario: Started optimistically (no existing protocol), feature enabled,
-///          content root in later commit
-/// Expected: Should keep searching until content root is found
+///          checkpoint action in later commit
+/// Expected: Should keep searching until checkpoint action is found
 #[test]
 fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -389,7 +389,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
     // Commit 1: Some other action
     let commit1_content = r#"{"add":{"path":"file.parquet"}}"#;
 
-    // Commit 2: ContentRoot (should be found - we must keep searching)
+    // Commit 2: Checkpoint action (should be found - we must keep searching)
     let commit2_content =
         r#"{"checkpoint":{"version":2,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
@@ -474,7 +474,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
 
 /// Test continued searching when existing protocol has feature
 ///
-/// Scenario: Existing protocol with feature, content root in later commit
+/// Scenario: Existing protocol with feature, checkpoint action in later commit
 /// Expected: Should search and find checkpoint action
 #[test]
 fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<()> {
@@ -495,7 +495,7 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
     // Commit 1: Some other action
     let commit1_content = r#"{"add":{"path":"file.parquet"}}"#;
 
-    // Commit 2: ContentRoot (should be found)
+    // Commit 2: Checkpoint action (should be found)
     let commit2_content =
         r#"{"checkpoint":{"version":2,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
@@ -585,25 +585,25 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
     Ok(())
 }
 
-/// Test behavior when multiple content roots exist
+/// Test behavior when multiple checkpoint actions exist
 ///
-/// Scenario: Multiple commits with content root actions
+/// Scenario: Multiple commits with checkpoint actions
 /// Expected: Currently returns most recent one (implementation continues searching)
-/// Note: This test documents current behavior - multiple content roots is unusual
+/// Note: This test documents current behavior - multiple checkpoint actions is unusual
 #[test]
-fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
+fn test_multiple_checkpoint_actions_returns_most_recent() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = Arc::new(DefaultEngine::new(store.clone()));
 
-    // Commit 0: Protocol WITH feature + Metadata (no content root yet)
+    // Commit 0: Protocol WITH feature + Metadata (no checkpoint action yet)
     let commit0_content = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["metadataTree-experimental"],"writerFeatures":["metadataTree-experimental"]}}
 {"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#;
 
-    // Commit 1: First ContentRoot
+    // Commit 1: First checkpoint action
     let commit1_content =
         r#"{"checkpoint":{"version":1,"contentRoot":{"path":"first.parquet","sizeInBytes":1024}}}"#;
 
-    // Commit 2: Second ContentRoot (should be ignored - first one wins)
+    // Commit 2: Second checkpoint action (should be ignored - first one wins)
     let commit2_content = r#"{"checkpoint":{"version":2,"contentRoot":{"path":"second.parquet","sizeInBytes":2048}}}"#;
 
     futures::executor::block_on(async {
@@ -675,13 +675,13 @@ fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
     assert!(protocol.is_some(), "Should find protocol");
     assert!(checkpoint_action.is_some(), "Should find checkpoint action");
 
-    // Currently returns the MOST RECENT content root (from commit 2)
+    // Currently returns the MOST RECENT checkpoint action (from commit 2)
     // This is because the implementation continues searching and try_new_from_data
     // returns the last one it encounters
     let checkpoint_action = checkpoint_action.unwrap();
     assert_eq!(
         checkpoint_action.content_root.path, "second.parquet",
-        "Returns most recent content root"
+        "Returns most recent checkpoint action"
     );
     assert_eq!(checkpoint_action.content_root.size_in_bytes, 2048);
     assert_eq!(checkpoint_action.version, 2);

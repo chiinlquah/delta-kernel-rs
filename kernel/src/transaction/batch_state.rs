@@ -173,7 +173,7 @@ impl BatchState {
     /// # Returns
     ///
     /// * `Ok(Some(Url))` - The URL of the root manifest.
-    /// * `Ok(None)` - No content root exists yet.
+    /// * `Ok(None)` - No checkpoint action exists yet.
     /// * `Err` - Error constructing the URL.
     pub fn root_manifest_url(&self, _engine: &dyn Engine) -> DeltaResult<Option<Url>> {
         let checkpoint_action = self.read_snapshot.checkpoint_action();

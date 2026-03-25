@@ -445,7 +445,7 @@ impl<S> Transaction<S> {
     }
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
-    /// domain metadata, and add actions (or content root for batch commits).
+    /// domain metadata, and add actions (or checkpoint action for batch commits).
     fn generate_log_actions(
         &self,
         engine: &dyn Engine,
@@ -545,7 +545,7 @@ impl<S> Transaction<S> {
                     // Replay delta log from the version after the checkpoint action
                     (builder, Some(root_path), checkpoint_action.version + 1)
                 } else {
-                    // No content root found, start with empty metadata
+                    // No checkpoint action found, start with empty metadata
                     // Use commit_version for the new metadata, not the current snapshot version
                     let builder = crate::content_tree::builder::ContentTreeNodeBuilder::new_for(
                         table_root.clone(),
@@ -563,7 +563,7 @@ impl<S> Transaction<S> {
 
                 // TODO: Process incremental removes from delta log and mark them as DELETED
                 // in the appropriate leaf manifests. This requires:
-                // 1. Scanning delta log for Remove actions since the content root version
+                // 1. Scanning delta log for Remove actions since the checkpoint action version
                 // 2. Looking up which leaf manifest each removed file is in (via manifest metadata)
                 // 3. Calling metadata_builder.delete_from_leaf() for each removed file
                 // This is deferred to future work as it requires a new delta log processor.
@@ -616,9 +616,9 @@ impl<S> Transaction<S> {
                 b.apply_to_builder(&mut metadata_builder)?;
             }
 
-            // In batch mode, process ALL remove actions and mark entries as DELETED in the ContentRoot
-            // The ContentRoot manages all file state, so any removes should be reflected there
-            // This applies whether we loaded from an existing ContentRoot or built from snapshot
+            // In batch mode, process ALL remove actions and mark entries as DELETED in the content tree.
+            // The content tree manages all file state, so any removes should be reflected there.
+            // This applies whether we loaded from an existing checkpoint action or built from snapshot.
             if !self.remove_files_metadata.is_empty() {
                 let leaf_deletions = {
                     let mut visitor = ScanMetadataRemoveVisitor::new(
@@ -2454,13 +2454,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
+        // Step 3: Write checkpoint action (v1)
         write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2503,7 +2503,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2536,7 +2536,7 @@ mod tests {
         // Step 1: Create initial table (v0)
         create_initial_table(&table_root, true)?;
 
-        // Step 2: Build a leaf manifest with 5 data files and write a content root (v1)
+        // Step 2: Build a leaf manifest with 5 data files and write a checkpoint action (v1)
         let mut leaf_builder =
             ContentTreeNodeBuilder::new_for(table_root.clone(), 1, test_table_physical_schema());
         let data_files: Vec<String> = (0..5).map(|i| format!("data/file-{}.parquet", i)).collect();
@@ -2694,13 +2694,13 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Step 3: Write ContentRoot action (v1)
+        // Step 3: Write checkpoint action (v1)
         write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
         // Step 4: Scan to get initial file list
         let initial_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(initial_files.len(), 5, "Expected 5 data files");
 
@@ -2743,7 +2743,7 @@ mod tests {
         // Step 6: Scan again to verify file was removed
         let final_files: Vec<String> = get_files_from_scan(&table_root, &engine)?
             .into_iter()
-            .filter(|f| !f.contains(".content.")) // Filter out ContentRoot metadata files
+            .filter(|f| !f.contains(".content.")) // Filter out content tree metadata files
             .collect();
         assert_eq!(final_files.len(), 4, "Expected 4 data files after removal");
 
@@ -2913,7 +2913,7 @@ mod tests {
         let canonical_path = std::fs::canonicalize(temp_dir.path())?;
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
-        // Step 1: Create initial table (v0) with Protocol + Metadata for content root support
+        // Step 1: Create initial table (v0) with Protocol + Metadata for checkpoint action support
         // Create a table with metadataTree-experimental feature and column mapping
         use serde_json::json;
         use std::fs::{create_dir_all, write};

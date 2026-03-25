@@ -700,9 +700,6 @@ impl RowVisitor for InCommitTimestampVisitor {
     }
 }
 
-/// Visitor to extract ContentRoot actions from log batches.
-///
-/// ContentRoot actions point to a metadata tree that contains all file actions (adds/removes)
 /// Visitor to extract checkpoint actions from log batches.
 ///
 /// Checkpoint actions embed V4 metadata tree state in a Delta log entry, pointing to a root
