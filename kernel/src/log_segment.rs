@@ -1206,6 +1206,9 @@ impl LogSegment {
         existing_protocol: Option<&Protocol>,
         lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<CheckpointAction>)> {
+        // TODO: When CheckpointAction contains optional P+M, revisit checkpoint discovery to
+        // extract P+M directly from the checkpoint action.
+
         // Try CRC-optimized path for P&M
         let (mut metadata_opt, mut protocol_opt) =
             self.read_protocol_metadata_opt(engine, lazy_crc)?;
