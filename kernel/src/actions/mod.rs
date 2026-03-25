@@ -2182,7 +2182,7 @@ mod tests {
             .unwrap();
 
         let expected = StructType::new_unchecked([StructField::nullable(
-            "checkpoint",
+            CHECKPOINT_ACTION_NAME,
             StructType::new_unchecked([
                 StructField::not_null("version", DataType::LONG),
                 StructField::not_null(

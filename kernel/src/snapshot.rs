@@ -277,11 +277,7 @@ impl Snapshot {
         let existing_protocol = existing_snapshot.table_configuration().protocol();
         let temp_crc = LazyCrc::new(new_log_segment.listed.latest_crc_file.clone());
         let (new_metadata, new_protocol, new_checkpoint_action) = new_log_segment
-            .protocol_and_metadata_and_checkpoint_action(
-                engine,
-                Some(existing_protocol),
-                &temp_crc,
-            )?;
+            .protocol_and_metadata_and_checkpoint(engine, Some(existing_protocol), &temp_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -403,7 +399,7 @@ impl Snapshot {
         let start = Instant::now();
         // No existing protocol for initial snapshot - search will start optimistically
         let (metadata_opt, protocol_opt, checkpoint_action) =
-            log_segment.protocol_and_metadata_and_checkpoint_action(engine, None, &lazy_crc)?;
+            log_segment.protocol_and_metadata_and_checkpoint(engine, None, &lazy_crc)?;
 
         let read_metadata_duration = start.elapsed();
 

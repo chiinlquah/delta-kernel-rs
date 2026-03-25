@@ -1200,7 +1200,7 @@ impl LogSegment {
     /// The `lazy_crc` parameter is used for the CRC-optimized P&M path. Callers that want the
     /// CRC to be cached on a shared [`LazyCrc`] instance (e.g. the snapshot's own `lazy_crc`)
     /// should pass that instance here.
-    pub(crate) fn protocol_and_metadata_and_checkpoint_action(
+    pub(crate) fn protocol_and_metadata_and_checkpoint(
         &self,
         engine: &dyn Engine,
         existing_protocol: Option<&Protocol>,

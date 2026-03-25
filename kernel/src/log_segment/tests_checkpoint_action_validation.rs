@@ -81,7 +81,7 @@ fn test_error_when_protocol_lacks_feature_but_checkpoint_action_exists() -> Delt
     };
 
     // Should error because checkpoint action exists but protocol doesn't support it
-    let result = log_segment.protocol_and_metadata_and_checkpoint_action(
+    let result = log_segment.protocol_and_metadata_and_checkpoint(
         engine.as_ref(),
         None,
         &LazyCrc::new(None),
@@ -172,7 +172,7 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
 
     // Pass existing protocol - should skip checkpoint action search entirely
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(
+        .protocol_and_metadata_and_checkpoint(
             engine.as_ref(),
             Some(&existing_protocol),
             &LazyCrc::new(None),
@@ -254,7 +254,7 @@ fn test_find_checkpoint_action_when_protocol_has_feature() -> DeltaResult<()> {
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
+        .protocol_and_metadata_and_checkpoint(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -354,7 +354,7 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
+        .protocol_and_metadata_and_checkpoint(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -456,7 +456,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
+        .protocol_and_metadata_and_checkpoint(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
@@ -562,7 +562,7 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(
+        .protocol_and_metadata_and_checkpoint(
             engine.as_ref(),
             Some(&existing_protocol),
             &LazyCrc::new(None),
@@ -669,7 +669,7 @@ fn test_multiple_checkpoint_actions_returns_most_recent() -> DeltaResult<()> {
     };
 
     let (metadata, protocol, checkpoint_action) = log_segment
-        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
+        .protocol_and_metadata_and_checkpoint(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");

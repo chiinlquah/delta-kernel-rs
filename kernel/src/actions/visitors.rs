@@ -740,9 +740,9 @@ impl RowVisitor for CheckpointActionVisitor {
 /// Extract a [`CheckpointAction`] from getters at the given row index.
 ///
 /// Getter layout (derived from `CheckpointAction::to_schema`):
-///   [0] version
-///   [1] contentRoot.path
-///   [2] contentRoot.sizeInBytes
+///   \[0\] version
+///   \[1\] contentRoot.path
+///   \[2\] contentRoot.sizeInBytes
 #[internal_api]
 pub(crate) fn visit_checkpoint_action_at<'a>(
     row_index: usize,
