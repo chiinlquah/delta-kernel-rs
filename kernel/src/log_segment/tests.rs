@@ -111,7 +111,7 @@ fn test_replay_for_metadata() {
     // 5. txn (physically missing P&M columns)
     //
     // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
-    // now also looks for ContentRoot in addition to P&M, so it doesn't terminate early.
+    // now also looks for checkpoint action in addition to P&M, so it doesn't terminate early.
     //
     // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
     //
@@ -1190,7 +1190,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1265,7 +1265,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1335,7 +1335,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1393,7 +1393,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -1489,7 +1489,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,  // meta_predicate
         None,  // stats_schema
         None,  // partition_schema
-        None,  // content_root
+        None,  // checkpoint_action
         None,  // data_predicate
         false, // skip_leaf_manifests
         None,  // table_schema
@@ -3345,7 +3345,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
-        None, // content_root
+        None, // checkpoint_action
         None, // data_predicate
         false,
         None, // table_schema
@@ -3414,7 +3414,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
-        None, // content_root
+        None, // checkpoint_action
         None, // data_predicate
         false,
         None, // table_schema

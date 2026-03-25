@@ -4628,18 +4628,18 @@ mod tests {
             };
         }
 
-        // Step 5: Read the ContentRoot file directly to verify persisted sizes
+        // Step 5: Read the checkpoint action file directly to verify persisted sizes
         let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let content_root_info = snapshot_v2
-            .content_root()
-            .expect("Table should have ContentRoot after batch commit");
+        let checkpoint_action = snapshot_v2
+            .checkpoint_action()
+            .expect("Table should have checkpoint action after batch commit");
 
-        let root_manifest_url = table_url.join(content_root_info.path())?;
+        let root_manifest_url = table_url.join(checkpoint_action.path())?;
 
         let (iter, version, path_in_log) = ContentTreeNode::open_stream(
             engine.parquet_handler(),
             &root_manifest_url,
-            content_root_info.path().to_string(),
+            checkpoint_action.path().to_string(),
             None,
             None,
         )?;

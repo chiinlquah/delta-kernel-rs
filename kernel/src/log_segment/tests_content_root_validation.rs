@@ -15,7 +15,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     (store, log_root)
 }
 
-/// Test error when protocol lacks feature but content root exists
+/// Test error when protocol lacks feature but checkpoint action exists
 ///
 /// Scenario: Protocol without feature, then content root action in later commit
 /// Expected: Should error - invalid table state
@@ -30,7 +30,7 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
 
     // Commit 1: ContentRoot (invalid - protocol doesn't support it)
     let commit1_content =
-        r#"{"contentRoot":{"path":"root.parquet","sizeInBytes":1024,"version":1}}"#;
+        r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -80,8 +80,8 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
         checkpoint_schema: None,
     };
 
-    // Should error because content root exists but protocol doesn't support it
-    let result = log_segment.protocol_and_metadata_and_content_root(
+    // Should error because checkpoint action exists but protocol doesn't support it
+    let result = log_segment.protocol_and_metadata_and_checkpoint_action(
         engine.as_ref(),
         None,
         &LazyCrc::new(None),
@@ -89,13 +89,13 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
 
     assert!(
         result.is_err(),
-        "Should error when content root exists without protocol support"
+        "Should error when checkpoint action exists without protocol support"
     );
     let err = result.unwrap_err();
     assert!(
-        err.to_string().contains("ContentRoot")
+        err.to_string().contains("checkpoint action")
             && err.to_string().contains("MetadataTreeExperimental"),
-        "Error should mention ContentRoot and MetadataTreeExperimental, got: {}",
+        "Error should mention checkpoint action and MetadataTreeExperimental, got: {}",
         err
     );
 
@@ -105,7 +105,7 @@ fn test_error_when_protocol_lacks_feature_but_content_root_exists() -> DeltaResu
 /// Test correctness: skip content root search when existing protocol lacks feature
 ///
 /// Scenario: Existing protocol without feature passed in
-/// Expected: Should not search for content root (feature not supported)
+/// Expected: Should not search for checkpoint action (feature not supported)
 #[test]
 fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -120,7 +120,7 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
 
     // Commit 1: ContentRoot (should not be searched because existing protocol lacks feature)
     let commit1_content =
-        r#"{"contentRoot":{"path":"root.parquet","sizeInBytes":1024,"version":1}}"#;
+        r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -171,23 +171,24 @@ fn test_skip_search_when_existing_protocol_lacks_feature() -> DeltaResult<()> {
     };
 
     // Pass existing protocol - should skip content root search entirely
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        Some(&existing_protocol),
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(
+            engine.as_ref(),
+            Some(&existing_protocol),
+            &LazyCrc::new(None),
+        )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_none(), "Should not find new protocol");
     assert!(
-        content_root.is_none(),
-        "Should NOT search for content root when existing protocol lacks feature"
+        checkpoint_action.is_none(),
+        "Should NOT search for checkpoint action when existing protocol lacks feature"
     );
 
     Ok(())
 }
 
-/// Test happy path: find content root when protocol supports it
+/// Test happy path: find checkpoint action when protocol supports it
 ///
 /// Scenario: Protocol with feature, content root in later commit
 /// Expected: Should find metadata, protocol, and content root
@@ -202,7 +203,7 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
 
     // Commit 1: Content root
     let commit1_content =
-        r#"{"contentRoot":{"path":"root.parquet","sizeInBytes":1024,"version":1}}"#;
+        r#"{"checkpoint":{"version":1,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -252,22 +253,19 @@ fn test_find_content_root_when_protocol_has_feature() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        None,
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
     assert!(
-        content_root.is_some(),
-        "Should find content root when protocol supports it"
+        checkpoint_action.is_some(),
+        "Should find checkpoint action when protocol supports it"
     );
 
-    let content_root = content_root.unwrap();
-    assert_eq!(content_root.path, "root.parquet");
-    assert_eq!(content_root.size_in_bytes, 1024);
+    let checkpoint_action = checkpoint_action.unwrap();
+    assert_eq!(checkpoint_action.content_root.path, "root.parquet");
+    assert_eq!(checkpoint_action.content_root.size_in_bytes, 1024);
 
     Ok(())
 }
@@ -355,17 +353,14 @@ fn test_early_termination_when_feature_enabled_in_later_commit() -> DeltaResult<
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        None,
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
     assert!(
-        content_root.is_none(),
-        "Should NOT find content root (feature just enabled, none written yet)"
+        checkpoint_action.is_none(),
+        "Should NOT find checkpoint action (feature just enabled, none written yet)"
     );
 
     // Verify we found the upgraded protocol
@@ -396,7 +391,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
 
     // Commit 2: ContentRoot (should be found - we must keep searching)
     let commit2_content =
-        r#"{"contentRoot":{"path":"root.parquet","sizeInBytes":1024,"version":2}}"#;
+        r#"{"checkpoint":{"version":2,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -460,22 +455,19 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        None,
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
     assert!(
-        content_root.is_some(),
-        "Should find content root (must keep searching until found)"
+        checkpoint_action.is_some(),
+        "Should find checkpoint action (must keep searching until found)"
     );
 
-    let content_root = content_root.unwrap();
-    assert_eq!(content_root.path, "root.parquet");
-    assert_eq!(content_root.version, 2);
+    let checkpoint_action = checkpoint_action.unwrap();
+    assert_eq!(checkpoint_action.content_root.path, "root.parquet");
+    assert_eq!(checkpoint_action.version, 2);
 
     Ok(())
 }
@@ -483,7 +475,7 @@ fn test_continue_searching_when_started_optimistically() -> DeltaResult<()> {
 /// Test continued searching when existing protocol has feature
 ///
 /// Scenario: Existing protocol with feature, content root in later commit
-/// Expected: Should search and find content root
+/// Expected: Should search and find checkpoint action
 #[test]
 fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -505,7 +497,7 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
 
     // Commit 2: ContentRoot (should be found)
     let commit2_content =
-        r#"{"contentRoot":{"path":"root.parquet","sizeInBytes":1024,"version":2}}"#;
+        r#"{"checkpoint":{"version":2,"contentRoot":{"path":"root.parquet","sizeInBytes":1024}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -569,11 +561,12 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        Some(&existing_protocol),
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(
+            engine.as_ref(),
+            Some(&existing_protocol),
+            &LazyCrc::new(None),
+        )?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(
@@ -581,13 +574,13 @@ fn test_continue_searching_when_existing_protocol_has_feature() -> DeltaResult<(
         "Should not find new protocol (using existing)"
     );
     assert!(
-        content_root.is_some(),
-        "Should find content root (existing protocol has feature)"
+        checkpoint_action.is_some(),
+        "Should find checkpoint action (existing protocol has feature)"
     );
 
-    let content_root = content_root.unwrap();
-    assert_eq!(content_root.path, "root.parquet");
-    assert_eq!(content_root.version, 2);
+    let checkpoint_action = checkpoint_action.unwrap();
+    assert_eq!(checkpoint_action.content_root.path, "root.parquet");
+    assert_eq!(checkpoint_action.version, 2);
 
     Ok(())
 }
@@ -608,11 +601,10 @@ fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
 
     // Commit 1: First ContentRoot
     let commit1_content =
-        r#"{"contentRoot":{"path":"first.parquet","sizeInBytes":1024,"version":1}}"#;
+        r#"{"checkpoint":{"version":1,"contentRoot":{"path":"first.parquet","sizeInBytes":1024}}}"#;
 
     // Commit 2: Second ContentRoot (should be ignored - first one wins)
-    let commit2_content =
-        r#"{"contentRoot":{"path":"second.parquet","sizeInBytes":2048,"version":2}}"#;
+    let commit2_content = r#"{"checkpoint":{"version":2,"contentRoot":{"path":"second.parquet","sizeInBytes":2048}}}"#;
 
     futures::executor::block_on(async {
         store
@@ -676,26 +668,23 @@ fn test_multiple_content_roots_returns_most_recent() -> DeltaResult<()> {
         checkpoint_schema: None,
     };
 
-    let (metadata, protocol, content_root) = log_segment.protocol_and_metadata_and_content_root(
-        engine.as_ref(),
-        None,
-        &LazyCrc::new(None),
-    )?;
+    let (metadata, protocol, checkpoint_action) = log_segment
+        .protocol_and_metadata_and_checkpoint_action(engine.as_ref(), None, &LazyCrc::new(None))?;
 
     assert!(metadata.is_some(), "Should find metadata");
     assert!(protocol.is_some(), "Should find protocol");
-    assert!(content_root.is_some(), "Should find content root");
+    assert!(checkpoint_action.is_some(), "Should find checkpoint action");
 
     // Currently returns the MOST RECENT content root (from commit 2)
     // This is because the implementation continues searching and try_new_from_data
     // returns the last one it encounters
-    let content_root = content_root.unwrap();
+    let checkpoint_action = checkpoint_action.unwrap();
     assert_eq!(
-        content_root.path, "second.parquet",
+        checkpoint_action.content_root.path, "second.parquet",
         "Returns most recent content root"
     );
-    assert_eq!(content_root.size_in_bytes, 2048);
-    assert_eq!(content_root.version, 2);
+    assert_eq!(checkpoint_action.content_root.size_in_bytes, 2048);
+    assert_eq!(checkpoint_action.version, 2);
 
     Ok(())
 }

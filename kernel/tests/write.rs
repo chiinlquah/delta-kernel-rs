@@ -2285,19 +2285,19 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // With batch_commit, JSON log should contain: commit_info + contentRoot
+        // With batch_commit, JSON log should contain: commit_info + checkpoint action
         // No add actions should be in the JSON log
         assert_eq!(
             parsed_actions.len(),
             2,
-            "Expected commit info and contentRoot actions, got {}. Actions: {:?}",
+            "Expected commit info and checkpoint actions, got {}. Actions: {:?}",
             parsed_actions.len(),
             parsed_actions
         );
         assert!(parsed_actions[0].get("commitInfo").is_some());
         assert!(
-            parsed_actions[1].get("contentRoot").is_some(),
-            "Second action should be contentRoot, but got: {:?}",
+            parsed_actions[1].get("checkpoint").is_some(),
+            "Second action should be checkpoint, but got: {:?}",
             parsed_actions[1]
         );
 
@@ -3589,7 +3589,7 @@ async fn batch_remove_all_files_impl(
         }
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        assert_eq!(snapshot.content_root().is_some(), with_existing_root);
+        assert_eq!(snapshot.checkpoint_action().is_some(), with_existing_root);
 
         let mut txn = snapshot
             .clone()

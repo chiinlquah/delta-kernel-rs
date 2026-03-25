@@ -74,7 +74,7 @@ async fn test_create_table_batch_commit_with_leaves() -> Result<(), Box<dyn std:
         Snapshot::builder_for(delta_kernel::try_parse_uri(&table_path)?).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
     assert!(
-        snapshot.content_root().is_some(),
+        snapshot.checkpoint_action().is_some(),
         "Batch commit should produce a content root"
     );
 

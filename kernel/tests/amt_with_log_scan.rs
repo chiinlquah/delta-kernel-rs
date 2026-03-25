@@ -71,7 +71,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                     assert_eq!(c.commit_version(), 2);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        new_snapshot.content_root().is_some(),
+                        new_snapshot.checkpoint_action().is_some(),
                         "Root manifest should exist"
                     );
                 }
@@ -178,7 +178,7 @@ async fn test_files_added_after_root() -> Result<(), Box<dyn std::error::Error>>
                 CommitResult::CommittedTransaction(c) => {
                     assert_eq!(c.commit_version(), 5);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -241,7 +241,7 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 1);
                     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        snapshot_v1.content_root().is_some(),
+                        snapshot_v1.checkpoint_action().is_some(),
                         "v1 should create root manifest"
                     );
                 }
@@ -337,7 +337,7 @@ async fn test_file_removal_of_root_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 3);
                     let new_snapshot: Arc<Snapshot> =
                         Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -402,7 +402,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 1);
                     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        snapshot_v1.content_root().is_some(),
+                        snapshot_v1.checkpoint_action().is_some(),
                         "v1 should create root manifest"
                     );
                 }
@@ -504,7 +504,7 @@ async fn test_file_removal_of_leaf_entry_in_log() -> Result<(), Box<dyn std::err
                     assert_eq!(c.commit_version(), 3);
                     let new_snapshot: Arc<Snapshot> =
                         Snapshot::builder_for(table_url.clone()).build(&engine)?;
-                    assert!(new_snapshot.content_root().is_some());
+                    assert!(new_snapshot.checkpoint_action().is_some());
                 }
                 other => panic!("Expected success, got {:?}", other),
             };
@@ -718,7 +718,7 @@ async fn test_dv_replacement() -> Result<(), Box<dyn std::error::Error>> {
                     assert_eq!(c.commit_version(), 4);
                     let new_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
                     assert!(
-                        new_snapshot.content_root().is_some(),
+                        new_snapshot.checkpoint_action().is_some(),
                         "v4 should create new root manifest"
                     );
                 }
