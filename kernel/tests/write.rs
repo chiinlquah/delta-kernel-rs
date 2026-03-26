@@ -60,7 +60,7 @@ use test_utils::{
 
 mod common;
 
-/// Create a simple schema with column mapping enabled (required for batch_commit mode)
+/// Create a simple schema with column mapping enabled (required for manifest_commit mode)
 fn create_column_mapping_schema(
     field_name: &str,
     data_type: DataType,
@@ -136,8 +136,8 @@ fn validate_timestamp(commit_info: &serde_json::Value) {
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// Creates tables with MetadataTreeExperimental feature for batch commit tests
-async fn setup_batch_commit_test_tables(
+/// Creates tables with MetadataTreeExperimental feature for manifest commit tests
+async fn setup_manifest_commit_test_tables(
     schema: Arc<StructType>,
     partition_columns: &[&str],
     table_base_name: &str,
@@ -480,7 +480,7 @@ async fn batch_write_data_and_check_result_and_stats(
         .clone()
         .transaction(committer, engine.as_ref())?
         .with_data_change(true);
-    txn.with_batch_commit();
+    txn.with_manifest_commit();
     append_data_and_check_result_and_stats(snapshot, txn, schema, engine, expected_since_commit)
         .await
 }
@@ -2290,24 +2290,24 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_manifest_commit_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a table with column mapping (required for batch_commit mode)
+    // create a table with column mapping (required for manifest_commit mode)
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, store, table_name) in
-        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
+        setup_manifest_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("batch commit test");
-        txn.with_batch_commit();
+            .with_engine_info("manifest commit test");
+        txn.with_manifest_commit();
 
         // Commit without adding any add files
-        // Note: batch_commit flag is currently a placeholder for future metadata tree writing
+        // Note: manifest_commit flag is currently a placeholder for future metadata tree writing
         assert!(txn.commit(&engine)?.is_committed());
 
         let commit1 = store
@@ -2328,22 +2328,22 @@ async fn test_batch_commit_no_add_actions() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
-async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // create a simple table with column mapping (required for batch_commit mode)
+    // create a simple table with column mapping (required for manifest_commit mode)
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, store, table_name) in
-        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
+        setup_manifest_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("batch commit test")
+            .with_engine_info("manifest commit test")
             .with_data_change(true);
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -2378,9 +2378,9 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
         }
 
         // commit!
-        // With batch_commit, add actions are written to metadata tree (parquet file)
+        // With manifest_commit, add actions are written to metadata tree (parquet file)
         let result = txn.commit(engine.as_ref())?;
-        assert!(result.is_committed(), "Batch commit should succeed");
+        assert!(result.is_committed(), "Manifest commit should succeed");
 
         // Verify the commit was written
         let commit1 = store
@@ -2393,7 +2393,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // With batch_commit, JSON log should contain: commit_info + checkpoint action
+        // With manifest_commit, JSON log should contain: commit_info + checkpoint action
         // No add actions should be in the JSON log
         assert_eq!(
             parsed_actions.len(),
@@ -2415,7 +2415,7 @@ async fn test_batch_commit_with_add_files() -> Result<(), Box<dyn std::error::Er
             .any(|action| action.get("add").is_some());
         assert!(
             !has_add_actions,
-            "Batch commit should not write add actions to JSON log"
+            "Manifest commit should not write add actions to JSON log"
         );
     }
     Ok(())
@@ -3047,13 +3047,13 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
 /// Helper method: Adds and then removes files and then verifies they don't appear in the scan.
 async fn remove_files_verify_files_excluded_from_scan_impl(
-    use_batch_commit: bool,
+    use_manifest_commit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // batch_commit mode requires column mapping
-    let schema = if use_batch_commit {
+    // manifest_commit mode requires column mapping
+    let schema = if use_manifest_commit {
         create_column_mapping_schema("number", DataType::INTEGER)?
     } else {
         Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -3066,8 +3066,8 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
         )])])?)
     };
 
-    let tables = if use_batch_commit {
-        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
+    let tables = if use_manifest_commit {
+        setup_manifest_commit_test_tables(schema.clone(), &[], "test_table").await?
     } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     };
@@ -3075,7 +3075,7 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
     for (table_url, engine, _store, _table_name) in tables {
         // First, add some files to the table
         let engine = Arc::new(engine);
-        if use_batch_commit {
+        if use_manifest_commit {
             batch_write_data_and_check_result_and_stats(
                 table_url.clone(),
                 schema.clone(),
@@ -3107,9 +3107,9 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
-        // Conditionally enable batch commit mode
-        if use_batch_commit {
-            txn.with_batch_commit();
+        // Conditionally enable manifest commit mode
+        if use_manifest_commit {
+            txn.with_manifest_commit();
         }
 
         // Create a new scan to get file metadata for removal
@@ -3147,9 +3147,9 @@ async fn remove_files_verify_files_excluded_from_scan_impl(
 #[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Tests both batch and non-batch commit modes.
-    for use_batch_commit in [false, true] {
-        remove_files_verify_files_excluded_from_scan_impl(use_batch_commit).await?;
+    // Tests both manifest commit and log commit modes.
+    for use_manifest_commit in [false, true] {
+        remove_files_verify_files_excluded_from_scan_impl(use_manifest_commit).await?;
     }
     Ok(())
 }
@@ -3158,12 +3158,12 @@ async fn test_remove_files_verify_files_excluded_from_scan(
 /// 1. Calling remove_files multiple times with different subsets
 /// 2. Modifying the selection vector to choose which files to remove
 async fn remove_files_with_modified_selection_vector_impl(
-    use_batch_commit: bool,
+    use_manifest_commit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // batch_commit mode requires column mapping
-    let schema = if use_batch_commit {
+    // manifest_commit mode requires column mapping
+    let schema = if use_manifest_commit {
         create_column_mapping_schema("number", DataType::INTEGER)?
     } else {
         Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -3176,8 +3176,8 @@ async fn remove_files_with_modified_selection_vector_impl(
         )])])?)
     };
 
-    let tables = if use_batch_commit {
-        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
+    let tables = if use_manifest_commit {
+        setup_manifest_commit_test_tables(schema.clone(), &[], "test_table").await?
     } else {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     };
@@ -3187,7 +3187,7 @@ async fn remove_files_with_modified_selection_vector_impl(
 
         // Write data multiple times to create multiple files
         for i in 1..=5 {
-            if use_batch_commit {
+            if use_manifest_commit {
                 batch_write_data_and_check_result_and_stats(
                     table_url.clone(),
                     schema.clone(),
@@ -3234,9 +3234,9 @@ async fn remove_files_with_modified_selection_vector_impl(
             .with_operation("DELETE".to_string())
             .with_data_change(true);
 
-        // Conditionally enable batch commit mode
-        if use_batch_commit {
-            txn.with_batch_commit();
+        // Conditionally enable manifest commit mode
+        if use_manifest_commit {
+            txn.with_manifest_commit();
         }
 
         // First batch: Remove only the first file
@@ -3349,9 +3349,9 @@ async fn remove_files_with_modified_selection_vector_impl(
 #[tokio::test]
 async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
 {
-    // Tests both batch and non-batch commit modes.
-    for use_batch_commit in [false, true] {
-        remove_files_with_modified_selection_vector_impl(use_batch_commit).await?;
+    // Tests both manifest commit and log commit modes.
+    for use_manifest_commit in [false, true] {
+        remove_files_with_modified_selection_vector_impl(use_manifest_commit).await?;
     }
     Ok(())
 }
@@ -3567,23 +3567,23 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Test that batch commits create a checkpoint action that is properly detected
+/// Test that manifest commits create a checkpoint action that is properly detected
 /// during log replay. This test verifies:
 /// 1. Creates a table with initial data
-/// 2. Performs a batch commit (which writes a checkpoint action)
+/// 2. Performs a manifest commit (which writes a checkpoint action)
 /// 3. Verifies the checkpoint action is written to the commit file
 /// 4. Creates a fresh Snapshot and verifies it builds successfully
 #[tokio::test]
-async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_manifest_commit_content_root_detected_in_scan(
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Create a simple table schema with column mapping (required for batch_commit mode)
+    // Create a simple table schema with column mapping (required for manifest_commit mode)
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     // Setup table with column mapping - wrap engine in Arc for helper functions
     for (table_url, engine, store, _table_name) in
-        setup_batch_commit_test_tables(schema.clone(), &[], "batch_commit_test").await?
+        setup_manifest_commit_test_tables(schema.clone(), &[], "manifest_commit_test").await?
     {
         let engine = Arc::new(engine);
 
@@ -3594,29 +3594,29 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         assert_eq!(snapshot1.version(), 1);
 
-        // Step 2: Perform a batch commit (commit 2)
+        // Step 2: Perform a manifest commit (commit 2)
         // This should create a checkpoint action pointing to a metadata tree
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut batch_txn = snapshot
+        let mut manifest_txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_engine_info("batch commit test")
+            .with_engine_info("manifest commit test")
             .with_operation("BATCH_COMMIT".to_string());
-        batch_txn.with_batch_commit();
+        manifest_txn.with_manifest_commit();
 
-        // Add data in the batch commit
-        add_files_to_transaction(&mut batch_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
+        // Add data in the manifest commit
+        add_files_to_transaction(&mut manifest_txn, &engine, schema.clone(), vec![7, 8, 9]).await?;
 
-        let batch_result = batch_txn.commit(engine.as_ref())?;
-        let batch_version = match batch_result {
+        let manifest_result = manifest_txn.commit(engine.as_ref())?;
+        let manifest_version = match manifest_result {
             CommitResult::CommittedTransaction(committed) => {
                 assert_eq!(committed.commit_version(), 2);
                 committed.commit_version()
             }
-            _ => panic!("Batch commit should succeed"),
+            _ => panic!("Manifest commit should succeed"),
         };
 
-        // Step 3: Verify the batch commit contains a contentRoot action
+        // Step 3: Verify the manifest commit contains a contentRoot action
         // Get the table path from the URL (without scheme and trailing slash)
         let table_path = table_url
             .path()
@@ -3633,7 +3633,7 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         let commit_content = String::from_utf8(commit2.bytes().await?.to_vec())?;
         assert!(
             commit_content.contains("contentRoot"),
-            "Batch commit should contain a contentRoot action. Commit content: {}",
+            "Manifest commit should contain a contentRoot action. Commit content: {}",
             commit_content
         );
 
@@ -3650,8 +3650,8 @@ async fn test_batch_commit_content_root_detected_in_scan() -> Result<(), Box<dyn
         assert_eq!(log_segment.end_version, 2);
         assert_eq!(log_segment.listed.ascending_commit_files.len(), 3); // commits 0, 1, 2
 
-        // Verify the batch commit version
-        assert_eq!(batch_version, 2);
+        // Verify the manifest commit version
+        assert_eq!(manifest_version, 2);
     }
 
     Ok(())
@@ -3672,7 +3672,7 @@ async fn batch_remove_all_files_impl(
     let schema = create_column_mapping_schema("number", DataType::INTEGER)?;
 
     for (table_url, engine, _store, _table_name) in
-        setup_batch_commit_test_tables(schema.clone(), &[], "test_table").await?
+        setup_manifest_commit_test_tables(schema.clone(), &[], "test_table").await?
     {
         let engine = Arc::new(engine);
 
@@ -3686,7 +3686,7 @@ async fn batch_remove_all_files_impl(
             )
             .await?;
         } else {
-            // Add files via a non-batch commit — no checkpoint action established.
+            // Add files via a non-manifest commit — no checkpoint action established.
             write_data_and_check_result_and_stats(
                 table_url.clone(),
                 schema.clone(),
@@ -3705,7 +3705,7 @@ async fn batch_remove_all_files_impl(
             .with_engine_info("test engine")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         let removed =
             remove_all_scan_files(&mut txn, snapshot.scan_builder().build()?, engine.as_ref())?;
@@ -3717,12 +3717,12 @@ async fn batch_remove_all_files_impl(
 }
 
 #[tokio::test]
-async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
-    // Verify that remove_files in batch commit mode is rejected when no checkpoint action exists.
+async fn test_remove_files_manifest_commit_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // Verify that remove_files in manifest commit mode is rejected when no checkpoint action exists.
     batch_remove_all_files_impl(false, |txn, engine, _url| {
         assert!(
             txn.commit(engine.as_ref()).is_err(),
-            "expected error when removing files in batch commit mode without a checkpoint action"
+            "expected error when removing files in manifest commit mode without a checkpoint action"
         );
         Ok(())
     })
@@ -3730,9 +3730,9 @@ async fn test_remove_files_batch_commit_mode() -> Result<(), Box<dyn std::error:
 }
 
 #[tokio::test]
-async fn test_remove_files_batch_commit_mode_with_existing_root(
+async fn test_remove_files_manifest_commit_mode_with_existing_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Verify that remove_files in batch commit mode succeeds when a checkpoint action exists.
+    // Verify that remove_files in manifest commit mode succeeds when a checkpoint action exists.
     batch_remove_all_files_impl(true, |txn, engine, table_url| {
         match txn.commit(engine.as_ref())? {
             CommitResult::CommittedTransaction(committed) => {

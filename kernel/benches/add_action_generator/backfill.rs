@@ -924,20 +924,20 @@ async fn generate_content_root(
 
     println!("      ✓ Opened table at version {}", snapshot.version());
 
-    // Create transaction with batch_commit mode
+    // Create transaction with manifest_commit mode
     println!("      Creating transaction...");
 
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot.transaction(committer, engine.as_ref())?;
 
-    println!("      ✓ Transaction created in batch_commit mode");
+    println!("      ✓ Transaction created in manifest_commit mode");
 
     println!("   Step 6b: Scanning existing actions...");
 
     // Release root and delta actions (no predicate needed for counting approach)
     let scan = {
-        let batch = txn.with_batch_commit();
-        batch.release_root_and_delta_actions()?
+        let mc = txn.with_manifest_commit();
+        mc.release_root_and_delta_actions()?
     };
 
     println!("      ✓ Released root and delta actions");
@@ -1000,7 +1000,7 @@ fn partition_actions_into_leaves(
     let mut actions_in_current_leaf: usize = 0;
     let mut leaf_count: usize = 0;
 
-    let batch = txn.with_batch_commit();
+    let mc = txn.with_manifest_commit();
 
     // Scan metadata and count actions
     let scan_iter = scan.scan_metadata(engine)?;
@@ -1031,14 +1031,14 @@ fn partition_actions_into_leaves(
         if actions_in_current_leaf > 0 && actions_in_current_leaf + selected_count > batch_size {
             // Finish the current leaf before adding this batch
             let leaf_result = current_leaf_writer.take().unwrap().finish(engine)?;
-            batch.add_leaf(leaf_result)?;
+            mc.add_leaf(leaf_result)?;
             leaf_count += 1;
             actions_in_current_leaf = 0;
         }
 
         // Add this batch to the current (or new) leaf
         if current_leaf_writer.is_none() {
-            current_leaf_writer = Some(batch.new_leaf_node_writer(engine)?);
+            current_leaf_writer = Some(mc.new_leaf_node_writer(engine)?);
         }
 
         let leaf_writer = current_leaf_writer.as_mut().unwrap();
@@ -1048,7 +1048,7 @@ fn partition_actions_into_leaves(
         // If we've reached or exceeded batch_size, finish this leaf
         if actions_in_current_leaf >= batch_size {
             let leaf_result = current_leaf_writer.take().unwrap().finish(engine)?;
-            batch.add_leaf(leaf_result)?;
+            mc.add_leaf(leaf_result)?;
             leaf_count += 1;
             actions_in_current_leaf = 0;
 
@@ -1060,7 +1060,7 @@ fn partition_actions_into_leaves(
 
     // Finish any remaining leaf
     if let Some(writer) = current_leaf_writer {
-        batch.add_leaf(writer.finish(engine)?)?;
+        mc.add_leaf(writer.finish(engine)?)?;
         leaf_count += 1;
     }
 

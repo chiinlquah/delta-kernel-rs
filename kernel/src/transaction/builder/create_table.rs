@@ -48,7 +48,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::DomainMetadata,
     // ColumnMapping enables column mapping (name/id mode)
     TableFeature::ColumnMapping,
-    // MetadataTreeExperimental enables content-tree (batch commit) mode
+    // MetadataTreeExperimental enables content-tree (manifest commit) mode
     TableFeature::MetadataTreeExperimental,
     // InCommitTimestamp enables in-commit timestamps (writer-only)
     TableFeature::InCommitTimestamp,

@@ -12,7 +12,7 @@ use url::Url;
 /// Output from finishing a leaf writer.
 /// Contains metadata needed to incorporate the leaf into a transaction.
 ///
-/// This is an opaque type - use it by passing to [`crate::transaction::BatchState::add_leaf`].
+/// This is an opaque type - use it by passing to [`crate::transaction::ManifestCommitState::add_leaf`].
 #[derive(Debug)]
 pub struct LeafNodeWriterResult {
     /// Map of manifest paths (relative to table root) to roaring bitmaps indicating which entries are deleted.
@@ -245,7 +245,7 @@ impl LeafNodeWriter {
 
     /// Buffer net new files for writing to data manifest.
     ///
-    /// This method is designed for batch commit scenarios where the data contains simple
+    /// This method is designed for manifest commit scenarios where the data contains simple
     /// write metadata (path, partitionValues, size, modificationTime, stats) rather than
     /// full Add actions.
     ///

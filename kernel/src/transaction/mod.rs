@@ -38,15 +38,15 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
-pub mod batch_state;
 mod content_tree;
 pub mod leaf_writer;
+pub mod manifest_commit_state;
 
 use content_tree::ScanMetadataRemoveVisitor;
 
 // Re-export types needed for public API
-pub use batch_state::BatchState;
 pub use leaf_writer::LeafNodeWriterResult;
+pub use manifest_commit_state::ManifestCommitState;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -241,9 +241,9 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
-    // Batch (content-tree) commit state. `Some` when the caller has opted in via
-    // `with_batch_commit()`. `None` for standard incremental commits.
-    batch_state: Option<BatchState>,
+    // Manifest commit state. `Some` when the caller has opted in via
+    // `with_manifest_commit()`. `None` for log commits.
+    manifest_commit_state: Option<ManifestCommitState>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -365,20 +365,20 @@ impl<S> Transaction<S> {
         let commit_version = self.get_commit_version();
 
         // Step 4: Generate DV update actions (remove/add pairs) if any DV updates are present
-        // TODO: In batch commit mode, DV updates should be recorded in the content tree rather
+        // TODO: In manifest commit mode, DV updates should be recorded in the content tree rather
         // than written to the delta log (same issue as removes). This requires:
-        // 1. Processing dv_matched_files in the batch commit block of generate_log_actions
+        // 1. Processing dv_matched_files in the manifest commit block of generate_log_actions
         //    to update the content tree with new DV descriptors.
         // 2. Suppressing dv_update_actions from the log (similar to how remove_actions are
-        //    suppressed when batch_commit is active).
-        // 3. Including !self.dv_matched_files.is_empty() in is_batch_commit_active()'s
+        //    suppressed when manifest_commit is active).
+        // 3. Including !self.dv_matched_files.is_empty() in is_manifest_commit()'s
         //    has_work_to_do check.
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 5: Generate remove actions for the delta log (skipped in batch commit mode, where
+        // Step 5: Generate remove actions for the delta log (skipped in manifest commit mode, where
         // removes are recorded in the content tree instead).
-        let batch_commit = self.is_batch_commit_active();
-        let remove_actions = if batch_commit {
+        let manifest_commit = self.is_manifest_commit();
+        let remove_actions = if manifest_commit {
             None
         } else {
             Some(self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?)
@@ -446,7 +446,7 @@ impl<S> Transaction<S> {
     }
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
-    /// domain metadata, and add actions (or checkpoint action for batch commits).
+    /// domain metadata, and add actions (or checkpoint action for manifest commits).
     fn generate_log_actions(
         &self,
         engine: &dyn Engine,
@@ -495,8 +495,8 @@ impl<S> Transaction<S> {
                 .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
         );
 
-        // Handle batch commit - either write to metadata tree or include in JSON log
-        if self.is_batch_commit_active() {
+        // Handle manifest commit - either write to metadata tree or include in JSON log
+        if self.is_manifest_commit() {
             // Content metadata trees require column mapping mode to be ID for stable field IDs
             let column_mapping_mode = self
                 .read_snapshot
@@ -505,7 +505,7 @@ impl<S> Transaction<S> {
             require!(
                 column_mapping_mode == crate::table_features::ColumnMappingMode::Id,
                 Error::generic(format!(
-                    "Content metadata trees (batch_commit mode) require column mapping mode 'id', found '{:?}'",
+                    "Content metadata trees (manifest_commit mode) require column mapping mode 'id', found '{:?}'",
                     column_mapping_mode
                 ))
             );
@@ -513,14 +513,14 @@ impl<S> Transaction<S> {
             // Get the cached checkpoint action from the snapshot (no I/O needed)
             let latest_checkpoint_action = self.read_snapshot.checkpoint_action().cloned();
 
-            // Removes in batch mode require an existing checkpoint action so that every file
+            // Removes in manifest commit mode require an existing checkpoint action so that every file
             // carries a data_manifest_path and data_manifest_position (row ID). Without
             // a checkpoint action the scan metadata lacks those fields and we cannot locate entries.
-            // TODO: revisit whether removes should be supported for the first batch commit
+            // TODO: revisit whether removes should be supported for the first manifest commit
             // (e.g. by treating files with no manifest path as root deletions by path).
             if latest_checkpoint_action.is_none() && !self.remove_files_metadata.is_empty() {
                 return Err(Error::invalid_transaction_state(
-                    "remove_files is not supported in batch commit mode without an existing checkpoint action",
+                    "remove_files is not supported in manifest commit mode without an existing checkpoint action",
                 ));
             }
 
@@ -559,7 +559,11 @@ impl<S> Transaction<S> {
 
             // If root was released to client control, clear all root data and DV entries
             // The client will add them back via leaf manifests
-            if self.batch_state.as_ref().is_some_and(|b| b.root_released) {
+            if self
+                .manifest_commit_state
+                .as_ref()
+                .is_some_and(|b| b.root_released)
+            {
                 metadata_builder.clear_root_data_and_dv_entries();
 
                 // TODO: Process incremental removes from delta log and mark them as DELETED
@@ -613,11 +617,11 @@ impl<S> Transaction<S> {
                 )?;
             }
 
-            if let Some(b) = &self.batch_state {
+            if let Some(b) = &self.manifest_commit_state {
                 b.apply_to_builder(&mut metadata_builder)?;
             }
 
-            // In batch mode, process ALL remove actions and mark entries as DELETED in the content tree.
+            // In manifest commit mode, process ALL remove actions and mark entries as DELETED in the content tree.
             // The content tree manages all file state, so any removes should be reflected there.
             // This applies whether we loaded from an existing checkpoint action or built from snapshot.
             if !self.remove_files_metadata.is_empty() {
@@ -691,21 +695,21 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Initialize batch (content-tree) commit mode and return a mutable reference to the
-    /// [`BatchState`].
+    /// Initialize manifest commit mode and return a mutable reference to the
+    /// [`ManifestCommitState`].
     ///
-    /// Calling this method opts the transaction into the batch commit path: on
+    /// Calling this method opts the transaction into the manifest commit path: on
     /// [`Transaction::commit`], add/remove actions are recorded in the metadata content tree
     /// rather than written to the delta log directly.
     ///
-    /// Any incremental actions accumulated since the last batch commit will automatically be added
+    /// Any incremental actions accumulated since the last manifest commit will automatically be added
     /// to the tree root on commit.
     ///
     /// Requires the `metadataTree-experimental` writer feature on the table.
     ///
-    /// The returned `&mut BatchState` provides tree-manipulation methods
-    /// ([`BatchState::release_root_and_delta_actions`], [`BatchState::new_leaf_node_writer`],
-    /// [`BatchState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
+    /// The returned `&mut ManifestCommitState` provides tree-manipulation methods
+    /// ([`ManifestCommitState::release_root_and_delta_actions`], [`ManifestCommitState::new_leaf_node_writer`],
+    /// [`ManifestCommitState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
     /// other `&mut Transaction` methods.
     ///
     /// # Example
@@ -715,19 +719,19 @@ impl<S> Transaction<S> {
     ///     .with_data_change(true);
     ///
     /// {
-    ///     let batch = txn.with_batch_commit();
-    ///     let scan = batch.release_root_and_delta_actions()?;
+    ///     let mc = txn.with_manifest_commit();
+    ///     let scan = mc.release_root_and_delta_actions()?;
     ///     // ...process scan...
-    ///     let mut leaf = batch.new_leaf_node_writer(engine)?;
+    ///     let mut leaf = mc.new_leaf_node_writer(engine)?;
     ///     leaf.add_files(engine, metadata)?;
-    ///     batch.add_leaf(leaf.finish(engine)?)?;
-    /// } // batch borrow released
+    ///     mc.add_leaf(leaf.finish(engine)?)?;
+    /// } // mc borrow released
     ///
     /// txn.commit(engine)?;
     /// ```
-    pub fn with_batch_commit(&mut self) -> &mut BatchState {
-        self.batch_state.get_or_insert_with(|| {
-            BatchState::new(
+    pub fn with_manifest_commit(&mut self) -> &mut ManifestCommitState {
+        self.manifest_commit_state.get_or_insert_with(|| {
+            ManifestCommitState::new(
                 self.read_snapshot.version().wrapping_add(1),
                 self.snapshot_id,
                 self.read_snapshot.clone(),
@@ -876,29 +880,28 @@ impl<S> Transaction<S> {
         self.read_snapshot.version().wrapping_add(1)
     }
 
-    /// Returns true if this commit will be handled as a batch commit (content tree update).
+    /// Returns true if this commit will be handled as a manifest commit (content tree update).
     /// When true, add/remove actions are recorded in the content tree rather than the delta log.
-    /// Returns `true` if `with_batch_commit()` has been called on this transaction.
-    fn is_batch_transaction(&self) -> bool {
-        self.batch_state.is_some()
+    /// Returns `true` if `with_manifest_commit()` has been called on this transaction.
+    fn has_manifest_commit_state(&self) -> bool {
+        self.manifest_commit_state.is_some()
     }
 
-    ///
-    /// Batch commit is active when:
-    /// - The caller explicitly opted in via `with_batch_commit()` and the
+    /// Manifest commit is active when:
+    /// - The caller explicitly opted in via `with_manifest_commit()` and the
     ///   `metadataTree-experimental` writer feature is present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
-    fn is_batch_commit_active(&self) -> bool {
+    fn is_manifest_commit(&self) -> bool {
         let table_config = self.read_snapshot.table_configuration();
         let protocol = table_config.protocol();
-        let explicitly_requested = self.is_batch_transaction()
+        let explicitly_requested = self.has_manifest_commit_state()
             && protocol
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
         let iceberg_native_v4 = protocol
             .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
-        let can_batch_commit = explicitly_requested || iceberg_native_v4;
+        let can_manifest_commit = explicitly_requested || iceberg_native_v4;
         let leaf_manifests_empty = self
-            .batch_state
+            .manifest_commit_state
             .as_ref()
             .is_none_or(|b| b.leaf_manifests.is_empty());
         let has_work_to_do = !self.add_files_metadata.is_empty()
@@ -910,7 +913,7 @@ impl<S> Transaction<S> {
                 .map_or(self.read_snapshot.version() > 0, |ca| {
                     ca.version < self.read_snapshot.version()
                 });
-        can_batch_commit && has_work_to_do
+        can_manifest_commit && has_work_to_do
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
@@ -1832,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_with_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1845,15 +1848,15 @@ mod tests {
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
-        // Verify batch state is initialized
-        assert!(txn.is_batch_transaction());
+        // Verify manifest commit state is initialized
+        assert!(txn.has_manifest_commit_state());
         Ok(())
     }
 
     #[test]
-    fn test_with_batch_commit_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_with_manifest_commit_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1867,19 +1870,19 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test engine");
 
-        // First call creates batch state; mutate it to confirm state is preserved
-        txn.with_batch_commit().root_released = true;
+        // First call creates manifest commit state; mutate it to confirm state is preserved
+        txn.with_manifest_commit().root_released = true;
 
-        // Second call must return the same BatchState without reinitializing it
+        // Second call must return the same ManifestCommitState without reinitializing it
         assert!(
-            txn.with_batch_commit().root_released,
-            "second call to with_batch_commit should preserve existing state"
+            txn.with_manifest_commit().root_released,
+            "second call to with_manifest_commit should preserve existing state"
         );
         Ok(())
     }
 
     #[test]
-    fn test_batch_commit_default_false() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_manifest_commit_default_false() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1889,9 +1892,9 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        // Verify batch state defaults to None
+        // Verify manifest commit state defaults to None
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        assert!(txn.batch_state.is_none());
+        assert!(txn.manifest_commit_state.is_none());
         Ok(())
     }
 
@@ -2289,7 +2292,7 @@ mod tests {
     ///
     /// # Arguments
     /// * `table_root` - The table root URL
-    /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for batch_commit/content metadata trees)
+    /// * `enable_column_mapping` - If true, enables column mapping mode 'id' (required for manifest_commit/content metadata trees)
     fn create_initial_table(table_root: &Url, enable_column_mapping: bool) -> DeltaResult<()> {
         use serde_json::json;
         use std::fs::{create_dir_all, write};
@@ -2463,7 +2466,7 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        // Enable column mapping for batch_commit mode (content metadata trees)
+        // Enable column mapping for manifest_commit mode (content metadata trees)
         create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with leaf manifest containing Add actions
@@ -2502,7 +2505,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         // Remove file at row index 2 within the scan batch
         // With batched EngineData creation, all files are now in a single batch
@@ -2547,11 +2550,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: remove actions must NOT appear in the delta log when using batch commit.
-    /// In batch commit mode, removes are recorded in the content tree (manifest DV), so writing
+    /// Regression test: remove actions must NOT appear in the delta log when using manifest commit.
+    /// In manifest commit mode, removes are recorded in the content tree (manifest DV), so writing
     /// them to the log as well would cause double-counting on replay.
     #[test]
-    fn test_batch_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_manifest_commit_remove_not_written_to_log() -> Result<(), Box<dyn std::error::Error>> {
         use crate::committer::FileSystemCommitter;
         use crate::content_tree::builder::ContentTreeNodeBuilder;
         use crate::content_tree::writer::ContentTreeNodeWriter;
@@ -2583,7 +2586,7 @@ mod tests {
             .location;
         write_checkpoint_action(&table_root, root_url.as_str(), 1)?;
 
-        // Step 3: Batch-commit a remove (v2)
+        // Step 3: Manifest-commit a remove (v2)
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let scan = snapshot.clone().scan_builder().build()?;
 
@@ -2591,7 +2594,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         let mut scan_metadata_iter = scan.scan_metadata(&engine)?;
         if let Some(res) = scan_metadata_iter.next() {
@@ -2622,7 +2625,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(line)?;
             assert!(
                 json.get("remove").is_none(),
-                "batch commit should not write remove actions to the delta log, but found: {line}"
+                "manifest commit should not write remove actions to the delta log, but found: {line}"
             );
         }
 
@@ -2676,7 +2679,7 @@ mod tests {
         let table_root = Url::from_directory_path(canonical_path).unwrap();
 
         // Step 1: Create initial table (v0) with Protocol + Metadata
-        // Enable column mapping for batch_commit mode (content metadata trees)
+        // Enable column mapping for manifest_commit mode (content metadata trees)
         create_initial_table(&table_root, true)?;
 
         // Step 2: Build metadata tree with TWO leaf manifests:
@@ -2742,7 +2745,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("DELETE".to_string());
-        txn.with_batch_commit();
+        txn.with_manifest_commit();
 
         // Remove file at row index 2 (file-2.parquet which has a DV)
         // With batched EngineData creation, all files are now in a single batch
@@ -3020,24 +3023,24 @@ mod tests {
         write(&file_path, data)
             .map_err(|e| Error::generic(format!("Failed to write initial log: {e}")))?;
 
-        // Step 2: Create snapshot and transaction in batch_commit mode
+        // Step 2: Create snapshot and transaction in manifest_commit mode
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let committer = Box::new(FileSystemCommitter::new());
         let mut txn = snapshot
             .transaction(committer, &engine)?
             .with_operation("CREATE_CONTENT_ROOT".to_string());
 
-        // Step 3-4: Initialize batch state and create scan + leaf writers
+        // Step 3-4: Initialize manifest commit state and create scan + leaf writers
         let scan;
         let mut leaf1;
         let mut leaf2;
         {
-            let batch = txn.with_batch_commit();
+            let mc = txn.with_manifest_commit();
             // Step 3: Release root and delta actions
-            scan = batch.release_root_and_delta_actions()?;
+            scan = mc.release_root_and_delta_actions()?;
             // Step 4: Create leaf writers
-            leaf1 = batch.new_leaf_node_writer(&engine)?;
-            leaf2 = batch.new_leaf_node_writer(&engine)?;
+            leaf1 = mc.new_leaf_node_writer(&engine)?;
+            leaf2 = mc.new_leaf_node_writer(&engine)?;
         }
 
         // Helper to create add metadata for testing
@@ -3147,11 +3150,11 @@ mod tests {
             create_test_add_metadata(vec!["leaf2-file-0.parquet", "leaf2-file-1.parquet"])?;
         leaf2.add_files(&engine, leaf2_metadata)?;
 
-        // Step 5: Finish leaf writers and add to batch
+        // Step 5: Finish leaf writers and add to manifest commit
         {
-            let batch = txn.with_batch_commit();
-            batch.add_leaf(leaf1.finish(&engine)?)?;
-            batch.add_leaf(leaf2.finish(&engine)?)?;
+            let mc = txn.with_manifest_commit();
+            mc.add_leaf(leaf1.finish(&engine)?)?;
+            mc.add_leaf(leaf2.finish(&engine)?)?;
         }
 
         // Exhaust the scan (required before commit)
@@ -3749,9 +3752,9 @@ mod tests {
         );
     }
 
-    /// Test that icebergNativeV4 forces batch commit without explicit with_batch_commit()
+    /// Test that icebergNativeV4 forces manifest commit without explicit with_manifest_commit()
     #[test]
-    fn test_iceberg_native_v4_forces_batch_commit() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_iceberg_native_v4_forces_manifest_commit() -> Result<(), Box<dyn std::error::Error>> {
         use crate::engine::sync::SyncEngine;
         use crate::expressions::{MapData, Scalar};
         use tempfile::tempdir;
@@ -3827,16 +3830,16 @@ mod tests {
         let file_path = delta_log_path.join("00000000000000000000.json");
         write(&file_path, data)?;
 
-        // Create a transaction without calling with_batch_commit()
+        // Create a transaction without calling with_manifest_commit()
         let snapshot = crate::Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("test".to_string());
 
-        assert!(txn.batch_state.is_none());
+        assert!(txn.manifest_commit_state.is_none());
         assert!(
-            !txn.is_batch_commit_active(),
-            "batch commit should not be active without work to do"
+            !txn.is_manifest_commit(),
+            "manifest commit should not be active without work to do"
         );
 
         // Add a dummy file to trigger has_work_to_do
@@ -3860,8 +3863,8 @@ mod tests {
         txn.add_files(add_data);
 
         assert!(
-            txn.is_batch_commit_active(),
-            "icebergNativeV4 should force batch commit even without with_batch_commit()"
+            txn.is_manifest_commit(),
+            "icebergNativeV4 should force manifest commit even without with_manifest_commit()"
         );
 
         Ok(())
