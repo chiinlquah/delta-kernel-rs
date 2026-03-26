@@ -1,10 +1,10 @@
 // Tests for checkpoint action validation and optimization
 use super::*;
 use crate::engine::default::DefaultEngine;
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStore;
 use crate::DeltaResult;
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use std::sync::Arc;
 use url::Url;
 

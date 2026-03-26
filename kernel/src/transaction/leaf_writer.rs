@@ -355,7 +355,7 @@ mod tests {
     /// Helper to create a test engine, table root URL, and schema
     fn test_setup() -> (Arc<dyn Engine>, Url, SchemaRef) {
         use crate::engine::default::DefaultEngineBuilder;
-        use object_store::local::LocalFileSystem;
+        use crate::object_store::local::LocalFileSystem;
 
         let temp_path = tempfile::tempdir().unwrap().keep();
         // Use LocalFileSystem::new() (no prefix) so that absolute URLs passed to write_parquet_file

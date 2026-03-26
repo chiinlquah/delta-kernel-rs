@@ -12,12 +12,12 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::TypedGetData;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
-use object_store::ObjectStore;
 use test_utils::{
     collect_file_paths, create_add_files_metadata, create_table, engine_store_setup,
     remove_scan_files_with_selection,

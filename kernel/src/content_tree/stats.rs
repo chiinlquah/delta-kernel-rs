@@ -3014,13 +3014,12 @@ mod tests {
         };
         assert_eq!(exprs.len(), 5, "stats_parsed struct should have 5 fields");
         let tight_bounds_expr = exprs[4].as_ref();
+        // tightBounds must be derived from column stats (not a hardcoded literal).
+        // For a single column, junction normalization yields the coalesce expression directly
+        // rather than AND(...), so we only verify it is not a hardcoded literal.
         assert!(
-            !matches!(tight_bounds_expr, Expression::Literal(Scalar::Boolean(false))),
-            "tightBounds must not be hardcoded to false; should be derived from content_stats.exact_bounds"
-        );
-        assert!(
-            matches!(tight_bounds_expr, Expression::Predicate(_)),
-            "tightBounds should be Predicate(AND(...)) when columns have stats"
+            !matches!(tight_bounds_expr, Expression::Literal(_)),
+            "tightBounds must not be a hardcoded literal; should be derived from content_stats.exact_bounds"
         );
     }
 

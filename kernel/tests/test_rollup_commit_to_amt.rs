@@ -2,9 +2,9 @@
 //! then doing a batch commit to convert those stats to content_stats.
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::Snapshot;
-use object_store::ObjectStore;
 use std::sync::Arc;
 use test_utils::{create_table, engine_store_setup};
 
@@ -48,8 +48,10 @@ async fn test_batch_commit_no_op_when_up_to_date() -> Result<(), Box<dyn std::er
     // Write version 1 with an Add action (similar to first test)
     let commit_json = r#"{"add":{"path":"part-00001.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"stats":"{\"numRecords\":100,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":100},\"nullCount\":{\"id\":0}}"}}
 "#;
-    let commit_path =
-        object_store::path::Path::from(format!("no_op_batch_commit/_delta_log/{:020}.json", 1));
+    let commit_path = delta_kernel::object_store::path::Path::from(format!(
+        "no_op_batch_commit/_delta_log/{:020}.json",
+        1
+    ));
     store
         .put(&commit_path, commit_json.as_bytes().to_vec().into())
         .await?;

@@ -149,7 +149,7 @@ impl BatchState {
             self.read_snapshot
                 .schema()
                 .as_ref()
-                .make_physical(column_mapping_mode),
+                .make_physical(column_mapping_mode)?,
         );
 
         let writer = LeafNodeWriter::new(
