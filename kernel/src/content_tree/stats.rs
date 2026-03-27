@@ -1153,6 +1153,138 @@ pub(crate) fn delta_json_stats_to_content_stats(
     Ok(Some(content_stats))
 }
 
+/// Builds a content_stats entry for a single partition column.
+///
+/// Partition columns have a single constant value across all rows in the file, so:
+/// - `value_count` = num_records
+/// - `null_value_count` = num_records if partition value is null, else 0
+/// - `lower_bound` / `upper_bound` = the parsed partition value (both equal)
+/// - `exact_bounds` = true (partition values are always exact)
+fn build_partition_column_stats(
+    stats_struct: &StructType,
+    partition_value: Option<&Scalar>,
+    num_records: Option<i64>,
+) -> StructData {
+    let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
+    let mut values: Vec<Scalar> = Vec::with_capacity(fields.len());
+
+    let is_null = partition_value.map(|v| v.is_null()).unwrap_or(true);
+
+    for stats_field in &fields {
+        let scalar = match stats_field.name().as_str() {
+            VALUE_COUNT => num_records.map(Scalar::Long),
+            field if field == NULL_VALUE_COUNT => {
+                if is_null {
+                    num_records.map(Scalar::Long)
+                } else {
+                    Some(Scalar::Long(0))
+                }
+            }
+            LOWER_BOUND | UPPER_BOUND => {
+                if is_null {
+                    None
+                } else {
+                    partition_value.cloned()
+                }
+            }
+            EXACT_BOUNDS => Some(Scalar::Boolean(true)),
+            _ => None,
+        };
+
+        let scalar = scalar.unwrap_or_else(|| Scalar::Null(stats_field.data_type().clone()));
+        values.push(scalar);
+    }
+
+    StructData::new_unchecked(fields, values)
+}
+
+/// Merges partition column values into an existing content_stats `StructData`.
+///
+/// Delta Add actions store per-file statistics (`stats` JSON) only for data columns, not
+/// partition columns. Partition values are stored separately in `add.partitionValues`. This
+/// function injects partition column statistics into the AMT `content_stats` struct so that
+/// the full table schema (including partition columns) is represented.
+///
+/// For each partition column, the statistics are derived from the constant partition value:
+/// - `value_count` = `num_records`
+/// - `null_value_count` = `num_records` when the partition value is null, else 0
+/// - `lower_bound` = `upper_bound` = the typed partition value
+/// - `exact_bounds` = true
+///
+/// Partition values are keyed by **physical** column name (matching `add.partitionValues` in
+/// the Delta log). The `table_schema` must also use physical names so that field lookups and
+/// `PARQUET:field_id` metadata resolve correctly.
+///
+/// # Arguments
+/// * `content_stats` - Existing content_stats (may be `None` if no data-column stats exist)
+/// * `partition_values` - Map of physical partition column name to string-serialised value
+/// * `table_schema` - The physical table schema (including partition columns with field IDs)
+/// * `num_records` - Record count for this file (used for `value_count` / `null_value_count`)
+pub(crate) fn merge_partition_values_into_stats(
+    content_stats: Option<StructData>,
+    partition_values: &HashMap<String, String>,
+    table_schema: &StructType,
+    num_records: Option<i64>,
+) -> DeltaResult<Option<StructData>> {
+    if partition_values.is_empty() {
+        return Ok(content_stats);
+    }
+
+    let stats_struct = stats_schema(table_schema)?;
+
+    // Start from the existing content_stats fields/values, or build fresh ones from the
+    // full stats schema (all null for data columns that had no JSON stats).
+    let (mut fields, mut values) = match content_stats {
+        Some(existing) => {
+            let fields = existing.fields().to_vec();
+            let values = existing.values().to_vec();
+            (fields, values)
+        }
+        None => {
+            let fields: Vec<StructField> = stats_struct.fields().cloned().collect();
+            let values: Vec<Scalar> = fields
+                .iter()
+                .map(|f| Scalar::Null(f.data_type().clone()))
+                .collect();
+            (fields, values)
+        }
+    };
+
+    for (partition_col_name, partition_str_value) in partition_values {
+        // Find this partition column in the table schema to get its data type
+        let Some(table_field) = table_schema.field(partition_col_name) else {
+            continue;
+        };
+
+        // Parse the string value into a typed Scalar using Delta partition serialisation rules
+        let parsed_value = match table_field.data_type() {
+            DataType::Primitive(ptype) => Some(ptype.parse_scalar(partition_str_value)?),
+            _ => None,
+        };
+
+        // Find the corresponding stats field in the stats schema
+        let Some(stats_field) = stats_struct.field(partition_col_name) else {
+            continue;
+        };
+        let DataType::Struct(inner_stats_struct) = stats_field.data_type() else {
+            continue;
+        };
+
+        let partition_stats =
+            build_partition_column_stats(inner_stats_struct, parsed_value.as_ref(), num_records);
+
+        // Find the position of this column in the existing fields, or append it
+        if let Some(pos) = fields.iter().position(|f| f.name() == partition_col_name) {
+            values[pos] = Scalar::Struct(partition_stats);
+        } else {
+            fields.push(stats_field.clone());
+            values.push(Scalar::Struct(partition_stats));
+        }
+    }
+
+    Ok(Some(StructData::new_unchecked(fields, values)))
+}
+
 /// Checks if a schema's stats column is in Delta JSON format (has numRecords).
 fn is_delta_json_stats_schema(schema: &StructType, stats_column_name: &str) -> bool {
     schema
@@ -3585,6 +3717,437 @@ mod tests {
             exprs.len(),
             3,
             "expression field count must match stats_schema when minValues/maxValues are absent"
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_single_partition_column() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("part", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json =
+            r#"{"numRecords":100,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("part".to_string(), "hello".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(100),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        // Build expected stats and compare by struct equality
+        let full_stats_schema = stats_schema(&table_schema).expect("stats schema");
+
+        // Data column: id (LONG, non-nullable)
+        let id_stats_field = full_stats_schema.field("id").expect("id field");
+        let DataType::Struct(id_inner) = id_stats_field.data_type() else {
+            panic!("id stats should be a struct");
+        };
+        let expected_id = StructData::try_new(
+            id_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(100),     // value_count
+                Scalar::Long(1),       // lower_bound
+                Scalar::Long(50),      // upper_bound
+                Scalar::Boolean(true), // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let id_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "id")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            id_value,
+            Some(&Scalar::Struct(expected_id)),
+            "column stats mismatch for 'id'"
+        );
+
+        // Partition column: part (STRING, nullable)
+        let part_stats_field = full_stats_schema.field("part").expect("part field");
+        let DataType::Struct(part_inner) = part_stats_field.data_type() else {
+            panic!("part stats should be a struct");
+        };
+        let expected_part = StructData::try_new(
+            part_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(100),                   // value_count
+                Scalar::Long(0),                     // null_value_count
+                Scalar::Null(DataType::INTEGER),     // avg_value_size
+                Scalar::Null(DataType::INTEGER),     // max_value_size
+                Scalar::String("hello".to_string()), // lower_bound
+                Scalar::String("hello".to_string()), // upper_bound
+                Scalar::Boolean(true),               // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let part_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "part")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            part_value,
+            Some(&Scalar::Struct(expected_part)),
+            "partition stats mismatch for 'part'"
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_null_partition_value() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("region", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json =
+            r#"{"numRecords":50,"minValues":{"id":10},"maxValues":{"id":20},"nullCount":{"id":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        // Empty string value -> null partition (Delta convention: empty string means null)
+        let partition_values = HashMap::from([("region".to_string(), "".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(50),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        // Build expected partition stats with null bounds and compare by struct equality
+        let full_stats_schema = stats_schema(&table_schema).expect("stats schema");
+        let region_stats_field = full_stats_schema.field("region").expect("region field");
+        let DataType::Struct(region_inner) = region_stats_field.data_type() else {
+            panic!("region stats should be a struct");
+        };
+        let expected_region = StructData::try_new(
+            region_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(50),                // value_count
+                Scalar::Long(50),                // null_value_count (all null)
+                Scalar::Null(DataType::INTEGER), // avg_value_size
+                Scalar::Null(DataType::INTEGER), // max_value_size
+                Scalar::Null(DataType::STRING),  // lower_bound (null partition)
+                Scalar::Null(DataType::STRING),  // upper_bound (null partition)
+                Scalar::Boolean(true),           // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let region_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "region")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            region_value,
+            Some(&Scalar::Struct(expected_region)),
+            "partition stats mismatch for 'region'"
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_no_existing_stats() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("date", DataType::DATE, true, 2),
+        ]);
+
+        let partition_values = HashMap::from([("date".to_string(), "2024-01-15".to_string())]);
+        let merged =
+            merge_partition_values_into_stats(None, &partition_values, &table_schema, Some(200))
+                .expect("merge should succeed")
+                .expect("should produce stats");
+
+        // Build expected partition stats and compare by struct equality
+        let full_stats_schema = stats_schema(&table_schema).expect("stats schema");
+        let date_stats_field = full_stats_schema.field("date").expect("date field");
+        let DataType::Struct(date_inner) = date_stats_field.data_type() else {
+            panic!("date stats should be a struct");
+        };
+        let expected_date = StructData::try_new(
+            date_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(200),     // value_count
+                Scalar::Long(0),       // null_value_count
+                Scalar::Date(19737),   // lower_bound (2024-01-15)
+                Scalar::Date(19737),   // upper_bound (2024-01-15)
+                Scalar::Boolean(true), // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let date_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "date")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            date_value,
+            Some(&Scalar::Struct(expected_date)),
+            "partition stats mismatch for 'date'"
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_empty_partition_values_is_noop() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+        ]);
+
+        let stats_json =
+            r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"nullCount":{"id":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let original_id_lower = get_column_stat(&content_stats, "id", LOWER_BOUND).cloned();
+
+        let partition_values = HashMap::new();
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(10),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        assert_eq!(
+            get_column_stat(&merged, "id", LOWER_BOUND).cloned(),
+            original_id_lower
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_no_existing_stats_and_no_partitions() {
+        let table_schema =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 1)]);
+
+        let result =
+            merge_partition_values_into_stats(None, &HashMap::new(), &table_schema, Some(10))
+                .expect("merge should succeed");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_integer_partition_column() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("data", DataType::STRING, true, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+        ]);
+
+        let stats_json = r#"{"numRecords":75,"minValues":{"data":"abc"},"maxValues":{"data":"xyz"},"nullCount":{"data":5}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([("year".to_string(), "2024".to_string())]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(75),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        // Build expected stats and compare by struct equality
+        let full_stats_schema = stats_schema(&table_schema).expect("stats schema");
+
+        // Data column: data (STRING, nullable)
+        let data_stats_field = full_stats_schema.field("data").expect("data field");
+        let DataType::Struct(data_inner) = data_stats_field.data_type() else {
+            panic!("data stats should be a struct");
+        };
+        let expected_data = StructData::try_new(
+            data_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(75),                  // value_count
+                Scalar::Long(5),                   // null_value_count
+                Scalar::Null(DataType::INTEGER),   // avg_value_size
+                Scalar::Null(DataType::INTEGER),   // max_value_size
+                Scalar::String("abc".to_string()), // lower_bound
+                Scalar::String("xyz".to_string()), // upper_bound
+                Scalar::Boolean(true),             // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let data_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "data")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            data_value,
+            Some(&Scalar::Struct(expected_data)),
+            "data column stats mismatch for 'data'"
+        );
+
+        // Partition column: year (INTEGER, non-nullable)
+        let year_stats_field = full_stats_schema.field("year").expect("year field");
+        let DataType::Struct(year_inner) = year_stats_field.data_type() else {
+            panic!("year stats should be a struct");
+        };
+        let expected_year = StructData::try_new(
+            year_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(75),      // value_count
+                Scalar::Integer(2024), // lower_bound
+                Scalar::Integer(2024), // upper_bound
+                Scalar::Boolean(true), // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let year_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "year")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            year_value,
+            Some(&Scalar::Struct(expected_year)),
+            "partition stats mismatch for 'year'"
+        );
+    }
+
+    #[test]
+    fn merge_partition_values_into_stats_multiple_partition_columns() {
+        let table_schema = StructType::new_unchecked([
+            field_with_id("data", DataType::STRING, true, 1),
+            field_with_id("year", DataType::INTEGER, false, 2),
+            field_with_id("score", DataType::DOUBLE, true, 3),
+        ]);
+
+        let stats_json = r#"{"numRecords":30,"minValues":{"data":"a"},"maxValues":{"data":"z"},"nullCount":{"data":0}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("convert")
+                .expect("some");
+
+        let partition_values = HashMap::from([
+            ("year".to_string(), "2023".to_string()),
+            ("score".to_string(), "19.15".to_string()),
+        ]);
+        let merged = merge_partition_values_into_stats(
+            Some(content_stats),
+            &partition_values,
+            &table_schema,
+            Some(30),
+        )
+        .expect("merge should succeed")
+        .expect("should produce stats");
+
+        // Build expected stats and compare by struct equality
+        let full_stats_schema = stats_schema(&table_schema).expect("stats schema");
+
+        // Data column: data (STRING, nullable)
+        let data_stats_field = full_stats_schema.field("data").expect("data field");
+        let DataType::Struct(data_inner) = data_stats_field.data_type() else {
+            panic!("data stats should be a struct");
+        };
+        let expected_data = StructData::try_new(
+            data_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(30),                // value_count
+                Scalar::Long(0),                 // null_value_count
+                Scalar::Null(DataType::INTEGER), // avg_value_size
+                Scalar::Null(DataType::INTEGER), // max_value_size
+                Scalar::String("a".to_string()), // lower_bound
+                Scalar::String("z".to_string()), // upper_bound
+                Scalar::Boolean(true),           // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let data_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "data")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            data_value,
+            Some(&Scalar::Struct(expected_data)),
+            "data column stats mismatch for 'data'"
+        );
+
+        // Integer partition column (non-nullable): value_count, lower, upper, exact_bounds
+        let year_stats_field = full_stats_schema.field("year").expect("year field");
+        let DataType::Struct(year_inner) = year_stats_field.data_type() else {
+            panic!("year stats should be a struct");
+        };
+        let expected_year = StructData::try_new(
+            year_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(30),      // value_count
+                Scalar::Integer(2023), // lower_bound
+                Scalar::Integer(2023), // upper_bound
+                Scalar::Boolean(true), // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let year_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "year")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            year_value,
+            Some(&Scalar::Struct(expected_year)),
+            "partition stats mismatch for 'year'"
+        );
+
+        // Double partition column (nullable): value_count, null_value_count, nan_value_count,
+        // lower, upper, exact_bounds
+        let score_stats_field = full_stats_schema.field("score").expect("score field");
+        let DataType::Struct(score_inner) = score_stats_field.data_type() else {
+            panic!("score stats should be a struct");
+        };
+        let expected_score = StructData::try_new(
+            score_inner.fields().cloned().collect(),
+            vec![
+                Scalar::Long(30),             // value_count
+                Scalar::Long(0),              // null_value_count
+                Scalar::Null(DataType::LONG), // nan_value_count (not set by partition stats)
+                Scalar::Double(19.15),        // lower_bound
+                Scalar::Double(19.15),        // upper_bound
+                Scalar::Boolean(true),        // exact_bounds
+            ],
+        )
+        .expect("valid struct");
+
+        let score_value = merged
+            .fields()
+            .iter()
+            .position(|f| f.name() == "score")
+            .map(|idx| &merged.values()[idx]);
+        assert_eq!(
+            score_value,
+            Some(&Scalar::Struct(expected_score)),
+            "partition stats mismatch for 'score'"
         );
     }
 }
