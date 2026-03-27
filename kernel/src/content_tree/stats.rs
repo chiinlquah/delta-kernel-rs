@@ -25,6 +25,10 @@ const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
 /// Number of reserved field IDs at the top of the i32 range.
 const NUM_RESERVED_FIELD_IDS: i32 = 200;
 
+/// Name of the variant inner field for which we track stats. Other variant fields
+/// (e.g. `metadata`) are excluded from stats collection.
+const VARIANT_VALUE_FIELD_NAME: &str = "value";
+
 /// Starting field ID of the stats space for the data field IDs (regular column stats).
 const STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS: i32 = 10_000;
 
@@ -187,6 +191,40 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
+/// Returns the inner [`StructType`] for either a [`DataType::Struct`] or [`DataType::Variant`],
+/// or `None` for any other data type.
+fn match_struct_or_variant(data_type: &DataType) -> Option<&StructType> {
+    match data_type {
+        DataType::Struct(s) | DataType::Variant(s) => Some(s.as_ref()),
+        _ => None,
+    }
+}
+
+/// Wraps `inner` with the same container type (Struct or Variant) as `original`.
+fn wrap_struct_or_variant(original: &DataType, inner: StructType) -> DataType {
+    if matches!(original, DataType::Variant(_)) {
+        DataType::Variant(Box::new(inner))
+    } else {
+        DataType::Struct(Box::new(inner))
+    }
+}
+
+/// Returns `true` if `field_name` is the variant inner field for which we track stats.
+fn is_variant_value_field(field_name: &str) -> bool {
+    field_name == VARIANT_VALUE_FIELD_NAME
+}
+
+/// Checks whether a variant's `value` sub-field appears in a stat-category sub-schema. Used
+/// to determine if a variant's `value` field needs min, max, or null-count stats.
+///
+/// `field_name` is the top-level struct field name (not a nested/dotted column path).
+fn variant_value_in_sub_schema(sub_schema: Option<&StructType>, field_name: &str) -> bool {
+    sub_schema.is_some_and(|s| {
+        get_struct_sub_schema(s, field_name)
+            .is_some_and(|vs| vs.field(VARIANT_VALUE_FIELD_NAME).is_some())
+    })
+}
+
 /// A visitor that builds stats schemas by traversing the data schema.
 struct StatsSchemaVisitor;
 
@@ -221,6 +259,22 @@ impl SchemaVisitor for StatsSchemaVisitor {
             DataType::Primitive(_) => {
                 build_primitive_stats_struct(base_stats_id, field.data_type.clone(), field.nullable)
             }
+            DataType::Variant(inner) => {
+                // Variant inner fields don't have their own field IDs; the variant field's
+                // base stats ID covers the entire variant. We only track stats for "value".
+                match inner.field(VARIANT_VALUE_FIELD_NAME) {
+                    Some(vf) => StructType::new_unchecked([StructField::new(
+                        vf.name(),
+                        DataType::Struct(Box::new(build_primitive_stats_struct(
+                            base_stats_id,
+                            vf.data_type.clone(),
+                            vf.nullable,
+                        ))),
+                        true,
+                    )]),
+                    None => StructType::new_unchecked(type_result),
+                }
+            }
             _ => StructType::new_unchecked(type_result),
         };
 
@@ -244,7 +298,7 @@ impl SchemaVisitor for StatsSchemaVisitor {
 
         Ok(vec![StructField::new(
             field.name(),
-            DataType::Struct(Box::new(stats_struct)),
+            wrap_struct_or_variant(field.data_type(), stats_struct),
             true,
         )
         .with_metadata(metadata)])
@@ -270,8 +324,10 @@ impl SchemaVisitor for StatsSchemaVisitor {
         Ok(key_result.into_iter().chain(value_result).collect())
     }
 
-    fn variant(&mut self, _struct: &StructType) -> DeltaResult<Self::T> {
-        // TODO: Variant stats
+    fn variant(&mut self, _struct_type: &StructType) -> DeltaResult<Self::T> {
+        // Variant inner fields don't have their own field IDs, so we cannot use
+        // visit_struct (which calls field() and requires field IDs). The actual stats
+        // construction for the variant's "value" field is handled in field() above.
         Ok(Vec::new())
     }
 }
@@ -551,7 +607,13 @@ fn json_value_to_scalar(value: &JsonValue, data_type: &DataType) -> Option<Scala
                     .or_else(|| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
                     .map(|dt| Scalar::TimestampNtz(dt.and_utc().timestamp_micros()))
             }),
-            PrimitiveType::Binary | PrimitiveType::Decimal(..) => None, // Not supported in JSON stats
+            // Variant value fields are stored as BINARY, and their min/max stats
+            // are z85-encoded strings in Delta JSON stats.
+            PrimitiveType::Binary => match value {
+                JsonValue::String(s) => z85::decode(s).ok().map(Scalar::Binary),
+                _ => None,
+            },
+            PrimitiveType::Decimal(..) => None,
         },
         _ => None, // Complex types not supported in min/max stats
     }
@@ -634,21 +696,20 @@ fn build_struct_stats(
         // The stats schema always wraps columns in a Struct (containing value_count, bounds, etc.)
         // So we need to check the TABLE schema to know if we should recurse
         let scalar = if let Some(tf) = table_field {
-            match tf.data_type() {
-                DataType::Struct(nested_table_struct) => {
-                    // Table field is a nested struct - recurse into it
-                    if let DataType::Struct(nested_stats_struct) = stats_field.data_type() {
-                        let nested_data = build_struct_stats(
-                            nested_table_struct,
-                            nested_stats_struct,
-                            delta_stats,
-                            &column_name,
-                        );
-                        Scalar::Struct(nested_data)
-                    } else {
-                        Scalar::Null(stats_field.data_type().clone())
-                    }
+            match (
+                match_struct_or_variant(tf.data_type()),
+                match_struct_or_variant(stats_field.data_type()),
+            ) {
+                (Some(nested_table_struct), Some(nested_stats_struct)) => {
+                    let nested_data = build_struct_stats(
+                        nested_table_struct,
+                        nested_stats_struct,
+                        delta_stats,
+                        &column_name,
+                    );
+                    Scalar::Struct(nested_data)
                 }
+                (Some(_), None) => Scalar::Null(stats_field.data_type().clone()),
                 _ => {
                     // Table field is a primitive - build column stats
                     if let DataType::Struct(inner_stats) = stats_field.data_type() {
@@ -1148,12 +1209,11 @@ fn build_amt_struct_expr(
         .map(|amt_field| {
             let table_field = table_schema.field(amt_field.name());
             let expr = if let Some(tf) = table_field {
-                match tf.data_type() {
-                    DataType::Struct(nested_table_struct) => {
-                        let nested_amt_struct = match amt_field.data_type() {
-                            DataType::Struct(s) => s.as_ref(),
-                            _ => unreachable!("AMT schema for struct field must be struct"),
-                        };
+                match (
+                    match_struct_or_variant(tf.data_type()),
+                    match_struct_or_variant(amt_field.data_type()),
+                ) {
+                    (Some(nested_table_struct), Some(nested_amt_struct)) => {
                         let mut new_path = col_path.to_vec();
                         new_path.push(amt_field.name().as_str());
                         build_amt_struct_expr(
@@ -1164,20 +1224,19 @@ fn build_amt_struct_expr(
                             known_stats_schema,
                         )
                     }
-                    _ => {
-                        let amt_leaf_struct = match amt_field.data_type() {
-                            DataType::Struct(s) => s.as_ref(),
-                            _ => unreachable!("AMT schema for primitive field must be struct"),
-                        };
-                        let mut leaf_path = col_path.to_vec();
-                        leaf_path.push(amt_field.name().as_str());
-                        build_amt_leaf_expr(
-                            amt_leaf_struct,
-                            stats_col,
-                            &leaf_path,
-                            known_stats_schema,
-                        )
-                    }
+                    _ => match match_struct_or_variant(amt_field.data_type()) {
+                        Some(amt_leaf_struct) => {
+                            let mut leaf_path = col_path.to_vec();
+                            leaf_path.push(amt_field.name().as_str());
+                            build_amt_leaf_expr(
+                                amt_leaf_struct,
+                                stats_col,
+                                &leaf_path,
+                                known_stats_schema,
+                            )
+                        }
+                        None => Expression::null_literal(amt_field.data_type().clone()),
+                    },
                 }
             } else {
                 Expression::null_literal(amt_field.data_type().clone())
@@ -1202,6 +1261,7 @@ fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
                 } else {
                     match f.data_type() {
                         DataType::Struct(s) => has_nested_field(s, rest),
+                        DataType::Variant(s) => has_nested_field(s, rest),
                         _ => false,
                     }
                 }
@@ -1265,7 +1325,8 @@ fn build_amt_leaf_expr(
                 EXACT_BOUNDS if field_exists(DELTA_STATS_TIGHT_BOUNDS, &[]) => {
                     Expression::column([stats_col, DELTA_STATS_TIGHT_BOUNDS])
                 }
-                // Field not in Delta JSON stats or not present in known schema → null literal
+                // Field not in Delta JSON stats or not present in known schema -> null literal.
+                // This includes AMT-only fields like avg_value_size and max_value_size.
                 _ => Expression::null_literal(field.data_type().clone()),
             };
             Arc::new(expr)
@@ -1370,10 +1431,9 @@ pub(crate) fn try_pre_convert_stats_column(
 /// Extracts a named field from a struct schema as a `&StructType`, returning `None` if absent
 /// or if the field is not a struct type.
 fn get_struct_sub_schema<'a>(schema: &'a StructType, field_name: &str) -> Option<&'a StructType> {
-    schema.field(field_name).and_then(|f| match f.data_type() {
-        DataType::Struct(s) => Some(s.as_ref()),
-        _ => None,
-    })
+    schema
+        .field(field_name)
+        .and_then(|f| match_struct_or_variant(f.data_type()))
 }
 
 /// Builds an AMT-format stats sub-struct for a single primitive column, containing only the
@@ -1393,6 +1453,42 @@ fn build_primitive_amt_struct_for_stats(
     _needs_max: bool,
 ) -> StructType {
     build_primitive_stats_struct(base_field_id, data_type.clone(), nullable)
+}
+
+/// Builds the filtered AMT stats sub-struct for a variant's `value` field.
+///
+/// Variant types are represented as a struct with `metadata` and `value` (and optionally
+/// `typed_value` for shredded variants). Only the `value` field participates in stats
+/// collection because it holds the serialized variant payload; `metadata` is encoding overhead
+/// and other shredded fields are not stat-eligible. Variant inner fields share the parent
+/// variant's field ID (they do not have their own IDs), so stats are built with the variant's
+/// `base_stats_id`.
+///
+/// Returns `None` when the variant has no `value` field (degenerate schema).
+fn build_variant_value_stats(
+    inner: &StructType,
+    base_stats_id: i32,
+    col_name: &str,
+    null_count_cols: Option<&StructType>,
+    min_vals_cols: Option<&StructType>,
+    max_vals_cols: Option<&StructType>,
+) -> Option<StructType> {
+    let vf = inner.field(VARIANT_VALUE_FIELD_NAME)?;
+    let needs_min = variant_value_in_sub_schema(min_vals_cols, col_name);
+    let needs_max = variant_value_in_sub_schema(max_vals_cols, col_name);
+    let nullable = variant_value_in_sub_schema(null_count_cols, col_name);
+    let value_stats = build_primitive_amt_struct_for_stats(
+        base_stats_id,
+        &vf.data_type,
+        nullable,
+        needs_min,
+        needs_max,
+    );
+    Some(StructType::new_unchecked([StructField::new(
+        vf.name(),
+        DataType::Struct(Box::new(value_stats)),
+        true,
+    )]))
 }
 
 /// Generates AMT-format stats schema fields for only the (stat type, column) pairs present in
@@ -1461,6 +1557,19 @@ fn filtered_stats_schema_fields(
                     max_nested,
                 )?)
             }
+            DataType::Variant(inner) => {
+                match build_variant_value_stats(
+                    inner,
+                    base_stats_id,
+                    col_name,
+                    null_count_cols,
+                    min_vals_cols,
+                    max_vals_cols,
+                ) {
+                    Some(s) => s,
+                    None => continue,
+                }
+            }
             _ => continue,
         };
 
@@ -1481,7 +1590,7 @@ fn filtered_stats_schema_fields(
         fields.push(
             StructField::new(
                 table_field.name(),
-                DataType::Struct(Box::new(stats_struct)),
+                wrap_struct_or_variant(table_field.data_type(), stats_struct),
                 true,
             )
             .with_metadata(metadata),
@@ -1678,7 +1787,14 @@ fn collect_stats_expressions_filtered(
         };
 
         match table_field.data_type() {
-            DataType::Struct(table_nested) => {
+            DataType::Struct(table_nested) | DataType::Variant(table_nested) => {
+                // For variants, only the "value" sub-field carries stats. Skip other
+                // variant inner fields (e.g. "metadata") so they don't generate spurious stat expressions.
+                if matches!(table_field.data_type(), DataType::Variant(_))
+                    && !is_variant_value_field(col_name)
+                {
+                    continue;
+                }
                 let nc_nested = null_count_cols.and_then(|s| get_struct_sub_schema(s, col_name));
                 let min_nested = min_vals_cols.and_then(|s| get_struct_sub_schema(s, col_name));
                 let max_nested = max_vals_cols.and_then(|s| get_struct_sub_schema(s, col_name));
@@ -2206,6 +2322,63 @@ mod tests {
         } else {
             None
         }
+    }
+
+    /// Extracts the "value" sub-field stats from a variant column's content_stats.
+    fn extract_variant_value_stats<'a>(content_stats: &'a StructData, col: &str) -> &'a StructData {
+        let v_scalar =
+            get_struct_field(content_stats, col).unwrap_or_else(|| panic!("{col} should exist"));
+        let v_stats = match v_scalar {
+            Scalar::Struct(s) => s,
+            other => panic!("expected struct for {col}, got {other:?}"),
+        };
+        assert!(
+            get_struct_field(v_stats, "metadata").is_none(),
+            "variant stats should not include metadata"
+        );
+        let value_scalar = get_struct_field(v_stats, "value")
+            .unwrap_or_else(|| panic!("{col}.value should exist"));
+        match value_scalar {
+            Scalar::Struct(s) => s,
+            other => panic!("expected struct for {col}.value stats, got {other:?}"),
+        }
+    }
+
+    /// Builds Delta JSON stats for a variant BINARY column with deterministic test data.
+    /// Returns (min_bytes, max_bytes, json_string).
+    fn variant_binary_stats_json(
+        col: &str,
+        num_records: i64,
+        null_count: Option<i64>,
+        tight_bounds: Option<bool>,
+    ) -> (Vec<u8>, Vec<u8>, String) {
+        let min_bytes = b"aaaa".to_vec();
+        let max_bytes = b"zzzz".to_vec();
+        let min_z85 = z85::encode(&min_bytes);
+        let max_z85 = z85::encode(&max_bytes);
+        let value_key = format!("{col}.value");
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("numRecords".into(), serde_json::json!(num_records));
+        obj.insert(
+            "minValues".into(),
+            serde_json::json!({ &value_key: min_z85 }),
+        );
+        obj.insert(
+            "maxValues".into(),
+            serde_json::json!({ &value_key: max_z85 }),
+        );
+        if let Some(nc) = null_count {
+            obj.insert("nullCount".into(), serde_json::json!({ &value_key: nc }));
+        }
+        if let Some(tb) = tight_bounds {
+            obj.insert("tightBounds".into(), serde_json::json!(tb));
+        }
+        (
+            min_bytes,
+            max_bytes,
+            serde_json::Value::Object(obj).to_string(),
+        )
     }
 
     #[test]
@@ -2844,6 +3017,361 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_stats_schema_variant_column() {
+        // Only the top-level variant field gets a field ID; inner fields (metadata, value)
+        // do not have their own IDs per the variant spec.
+        let variant_type = DataType::unshredded_variant();
+        let table_schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+
+        let stats = stats_schema(&table_schema).expect("stats_schema should succeed");
+
+        let v_field = stats.field("v").expect("v should exist");
+        // The stats schema preserves the Variant wrapper; only the "value" child has stats.
+        let v_variant = match v_field.data_type() {
+            DataType::Variant(s) => s.as_ref(),
+            other => panic!("expected Variant stats, got {other:?}"),
+        };
+        assert!(
+            v_variant.field("metadata").is_none(),
+            "variant stats should not include metadata"
+        );
+        assert!(
+            v_variant.field("value").is_some(),
+            "variant stats should include value"
+        );
+
+        // Each leaf field's stats are stored as a struct of stat columns.
+        let value_stats = v_variant.field("value").unwrap();
+        let value_inner = match value_stats.data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            other => panic!("expected Struct for value stats, got {other:?}"),
+        };
+        assert!(
+            value_inner.field(VALUE_COUNT).is_some(),
+            "variant value field stats should have value_count"
+        );
+        assert!(
+            value_inner.field(LOWER_BOUND).is_some(),
+            "variant value field stats should have lower_bound"
+        );
+        assert!(
+            value_inner.field(UPPER_BOUND).is_some(),
+            "variant value field stats should have upper_bound"
+        );
+        assert!(
+            value_inner.field(EXACT_BOUNDS).is_some(),
+            "variant value field stats should have exact_bounds"
+        );
+        assert!(
+            value_inner.field(AVG_VALUE_SIZE).is_some(),
+            "variant value BINARY field stats should have avg_value_size"
+        );
+        assert!(
+            value_inner.field(MAX_VALUE_SIZE).is_some(),
+            "variant value BINARY field stats should have max_value_size"
+        );
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_variant() {
+        // Delta JSON stats for variant columns use dot-notation for inner fields.
+        // Use nullable value so that the stats struct includes null_value_count.
+        // Variant BINARY min/max values are z85-encoded in Delta JSON stats.
+        let variant_inner = [
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::nullable("value", DataType::BINARY),
+        ];
+        let variant_type = DataType::variant_type(variant_inner).expect("variant type");
+        let table_schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+
+        let (min_bytes, max_bytes, stats_json) =
+            variant_binary_stats_json("v", 50, Some(2), Some(false));
+
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(&stats_json), &table_schema, None)
+                .expect("should convert")
+                .expect("should have stats");
+
+        assert_eq!(content_stats.fields().len(), 1);
+        let value_stats = extract_variant_value_stats(&content_stats, "v");
+        assert_eq!(
+            get_struct_field(value_stats, VALUE_COUNT),
+            Some(&Scalar::Long(50)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, NULL_VALUE_COUNT),
+            Some(&Scalar::Long(2)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, EXACT_BOUNDS),
+            Some(&Scalar::Boolean(false)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, LOWER_BOUND),
+            Some(&Scalar::Binary(min_bytes)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, UPPER_BOUND),
+            Some(&Scalar::Binary(max_bytes)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, AVG_VALUE_SIZE),
+            Some(&Scalar::Null(DataType::INTEGER)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, MAX_VALUE_SIZE),
+            Some(&Scalar::Null(DataType::INTEGER)),
+        );
+    }
+
+    #[test]
+    fn test_stats_schema_variant_with_extra_fields() {
+        // Shredded variant: metadata + value + typed_value. Only "value" should get stats.
+        let variant_inner = [
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::not_null("value", DataType::BINARY),
+            StructField::nullable("typed_value", DataType::INTEGER),
+        ];
+        let variant_type = DataType::variant_type(variant_inner).expect("variant type");
+        let table_schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+
+        let stats = stats_schema(&table_schema).expect("stats_schema should succeed");
+
+        let v_field = stats.field("v").expect("v should exist");
+        let v_variant = match v_field.data_type() {
+            DataType::Variant(s) => s.as_ref(),
+            other => panic!("expected Variant stats, got {other:?}"),
+        };
+        assert!(
+            v_variant.field("metadata").is_none(),
+            "metadata should be excluded"
+        );
+        assert!(
+            v_variant.field("typed_value").is_none(),
+            "typed_value should be excluded"
+        );
+        assert!(
+            v_variant.field("value").is_some(),
+            "value should be included"
+        );
+    }
+
+    #[test]
+    fn test_stats_schema_variant_nested_in_struct() {
+        // A struct column containing a variant field.
+        let variant_type = DataType::unshredded_variant();
+        let inner_struct = DataType::Struct(Box::new(StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 5),
+            field_with_id("data", variant_type, false, 6),
+        ])));
+        let table_schema =
+            StructType::new_unchecked([field_with_id("record", inner_struct, false, 3)]);
+
+        let stats = stats_schema(&table_schema).expect("stats_schema should succeed");
+
+        let record_field = stats.field("record").expect("record should exist");
+        let record_struct = match record_field.data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            _ => panic!("record should have struct stats"),
+        };
+        assert!(
+            record_struct.field("id").is_some(),
+            "id field should have stats"
+        );
+        let data_field = record_struct
+            .field("data")
+            .expect("data (variant) should exist");
+        let data_variant = match data_field.data_type() {
+            DataType::Variant(s) => s.as_ref(),
+            other => panic!("expected Variant stats for data, got {other:?}"),
+        };
+        assert!(
+            data_variant.field("metadata").is_none(),
+            "variant metadata should be excluded"
+        );
+        assert!(
+            data_variant.field("value").is_some(),
+            "variant value should have stats"
+        );
+    }
+
+    #[test]
+    fn test_delta_json_stats_to_content_stats_variant_with_extra_fields() {
+        // Variant with extra fields (e.g. typed_value) -- only "value" should appear in stats.
+        let variant_inner = [
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::nullable("value", DataType::BINARY),
+            StructField::nullable("typed_value", DataType::INTEGER),
+        ];
+        let variant_type = DataType::variant_type(variant_inner).expect("variant type");
+        let table_schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+
+        let (min_bytes, max_bytes, stats_json) = variant_binary_stats_json("v", 100, Some(5), None);
+
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(&stats_json), &table_schema, None)
+                .expect("should convert")
+                .expect("should have stats");
+
+        let v_scalar = get_struct_field(&content_stats, "v").expect("v should exist");
+        let v_stats = match v_scalar {
+            Scalar::Struct(s) => s,
+            _ => panic!("v should be struct"),
+        };
+        assert!(
+            get_struct_field(v_stats, "metadata").is_none(),
+            "metadata should be excluded"
+        );
+        assert!(
+            get_struct_field(v_stats, "typed_value").is_none(),
+            "typed_value should be excluded"
+        );
+
+        let value_stats = extract_variant_value_stats(&content_stats, "v");
+        assert_eq!(
+            get_struct_field(value_stats, VALUE_COUNT),
+            Some(&Scalar::Long(100)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, NULL_VALUE_COUNT),
+            Some(&Scalar::Long(5)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, EXACT_BOUNDS),
+            Some(&Scalar::Boolean(true)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, LOWER_BOUND),
+            Some(&Scalar::Binary(min_bytes)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, UPPER_BOUND),
+            Some(&Scalar::Binary(max_bytes)),
+        );
+    }
+
+    #[test]
+    fn test_variant_stats_alongside_primitive_columns() {
+        // Table with both primitive and variant columns -- all columns should get stats.
+        let variant_type = DataType::unshredded_variant();
+        let table_schema = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+            field_with_id("payload", variant_type, false, 3),
+        ]);
+
+        let stats = stats_schema(&table_schema).expect("stats_schema should succeed");
+        assert_eq!(
+            stats.fields().count(),
+            3,
+            "all three columns should have stats"
+        );
+
+        // Primitive columns have struct stats
+        let id_stats = stats.field("id").expect("id should exist");
+        assert!(matches!(id_stats.data_type(), DataType::Struct(_)));
+
+        // Variant column preserves the Variant wrapper
+        let payload_stats = stats.field("payload").expect("payload should exist");
+        let payload_variant = match payload_stats.data_type() {
+            DataType::Variant(s) => s.as_ref(),
+            other => panic!("expected Variant for payload stats, got {other:?}"),
+        };
+        assert!(payload_variant.field("metadata").is_none());
+        assert!(payload_variant.field("value").is_some());
+    }
+
+    #[test]
+    fn test_variant_json_stats_with_null_bounds() {
+        // Variant column where min/max are null (all values are null).
+        let variant_inner = [
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::nullable("value", DataType::BINARY),
+        ];
+        let variant_type = DataType::variant_type(variant_inner).expect("variant type");
+        let table_schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+
+        let stats_json = r#"{"numRecords": 10, "minValues": {"v.value": null}, "maxValues": {"v.value": null}, "nullCount": {"v.value": 10}}"#;
+        let content_stats =
+            delta_json_stats_to_content_stats(Some(stats_json), &table_schema, None)
+                .expect("should convert")
+                .expect("should have stats");
+
+        let value_stats = extract_variant_value_stats(&content_stats, "v");
+        assert_eq!(
+            get_struct_field(value_stats, VALUE_COUNT),
+            Some(&Scalar::Long(10)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, NULL_VALUE_COUNT),
+            Some(&Scalar::Long(10)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, LOWER_BOUND),
+            Some(&Scalar::Null(DataType::BINARY)),
+        );
+        assert_eq!(
+            get_struct_field(value_stats, UPPER_BOUND),
+            Some(&Scalar::Null(DataType::BINARY)),
+        );
+    }
+
+    #[test]
+    fn test_multiple_variant_columns_get_independent_stats() {
+        // Two variant columns should each get their own stats based on their field IDs.
+        let variant_type_a = DataType::unshredded_variant();
+        let variant_type_b = DataType::unshredded_variant();
+        let table_schema = StructType::new_unchecked([
+            field_with_id("a", variant_type_a, false, 1),
+            field_with_id("b", variant_type_b, true, 2),
+        ]);
+
+        let stats = stats_schema(&table_schema).expect("stats_schema should succeed");
+        assert_eq!(stats.fields().count(), 2);
+
+        // Both columns should have Variant stats
+        for col in ["a", "b"] {
+            let field = stats
+                .field(col)
+                .unwrap_or_else(|| panic!("{col} should exist"));
+            let variant = match field.data_type() {
+                DataType::Variant(s) => s.as_ref(),
+                other => panic!("expected Variant for {col}, got {other:?}"),
+            };
+            assert!(
+                variant.field("value").is_some(),
+                "{col} should have value stats"
+            );
+            assert!(
+                variant.field("metadata").is_none(),
+                "{col} should exclude metadata"
+            );
+        }
+
+        // Field IDs should differ (field 1 -> base 10200, field 2 -> base 10400)
+        let a_value_stats = match stats.field("a").unwrap().data_type() {
+            DataType::Variant(s) => match s.field("value").unwrap().data_type() {
+                DataType::Struct(s) => s.as_ref().clone(),
+                _ => panic!("expected struct"),
+            },
+            _ => panic!("expected variant"),
+        };
+        let b_value_stats = match stats.field("b").unwrap().data_type() {
+            DataType::Variant(s) => match s.field("value").unwrap().data_type() {
+                DataType::Struct(s) => s.as_ref().clone(),
+                _ => panic!("expected struct"),
+            },
+            _ => panic!("expected variant"),
+        };
+        let a_vc_id = get_field_id(a_value_stats.field(VALUE_COUNT).unwrap());
+        let b_vc_id = get_field_id(b_value_stats.field(VALUE_COUNT).unwrap());
+        assert_ne!(
+            a_vc_id, b_vc_id,
+            "different variant columns must have different stats field IDs"
+        );
     }
 
     #[test]
