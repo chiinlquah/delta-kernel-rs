@@ -382,16 +382,13 @@ impl Metadata {
     }
 }
 
-// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
-// and create_one expects flattened values for nested schemas.
-impl IntoEngineData for Metadata {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
-        let values = [
+impl Metadata {
+    /// Convert this Metadata into a list of leaf [`Scalar`] values matching the schema leaf order.
+    /// This is the single source of truth for Metadata scalar conversion, used by both
+    /// [`Metadata::into_engine_data`] and [`CheckpointAction::into_engine_data`].
+    /// The Format sub-struct is flattened into provider and options.
+    pub(crate) fn into_scalars(self) -> DeltaResult<Vec<Scalar>> {
+        Ok(vec![
             self.id.into(),
             self.name.into(),
             self.description.into(),
@@ -401,15 +398,24 @@ impl IntoEngineData for Metadata {
             self.partition_columns.try_into()?,
             self.created_time.into(),
             self.configuration.try_into()?,
-        ];
+        ])
+    }
+}
 
+// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
+// and create_one expects flattened values for nested schemas.
+impl IntoEngineData for Metadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let values = self.into_scalars()?;
         engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
-#[derive(
-    Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
-)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -654,6 +660,18 @@ impl Protocol {
         }
     }
 
+    /// Convert this Protocol into a list of leaf [`Scalar`] values matching the schema leaf order.
+    /// This is the single source of truth for Protocol scalar conversion, used by both
+    /// [`Protocol::into_engine_data`] and [`CheckpointAction::into_engine_data`].
+    pub(crate) fn into_scalars(self) -> DeltaResult<Vec<Scalar>> {
+        Ok(vec![
+            self.min_reader_version.into(),
+            self.min_writer_version.into(),
+            self.reader_features.try_into()?,
+            self.writer_features.try_into()?,
+        ])
+    }
+
     #[cfg(test)]
     pub(crate) fn new_unchecked(
         min_reader_version: i32,
@@ -667,6 +685,18 @@ impl Protocol {
             reader_features,
             writer_features,
         }
+    }
+}
+
+// Manual impl shares `into_scalars` with `CheckpointAction::into_engine_data` to avoid drift.
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let values = self.into_scalars()?;
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -926,13 +956,16 @@ pub(crate) struct ContentRoot {
 ///
 /// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
 /// references a V4 root manifest file. The `version` field indicates the table version up to
-/// which the checkpoint is complete.
+/// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
+/// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
 /// JSON format:
 /// ```json
 /// { "checkpoint": {
 ///     "version": 42,
-///     "contentRoot": { "path": "...", "sizeInBytes": 1024 }
+///     "contentRoot": { "path": "...", "sizeInBytes": 1024 },
+///     "protocol": { ... },
+///     "metaData": { ... }
 /// } }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -948,6 +981,10 @@ pub(crate) struct CheckpointAction {
     pub(crate) version: Version,
     /// Reference to the V4 root manifest file.
     pub(crate) content_root: ContentRoot,
+    /// The table protocol at the checkpoint version.
+    pub(crate) protocol: Protocol,
+    /// The table metadata at the checkpoint version.
+    pub(crate) meta_data: Metadata,
 }
 
 impl CheckpointAction {
@@ -977,6 +1014,23 @@ impl CheckpointAction {
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
     }
+
+    /// Fill missing protocol and metadata from this checkpoint action's nested fields.
+    ///
+    /// Manifest commits embed P+M inside the checkpoint action. This extracts them when
+    /// they haven't been found as top-level actions.
+    pub(crate) fn fill_missing_pm(
+        &self,
+        protocol_opt: &mut Option<Protocol>,
+        metadata_opt: &mut Option<Metadata>,
+    ) {
+        if protocol_opt.is_none() {
+            *protocol_opt = Some(self.protocol.clone());
+        }
+        if metadata_opt.is_none() {
+            *metadata_opt = Some(self.meta_data.clone());
+        }
+    }
 }
 
 impl IntoEngineData for CheckpointAction {
@@ -985,11 +1039,16 @@ impl IntoEngineData for CheckpointAction {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
+        // Build leaf scalars for create_one. Struct fields are flattened into their leaf
+        // children so that create_one receives a flat array of values.
+        let mut values: Vec<Scalar> = vec![
             self.version.into(),
             self.content_root.path.into(),
             self.content_root.size_in_bytes.into(),
         ];
+
+        values.extend(self.protocol.into_scalars()?);
+        values.extend(self.meta_data.into_scalars()?);
 
         engine.evaluation_handler().create_one(schema, &values)
     }
@@ -1181,13 +1240,16 @@ mod tests {
     use crate::{
         arrow::{
             array::{
-                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+                Array, AsArray, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder,
+                MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
             },
             datatypes::{DataType as ArrowDataType, Field, Schema},
             json::ReaderBuilder,
         },
-        engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
+        engine::{
+            arrow_data::{ArrowEngineData, EngineDataArrowExt as _},
+            arrow_expression::ArrowEvaluationHandler,
+        },
         schema::{ArrayType, DataType, MapType, StructField},
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
@@ -2220,83 +2282,30 @@ mod tests {
             .project(&[CHECKPOINT_ACTION_NAME])
             .unwrap();
 
-        let expected = StructType::new_unchecked([StructField::nullable(
-            CHECKPOINT_ACTION_NAME,
-            StructType::new_unchecked([
-                StructField::not_null("version", DataType::LONG),
-                StructField::not_null(
-                    "contentRoot",
-                    StructType::new_unchecked([
-                        StructField::not_null("path", DataType::STRING),
-                        StructField::not_null("sizeInBytes", DataType::LONG),
-                    ]),
-                ),
-            ]),
-        )]);
-
-        assert_eq!(*schema, expected);
-    }
-
-    #[test]
-    fn test_checkpoint_action_into_engine_data_with_log_schema() {
-        use crate::arrow::array::AsArray;
-        use crate::engine::arrow_data::ArrowEngineData;
-
-        let engine = ExprEngine::new();
-
-        let checkpoint_action = CheckpointAction {
-            version: 1,
-            content_root: ContentRoot {
-                path: "s3://bucket/table/data.parquet".to_string(),
-                size_in_bytes: 1024,
-            },
+        let checkpoint_field = schema.field(CHECKPOINT_ACTION_NAME).unwrap();
+        assert!(checkpoint_field.is_nullable());
+        let inner = match checkpoint_field.data_type() {
+            DataType::Struct(s) => s,
+            other => panic!("Expected struct, got {:?}", other),
         };
+        let field_names: Vec<&str> = inner.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["version", "contentRoot", "protocol", "metaData"]
+        );
 
-        // Test with full log schema that wraps CheckpointAction in a "checkpoint" field
-        let log_schema = get_commit_schema()
-            .project(&[CHECKPOINT_ACTION_NAME])
-            .unwrap();
-        let engine_data = checkpoint_action
-            .into_engine_data(log_schema.clone(), &engine)
-            .unwrap();
+        // protocol and metaData are required (non-nullable) struct fields
+        let protocol_field = inner.field("protocol").unwrap();
+        assert!(!protocol_field.is_nullable());
+        assert!(matches!(protocol_field.data_type(), DataType::Struct(_)));
 
-        let record_batch: RecordBatch = engine_data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-
-        // Verify the structure has the checkpoint wrapper field
-        assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 1); // checkpoint field
-
-        // Verify the checkpoint field contains the expected data
-        let checkpoint_array = record_batch.column(0).as_struct();
-        assert_eq!(checkpoint_array.num_columns(), 2); // version, contentRoot
-
-        // Verify the version field
-        let version_array = checkpoint_array
-            .column(0)
-            .as_primitive::<crate::arrow::datatypes::Int64Type>();
-        assert_eq!(version_array.value(0), 1);
-
-        // Verify the contentRoot struct
-        let content_root_array = checkpoint_array.column(1).as_struct();
-        assert_eq!(content_root_array.num_columns(), 2); // path, sizeInBytes
-
-        let path_array = content_root_array.column(0).as_string::<i32>();
-        assert_eq!(path_array.value(0), "s3://bucket/table/data.parquet");
-
-        let size_array = content_root_array
-            .column(1)
-            .as_primitive::<crate::arrow::datatypes::Int64Type>();
-        assert_eq!(size_array.value(0), 1024);
+        let metadata_field = inner.field("metaData").unwrap();
+        assert!(!metadata_field.is_nullable());
+        assert!(matches!(metadata_field.data_type(), DataType::Struct(_)));
     }
 
     #[test]
     fn test_checkpoint_action_with_log_schema() {
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let engine = ExprEngine::new();
 
         let checkpoint_action = CheckpointAction {
@@ -2305,12 +2314,24 @@ mod tests {
                 path: "s3://bucket/table/data.parquet".to_string(),
                 size_in_bytes: 1024,
             },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            meta_data: Metadata {
+                id: "test-id".to_string(),
+                name: None,
+                description: None,
+                format: Format {
+                    provider: "parquet".to_string(),
+                    options: HashMap::new(),
+                },
+                schema_string: r#"{"type":"struct","fields":[]}"#.to_string(),
+                partition_columns: vec![],
+                created_time: Some(1677811175819),
+                configuration: HashMap::new(),
+            },
         };
 
-        // Test with the full log schema that wraps CheckpointAction in a "checkpoint" field
-        let log_schema = get_commit_schema()
-            .project(&[CHECKPOINT_ACTION_NAME])
-            .unwrap();
+        // Test with the write schema that includes all fields
+        let log_schema = get_log_checkpoint_action_schema().clone();
         let actual: RecordBatch = checkpoint_action
             .into_engine_data(log_schema, &engine)
             .unwrap()
@@ -2325,6 +2346,21 @@ mod tests {
                 "contentRoot": {
                     "path": "s3://bucket/table/data.parquet",
                     "sizeInBytes": 1024
+                },
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                },
+                "metaData": {
+                    "id": "test-id",
+                    "format": {
+                        "provider": "parquet",
+                        "options": {}
+                    },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "createdTime": 1677811175819i64,
+                    "configuration": {}
                 }
             }
         })
@@ -2337,6 +2373,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_checkpoint_action_into_engine_data_with_populated_pm() {
+        let engine = ExprEngine::new();
+
+        let checkpoint_action = CheckpointAction {
+            version: 5,
+            content_root: ContentRoot {
+                path: "root.parquet".to_string(),
+                size_in_bytes: 2048,
+            },
+            protocol: Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
+            meta_data: Metadata {
+                id: "test-id".to_string(),
+                name: None,
+                description: None,
+                format: Format {
+                    provider: "parquet".to_string(),
+                    options: HashMap::new(),
+                },
+                schema_string: r#"{"type":"struct","fields":[]}"#.to_string(),
+                partition_columns: vec![],
+                created_time: Some(1677811175819),
+                configuration: HashMap::new(),
+            },
+        };
+
+        let log_schema = get_log_checkpoint_action_schema().clone();
+        let engine_data = checkpoint_action
+            .into_engine_data(log_schema, &engine)
+            .unwrap();
+
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        let checkpoint_array = record_batch.column(0).as_struct();
+
+        // version
+        let version_array = checkpoint_array
+            .column(0)
+            .as_primitive::<crate::arrow::datatypes::Int64Type>();
+        assert_eq!(version_array.value(0), 5);
+
+        // protocol should NOT be null
+        assert!(
+            !checkpoint_array.column(2).is_null(0),
+            "protocol must not be null"
+        );
+        let protocol_array = checkpoint_array.column(2).as_struct();
+        let min_reader = protocol_array
+            .column(0)
+            .as_primitive::<crate::arrow::datatypes::Int32Type>();
+        assert_eq!(min_reader.value(0), 3);
+
+        // metaData should NOT be null
+        assert!(
+            !checkpoint_array.column(3).is_null(0),
+            "metaData must not be null"
+        );
     }
 
     #[test]
