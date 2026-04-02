@@ -58,7 +58,7 @@ url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 rand = { version = "0.8", optional = true }
-iceberg = { version = "0.6", optional = true }
+iceberg = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 # Unity Catalog - only used by benchmark binaries, not exposed as a feature
 uc-client = { path = "../uc-client", optional = true }
