@@ -54,6 +54,7 @@ mod tests_checkpoint_action_validation;
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[internal_api]
 pub(crate) struct CheckpointReadInfo {
     /// Whether the checkpoint has compatible pre-parsed stats for data skipping.
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
@@ -87,6 +88,7 @@ impl CheckpointReadInfo {
 /// and checkpoint metadata.
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
+#[internal_api]
 pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
@@ -1206,9 +1208,6 @@ impl LogSegment {
         existing_protocol: Option<&Protocol>,
         lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, Option<CheckpointAction>)> {
-        // TODO: When CheckpointAction contains optional P+M, revisit checkpoint discovery to
-        // extract P+M directly from the checkpoint action.
-
         // Try CRC-optimized path for P&M
         let (mut metadata_opt, mut protocol_opt) =
             self.read_protocol_metadata_opt(engine, lazy_crc)?;
@@ -1255,6 +1254,21 @@ impl LogSegment {
             // Only search for checkpoint action if enabled
             if root_enabled && checkpoint_action_opt.is_none() {
                 checkpoint_action_opt = CheckpointAction::try_new_from_data(actions.as_ref())?;
+
+                // Extract nested P+M from checkpoint action if top-level ones were not found.
+                if let Some(ref ca) = checkpoint_action_opt {
+                    let had_protocol = protocol_opt.is_some();
+                    ca.fill_missing_pm(&mut protocol_opt, &mut metadata_opt);
+                    if !had_protocol {
+                        if let Some(protocol) = protocol_opt.as_ref() {
+                            Self::validate_checkpoint_action_with_protocol(
+                                protocol,
+                                &checkpoint_action_opt,
+                                &mut root_enabled,
+                            )?;
+                        }
+                    }
+                }
             }
 
             // Early termination: stop when we have everything we need
@@ -1274,6 +1288,7 @@ impl LogSegment {
                 }
             }
         }
+
         Ok((metadata_opt, protocol_opt, checkpoint_action_opt))
     }
 
@@ -1584,10 +1599,12 @@ impl LogSegment {
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    /// Recursively checks if two struct types have compatible field types.
     ///
-    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
-    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// For each field in `needed`, if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
+    ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
@@ -1614,9 +1631,16 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use can_read_as for type compatibility
+                // Non-struct types: use stats-specific rules for primitives and standard
+                // schema rules otherwise.
                 (avail_type, need_type) => {
-                    if avail_type.can_read_as(need_type).is_err() {
+                    let compatible = match (avail_type, need_type) {
+                        (DataType::Primitive(a), DataType::Primitive(b)) => {
+                            a.is_stats_type_compatible_with(b)
+                        }
+                        (a, b) => a.can_read_as(b).is_ok(),
+                    };
+                    if !compatible {
                         debug!(
                             "stats_parsed not compatible: incompatible type for '{}' in {}: \
                              checkpoint has {:?}, stats schema needs {:?}",

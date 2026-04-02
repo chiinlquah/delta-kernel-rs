@@ -4566,10 +4566,10 @@ mod tests {
             let metadata_engine_data: Box<dyn crate::EngineData> =
                 Box::new(ArrowEngineData::new(record_batch));
             {
-                let batch = txn.with_batch_commit();
-                let mut leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+                let mc = txn.with_manifest_commit();
+                let mut leaf = mc.new_leaf_node_writer(engine.as_ref())?;
                 leaf.add_files(engine.as_ref(), metadata_engine_data)?;
-                batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {
@@ -4610,8 +4610,8 @@ mod tests {
                 .with_operation("UPDATE".to_string());
 
             {
-                let batch = txn.with_batch_commit();
-                let leaf = batch.new_leaf_node_writer(engine.as_ref())?;
+                let mc = txn.with_manifest_commit();
+                let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
 
                 // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
                 // Previously used leaf.update_deletion_vectors(dv_updates) here.
@@ -4619,7 +4619,7 @@ mod tests {
                 // re-writing the data entry with updated dv_info.
                 let _ = (&file_locations, known_dv_size_in_bytes);
 
-                batch.add_leaf(leaf.finish(engine.as_ref())?)?;
+                mc.add_leaf(leaf.finish(engine.as_ref())?)?;
             }
 
             match txn.commit(engine.as_ref())? {
@@ -4632,7 +4632,7 @@ mod tests {
         let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let checkpoint_action = snapshot_v2
             .checkpoint_action()
-            .expect("Table should have checkpoint action after batch commit");
+            .expect("Table should have checkpoint action after manifest commit");
 
         let root_manifest_url = table_url.join(checkpoint_action.path())?;
 
