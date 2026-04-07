@@ -752,6 +752,40 @@ impl<S> Transaction<S> {
                 meta_data: table_config.metadata().clone(),
             };
 
+            // Generate Iceberg metadata.json if icebergNativeV4 is enabled
+            #[cfg(feature = "iceberg-nativev4")]
+            {
+                let has_iceberg_native_v4 = table_config
+                    .protocol()
+                    .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
+                if has_iceberg_native_v4 {
+                    let commit_info = CommitInfo::new(
+                        self.commit_timestamp,
+                        None,
+                        self.operation.clone(),
+                        self.engine_info.clone(),
+                        snapshot_id,
+                        self.is_blind_append,
+                    );
+                    // TODO: Read previous IcebergMetadataDomain for incremental snapshot history
+                    // TODO: Add IcebergMetadataDomain to commit actions
+                    let _result = crate::iceberg_metadata::generate_iceberg_metadata(
+                        engine,
+                        self.read_snapshot.table_root(),
+                        new_commit_version,
+                        table_config.metadata(),
+                        &commit_info,
+                        &checkpoint_action,
+                        None, // previous_domain
+                    )?;
+                    info!(
+                        version = new_commit_version,
+                        metadata_location = %_result.metadata_location,
+                        "Generated Iceberg metadata.json"
+                    );
+                }
+            }
+
             // Use the log schema to wrap CheckpointAction in a "checkpoint" field
             let checkpoint_data = checkpoint_action
                 .into_engine_data(get_log_checkpoint_action_schema().clone(), engine);

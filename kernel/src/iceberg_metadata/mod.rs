@@ -79,7 +79,7 @@ pub(crate) fn generate_iceberg_metadata(
     let snapshot = build_snapshot(snapshot_id, version, timestamp_ms, &manifest_list_path)?;
 
     // Step 4: Build TableMetadata
-    let table_uuid = parse_table_uuid(metadata)?;
+    let table_uuid = parse_table_uuid(metadata);
     let properties = build_iceberg_properties(metadata, version, timestamp_ms);
 
     let table_metadata = build_table_metadata(
@@ -157,14 +157,9 @@ fn resolve_manifest_list_path(
 }
 
 /// Parses the table UUID from the Delta Metadata action.
-fn parse_table_uuid(metadata: &Metadata) -> DeltaResult<uuid::Uuid> {
-    uuid::Uuid::parse_str(metadata.id()).map_err(|e| {
-        Error::generic(format!(
-            "Failed to parse table UUID '{}': {}",
-            metadata.id(),
-            e
-        ))
-    })
+/// Falls back to a new random UUID if the metadata ID is not a valid UUID.
+fn parse_table_uuid(metadata: &Metadata) -> uuid::Uuid {
+    uuid::Uuid::parse_str(metadata.id()).unwrap_or_else(|_| uuid::Uuid::new_v4())
 }
 
 /// Builds the Iceberg properties map from Delta metadata.
