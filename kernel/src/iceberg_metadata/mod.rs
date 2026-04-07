@@ -447,6 +447,107 @@ mod tests {
         .unwrap();
         assert_eq!(abs, "s3://bucket/table/metadata/root.parquet");
     }
+
+    #[test]
+    fn e2e_generated_metadata_json_round_trips_as_valid_iceberg() {
+        // Build a Delta schema with column mapping IDs
+        let schema = StructType::try_new([
+            field_with_id("id", DataType::LONG, false, 1),
+            field_with_id("name", DataType::STRING, true, 2),
+            field_with_id("score", DataType::DOUBLE, true, 3),
+            field_with_id("active", DataType::BOOLEAN, false, 4),
+            field_with_id("created", DataType::TIMESTAMP, true, 5),
+        ])
+        .unwrap();
+
+        let metadata = test_metadata(&schema);
+        let snapshot_id = generate_snapshot_id();
+        let version: Version = 42;
+        let timestamp_ms: i64 = 1711929600000;
+        let root_manifest_path = "s3://bucket/table/_delta_log/00000000000000000042.content.parquet";
+
+        // Step 1: Convert schema
+        let delta_schema = metadata.parse_schema().unwrap();
+        let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![]).unwrap();
+        let last_column_id = find_max_field_id(&iceberg_schema);
+
+        // Step 2: Build snapshot
+        let snapshot =
+            build_snapshot(snapshot_id, version, timestamp_ms, root_manifest_path).unwrap();
+
+        // Step 3: Build table metadata
+        let table_root = Url::parse("s3://bucket/table/").unwrap();
+        let table_uuid = uuid::Uuid::parse_str(metadata.id()).unwrap();
+        let properties = build_iceberg_properties(&metadata, version, timestamp_ms);
+
+        let table_metadata = build_table_metadata(
+            iceberg_schema,
+            &table_root,
+            table_uuid,
+            last_column_id,
+            version,
+            timestamp_ms,
+            snapshot,
+            properties,
+        )
+        .unwrap();
+
+        // Step 4: Serialize to JSON (what we'd write to disk)
+        let json_bytes = serde_json::to_vec(&table_metadata).unwrap();
+
+        // Step 5: Deserialize back as Iceberg TableMetadata — proves valid format
+        let parsed: iceberg_spec::TableMetadata =
+            serde_json::from_slice(&json_bytes).unwrap();
+
+        // Verify format version
+        assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V2);
+
+        // Verify table UUID
+        assert_eq!(parsed.uuid(), table_uuid);
+
+        // Verify current snapshot
+        assert_eq!(parsed.current_snapshot_id(), Some(snapshot_id));
+        let current_snapshot = parsed.current_snapshot().unwrap();
+        assert_eq!(current_snapshot.snapshot_id(), snapshot_id);
+        assert_eq!(current_snapshot.sequence_number(), version as i64);
+        assert_eq!(current_snapshot.timestamp_ms(), timestamp_ms);
+        assert_eq!(current_snapshot.manifest_list(), root_manifest_path);
+
+        // Verify schema
+        let iceberg_schema = parsed.current_schema();
+        let fields = iceberg_schema.as_struct().fields();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].id, 1);
+        assert!(fields[0].required);
+        assert_eq!(
+            *fields[0].field_type,
+            iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Long)
+        );
+        assert_eq!(fields[1].name, "name");
+        assert_eq!(fields[1].id, 2);
+        assert!(!fields[1].required);
+        assert_eq!(
+            *fields[4].field_type,
+            iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Timestamptz)
+        );
+
+        // Verify properties
+        assert_eq!(
+            parsed.properties().get("delta-version"),
+            Some(&"42".to_string())
+        );
+        assert_eq!(
+            parsed.properties().get("delta-timestamp"),
+            Some(&"1711929600000".to_string())
+        );
+
+        // Verify the JSON is pretty-printable (useful for debugging)
+        let pretty_json = serde_json::to_string_pretty(&table_metadata).unwrap();
+        assert!(pretty_json.contains("\"format-version\""));
+        assert!(pretty_json.contains("\"current-snapshot-id\""));
+        assert!(pretty_json.contains(root_manifest_path));
+    }
 }
 
 /// Test helper: creates a minimal CheckpointAction with the given content root path.
