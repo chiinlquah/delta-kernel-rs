@@ -755,9 +755,9 @@ impl<S> Transaction<S> {
             // Generate Iceberg metadata.json if icebergNativeV4 is enabled
             #[cfg(feature = "iceberg-nativev4")]
             {
-                let has_iceberg_native_v4 = table_config
-                    .protocol()
-                    .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
+                let has_iceberg_native_v4 = table_config.protocol().has_writer_feature(
+                    &crate::table_features::TableFeature::IcebergNativeV4Experimental,
+                );
                 if has_iceberg_native_v4 {
                     let commit_info = CommitInfo::new(
                         self.commit_timestamp,

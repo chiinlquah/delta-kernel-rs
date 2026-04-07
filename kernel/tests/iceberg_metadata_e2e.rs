@@ -7,12 +7,10 @@ use std::sync::Arc;
 use arrow_57::array::{Int32Array, StringArray};
 use arrow_57::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow_57::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::committer::FileSystemCommitter;
 use url::Url;
 
 #[tokio::test]
@@ -46,8 +44,7 @@ async fn test_iceberg_metadata_json_written_on_manifest_commit(
     // Setup local filesystem engine
     let tmp_dir = tempfile::tempdir()?;
     let base_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let (store, engine, table_url) =
-        test_utils::engine_store_setup("iceberg_e2e", Some(&base_url));
+    let (store, engine, table_url) = test_utils::engine_store_setup("iceberg_e2e", Some(&base_url));
 
     // Create table with icebergNativeV4 features
     test_utils::create_table(
@@ -111,14 +108,14 @@ async fn test_iceberg_metadata_json_written_on_manifest_commit(
     for entry in walkdir::WalkDir::new(&table_dir)
         .min_depth(1)
         .sort_by_file_name()
+        .into_iter()
+        .flatten()
     {
-        if let Ok(e) = entry {
-            if e.file_type().is_file() {
-                println!(
-                    "  {}",
-                    e.path().strip_prefix(&table_dir).unwrap().display()
-                );
-            }
+        if entry.file_type().is_file() {
+            println!(
+                "  {}",
+                entry.path().strip_prefix(&table_dir).unwrap().display()
+            );
         }
     }
 
@@ -131,11 +128,7 @@ async fn test_iceberg_metadata_json_written_on_manifest_commit(
     // Find the metadata.json file
     let metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".metadata.json")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
         .collect();
 
     assert!(
