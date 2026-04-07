@@ -249,7 +249,7 @@ fn build_table_metadata(
 /// Generates a unique metadata.json path under the Iceberg metadata directory.
 fn generate_metadata_path(table_root: &Url) -> DeltaResult<Url> {
     let uuid = uuid::Uuid::new_v4();
-    let path = format!("__iceberg/metadata/{}.metadata.json", uuid);
+    let path = format!("metadata/{}.metadata.json", uuid);
     table_root
         .join(&path)
         .map_err(|e| Error::generic(format!("Failed to generate metadata.json path: {}", e)))
@@ -410,8 +410,8 @@ mod tests {
 
         let path_str = path.to_string();
         assert!(
-            path_str.contains("__iceberg/metadata/"),
-            "Path should be under __iceberg/metadata/, got: {}",
+            path_str.contains("metadata/"),
+            "Path should be under metadata/, got: {}",
             path_str
         );
         assert!(

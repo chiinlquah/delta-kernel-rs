@@ -1102,6 +1102,11 @@ impl<S> Transaction<S> {
     ///   present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
     fn is_manifest_commit(&self) -> bool {
+        // Create table (PRE_COMMIT_VERSION) never does manifest commit — there's no
+        // content to roll up into a tree yet.
+        if self.is_create_table() {
+            return false;
+        }
         let table_config = self.read_snapshot.table_configuration();
         let protocol = table_config.protocol();
         let explicitly_requested = self.has_manifest_commit_state()
