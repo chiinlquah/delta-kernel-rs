@@ -14,7 +14,13 @@ use test_utils::{collect_file_paths, create_add_files_metadata, test_table_setup
 #[tokio::test]
 async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    // Use a fixed path so we can inspect the files after the test
+    let table_path = "/tmp/iceberg_test";
+    // Clean up from previous run
+    let _ = std::fs::remove_dir_all(table_path);
+    std::fs::create_dir_all(table_path)?;
+    let table_url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = test_utils::create_default_engine(&table_url)?;
     let schema = Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
         StructField::new("name", DataType::STRING, true),
@@ -113,31 +119,44 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         iceberg_metadata_dir
     );
 
-    // Read and validate the metadata.json
+    // Read and validate via the iceberg crate — proves the output is valid Iceberg format
     let metadata_path = metadata_files[0].path();
     let metadata_content = std::fs::read_to_string(&metadata_path)?;
     println!("\n=== Iceberg metadata.json ===");
     println!("{}", metadata_content);
 
-    let metadata_json: serde_json::Value = serde_json::from_str(&metadata_content)?;
-    assert_eq!(metadata_json["format-version"], 2);
-    assert!(metadata_json.get("schemas").is_some());
-    assert!(metadata_json.get("snapshots").is_some());
-    assert!(metadata_json.get("current-snapshot-id").is_some());
+    let table_metadata: iceberg::spec::TableMetadata =
+        serde_json::from_str(&metadata_content)?;
 
-    // Verify schema has correct fields
-    let schemas = metadata_json["schemas"].as_array().unwrap();
-    let fields = schemas[0]["fields"].as_array().unwrap();
+    // Verify format version
+    assert_eq!(
+        table_metadata.format_version(),
+        iceberg::spec::FormatVersion::V2
+    );
+
+    // Verify schema loaded correctly
+    let iceberg_schema = table_metadata.current_schema();
+    let fields = iceberg_schema.as_struct().fields();
     assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0]["name"], "id");
-    assert_eq!(fields[0]["type"], "int");
-    assert_eq!(fields[1]["name"], "name");
-    assert_eq!(fields[1]["type"], "string");
+    assert_eq!(fields[0].name, "id");
+    assert_eq!(fields[0].id, 1);
+    assert!(fields[0].required);
+    assert_eq!(
+        *fields[0].field_type,
+        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int)
+    );
+    assert_eq!(fields[1].name, "name");
+    assert_eq!(fields[1].id, 2);
+    assert!(!fields[1].required);
+    assert_eq!(
+        *fields[1].field_type,
+        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String)
+    );
 
-    // Verify snapshot points to root manifest
-    let snapshots = metadata_json["snapshots"].as_array().unwrap();
-    assert!(!snapshots.is_empty());
-    let manifest_list = snapshots[0]["manifest-list"].as_str().unwrap();
+    // Verify current snapshot exists and points to root manifest
+    assert!(table_metadata.current_snapshot_id().is_some());
+    let snapshot = table_metadata.current_snapshot().unwrap();
+    let manifest_list = snapshot.manifest_list();
     println!("\nSnapshot manifest-list: {}", manifest_list);
     assert!(
         manifest_list.contains(".content."),
@@ -145,6 +164,12 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         manifest_list
     );
 
-    println!("\n=== SUCCESS ===");
+    // Verify properties
+    assert_eq!(
+        table_metadata.properties().get("delta-version"),
+        Some(&"1".to_string())
+    );
+
+    println!("\n=== SUCCESS: Iceberg crate loaded metadata.json successfully ===");
     Ok(())
 }
