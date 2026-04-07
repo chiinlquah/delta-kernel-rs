@@ -47,10 +47,7 @@ impl IcebergMetadataDomain {
     /// Converts this domain metadata into a [`DomainMetadata`] action for the Delta log.
     pub(crate) fn to_domain_metadata(&self) -> DeltaResult<DomainMetadata> {
         let configuration = serde_json::to_string(self).map_err(|e| {
-            Error::generic(format!(
-                "Failed to serialize IcebergMetadataDomain: {}",
-                e
-            ))
+            Error::generic(format!("Failed to serialize IcebergMetadataDomain: {}", e))
         })?;
         Ok(DomainMetadata::new(
             ICEBERG_METADATA_DOMAIN.to_string(),
@@ -67,12 +64,8 @@ impl IcebergMetadataDomain {
                 dm.domain()
             )));
         }
-        serde_json::from_str(dm.configuration()).map_err(|e| {
-            Error::generic(format!(
-                "Failed to parse IcebergMetadataDomain: {}",
-                e
-            ))
-        })
+        serde_json::from_str(dm.configuration())
+            .map_err(|e| Error::generic(format!("Failed to parse IcebergMetadataDomain: {}", e)))
     }
 }
 
@@ -103,11 +96,7 @@ mod tests {
 
     #[test]
     fn json_format_matches_dbr() {
-        let domain = IcebergMetadataDomain::new(
-            10,
-            9999,
-            "s3://bucket/metadata.json".to_string(),
-        );
+        let domain = IcebergMetadataDomain::new(10, 9999, "s3://bucket/metadata.json".to_string());
 
         let json = serde_json::to_value(&domain).unwrap();
         assert_eq!(json["deltaCommitVersion"], 10);

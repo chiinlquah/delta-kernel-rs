@@ -67,12 +67,12 @@ pub(crate) fn generate_iceberg_metadata(
     let last_column_id = find_max_field_id(&iceberg_schema);
 
     // Step 2: Get snapshot ID and timestamp
-    let snapshot_id = commit_info
-        .snapshot_id
-        .ok_or_else(|| Error::generic("CommitInfo missing snapshot_id for Iceberg metadata generation"))?;
-    let timestamp_ms = commit_info
-        .timestamp
-        .ok_or_else(|| Error::generic("CommitInfo missing timestamp for Iceberg metadata generation"))?;
+    let snapshot_id = commit_info.snapshot_id.ok_or_else(|| {
+        Error::generic("CommitInfo missing snapshot_id for Iceberg metadata generation")
+    })?;
+    let timestamp_ms = commit_info.timestamp.ok_or_else(|| {
+        Error::generic("CommitInfo missing timestamp for Iceberg metadata generation")
+    })?;
 
     // Step 3: Build Iceberg Snapshot pointing to the v4 root manifest
     let manifest_list_path = resolve_manifest_list_path(table_root, checkpoint_action)?;
@@ -95,20 +95,16 @@ pub(crate) fn generate_iceberg_metadata(
 
     // Step 5: Serialize and write to storage
     let metadata_location = generate_metadata_path(table_root)?;
-    let metadata_bytes = serde_json::to_vec(&table_metadata).map_err(|e| {
-        Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e))
-    })?;
+    let metadata_bytes = serde_json::to_vec(&table_metadata)
+        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
 
     engine
         .storage_handler()
         .put(&metadata_location, Bytes::from(metadata_bytes), true)?;
 
     // Step 6: Build result
-    let iceberg_domain = IcebergMetadataDomain::new(
-        version as i64,
-        snapshot_id,
-        metadata_location.to_string(),
-    );
+    let iceberg_domain =
+        IcebergMetadataDomain::new(version as i64, snapshot_id, metadata_location.to_string());
 
     Ok(IcebergMetadataResult {
         metadata_location,
@@ -123,13 +119,17 @@ pub(crate) fn generate_iceberg_metadata(
 /// Finds the maximum field ID in an Iceberg schema (for `last_column_id`).
 fn find_max_field_id(schema: &iceberg_spec::Schema) -> i32 {
     fn max_id_in_fields(fields: &[iceberg_spec::NestedFieldRef]) -> i32 {
-        fields.iter().map(|f| {
-            let child_max = match f.field_type.as_ref() {
-                iceberg_spec::Type::Struct(s) => max_id_in_fields(s.fields()),
-                _ => 0,
-            };
-            f.id.max(child_max)
-        }).max().unwrap_or(0)
+        fields
+            .iter()
+            .map(|f| {
+                let child_max = match f.field_type.as_ref() {
+                    iceberg_spec::Type::Struct(s) => max_id_in_fields(s.fields()),
+                    _ => 0,
+                };
+                f.id.max(child_max)
+            })
+            .max()
+            .unwrap_or(0)
     }
     max_id_in_fields(schema.as_struct().fields())
 }
@@ -255,12 +255,9 @@ fn build_table_metadata(
 fn generate_metadata_path(table_root: &Url) -> DeltaResult<Url> {
     let uuid = uuid::Uuid::new_v4();
     let path = format!("__iceberg/metadata/{}.metadata.json", uuid);
-    table_root.join(&path).map_err(|e| {
-        Error::generic(format!(
-            "Failed to generate metadata.json path: {}",
-            e
-        ))
-    })
+    table_root
+        .join(&path)
+        .map_err(|e| Error::generic(format!("Failed to generate metadata.json path: {}", e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -282,9 +279,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![],
             1711929600000,
-            HashMap::from([
-                ("delta.columnMapping.mode".to_string(), "id".to_string()),
-            ]),
+            HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]),
         )
         .unwrap()
     }
@@ -342,8 +337,7 @@ mod tests {
         .unwrap();
 
         let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let table_uuid =
-            uuid::Uuid::parse_str("d20125c8-7284-442c-9aea-15fee620737e").unwrap();
+        let table_uuid = uuid::Uuid::parse_str("d20125c8-7284-442c-9aea-15fee620737e").unwrap();
 
         let metadata = build_table_metadata(
             iceberg_schema,
@@ -404,10 +398,7 @@ mod tests {
 
     #[test]
     fn iceberg_properties_include_delta_version() {
-        let schema = StructType::try_new([
-            field_with_id("id", DataType::LONG, false, 1),
-        ])
-        .unwrap();
+        let schema = StructType::try_new([field_with_id("id", DataType::LONG, false, 1)]).unwrap();
         let metadata = test_metadata(&schema);
 
         let props = build_iceberg_properties(&metadata, 42, 1711929600000);
@@ -464,7 +455,8 @@ mod tests {
         let snapshot_id = generate_snapshot_id();
         let version: Version = 42;
         let timestamp_ms: i64 = 1711929600000;
-        let root_manifest_path = "s3://bucket/table/_delta_log/00000000000000000042.content.parquet";
+        let root_manifest_path =
+            "s3://bucket/table/_delta_log/00000000000000000042.content.parquet";
 
         // Step 1: Convert schema
         let delta_schema = metadata.parse_schema().unwrap();
@@ -496,8 +488,7 @@ mod tests {
         let json_bytes = serde_json::to_vec(&table_metadata).unwrap();
 
         // Step 5: Deserialize back as Iceberg TableMetadata — proves valid format
-        let parsed: iceberg_spec::TableMetadata =
-            serde_json::from_slice(&json_bytes).unwrap();
+        let parsed: iceberg_spec::TableMetadata = serde_json::from_slice(&json_bytes).unwrap();
 
         // Verify format version
         assert_eq!(parsed.format_version(), iceberg_spec::FormatVersion::V2);
@@ -548,20 +539,25 @@ mod tests {
         assert!(pretty_json.contains("\"current-snapshot-id\""));
         assert!(pretty_json.contains(root_manifest_path));
     }
-}
 
-/// Test helper: creates a minimal CheckpointAction with the given content root path.
-#[cfg(test)]
-fn make_test_checkpoint_action(path: &str) -> CheckpointAction {
-    use crate::actions::{ContentRoot, Metadata, Protocol};
+    /// Test helper: creates a minimal CheckpointAction with the given content root path.
+    fn make_test_checkpoint_action(path: &str) -> CheckpointAction {
+        use crate::actions::{ContentRoot, Metadata, Protocol};
 
-    CheckpointAction {
-        version: 1,
-        content_root: ContentRoot {
-            path: path.to_string(),
-            size_in_bytes: 1024,
-        },
-        protocol: Protocol::try_new(3, 7, Some::<Vec<String>>(vec![]), Some::<Vec<String>>(vec![])).unwrap(),
-        meta_data: Metadata::default(),
+        CheckpointAction {
+            version: 1,
+            content_root: ContentRoot {
+                path: path.to_string(),
+                size_in_bytes: 1024,
+            },
+            protocol: Protocol::try_new(
+                3,
+                7,
+                Some::<Vec<String>>(vec![]),
+                Some::<Vec<String>>(vec![]),
+            )
+            .unwrap(),
+            meta_data: Metadata::default(),
+        }
     }
 }
