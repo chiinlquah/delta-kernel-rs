@@ -134,8 +134,11 @@ fn find_max_field_id(schema: &iceberg_spec::Schema) -> i32 {
     max_id_in_fields(schema.as_struct().fields())
 }
 
-/// Resolves the manifest list path from the checkpoint action.
-/// The path in CheckpointAction may be relative; resolve it against the table root.
+/// Resolves the manifest list path from the checkpoint action to an absolute URL string.
+///
+/// The path in CheckpointAction is typically relative (e.g. `_delta_log/00...01.content.parquet`).
+/// This resolves it against the table root to produce an absolute URL for the Iceberg snapshot's
+/// `manifest-list` field.
 fn resolve_manifest_list_path(
     table_root: &Url,
     checkpoint_action: &CheckpointAction,
@@ -163,6 +166,13 @@ fn parse_table_uuid(metadata: &Metadata) -> uuid::Uuid {
 }
 
 /// Builds the Iceberg properties map from Delta metadata.
+///
+/// Includes:
+/// - `delta-version` and `delta-timestamp`: track which Delta commit this metadata corresponds to,
+///   allowing UC and other systems to correlate Iceberg snapshots with Delta versions.
+/// - Non-delta user properties: forwarded from Delta table configuration so Iceberg clients can
+///   see user-defined table properties. Delta-internal properties (`delta.*`) are excluded since
+///   they are meaningless to Iceberg clients.
 fn build_iceberg_properties(
     metadata: &Metadata,
     version: Version,
