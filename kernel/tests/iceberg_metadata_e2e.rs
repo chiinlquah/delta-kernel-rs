@@ -14,11 +14,9 @@ use test_utils::{collect_file_paths, create_add_files_metadata};
 #[tokio::test]
 async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Use a fixed path so we can inspect the files after the test
-    let table_path = "/tmp/iceberg_test";
-    // Clean up from previous run
-    let _ = std::fs::remove_dir_all(table_path);
-    std::fs::create_dir_all(table_path)?;
+    let temp_dir = tempfile::tempdir()?;
+    let table_path = temp_dir.path().to_str().unwrap();
+    eprintln!("Table path: {}", table_path);
     let table_url = url::Url::from_directory_path(table_path).unwrap();
     let engine = test_utils::create_default_engine(&table_url)?;
     let schema = Arc::new(StructType::try_new(vec![
