@@ -1102,11 +1102,6 @@ impl<S> Transaction<S> {
     ///   present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
     fn is_manifest_commit(&self) -> bool {
-        // Create table (PRE_COMMIT_VERSION) never does manifest commit — there's no
-        // content to roll up into a tree yet.
-        if self.is_create_table() {
-            return false;
-        }
         let table_config = self.read_snapshot.table_configuration();
         let protocol = table_config.protocol();
         let explicitly_requested = self.has_manifest_commit_state()
@@ -1114,7 +1109,10 @@ impl<S> Transaction<S> {
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
         let iceberg_native_v4 = protocol
             .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
-        let can_manifest_commit = explicitly_requested || iceberg_native_v4;
+        // For icebergNativeV4 auto-triggering, skip CREATE TABLE since there's no
+        // existing content to roll up. Explicit with_manifest_commit() still works.
+        let can_manifest_commit =
+            explicitly_requested || (iceberg_native_v4 && !self.is_create_table());
         let leaf_manifests_empty = self
             .manifest_commit_state
             .as_ref()
@@ -1126,9 +1124,11 @@ impl<S> Transaction<S> {
             || self
                 .read_snapshot
                 .checkpoint_action()
-                .map_or(self.read_snapshot.version() > 0, |ca| {
-                    ca.version < self.read_snapshot.version()
-                });
+                // PRE_COMMIT_VERSION (u64::MAX) should not count as "version > 0"
+                .map_or(
+                    !self.is_create_table() && self.read_snapshot.version() > 0,
+                    |ca| ca.version < self.read_snapshot.version(),
+                );
         can_manifest_commit && has_work_to_do
     }
 
