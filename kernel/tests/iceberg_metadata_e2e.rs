@@ -9,7 +9,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use test_utils::{collect_file_paths, create_add_files_metadata, test_table_setup};
+use test_utils::{collect_file_paths, create_add_files_metadata};
 
 #[tokio::test]
 async fn test_iceberg_metadata_json_generated_on_manifest_commit(
@@ -27,7 +27,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     ])?);
 
     // Step 1: Create the table (version 0)
-    let txn = create_table(&table_path, schema.clone(), "TestEngine/1.0")
+    let txn = create_table(table_path, schema.clone(), "TestEngine/1.0")
         .with_table_properties([
             ("delta.columnMapping.mode", "id"),
             ("delta.feature.metadataTree-experimental", "supported"),
@@ -44,7 +44,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     assert_eq!(committed.commit_version(), 0);
 
     // Step 2: Write data via manifest commit (version 1)
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -125,8 +125,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     println!("\n=== Iceberg metadata.json ===");
     println!("{}", metadata_content);
 
-    let table_metadata: iceberg::spec::TableMetadata =
-        serde_json::from_str(&metadata_content)?;
+    let table_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&metadata_content)?;
 
     // Verify format version
     assert_eq!(
