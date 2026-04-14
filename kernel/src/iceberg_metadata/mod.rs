@@ -61,6 +61,11 @@ pub(crate) fn generate_iceberg_metadata(
     checkpoint_action: &CheckpointAction,
     _previous_domain: Option<&IcebergMetadataDomain>,
 ) -> DeltaResult<IcebergMetadataResult> {
+    // TODO: When previous_domain is Some, load the previous metadata.json and use
+    // into_builder() to append the new snapshot, preserving snapshot history for
+    // Iceberg time travel. Currently each commit produces a fresh TableMetadata
+    // with only the current snapshot.
+
     // Step 1: Convert Delta schema to Iceberg schema
     let delta_schema = metadata.parse_schema()?;
     let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
