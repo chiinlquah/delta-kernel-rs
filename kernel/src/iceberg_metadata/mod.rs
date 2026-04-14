@@ -83,7 +83,7 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
     .build()
     .map_err(|e| Error::generic(format!("Failed to build TableMetadata: {}", e)))?;
 
-    let metadata_location = generate_metadata_path(table_root)?;
+    let metadata_location = generate_metadata_path(table_root, version)?;
     let metadata_bytes = serde_json::to_vec(&table_metadata.metadata)
         .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
 
@@ -135,7 +135,7 @@ pub(crate) fn generate_iceberg_metadata(
     };
 
     // Step 4: Serialize and write to storage
-    let metadata_location = generate_metadata_path(table_root)?;
+    let metadata_location = generate_metadata_path(table_root, version)?;
     let metadata_bytes = serde_json::to_vec(&table_metadata)
         .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
 
@@ -336,9 +336,11 @@ fn add_snapshot_and_build(
 }
 
 /// Generates a unique metadata.json path under the Iceberg metadata directory.
-fn generate_metadata_path(table_root: &Url) -> DeltaResult<Url> {
+///
+/// Format: `__iceberg/metadata/v{version}-{uuid}.metadata.json`
+fn generate_metadata_path(table_root: &Url, version: Version) -> DeltaResult<Url> {
     let uuid = uuid::Uuid::new_v4();
-    let path = format!("metadata/{}.metadata.json", uuid);
+    let path = format!("__iceberg/metadata/v{}-{}.metadata.json", version, uuid);
     table_root
         .join(&path)
         .map_err(|e| Error::generic(format!("Failed to generate metadata.json path: {}", e)))
@@ -490,14 +492,19 @@ mod tests {
     }
 
     #[test]
-    fn generate_metadata_path_is_under_iceberg_dir() {
+    fn generate_metadata_path_has_version_and_uuid() {
         let table_root = Url::parse("s3://bucket/table/").unwrap();
-        let path = generate_metadata_path(&table_root).unwrap();
+        let path = generate_metadata_path(&table_root, 42).unwrap();
 
         let path_str = path.to_string();
         assert!(
-            path_str.contains("metadata/"),
-            "Path should be under metadata/, got: {}",
+            path_str.contains("__iceberg/metadata/"),
+            "Path should be under __iceberg/metadata/, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains("/v42-"),
+            "Path should contain version prefix v42-, got: {}",
             path_str
         );
         assert!(

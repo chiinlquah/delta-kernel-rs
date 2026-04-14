@@ -43,10 +43,10 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     // Verify: CREATE TABLE should generate metadata.json (no snapshot, schema only)
     let table_dir = std::path::Path::new(&table_path);
-    let iceberg_metadata_dir = table_dir.join("metadata");
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
     assert!(
         iceberg_metadata_dir.exists(),
-        "CREATE TABLE should generate metadata/ directory"
+        "CREATE TABLE should generate __iceberg/metadata/ directory"
     );
     let create_metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
         .filter_map(|e| e.ok())
@@ -56,6 +56,17 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         create_metadata_files.len(),
         1,
         "CREATE TABLE should produce exactly 1 metadata.json"
+    );
+
+    // Verify filename contains version: v0-<uuid>.metadata.json
+    let create_filename = create_metadata_files[0]
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        create_filename.starts_with("v0-"),
+        "CREATE TABLE metadata.json should be named v0-<uuid>.metadata.json, got: {}",
+        create_filename
     );
 
     // Verify the create-table metadata.json has schema but no snapshot
@@ -113,7 +124,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     // Verify metadata.json was written to metadata/
     let table_dir = std::path::Path::new(&table_path);
-    let iceberg_metadata_dir = table_dir.join("metadata");
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
 
     // Print all files for debugging
     println!("\n=== All files in table ===");
@@ -287,7 +298,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     // ===================================================================
     // Verify: metadata.json at version 3 should contain snapshot history
     // ===================================================================
-    let iceberg_metadata_dir = table_dir.join("metadata");
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
     let mut metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
