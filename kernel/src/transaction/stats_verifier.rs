@@ -257,8 +257,6 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,4 @@
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, read_to_string};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -96,7 +96,12 @@ async fn try_main() -> DeltaResult<()> {
     // Write the data using the engine
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref())
+        .write_parquet(
+            &sample_data,
+            write_context.as_ref(),
+            Default::default(),
+            &Default::default(),
+        )
         .await?;
 
     // Add the file metadata to the transaction

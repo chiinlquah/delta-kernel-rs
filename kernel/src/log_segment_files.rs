@@ -28,7 +28,6 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-
 /// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
 /// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May contain gaps.
@@ -191,7 +190,6 @@ fn should_process_log_file(file: &ParsedLogPath) -> bool {
     false
 }
 
-
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
 /// share the same version number (e.g., commit, checkpoint parts, CRC files).
 ///
@@ -324,7 +322,6 @@ impl LogSegmentFiles {
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let end = end_version.unwrap_or(Version::MAX);
-
 
         let mut acc = ListingAccumulator {
             end_version,
@@ -572,7 +569,7 @@ mod list_log_files_with_log_tail_tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+    use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt as _};
     use crate::FileMeta;
 
     use super::*;

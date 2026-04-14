@@ -1295,7 +1295,6 @@ mod tests {
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
-    use rstest::rstest;
     use serde_json::json;
     use std::collections::HashSet;
 

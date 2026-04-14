@@ -686,7 +686,7 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
 fn test_replay_for_scan_metadata_with_content_root_contiguous() -> DeltaResult<()> {
     use crate::actions::visitors::AddVisitor;
     use crate::engine::default::DefaultEngine;
-    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
     use crate::RowVisitor;
     use futures::executor::block_on;
 
@@ -1002,7 +1002,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
     use crate::actions::visitors::AddVisitor;
     use crate::engine::default::DefaultEngine;
     use crate::metrics::MetricId;
-    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::RowVisitor;
     use futures::executor::block_on;
@@ -1122,6 +1122,7 @@ fn test_replay_for_scan_metadata_with_content_root_gaps() -> DeltaResult<()> {
             max_published_version: None,
         },
         checkpoint_schema: None,
+        last_checkpoint_metadata: None,
     };
     let snapshot = Arc::new(crate::snapshot::Snapshot::try_new_from_log_segment_impl(
         table_root.clone(),
@@ -1618,7 +1619,6 @@ fn test_with_stats_columns_empty_no_stats_output() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-
     assert!(
         !scan_metadata_results.is_empty(),
         "Should have scan metadata"
@@ -1822,6 +1822,15 @@ impl ParquetHandler for EmptyParquetHandler {
         _predicate: Option<PredicateRef>,
     ) -> crate::DeltaResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
+    }
+
+    fn read_parquet_file_groups(
+        &self,
+        _file_groups: Vec<Vec<FileMeta>>,
+        _physical_schema: crate::schema::SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> crate::DeltaResult<Vec<FileDataReadResultIterator>> {
+        Ok(vec![])
     }
 
     fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {

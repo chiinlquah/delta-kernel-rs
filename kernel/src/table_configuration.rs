@@ -98,7 +98,6 @@ impl PartialEq for PhysicalSchemas {
     }
 }
 
-
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
@@ -1550,7 +1549,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_is_feature_supported_writer_only() {
         let feature = TableFeature::AppendOnly;
@@ -2175,7 +2173,7 @@ mod test {
         .unwrap();
         let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
 
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
@@ -2198,7 +2196,7 @@ mod test {
         .unwrap();
         let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, None, table_root, 0).unwrap();
 
         let column_names = config.physical_stats_column_names(None);
         assert!(column_names.is_empty());

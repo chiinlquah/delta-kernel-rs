@@ -4,8 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use tracing::{info, instrument, warn};
-use url::Url;
+use tracing::{info, instrument};
 
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema, get_log_remove_schema,
@@ -34,12 +33,12 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version, PRE_COMMIT_VERSION,
+    DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version,
+    PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -1729,14 +1728,8 @@ mod tests {
     use super::*;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::CommitInfo;
-    use crate::arrow::array::{
-        ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
-        StructArray,
-    };
-    use crate::arrow::buffer::OffsetBuffer;
-    use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::content_tree::builder::ContentTreeNodeBuilder;
@@ -2086,10 +2079,6 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
-    /// For partitioned tables, creates a partitioned write context with null values.
-    /// Returns a snapshot and a partitioned write context (with null partition values) for the
-    /// given test table. The table must be partitioned.
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
@@ -3475,7 +3464,7 @@ mod tests {
         #[case] expected_partition_cols: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::arrow::array::Float64Array;
-        let (_snap, wc) = snapshot_and_write_context(table_path)?;
+        let (_snap, wc) = snapshot_and_partitioned_write_context(table_path)?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![

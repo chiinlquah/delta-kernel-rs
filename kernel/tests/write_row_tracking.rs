@@ -76,7 +76,12 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     let engine_arc = Arc::new(engine);
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let add_files_metadata = engine_arc
-        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            Default::default(),
+            &Default::default(),
+        )
         .await?;
 
     txn.add_files(add_files_metadata);

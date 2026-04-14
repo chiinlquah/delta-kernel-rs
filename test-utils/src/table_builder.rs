@@ -341,7 +341,12 @@ async fn write_data_commit(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let add_files = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .write_parquet(
+                &ArrowEngineData::new(batch),
+                &write_context,
+                Default::default(),
+                &Default::default(),
+            )
             .await?;
         txn.add_files(add_files);
     }

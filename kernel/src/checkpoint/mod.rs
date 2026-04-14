@@ -425,12 +425,17 @@ impl CheckpointWriter {
         }
 
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
-        // checkpoint, to avoid regressing the hint.
+        // checkpoint, to avoid regressing the hint. We read `_last_checkpoint` directly from
+        // storage rather than relying on the snapshot's log segment, because time-travel
+        // snapshots may not include checkpoints newer than their target version.
         let checkpoint_version = self.snapshot.version();
-        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
-            if hint_version > checkpoint_version {
+        let log_root = &self.snapshot.log_segment().log_root;
+        if let Some(hint) =
+            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), log_root)?
+        {
+            if hint.version > checkpoint_version {
                 info!(
-                    hint_version,
+                    hint_version = hint.version,
                     checkpoint_version,
                     "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
                 );

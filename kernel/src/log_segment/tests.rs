@@ -19,7 +19,6 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::last_checkpoint_hint::LastCheckpointHintSummary;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -1246,13 +1245,13 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // content_root
-        None, // data_predicate
+        None,  // meta_predicate
+        None,  // stats_schema
+        None,  // partition_schema
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1323,13 +1322,13 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // content_root
-        None, // data_predicate
+        None,  // meta_predicate
+        None,  // stats_schema
+        None,  // partition_schema
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1392,13 +1391,13 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // content_root
-        None, // data_predicate
+        None,  // meta_predicate
+        None,  // stats_schema
+        None,  // partition_schema
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1450,13 +1449,13 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // content_root
-        None, // data_predicate
+        None,  // meta_predicate
+        None,  // stats_schema
+        None,  // partition_schema
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1546,13 +1545,13 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // content_root
-        None, // data_predicate
+        None,  // meta_predicate
+        None,  // stats_schema
+        None,  // partition_schema
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1865,22 +1864,32 @@ async fn test_commit_cover(
         ..Default::default()
     })
     .await;
-    let cover = log_segment.find_commit_cover();
+    let cover = log_segment
+        .find_commit_cover(get_commit_schema().clone(), None, None)
+        .unwrap();
+    // Flatten all files across all PartialCommitCover entries for comparison.
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this
-    let expected_locations = expected_files.iter().map(|ef| match ef {
-        ExpectedFile::Commit(version) => log_segment
-            .log_root
-            .join(&format!("{version:020}.json"))
-            .expect("Couldn't join"),
-        ExpectedFile::Compaction(lo, hi) => log_segment
-            .log_root
-            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
-            .expect("Couldn't join"),
-    });
-    assert_eq!(cover.len(), expected_locations.len());
-    for (location, expected_location) in cover.iter().zip(expected_locations) {
-        assert_eq!(location.location, expected_location);
+    let all_cover_files: Vec<&FileMeta> = cover.iter().flat_map(|c| c.files.iter()).collect();
+    let expected_locations: Vec<_> = expected_files
+        .iter()
+        .map(|ef| match ef {
+            ExpectedFile::Commit(version) => log_segment
+                .log_root
+                .join(&format!("{version:020}.json"))
+                .expect("Couldn't join"),
+            ExpectedFile::Compaction(lo, hi) => log_segment
+                .log_root
+                .join(&format!("{lo:020}.{hi:020}.compacted.json"))
+                .expect("Couldn't join"),
+        })
+        .collect();
+    assert_eq!(all_cover_files.len(), expected_locations.len());
+    for (file, expected_location) in all_cover_files.iter().zip(expected_locations) {
+        assert_eq!(
+            file.location, expected_location,
+            "cover file location mismatch"
+        );
     }
 }
 
@@ -2086,9 +2095,18 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         "0-byte compaction should have been filtered at listing time"
     );
 
-    let cover = log_segment.find_commit_cover();
-    assert_eq!(cover.len(), 5);
-    for (i, file) in cover.iter().enumerate() {
+    let cover = log_segment
+        .find_commit_cover(get_commit_schema().clone(), None, None)
+        .unwrap();
+    // All 5 commits should be in a single PartialCommitCover (in descending order)
+    assert_eq!(
+        cover.len(),
+        1,
+        "expected one cover group for commits-only case"
+    );
+    let files = &cover[0].files;
+    assert_eq!(files.len(), 5);
+    for (i, file) in files.iter().enumerate() {
         let expected_version = 4 - i as u64;
         let expected_url = log_root
             .join(&format!("{expected_version:020}.json"))
@@ -2359,11 +2377,7 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
-    // TODO(#2337): restore original expected values when log compaction is re-enabled.
-    // Compaction files are currently skipped during listing, so
-    // commits_since_log_compaction_or_checkpoint() equals commits_since_checkpoint().
-
-    // with compaction, no checkpoint
+    // with compaction, no checkpoint: compaction covers 0-2, so 3 commits remain (3,4)
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=4),
         compaction_versions: &[(0, 2)],
@@ -2371,7 +2385,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
     // checkpoint, no compaction
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2383,7 +2397,7 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
-    // checkpoint and compaction less than checkpoint
+    // checkpoint and compaction less than checkpoint: max(cp=3, compaction=2)=3
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=6),
         compaction_versions: &[(0, 2)],
@@ -2394,7 +2408,7 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
-    // checkpoint and compaction greater than checkpoint
+    // checkpoint and compaction greater than checkpoint: max(cp=2, compaction=4)=4
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=6),
         compaction_versions: &[(3, 4)],
@@ -2403,9 +2417,9 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
-    // multiple compactions
+    // multiple compactions: max compaction end=4, so 6-4=2
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=6),
         compaction_versions: &[(1, 2), (3, 4)],
@@ -2413,9 +2427,9 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 6);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
-    // multiple compactions, out of order
+    // multiple compactions, out of order: max compaction end=9, so 10-9=1
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=10),
         compaction_versions: &[(1, 2), (3, 9), (4, 6)],
@@ -2423,7 +2437,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 10);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 10);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
 }
 
 #[tokio::test]
@@ -2827,7 +2841,7 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     .unwrap();
 
     assert_eq!(log_segment.last_checkpoint_version(), Some(5));
-    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
+    assert_eq!(log_segment.get_checkpoint_schema().unwrap(), sample_schema);
 }
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
@@ -2838,7 +2852,7 @@ async fn test_checkpoint_schema_propagation_from_hint() {
 #[case::hint_older_than_checkpoint(0, false)]
 #[tokio::test]
 async fn test_get_file_actions_schema_v1_parquet_with_hint(
-    #[case] hint_version: u64,
+    #[case] _hint_version: u64,
     #[case] expect_hint_schema_used: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -2862,9 +2876,12 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         StructType::new_unchecked([]),
     )]));
 
-    // Build a commit that uses v1 checkpoint and a hint that describes a different schema
+    // Build a commit that uses v1 checkpoint. Only pass the hint schema to try_new when the
+    // hint version matches the actual checkpoint version (1). In production, this filtering
+    // is done by for_snapshot_impl before calling try_new.
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
+    let checkpoint_schema = expect_hint_schema_used.then(|| hint_schema.clone());
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
@@ -2874,21 +2891,21 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         },
         log_root,
         None,
-        Some(LastCheckpointHintSummary {
-            version: hint_version,
-            schema: Some(hint_schema.clone()),
-        }),
+        checkpoint_schema,
     )?;
 
-    // Verify that checkpoint_schema only returns schema if it is valid
+    // Verify that checkpoint_schema returns schema only when it was provided
     assert_eq!(log_segment.checkpoint_version, Some(1));
     assert_eq!(log_segment.end_version, 2);
     if expect_hint_schema_used {
-        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+        assert_eq!(
+            log_segment.get_checkpoint_schema().as_ref(),
+            Some(&hint_schema)
+        );
     } else {
         assert!(
-            log_segment.checkpoint_schema().is_none(),
-            "hint should not have been returned since version does not match checkpoint_version"
+            log_segment.get_checkpoint_schema().is_none(),
+            "hint schema should not be returned when hint version does not match checkpoint version"
         );
     }
 
@@ -2973,10 +2990,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| LastCheckpointHintSummary {
-            version: 1,
-            schema: Some(v1_schema.clone()),
-        }),
+        use_hint.then(|| v1_schema.clone()),
     )?;
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
@@ -3733,10 +3747,10 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
-        None, // content_root
-        None, // data_predicate
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -3802,10 +3816,10 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
-        None, // content_root
-        None, // data_predicate
+        None,  // content_root
+        None,  // data_predicate
         false, // skip_leaf_manifests
-        None, // table_schema
+        None,  // table_schema
     )?;
 
     // Verify it's false
@@ -4114,8 +4128,7 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     })
     .await;
     assert!(!log_segment.listed.ascending_commit_files.is_empty());
-    // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
-    assert!(log_segment.listed.ascending_compaction_files.is_empty());
+    assert!(!log_segment.listed.ascending_compaction_files.is_empty());
 
     let ckpt_path = create_log_path(path);
     let result = log_segment.try_new_with_checkpoint(ckpt_path).unwrap();
@@ -4298,7 +4311,7 @@ struct CrcPruningCase {
     checkpoint: None,
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
-    after_compactions: &[], // TODO(#2337): restore to &[(5, 7)] when re-enabled
+    after_compactions: &[(5, 7)],
     through_commits: &[0, 1, 2, 3, 4],
     through_compactions: &[],
 })]
@@ -4334,7 +4347,7 @@ struct CrcPruningCase {
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
     through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[], // TODO(#2337): restore to &[(0, 2)] when re-enabled
+    through_compactions: &[(0, 2)],
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {

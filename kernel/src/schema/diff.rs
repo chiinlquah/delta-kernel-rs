@@ -1899,7 +1899,6 @@ mod tests {
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
 
-
     #[test]
     fn test_map_value_struct_field_changes() {
         let before = StructType::new_unchecked([create_field_with_id(

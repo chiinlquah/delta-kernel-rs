@@ -49,7 +49,6 @@ impl PathExt for Path {
     }
 }
 
-
 /// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
 /// conventions where the table metadata declares columns as nullable.
 fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {

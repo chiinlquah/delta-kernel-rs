@@ -1191,7 +1191,10 @@ mod tests {
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
-    #[case::metadata_tree_experimental(TableFeature::MetadataTreeExperimental, "metadataTreeExperimental")]
+    #[case::metadata_tree_experimental(
+        TableFeature::MetadataTreeExperimental,
+        "metadataTree-experimental"
+    )]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
@@ -1377,7 +1380,6 @@ mod tests {
             .to_string()
             .contains("non-primitive type"));
     }
-
 
     #[rstest::rstest]
     #[case::integer(DataType::INTEGER)]

@@ -513,7 +513,12 @@ async fn write_data_and_check_result_and_stats(
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
+                .write_parquet(
+                    data.as_ref().unwrap(),
+                    write_context.as_ref(),
+                    HashMap::new(),
+                    &Default::default(),
+                )
                 .await
         })
     });
@@ -566,7 +571,12 @@ async fn append_data_and_check_result_and_stats(
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
+                .write_parquet(
+                    data.as_ref().unwrap(),
+                    write_context.as_ref(),
+                    HashMap::new(),
+                    &Default::default(),
+                )
                 .await
         })
     });
@@ -708,10 +718,18 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
 
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
         validate_timestamp(&parsed_commits[0]["commitInfo"]);
+        let snapshot_id = parsed_commits[0]["commitInfo"]["snapshotId"]
+            .as_i64()
+            .expect("snapshotId should be present and a positive integer in commitInfo");
+        assert!(
+            snapshot_id > 0,
+            "snapshotId must be positive, got {snapshot_id}"
+        );
 
         // Zero out non-deterministic fields for stable comparison.
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.snapshotId", json!(0))?;
 
         // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
         // omitted from the JSON — consistent with how the Delta log serializes optional fields.
@@ -727,6 +745,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "txnId": ZERO_UUID,
                 "timestamp": 0,
+                "snapshotId": 0,
             }
         })];
 
@@ -949,7 +968,12 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 let engine = engine.clone();
                 tokio::task::spawn(async move {
                     engine
-                        .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
+                        .write_parquet(
+                            data.as_ref().unwrap(),
+                            write_context.as_ref(),
+                            HashMap::new(),
+                            &Default::default(),
+                        )
                         .await
                 })
             });
@@ -1098,7 +1122,9 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         partition_col.to_string(),
         Scalar::String("a".into()),
     )]))?;
-    let result = engine.write_parquet(&data, &write_context).await?;
+    let result = engine
+        .write_parquet(&data, &write_context, HashMap::new(), &Default::default())
+        .await?;
     txn.add_files(result);
     assert!(txn.commit(engine.as_ref())?.is_committed());
 
@@ -1185,7 +1211,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
             let write_context = write_context.clone();
             tokio::task::spawn(async move {
                 engine
-                    .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
+                    .write_parquet(
+                        data.as_ref().unwrap(),
+                        write_context.as_ref(),
+                        HashMap::new(),
+                        &Default::default(),
+                    )
                     .await
             })
         });
@@ -1384,7 +1415,12 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+            &Default::default(),
+        )
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -2227,7 +2263,12 @@ async fn generate_and_add_data_file(
 
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let file_meta = engine
-        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+            &Default::default(),
+        )
         .await?;
     txn.add_files(file_meta);
     Ok(())
@@ -2417,7 +2458,7 @@ async fn test_manifest_commit_with_add_files() -> Result<(), Box<dyn std::error:
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
         let tasks = append_data.into_iter().map(|data| {
             let engine = engine.clone();
             let write_context = write_context.clone();
@@ -3477,7 +3518,12 @@ async fn add_files_to_transaction(
 
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+            &Default::default(),
+        )
         .await?;
     txn.add_files(add_files_metadata);
     Ok(())

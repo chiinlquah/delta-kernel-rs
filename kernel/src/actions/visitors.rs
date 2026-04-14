@@ -1509,7 +1509,6 @@ mod tests {
         assert_eq!(checkpoint.version, 1);
     }
 
-
     // Helper to create a boolean batch for SelectionVectorVisitor tests
     fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
         let array = BooleanArray::from(values);

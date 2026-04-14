@@ -8,8 +8,6 @@ use crate::crc::LazyCrc;
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, Error};
 
-use tracing::{info, instrument, warn};
-
 use super::LogSegment;
 
 impl LogSegment {

@@ -394,7 +394,9 @@ pub(crate) mod test_utils {
         let metadata =
             Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+        crate::table_configuration::TableConfiguration::try_new(
+            metadata, protocol, None, table_root, 0,
+        )
     }
 
     /// Helper to get a field from a StructType by name, panicking if not found.

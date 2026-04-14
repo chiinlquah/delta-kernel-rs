@@ -7,7 +7,6 @@ use tracing::info;
 
 use crate::metrics::{MetricEvent, MetricId, ScanType};
 
-
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
 pub(crate) struct ScanMetrics {

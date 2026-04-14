@@ -6,7 +6,7 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::datatypes::DataType;
 use crate::arrow::{
-    array::{create_array, Array, AsArray, RecordBatch, StructArray},
+    array::{create_array, Array, AsArray, Int32Array, RecordBatch, StructArray},
     datatypes::{Field, Schema},
 };
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
@@ -21,6 +21,7 @@ use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
+use crate::transaction::CommitResult;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 use serde_json::{from_slice, json, Value};
@@ -906,7 +907,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![1]))],
     )?;
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data),

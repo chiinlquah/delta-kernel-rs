@@ -125,7 +125,7 @@ pub(crate) struct LogSegment {
     pub listed: LogSegmentFiles,
     /// Metadata from the `_last_checkpoint` hint file, stored for use by the
     /// `last_checkpoint_hint_summary()` accessor.
-    last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
+    pub(crate) last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
 /// A partial commit cover is a set of files that cover is a set of files that is a
@@ -265,6 +265,7 @@ impl LogSegment {
     }
 
     /// Returns the checkpoint version from the `_last_checkpoint` hint.
+    #[allow(dead_code)] // used in tests
     pub(crate) fn last_checkpoint_version(&self) -> Option<Version> {
         self.checkpoint_version
     }
@@ -283,6 +284,7 @@ impl LogSegment {
     ///
     /// Prefer [`Self::get_checkpoint_schema`] or [`Self::last_checkpoint_version`] when requiring
     /// individual values from the hint.
+    #[allow(dead_code)] // used in tests
     pub(crate) fn last_checkpoint_hint_summary(&self) -> Option<LastCheckpointHintSummary> {
         self.last_checkpoint_metadata.clone()
     }
@@ -741,7 +743,6 @@ impl LogSegment {
         schema.project(&non_file_action_names)
     }
 
-
     /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
     /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
     /// the schema, so callers do not need to supply them.
@@ -755,7 +756,6 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
-            None,
             None,
             None,
             None,
@@ -1529,18 +1529,9 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema =
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Predicate::or(
-                    Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                    Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-                ),
-                Expression::column([CHECKPOINT_ACTION_NAME, "version"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema, META_PREDICATE.clone())
+        // IS NOT NULL predicates for protocol/metadata/checkpoint columns are auto-derived
+        // from the schema by `read_actions`.
+        self.read_actions(engine, schema)
     }
 
     /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.

@@ -336,8 +336,8 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve `_last_checkpoint` hint from old segment
-            old_log_segment.last_checkpoint_hint_summary(),
+            // Preserve `_last_checkpoint` checkpoint schema hint from old segment
+            old_log_segment.get_checkpoint_schema(),
         )?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
@@ -539,11 +539,12 @@ impl Snapshot {
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        match engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
-        {
-            Ok(()) => (),
+        match engine.parquet_handler().write_parquet_file(
+            checkpoint_path.clone(),
+            Box::new(lazy_data),
+            &Default::default(),
+        ) {
+            Ok(_) => (),
             Err(Error::FileAlreadyExists(_)) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
                 // so we log a warning but still return the correct result.
@@ -2669,9 +2670,15 @@ mod tests {
         Ok(())
     }
 
-    // Helper: write a compaction file
+    // Helper: write a compaction file with valid protocol + metadata + add actions
     async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> DeltaResult<()> {
-        let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        let content = concat!(
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            "\n",
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+            "\n",
+            r#"{"add":{"path":"file_compact.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":false}}"#,
+        );
         store
             .put(
                 &test_utils::compacted_log_path_for_versions(start, end, "json"),
@@ -2802,9 +2809,8 @@ mod tests {
         Ok(())
     }
 
-    // TODO(#2337): remove this test when log compaction is re-enabled.
     #[tokio::test]
-    async fn test_compaction_files_ignored_on_read() -> DeltaResult<()> {
+    async fn test_compaction_files_included_on_read() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
@@ -2814,62 +2820,16 @@ mod tests {
         write_compaction_file(&store, 0, 1).await?;
         write_compaction_file(&store, 0, 2).await?;
 
-        // Compaction files exist on disk but should be skipped during listing
+        // Compaction files exist on disk and should be included in the listing
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         assert!(
-            snapshot
+            !snapshot
                 .log_segment
                 .listed
                 .ascending_compaction_files
                 .is_empty(),
-            "Compaction files should be ignored when log compaction is disabled"
+            "Compaction files should be included when log compaction is enabled for reads"
         );
-
-        Ok(())
-    }
-
-    // TODO(#2337): remove this test when log compaction is re-enabled.
-    #[tokio::test]
-    async fn test_incremental_snapshot_ignores_compaction_files() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-        // Create commits 0-2 with compaction files in storage
-        setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 0, 1).await?;
-        write_compaction_file(&store, 0, 2).await?;
-
-        // Build base snapshot at v2
-        let snapshot_v2 = Snapshot::builder_for(table_root)
-            .at_version(2)
-            .build(&engine)?;
-        assert_eq!(snapshot_v2.version(), 2);
-        assert!(snapshot_v2
-            .log_segment
-            .listed
-            .ascending_compaction_files
-            .is_empty());
-
-        // Add commit 3
-        commit(
-            table_root,
-            &store,
-            3,
-            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
-        )
-        .await;
-
-        // Build v3 incrementally -- compaction files should still be skipped
-        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
-            .at_version(3)
-            .build(&engine)?;
-        assert_eq!(snapshot_v3.version(), 3);
-        assert!(snapshot_v3
-            .log_segment
-            .listed
-            .ascending_compaction_files
-            .is_empty());
 
         Ok(())
     }
@@ -2878,7 +2838,6 @@ mod tests {
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
-    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
@@ -2934,7 +2893,6 @@ mod tests {
     /// added after building the base snapshot at v2 gets filtered out because its start version
     /// (1) <= old_version (2).
     #[tokio::test]
-    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";

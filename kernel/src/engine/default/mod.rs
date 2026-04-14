@@ -6,11 +6,11 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
-use itertools::Itertools as _;
 use url::Url;
 
 use delta_kernel_derive::internal_api;
@@ -322,7 +322,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
-        partition_values: HashMap<String, String>,
+        _partition_values: HashMap<String, String>,
         write_config: &crate::ParquetWriterConfig,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();

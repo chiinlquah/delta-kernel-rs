@@ -67,7 +67,16 @@ async fn write_data_to_table(
     let tasks = data.into_iter().map(|data| {
         let engine = engine.clone();
         let write_context = write_context.clone();
-        tokio::task::spawn(async move { engine.write_parquet(&data, write_context.as_ref()).await })
+        tokio::task::spawn(async move {
+            engine
+                .write_parquet(
+                    &data,
+                    write_context.as_ref(),
+                    Default::default(),
+                    &Default::default(),
+                )
+                .await
+        })
     });
 
     let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
@@ -662,11 +671,21 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let write_context2 = Arc::new(txn2.unpartitioned_write_context()?);
 
     let metadata1 = engine1
-        .write_parquet(&ArrowEngineData::new(data1), write_context1.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data1),
+            write_context1.as_ref(),
+            Default::default(),
+            &Default::default(),
+        )
         .await?;
 
     let metadata2 = engine2
-        .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(data2),
+            write_context2.as_ref(),
+            Default::default(),
+            &Default::default(),
+        )
         .await?;
 
     txn1.add_files(metadata1);

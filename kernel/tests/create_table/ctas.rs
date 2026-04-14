@@ -264,7 +264,12 @@ async fn run_ctas_test(
 
     let write_context = Arc::new(tgt_txn.unpartitioned_write_context()?);
     let add_meta = engine
-        .write_parquet(&ArrowEngineData::new(source_data), write_context.as_ref())
+        .write_parquet(
+            &ArrowEngineData::new(source_data),
+            write_context.as_ref(),
+            Default::default(),
+            &Default::default(),
+        )
         .await?;
     tgt_txn.add_files(add_meta);
 

@@ -402,6 +402,7 @@ pub(crate) fn get_any_level_column_physical_name(
 /// This is the batch reverse of [`get_any_level_column_physical_name`]. It pre-builds a flat
 /// `HashMap<physical_name, logical_name>` at each schema depth (up to the deepest [`ColumnName`] in `physical_cols`),
 /// so every level of every [`ColumnName`] resolves in O(1).
+#[allow(dead_code)] // used in tests
 pub(crate) fn get_any_level_columns_logical_names(
     logical_schema: &StructType,
     physical_cols: &[ColumnName],

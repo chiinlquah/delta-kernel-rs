@@ -414,7 +414,6 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::ObjectStore;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 

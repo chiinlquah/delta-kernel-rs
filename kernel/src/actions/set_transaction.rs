@@ -89,16 +89,9 @@ fn replay_for_app_ids(
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     let txn_schema = get_log_txn_schema();
-    // This meta-predicate should be effective because all the app ids end up in a single
-    // checkpoint part when partitioned by `add.path` like the Delta spec requires. There's no
-    // point filtering by a particular app id, even if we have one, because app ids are all in
-    // a single checkpoint part having large min/max range (because they're usually uuids).
-    static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
-            Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
-        ))
-    });
-    log_segment.read_actions(engine, txn_schema.clone(), META_PREDICATE.clone())
+    // IS NOT NULL predicate for `txn.appId` is auto-derived from the schema by `read_actions`,
+    // so no explicit meta-predicate is needed here.
+    log_segment.read_actions(engine, txn_schema.clone())
 }
 
 #[cfg(test)]

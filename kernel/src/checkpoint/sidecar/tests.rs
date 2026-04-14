@@ -66,9 +66,11 @@ fn generate_checkpoint_parts(
                 .peekable();
         if single_sidecar_iter.peek().is_some() {
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
-            engine
-                .parquet_handler()
-                .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
+            engine.parquet_handler().write_parquet_file(
+                sidecar_url.clone(),
+                Box::new(single_sidecar_iter),
+                &Default::default(),
+            )?;
             sidecar_files.push(sidecar_url);
             sidecar_index += 1;
         }
