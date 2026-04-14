@@ -11,6 +11,49 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use test_utils::{collect_file_paths, create_add_files_metadata};
 
+/// Asserts the iceberg metadata directory has exactly `expected_count` metadata.json files,
+/// and the latest file has the expected version prefix (e.g. "v1-").
+fn assert_metadata_version(
+    iceberg_metadata_dir: &std::path::Path,
+    expected_count: usize,
+    expected_latest_version: u64,
+) {
+    let mut files: Vec<_> = std::fs::read_dir(iceberg_metadata_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
+
+    assert_eq!(
+        files.len(),
+        expected_count,
+        "Expected {} metadata.json files, got {}",
+        expected_count,
+        files.len()
+    );
+
+    let latest_name = files
+        .last()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    let expected_prefix = format!("v{}-", expected_latest_version);
+    assert!(
+        latest_name.starts_with(&expected_prefix),
+        "Latest metadata.json should start with '{}', got: {}",
+        expected_prefix,
+        latest_name
+    );
+    println!(
+        "  After version {}: {} metadata.json files, latest: {}",
+        expected_latest_version,
+        files.len(),
+        latest_name
+    );
+}
+
 #[tokio::test]
 async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -58,16 +101,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         "CREATE TABLE should produce exactly 1 metadata.json"
     );
 
-    // Verify filename contains version: v0-<uuid>.metadata.json
-    let create_filename = create_metadata_files[0]
-        .file_name()
-        .to_string_lossy()
-        .to_string();
-    assert!(
-        create_filename.starts_with("v0-"),
-        "CREATE TABLE metadata.json should be named v0-<uuid>.metadata.json, got: {}",
-        create_filename
-    );
+    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
 
     // Verify the create-table metadata.json has schema but no snapshot
     let create_metadata_content = std::fs::read_to_string(create_metadata_files[0].path())?;
@@ -106,6 +140,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 1);
+    assert_metadata_version(&iceberg_metadata_dir, 2, 1); // v0 + v1
 
     // Verify the table is readable
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -274,6 +309,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write v2, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 2);
+    assert_metadata_version(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
 
     // ===================================================================
     // Step 4: Write even more data (version 3)
@@ -294,11 +330,11 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write v3, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 3);
+    assert_metadata_version(&iceberg_metadata_dir, 4, 3); // v0 + v1 + v2 + v3
 
     // ===================================================================
     // Verify: metadata.json at version 3 should contain snapshot history
     // ===================================================================
-    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
     let mut metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
