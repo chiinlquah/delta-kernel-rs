@@ -8,11 +8,12 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
-    CommitInfo, ContentRoot, DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME,
-    PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema, get_log_remove_schema,
+    get_log_txn_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
+    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
+#[cfg(feature = "iceberg-nativev4")]
+use crate::actions::get_log_domain_metadata_schema;
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
