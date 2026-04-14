@@ -546,6 +546,14 @@ impl<S> Transaction<S> {
             let protocol = table_config.protocol().clone();
             let metadata = table_config.metadata().clone();
 
+            // Check icebergNativeV4 before protocol/metadata are moved
+            #[cfg(feature = "iceberg-nativev4")]
+            let has_iceberg_native_v4 = protocol.has_writer_feature(
+                &crate::table_features::TableFeature::IcebergNativeV4Experimental,
+            );
+            #[cfg(feature = "iceberg-nativev4")]
+            let metadata_for_iceberg = metadata.clone();
+
             let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
             let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
@@ -558,6 +566,29 @@ impl<S> Transaction<S> {
             actions_vec.push(Ok(FilteredEngineData::with_all_rows_selected(
                 metadata_data,
             )));
+
+            // Generate Iceberg metadata.json for CREATE TABLE (no snapshot, schema only)
+            #[cfg(feature = "iceberg-nativev4")]
+            if has_iceberg_native_v4 {
+                let result = crate::iceberg_metadata::generate_iceberg_metadata_for_create_table(
+                    engine,
+                    self.read_snapshot.table_root(),
+                    self.read_snapshot.version().wrapping_add(1),
+                    &metadata_for_iceberg,
+                    snapshot_id,
+                )?;
+                info!(
+                    metadata_location = %result.metadata_location,
+                    "Generated Iceberg metadata.json for CREATE TABLE"
+                );
+
+                let iceberg_domain_action = result
+                    .iceberg_domain
+                    .to_domain_metadata()?
+                    .into_engine_data(get_log_domain_metadata_schema().clone(), engine);
+                actions_vec
+                    .push(iceberg_domain_action.map(FilteredEngineData::with_all_rows_selected));
+            }
         }
 
         actions_vec.extend(

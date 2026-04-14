@@ -52,6 +52,56 @@ pub(crate) struct IcebergMetadataResult {
 ///
 /// Returns an error if schema conversion fails, metadata construction fails,
 /// or the metadata.json file cannot be written to storage.
+/// Generates an Iceberg metadata.json for a CREATE TABLE (no data, no snapshot).
+///
+/// Writes a metadata.json with schema and properties but no snapshots.
+/// This lets Iceberg clients discover the table immediately after creation.
+pub(crate) fn generate_iceberg_metadata_for_create_table(
+    engine: &dyn Engine,
+    table_root: &Url,
+    version: Version,
+    metadata: &Metadata,
+    _snapshot_id: i64,
+) -> DeltaResult<IcebergMetadataResult> {
+    let delta_schema = metadata.parse_schema()?;
+    let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
+    let table_uuid = parse_table_uuid(metadata);
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let properties = build_iceberg_properties(metadata, version, timestamp_ms);
+
+    // Build metadata without any snapshot
+    let table_metadata = iceberg_spec::TableMetadataBuilder::new(
+        iceberg_schema,
+        iceberg_spec::UnboundPartitionSpec::builder().build(),
+        iceberg_spec::SortOrder::unsorted_order(),
+        table_root.to_string(),
+        iceberg_spec::FormatVersion::V2,
+        properties,
+    )
+    .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?
+    .assign_uuid(table_uuid)
+    .build()
+    .map_err(|e| Error::generic(format!("Failed to build TableMetadata: {}", e)))?;
+
+    let metadata_location = generate_metadata_path(table_root)?;
+    let metadata_bytes = serde_json::to_vec(&table_metadata.metadata)
+        .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
+
+    engine
+        .storage_handler()
+        .put(&metadata_location, Bytes::from(metadata_bytes), true)?;
+
+    // For create table, there's no snapshot yet
+    let iceberg_domain =
+        IcebergMetadataDomain::new_without_snapshot(version as i64, metadata_location.to_string());
+
+    Ok(IcebergMetadataResult {
+        metadata_location,
+        iceberg_domain,
+    })
+}
+
+/// Generates an Iceberg metadata.json with a snapshot pointing to the v4 root manifest.
 pub(crate) fn generate_iceberg_metadata(
     engine: &dyn Engine,
     table_root: &Url,

@@ -41,7 +41,7 @@ pub(crate) struct IcebergMetadataDomain {
 }
 
 impl IcebergMetadataDomain {
-    /// Creates a new `IcebergMetadataDomain` for an unpartitioned table commit.
+    /// Creates a new `IcebergMetadataDomain` for an unpartitioned table commit with a snapshot.
     pub(crate) fn new(
         delta_commit_version: i64,
         snapshot_id: i64,
@@ -51,6 +51,21 @@ impl IcebergMetadataDomain {
             delta_commit_version,
             current_snapshot_id: Some(snapshot_id),
             new_snapshot_ids: vec![snapshot_id],
+            metadata_location: Some(metadata_location),
+            iceberg_partition_spec_json: UNPARTITIONED_SPEC_JSON.to_string(),
+            domain_name: ICEBERG_METADATA_DOMAIN.to_string(),
+        }
+    }
+
+    /// Creates an `IcebergMetadataDomain` for a CREATE TABLE (no snapshot yet).
+    pub(crate) fn new_without_snapshot(
+        delta_commit_version: i64,
+        metadata_location: String,
+    ) -> Self {
+        Self {
+            delta_commit_version,
+            current_snapshot_id: None,
+            new_snapshot_ids: vec![],
             metadata_location: Some(metadata_location),
             iceberg_partition_spec_json: UNPARTITIONED_SPEC_JSON.to_string(),
             domain_name: ICEBERG_METADATA_DOMAIN.to_string(),
