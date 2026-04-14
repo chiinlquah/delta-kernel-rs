@@ -8,6 +8,8 @@ use crate::crc::LazyCrc;
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, Error};
 
+use tracing::{info, instrument, warn};
+
 use super::LogSegment;
 
 impl LogSegment {
@@ -62,7 +64,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        self.read_actions(engine, schema, None)
+        self.read_actions(engine, schema)
     }
 }
 

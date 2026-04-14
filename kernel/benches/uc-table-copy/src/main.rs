@@ -23,7 +23,7 @@ use clap::Parser;
 use futures::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use uc_client::prelude::*;
+use unity_catalog_delta_client_api::Operation;
 
 #[derive(Parser)]
 #[command(name = "uc-table-copy")]

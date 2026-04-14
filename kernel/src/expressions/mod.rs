@@ -647,6 +647,7 @@ impl PartitionValuesToMapExpression {
     }
 }
 
+
 /// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
 /// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
@@ -849,6 +850,7 @@ impl Expression {
     pub fn partition_values_to_map(struct_expr: impl Into<Expression>) -> Self {
         Self::PartitionValuesToMap(PartitionValuesToMapExpression::new(struct_expr))
     }
+
 
     /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using
     /// Delta's partition value serialization rules. The output struct schema is determined by the
