@@ -8,9 +8,10 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema, get_log_remove_schema,
-    get_log_txn_schema, CheckpointAction, CommitInfo, ContentRoot, DomainMetadata, Metadata,
-    Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_checkpoint_action_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CheckpointAction,
+    CommitInfo, ContentRoot, DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME,
+    PROTOCOL_NAME,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -768,8 +769,7 @@ impl<S> Transaction<S> {
                         self.is_blind_append,
                     );
                     // TODO: Read previous IcebergMetadataDomain for incremental snapshot history
-                    // TODO: Add IcebergMetadataDomain to commit actions
-                    let _result = crate::iceberg_metadata::generate_iceberg_metadata(
+                    let result = crate::iceberg_metadata::generate_iceberg_metadata(
                         engine,
                         self.read_snapshot.table_root(),
                         new_commit_version,
@@ -780,8 +780,17 @@ impl<S> Transaction<S> {
                     )?;
                     info!(
                         version = new_commit_version,
-                        metadata_location = %_result.metadata_location,
+                        metadata_location = %result.metadata_location,
                         "Generated Iceberg metadata.json"
+                    );
+
+                    // Add IcebergMetadataDomain to commit actions
+                    let iceberg_domain_action = result
+                        .iceberg_domain
+                        .to_domain_metadata()?
+                        .into_engine_data(get_log_domain_metadata_schema().clone(), engine);
+                    actions_vec.push(
+                        iceberg_domain_action.map(FilteredEngineData::with_all_rows_selected),
                     );
                 }
             }

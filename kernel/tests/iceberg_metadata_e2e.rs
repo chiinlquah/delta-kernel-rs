@@ -167,6 +167,48 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         Some(&"1".to_string())
     );
 
-    println!("\n=== SUCCESS: Iceberg crate loaded metadata.json successfully ===");
+    // Verify IcebergMetadataDomain is in the Delta commit JSON
+    let commit_path = table_dir
+        .join("_delta_log")
+        .join("00000000000000000001.json");
+    let commit_content = std::fs::read_to_string(&commit_path)?;
+    println!("\n=== Delta commit JSON ===");
+    println!("{}", commit_content);
+
+    // Parse commit JSON lines and find the Iceberg domainMetadata action
+    let domain_action = commit_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|action| {
+            action
+                .get("domainMetadata")
+                .and_then(|dm| dm.get("domain"))
+                .and_then(|d| d.as_str())
+                == Some("com.databricks.iceberg.metadata")
+        })
+        .expect("Commit should contain an Iceberg domainMetadata action");
+
+    let dm = &domain_action["domainMetadata"];
+    assert_eq!(dm["removed"], false);
+
+    // Parse the configuration JSON and verify fields
+    let config: serde_json::Value = serde_json::from_str(dm["configuration"].as_str().unwrap())?;
+    println!("\n=== IcebergMetadataDomain configuration ===");
+    println!("{}", serde_json::to_string_pretty(&config)?);
+
+    assert_eq!(config["deltaCommitVersion"], 1);
+    assert!(config["currentSnapshotId"].as_i64().is_some());
+    assert!(!config["newSnapshotIds"].as_array().unwrap().is_empty());
+    assert!(config["metadataLocation"]
+        .as_str()
+        .unwrap()
+        .contains("metadata.json"));
+    assert_eq!(
+        config["icebergPartitionSpecJson"],
+        r#"{"spec-id":0,"fields":[]}"#
+    );
+    assert_eq!(config["domainName"], "com.databricks.iceberg.metadata");
+
+    println!("\n=== SUCCESS: Iceberg metadata.json + DomainMetadata verified ===");
     Ok(())
 }

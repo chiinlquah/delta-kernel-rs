@@ -12,10 +12,16 @@ use crate::{DeltaResult, Error};
 /// Domain name for Iceberg metadata tracking in Delta log.
 pub(crate) const ICEBERG_METADATA_DOMAIN: &str = "com.databricks.iceberg.metadata";
 
+/// Default partition spec JSON for unpartitioned tables.
+const UNPARTITIONED_SPEC_JSON: &str = r#"{"spec-id":0,"fields":[]}"#;
+
 /// Tracks the Iceberg metadata.json state across Delta commits.
 ///
 /// This is serialized as the `configuration` field of a [`DomainMetadata`] action
 /// with domain [`ICEBERG_METADATA_DOMAIN`].
+///
+/// The JSON format matches DBR's `IcebergMetadataDomain` case class, including the
+/// `domainName` field which is serialized by Jackson's `JsonUtils.toJson()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IcebergMetadataDomain {
@@ -27,10 +33,15 @@ pub(crate) struct IcebergMetadataDomain {
     pub new_snapshot_ids: Vec<i64>,
     /// Location of the Iceberg metadata.json file.
     pub metadata_location: Option<String>,
+    /// The table's default Iceberg partition spec serialized as JSON.
+    pub iceberg_partition_spec_json: String,
+    /// Domain name, always "com.databricks.iceberg.metadata".
+    /// Included in serialization to match DBR's JsonMetadataDomain trait behavior.
+    pub domain_name: String,
 }
 
 impl IcebergMetadataDomain {
-    /// Creates a new `IcebergMetadataDomain` for a commit.
+    /// Creates a new `IcebergMetadataDomain` for an unpartitioned table commit.
     pub(crate) fn new(
         delta_commit_version: i64,
         snapshot_id: i64,
@@ -41,6 +52,8 @@ impl IcebergMetadataDomain {
             current_snapshot_id: Some(snapshot_id),
             new_snapshot_ids: vec![snapshot_id],
             metadata_location: Some(metadata_location),
+            iceberg_partition_spec_json: UNPARTITIONED_SPEC_JSON.to_string(),
+            domain_name: ICEBERG_METADATA_DOMAIN.to_string(),
         }
     }
 
@@ -78,7 +91,7 @@ mod tests {
         let domain = IcebergMetadataDomain::new(
             42,
             123456789,
-            "s3://bucket/table/__iceberg/metadata/abc.metadata.json".to_string(),
+            "s3://bucket/table/metadata/abc.metadata.json".to_string(),
         );
 
         let dm = domain.to_domain_metadata().unwrap();
@@ -90,8 +103,13 @@ mod tests {
         assert_eq!(parsed.new_snapshot_ids, vec![123456789]);
         assert_eq!(
             parsed.metadata_location.unwrap(),
-            "s3://bucket/table/__iceberg/metadata/abc.metadata.json"
+            "s3://bucket/table/metadata/abc.metadata.json"
         );
+        assert_eq!(
+            parsed.iceberg_partition_spec_json,
+            r#"{"spec-id":0,"fields":[]}"#
+        );
+        assert_eq!(parsed.domain_name, ICEBERG_METADATA_DOMAIN);
     }
 
     #[test]
@@ -103,5 +121,10 @@ mod tests {
         assert_eq!(json["currentSnapshotId"], 9999);
         assert_eq!(json["newSnapshotIds"], serde_json::json!([9999]));
         assert_eq!(json["metadataLocation"], "s3://bucket/metadata.json");
+        assert_eq!(
+            json["icebergPartitionSpecJson"],
+            r#"{"spec-id":0,"fields":[]}"#
+        );
+        assert_eq!(json["domainName"], ICEBERG_METADATA_DOMAIN);
     }
 }
