@@ -59,19 +59,9 @@ pub(crate) fn generate_iceberg_metadata(
     metadata: &Metadata,
     commit_info: &CommitInfo,
     checkpoint_action: &CheckpointAction,
-    _previous_domain: Option<&IcebergMetadataDomain>,
+    previous_domain: Option<&IcebergMetadataDomain>,
 ) -> DeltaResult<IcebergMetadataResult> {
-    // TODO: When previous_domain is Some, load the previous metadata.json and use
-    // into_builder() to append the new snapshot, preserving snapshot history for
-    // Iceberg time travel. Currently each commit produces a fresh TableMetadata
-    // with only the current snapshot.
-
-    // Step 1: Convert Delta schema to Iceberg schema
-    let delta_schema = metadata.parse_schema()?;
-    let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
-    let last_column_id = find_max_field_id(&iceberg_schema);
-
-    // Step 2: Get snapshot ID and timestamp
+    // Step 1: Get snapshot ID and timestamp
     let snapshot_id = commit_info.snapshot_id.ok_or_else(|| {
         Error::generic("CommitInfo missing snapshot_id for Iceberg metadata generation")
     })?;
@@ -79,26 +69,22 @@ pub(crate) fn generate_iceberg_metadata(
         Error::generic("CommitInfo missing timestamp for Iceberg metadata generation")
     })?;
 
-    // Step 3: Build Iceberg Snapshot pointing to the v4 root manifest
+    // Step 2: Build Iceberg Snapshot pointing to the v4 root manifest
     let manifest_list_path = resolve_manifest_list_path(table_root, checkpoint_action)?;
     let snapshot = build_snapshot(snapshot_id, version, timestamp_ms, &manifest_list_path)?;
 
-    // Step 4: Build TableMetadata
-    let table_uuid = parse_table_uuid(metadata);
-    let properties = build_iceberg_properties(metadata, version, timestamp_ms);
+    // Step 3: Build TableMetadata — incremental if previous metadata exists, fresh otherwise
+    let table_metadata = if let Some(prev) = previous_domain {
+        build_table_metadata_incremental(engine, prev, snapshot)?
+    } else {
+        let delta_schema = metadata.parse_schema()?;
+        let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
+        let table_uuid = parse_table_uuid(metadata);
+        let properties = build_iceberg_properties(metadata, version, timestamp_ms);
+        build_table_metadata_fresh(iceberg_schema, table_root, table_uuid, snapshot, properties)?
+    };
 
-    let table_metadata = build_table_metadata(
-        iceberg_schema,
-        table_root,
-        table_uuid,
-        last_column_id,
-        version,
-        timestamp_ms,
-        snapshot,
-        properties,
-    )?;
-
-    // Step 5: Serialize and write to storage
+    // Step 4: Serialize and write to storage
     let metadata_location = generate_metadata_path(table_root)?;
     let metadata_bytes = serde_json::to_vec(&table_metadata)
         .map_err(|e| Error::generic(format!("Failed to serialize Iceberg metadata.json: {}", e)))?;
@@ -107,7 +93,7 @@ pub(crate) fn generate_iceberg_metadata(
         .storage_handler()
         .put(&metadata_location, Bytes::from(metadata_bytes), true)?;
 
-    // Step 6: Build result
+    // Step 5: Build result
     let iceberg_domain =
         IcebergMetadataDomain::new(version as i64, snapshot_id, metadata_location.to_string());
 
@@ -217,15 +203,11 @@ fn build_snapshot(
         .build())
 }
 
-/// Builds the Iceberg TableMetadata from all components.
-#[allow(clippy::too_many_arguments)]
-fn build_table_metadata(
+/// Builds a fresh Iceberg TableMetadata from scratch (first commit with icebergNativeV4).
+fn build_table_metadata_fresh(
     schema: iceberg_spec::Schema,
     table_root: &Url,
     table_uuid: uuid::Uuid,
-    _last_column_id: i32,
-    _version: Version,
-    _timestamp_ms: i64,
     snapshot: iceberg_spec::Snapshot,
     properties: HashMap<String, String>,
 ) -> DeltaResult<iceberg_spec::TableMetadata> {
@@ -239,6 +221,49 @@ fn build_table_metadata(
     )
     .map_err(|e| Error::generic(format!("Failed to create TableMetadataBuilder: {}", e)))?;
 
+    add_snapshot_and_build(builder.assign_uuid(table_uuid), snapshot)
+}
+
+/// Builds TableMetadata incrementally by loading the previous metadata.json and appending
+/// a new snapshot. This preserves snapshot history for Iceberg time travel.
+fn build_table_metadata_incremental(
+    engine: &dyn Engine,
+    previous_domain: &IcebergMetadataDomain,
+    snapshot: iceberg_spec::Snapshot,
+) -> DeltaResult<iceberg_spec::TableMetadata> {
+    let prev_location = previous_domain
+        .metadata_location
+        .as_ref()
+        .ok_or_else(|| Error::generic("Previous IcebergMetadataDomain has no metadataLocation"))?;
+
+    // Load previous metadata.json from storage
+    let prev_url = Url::parse(prev_location).map_err(|e| {
+        Error::generic(format!(
+            "Failed to parse previous metadata location '{}': {}",
+            prev_location, e
+        ))
+    })?;
+    let prev_bytes_iter = engine
+        .storage_handler()
+        .read_files(vec![(prev_url.clone(), None)])?;
+    let prev_bytes = prev_bytes_iter
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::generic("No data returned for previous metadata.json"))??;
+    let prev_metadata: iceberg_spec::TableMetadata = serde_json::from_slice(&prev_bytes)
+        .map_err(|e| Error::generic(format!("Failed to parse previous metadata.json: {}", e)))?;
+
+    // Build on top of previous metadata, preserving snapshot history
+    let builder = prev_metadata.into_builder(Some(prev_location.clone()));
+
+    add_snapshot_and_build(builder, snapshot)
+}
+
+/// Shared helper: adds a snapshot to a TableMetadataBuilder and sets the main branch ref.
+fn add_snapshot_and_build(
+    builder: iceberg_spec::TableMetadataBuilder,
+    snapshot: iceberg_spec::Snapshot,
+) -> DeltaResult<iceberg_spec::TableMetadata> {
     let snapshot_id = snapshot.snapshot_id();
     let main_branch_ref = iceberg_spec::SnapshotReference::new(
         snapshot_id,
@@ -250,7 +275,6 @@ fn build_table_metadata(
     );
 
     let result = builder
-        .assign_uuid(table_uuid)
         .add_snapshot(snapshot)
         .map_err(|e| Error::generic(format!("Failed to add snapshot: {}", e)))?
         .set_ref(iceberg_spec::MAIN_BRANCH, main_branch_ref)
@@ -349,13 +373,10 @@ mod tests {
         let table_root = Url::parse("s3://bucket/table/").unwrap();
         let table_uuid = uuid::Uuid::parse_str("d20125c8-7284-442c-9aea-15fee620737e").unwrap();
 
-        let metadata = build_table_metadata(
+        let metadata = build_table_metadata_fresh(
             iceberg_schema,
             &table_root,
             table_uuid,
-            2, // last_column_id
-            1, // version
-            1711929600000,
             snapshot,
             HashMap::from([("delta-version".to_string(), "1".to_string())]),
         )
@@ -471,8 +492,6 @@ mod tests {
         // Step 1: Convert schema
         let delta_schema = metadata.parse_schema().unwrap();
         let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![]).unwrap();
-        let last_column_id = find_max_field_id(&iceberg_schema);
-
         // Step 2: Build snapshot
         let snapshot =
             build_snapshot(snapshot_id, version, timestamp_ms, root_manifest_path).unwrap();
@@ -482,13 +501,10 @@ mod tests {
         let table_uuid = uuid::Uuid::parse_str(metadata.id()).unwrap();
         let properties = build_iceberg_properties(&metadata, version, timestamp_ms);
 
-        let table_metadata = build_table_metadata(
+        let table_metadata = build_table_metadata_fresh(
             iceberg_schema,
             &table_root,
             table_uuid,
-            last_column_id,
-            version,
-            timestamp_ms,
             snapshot,
             properties,
         )

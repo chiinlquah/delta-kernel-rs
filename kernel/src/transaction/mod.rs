@@ -769,7 +769,26 @@ impl<S> Transaction<S> {
                         snapshot_id,
                         self.is_blind_append,
                     );
-                    // TODO: Read previous IcebergMetadataDomain for incremental snapshot history
+                    // Read previous IcebergMetadataDomain for incremental snapshot history
+                    let previous_domain = self
+                        .read_snapshot
+                        .get_domain_metadata(
+                            crate::iceberg_metadata::domain::ICEBERG_METADATA_DOMAIN,
+                            engine,
+                        )?
+                        .map(|config| {
+                            serde_json::from_str::<
+                                crate::iceberg_metadata::domain::IcebergMetadataDomain,
+                            >(&config)
+                        })
+                        .transpose()
+                        .map_err(|e| {
+                            Error::generic(format!(
+                                "Failed to parse previous IcebergMetadataDomain: {}",
+                                e
+                            ))
+                        })?;
+
                     let result = crate::iceberg_metadata::generate_iceberg_metadata(
                         engine,
                         self.read_snapshot.table_root(),
@@ -777,7 +796,7 @@ impl<S> Transaction<S> {
                         table_config.metadata(),
                         &commit_info,
                         &checkpoint_action,
-                        None, // previous_domain
+                        previous_domain.as_ref(),
                     )?;
                     info!(
                         version = new_commit_version,
