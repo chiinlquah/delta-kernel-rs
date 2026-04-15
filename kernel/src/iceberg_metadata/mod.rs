@@ -121,7 +121,14 @@ pub(crate) fn generate_iceberg_metadata(
 
     // Step 2: Build Iceberg Snapshot pointing to the v4 root manifest
     let manifest_list_path = resolve_manifest_list_path(table_root, checkpoint_action)?;
-    let snapshot = build_snapshot(snapshot_id, version, timestamp_ms, &manifest_list_path)?;
+    let parent_snapshot_id = previous_domain.and_then(|d| d.current_snapshot_id);
+    let snapshot = build_snapshot(
+        snapshot_id,
+        parent_snapshot_id,
+        version,
+        timestamp_ms,
+        &manifest_list_path,
+    )?;
 
     // Step 3: Build TableMetadata — incremental if previous metadata exists, fresh otherwise
     let table_metadata = if let Some(prev) = previous_domain {
@@ -236,12 +243,14 @@ fn build_iceberg_properties(
 /// Builds an Iceberg Snapshot pointing to the v4 root manifest.
 fn build_snapshot(
     snapshot_id: i64,
+    parent_snapshot_id: Option<i64>,
     version: Version,
     timestamp_ms: i64,
     manifest_list_path: &str,
 ) -> DeltaResult<iceberg_spec::Snapshot> {
     Ok(iceberg_spec::Snapshot::builder()
         .with_snapshot_id(snapshot_id)
+        .with_parent_snapshot_id(parent_snapshot_id)
         .with_sequence_number(version as i64)
         .with_timestamp_ms(timestamp_ms)
         .with_manifest_list(manifest_list_path)
@@ -389,11 +398,13 @@ mod tests {
     fn build_snapshot_points_to_root_manifest() {
         let snapshot = build_snapshot(
             12345,
+            Some(99999), // parent snapshot ID
             42,
             1711929600000,
             "s3://bucket/table/metadata/root-v42.parquet",
         )
         .unwrap();
+        assert_eq!(snapshot.parent_snapshot_id(), Some(99999));
 
         assert_eq!(snapshot.snapshot_id(), 12345);
         assert_eq!(snapshot.sequence_number(), 42);
@@ -416,6 +427,7 @@ mod tests {
         let snapshot_id = generate_snapshot_id();
         let snapshot = build_snapshot(
             snapshot_id,
+            None, // first snapshot, no parent
             1,
             1711929600000,
             "s3://bucket/table/_delta_log/00000000000000000001.content.parquet",
@@ -551,7 +563,7 @@ mod tests {
         let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![]).unwrap();
         // Step 2: Build snapshot
         let snapshot =
-            build_snapshot(snapshot_id, version, timestamp_ms, root_manifest_path).unwrap();
+            build_snapshot(snapshot_id, None, version, timestamp_ms, root_manifest_path).unwrap();
 
         // Step 3: Build table metadata
         let table_root = Url::parse("s3://bucket/table/").unwrap();
