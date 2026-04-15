@@ -161,7 +161,7 @@ default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["catalog-managed", "iceberg-nativev4", "test-utils"] }
+delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "iceberg-nativev4", "test-utils"] }
 test_utils = { path = "../test-utils", default-features = false }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
