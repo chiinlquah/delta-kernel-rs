@@ -30,4 +30,3 @@ ffi/examples/visit-expression/build
 # Benchmark data
 kernel/benches/add_action_generator/datasets/
 /benchmarks/data/workloads/
-benchmarks/workloads/

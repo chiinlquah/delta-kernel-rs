@@ -8,7 +8,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use iceberg::spec as iceberg_spec;
 use test_utils::{collect_file_paths, create_add_files_metadata};
 
 /// Reads the latest metadata.json from the iceberg metadata directory, validates file count
@@ -17,7 +17,7 @@ fn read_and_validate_iceberg_metadata(
     iceberg_metadata_dir: &std::path::Path,
     expected_file_count: usize,
     expected_version: u64,
-) -> iceberg::spec::TableMetadata {
+) -> iceberg_spec::TableMetadata {
     let mut files: Vec<_> = std::fs::read_dir(iceberg_metadata_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -71,10 +71,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction for create table, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     // Verify: CREATE TABLE should generate metadata.json (no snapshot, schema only)
@@ -104,10 +101,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     )?);
 
     // Commit — should automatically generate metadata.json
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction for write, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
     read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1); // v0 + v1
 
@@ -130,7 +124,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
     assert_eq!(
         table_metadata.format_version(),
-        iceberg::spec::FormatVersion::V2
+        iceberg_spec::FormatVersion::V2
     );
     assert_eq!(
         table_metadata.current_schema().as_struct().fields().len(),
@@ -202,10 +196,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         vec![("part-00002.parquet", 3072, 1_000_002, 30)],
     )?);
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction for write v2, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 2);
     read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
 
@@ -223,10 +214,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         vec![("part-00003.parquet", 4096, 1_000_003, 40)],
     )?);
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction for write v3, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 3);
     read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 4, 3); // v0 + v1 + v2 + v3
 
@@ -242,7 +230,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
 
     let latest_metadata_path = metadata_files.last().unwrap().path();
     let latest_content = std::fs::read_to_string(&latest_metadata_path)?;
-    let latest_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&latest_content)?;
+    let latest_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&latest_content)?;
 
     println!("\n=== Latest metadata.json (version 3) ===");
     println!("{}", latest_content);
@@ -322,10 +310,12 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 0),
-        other => panic!("Expected committed transaction, got {other:?}"),
-    };
+    assert_eq!(
+        txn.commit(engine.as_ref())?
+            .unwrap_committed()
+            .commit_version(),
+        0
+    );
 
     let table_dir = std::path::Path::new(table_path);
     let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
@@ -357,10 +347,7 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
         vec![("part-00000.parquet", 1024, 1_000_000, 10)],
     )?);
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
 
     // Verify: kernel should NOT have generated a new metadata.json — count stays at 1
@@ -412,13 +399,13 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
     ])?);
 
     // CTAS: create table + add files in one commit
-    // Note: Row tracking is not yet supported for CTAS in kernel, so we skip it here.
     let mut txn = create_table(table_path, schema, "TestEngine/1.0")
         .with_table_properties([
             ("delta.columnMapping.mode", "id"),
             ("delta.feature.metadataTree-experimental", "supported"),
             ("delta.feature.domainMetadata", "supported"),
-            ("delta.feature.icebergNativeV4-experimental", "supported"),
+            ("delta.enableRowTracking", "true"),
+            ("delta.enableIcebergNativeV4Experimental", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -432,10 +419,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         ],
     )?);
 
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed transaction for CTAS, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     // Verify metadata.json was generated
@@ -467,7 +451,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
 
     // Verify it has a snapshot (unlike pure CREATE TABLE which has 0)
     let content = std::fs::read_to_string(metadata_files[0].path())?;
-    let table_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&content)?;
+    let table_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&content)?;
 
     println!("\n=== CTAS metadata.json ===");
     println!("{}", content);
@@ -487,6 +471,21 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         snapshot.manifest_list().contains(".content."),
         "Snapshot should point to a .content. parquet file, got: {}",
         snapshot.manifest_list()
+    );
+
+    // Verify Iceberg schema is readable and matches the Delta schema
+    let iceberg_schema = table_metadata.current_schema();
+    let fields = iceberg_schema.as_struct().fields();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].name, "id");
+    assert_eq!(
+        *fields[0].field_type,
+        iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int)
+    );
+    assert_eq!(fields[1].name, "value");
+    assert_eq!(
+        *fields[1].field_type,
+        iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::String)
     );
 
     // Verify the table is readable
@@ -516,10 +515,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         add_files_schema,
         vec![("insert-part-00000.parquet", 3072, 1_000_002, 50)],
     )?);
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed for v1, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
     read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1); // v0 (CTAS) + v1
 
@@ -534,10 +530,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         add_files_schema,
         vec![("insert-part-00001.parquet", 4096, 1_000_003, 60)],
     )?);
-    let committed = match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(c) => c,
-        other => panic!("Expected committed for v2, got {other:?}"),
-    };
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 2);
     read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
 
@@ -548,7 +541,7 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         .collect();
     final_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
     let final_content = std::fs::read_to_string(final_files.last().unwrap().path())?;
-    let final_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&final_content)?;
+    let final_metadata: iceberg_spec::TableMetadata = serde_json::from_str(&final_content)?;
 
     assert_eq!(
         final_metadata.snapshots().len(),

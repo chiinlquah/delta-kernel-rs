@@ -514,12 +514,8 @@ fn maybe_enable_ict_for_catalog_managed(
 /// Conditionally enables the icebergNativeV4 feature during table creation.
 ///
 /// When `delta.enableIcebergNativeV4Experimental` is set to `"true"`, adds the
-/// `IcebergNativeV4Experimental` feature to the protocol.
-///
-/// Note: RowTracking is a dependency of icebergNativeV4 but is NOT auto-enabled here
-/// because CTAS (create table with data) does not yet support row tracking in kernel.
-/// Users should enable row tracking separately via `delta.enableRowTracking` for
-/// non-CTAS create table, or via `delta.feature.rowTracking = supported` as a feature signal.
+/// `IcebergNativeV4Experimental` feature to the protocol. RowTracking is auto-enabled
+/// via `maybe_auto_enable_property_driven_features` when `delta.enableRowTracking` is set.
 fn maybe_enable_iceberg_native_v4(validated: &mut ValidatedTableProperties) {
     let enabled = validated
         .properties
@@ -528,6 +524,12 @@ fn maybe_enable_iceberg_native_v4(validated: &mut ValidatedTableProperties) {
     if enabled {
         add_feature_to_lists(
             TableFeature::IcebergNativeV4Experimental,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        // RowTracking is a required dependency of icebergNativeV4
+        add_feature_to_lists(
+            TableFeature::RowTracking,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
