@@ -1116,7 +1116,7 @@ impl ContentTreeNode {
                 let batch_entries: Vec<_> = visitor
                     .entries
                     .into_iter()
-                    .zip(selection_vector.into_iter())
+                    .zip(selection_vector)
                     .filter_map(|(entry, keep)| {
                         debug!(
                             "Manifest pruning: {} location={:?}",
