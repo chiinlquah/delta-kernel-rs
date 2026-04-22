@@ -572,7 +572,10 @@ mod tests {
 
         let result = iceberg_schema_to_delta(&iceberg_schema);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no Delta equivalent"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no Delta equivalent"));
     }
 
     #[test]
