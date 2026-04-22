@@ -286,30 +286,38 @@ mod tests {
         .unwrap();
 
         let iceberg = delta_schema_to_iceberg(&schema, 0, vec![]).unwrap();
-        let json = serde_json::to_value(&iceberg).unwrap();
-
-        let fields = json["fields"].as_array().unwrap();
+        let fields = iceberg.as_struct().fields();
         assert_eq!(fields.len(), 13);
 
-        assert_eq!(fields[0]["type"], "string");
-        assert_eq!(fields[0]["required"], true);
-        assert_eq!(fields[0]["id"], 1);
+        use iceberg::spec as is;
 
-        assert_eq!(fields[1]["type"], "long");
-        assert_eq!(fields[1]["required"], false);
+        let assert_field =
+            |f: &is::NestedFieldRef, id: i32, name: &str, required: bool, ty: is::PrimitiveType| {
+                assert_eq!(f.id, id);
+                assert_eq!(f.name, name);
+                assert_eq!(f.required, required);
+                assert_eq!(*f.field_type, is::Type::Primitive(ty));
+            };
 
-        assert_eq!(fields[2]["type"], "int");
-        assert_eq!(fields[3]["type"], "int"); // short -> int
-        assert_eq!(fields[4]["type"], "int"); // byte -> int
-
-        assert_eq!(fields[5]["type"], "float");
-        assert_eq!(fields[6]["type"], "double");
-        assert_eq!(fields[7]["type"], "boolean");
-        assert_eq!(fields[8]["type"], "binary");
-        assert_eq!(fields[9]["type"], "date");
-        assert_eq!(fields[10]["type"], "timestamptz");
-        assert_eq!(fields[11]["type"], "timestamp");
-        assert_eq!(fields[12]["type"], "decimal(10,2)");
+        assert_field(&fields[0], 1, "a_string", true, is::PrimitiveType::String);
+        assert_field(&fields[1], 2, "a_long", false, is::PrimitiveType::Long);
+        assert_field(&fields[2], 3, "an_int", true, is::PrimitiveType::Int);
+        assert_field(&fields[3], 4, "a_short", false, is::PrimitiveType::Int); // short -> int
+        assert_field(&fields[4], 5, "a_byte", false, is::PrimitiveType::Int); // byte -> int
+        assert_field(&fields[5], 6, "a_float", false, is::PrimitiveType::Float);
+        assert_field(&fields[6], 7, "a_double", false, is::PrimitiveType::Double);
+        assert_field(&fields[7], 8, "a_bool", true, is::PrimitiveType::Boolean);
+        assert_field(&fields[8], 9, "a_binary", false, is::PrimitiveType::Binary);
+        assert_field(&fields[9], 10, "a_date", false, is::PrimitiveType::Date);
+        assert_field(&fields[10], 11, "a_timestamp", false, is::PrimitiveType::Timestamptz);
+        assert_field(&fields[11], 12, "a_timestamp_ntz", false, is::PrimitiveType::Timestamp);
+        assert_field(
+            &fields[12],
+            13,
+            "a_decimal",
+            false,
+            is::PrimitiveType::Decimal { precision: 10, scale: 2 },
+        );
     }
 
     #[test]
@@ -326,17 +334,20 @@ mod tests {
         .unwrap();
 
         let iceberg = delta_schema_to_iceberg(&schema, 0, vec![]).unwrap();
-        let json = serde_json::to_value(&iceberg).unwrap();
+        let fields = iceberg.as_struct().fields();
+        assert_eq!(fields.len(), 2);
 
-        let point_type = &json["fields"][1]["type"];
-        assert_eq!(point_type["type"], "struct");
-
-        let inner_fields = point_type["fields"].as_array().unwrap();
-        assert_eq!(inner_fields.len(), 2);
-        assert_eq!(inner_fields[0]["id"], 3);
-        assert_eq!(inner_fields[0]["name"], "x");
-        assert_eq!(inner_fields[1]["id"], 4);
-        assert_eq!(inner_fields[1]["name"], "y");
+        assert_eq!(fields[1].name, "point");
+        if let iceberg::spec::Type::Struct(inner) = &*fields[1].field_type {
+            let inner_fields = inner.fields();
+            assert_eq!(inner_fields.len(), 2);
+            assert_eq!(inner_fields[0].id, 3);
+            assert_eq!(inner_fields[0].name, "x");
+            assert_eq!(inner_fields[1].id, 4);
+            assert_eq!(inner_fields[1].name, "y");
+        } else {
+            panic!("Expected Struct type for 'point' field");
+        }
     }
 
     #[test]
@@ -348,10 +359,10 @@ mod tests {
         .unwrap();
 
         let iceberg = delta_schema_to_iceberg(&schema, 5, vec![1]).unwrap();
-        let json = serde_json::to_value(&iceberg).unwrap();
 
-        assert_eq!(json["schema-id"], 5);
-        assert_eq!(json["identifier-field-ids"], serde_json::json!([1]));
+        assert_eq!(iceberg.schema_id(), 5);
+        let ids: Vec<i32> = iceberg.identifier_field_ids().collect();
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
@@ -576,14 +587,6 @@ mod tests {
         let iceberg = delta_schema_to_iceberg(&original, 0, vec![]).unwrap();
         let round_tripped = iceberg_schema_to_delta(&iceberg).unwrap();
 
-        // Field names, types, and nullability should match
-        let orig_fields: Vec<&StructField> = original.fields().collect();
-        let rt_fields: Vec<&StructField> = round_tripped.fields().collect();
-        assert_eq!(orig_fields.len(), rt_fields.len());
-        for (o, r) in orig_fields.iter().zip(rt_fields.iter()) {
-            assert_eq!(o.name, r.name);
-            assert_eq!(o.data_type, r.data_type);
-            assert_eq!(o.nullable, r.nullable);
-        }
+        assert_eq!(original, round_tripped);
     }
 }
