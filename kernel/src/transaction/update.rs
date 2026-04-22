@@ -34,6 +34,7 @@ use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 use delta_kernel_derive::internal_api;
 
+use super::manifest_commit_state::ExplicitRootManifestCommit;
 use super::Transaction;
 
 // =============================================================================
@@ -92,6 +93,7 @@ impl Transaction {
             dv_matched_files: vec![],
             snapshot_id: generate_snapshot_id(),
             manifest_commit_state: None,
+            explicit_root_manifest_commit: None,
             physical_clustering_columns: clustering_columns,
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
@@ -101,6 +103,38 @@ impl Transaction {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /// Configure this transaction to use a caller-supplied root manifest instead of having kernel
+    /// build one.
+    ///
+    /// On commit, the checkpoint action references `file` as the content root; kernel writes no
+    /// new root manifest parquet file. This mode is mutually exclusive with
+    /// [`Transaction::with_manifest_commit`].
+    ///
+    /// `file.location` must be under the table root (same scheme, host, and path prefix).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`with_manifest_commit`] has already been called, if this method has
+    /// already been called, if the snapshot has no existing checkpoint action, if the checkpoint
+    /// does not cover the snapshot version, or if `file.location` is not under the table root.
+    ///
+    /// [`with_manifest_commit`]: Transaction::with_manifest_commit
+    pub fn with_explicit_root_manifest(&mut self, file: crate::FileMeta) -> DeltaResult<()> {
+        if self.manifest_commit_state.is_some() {
+            return Err(Error::invalid_transaction_state(
+                "explicit root manifest and manifest commit are mutually exclusive",
+            ));
+        }
+        if self.explicit_root_manifest_commit.is_some() {
+            return Err(Error::invalid_transaction_state(
+                "explicit root manifest may only be set once per transaction",
+            ));
+        }
+        self.explicit_root_manifest_commit =
+            Some(ExplicitRootManifestCommit::new(file, &self.read_snapshot)?);
+        Ok(())
+    }
 
     /// Mark this transaction as a blind append.
     ///

@@ -59,29 +59,12 @@ use test_utils::{
 
 mod common;
 
-/// Create a simple schema with column mapping enabled (required for manifest_commit mode)
-fn create_column_mapping_schema(
-    field_name: &str,
-    data_type: DataType,
-) -> Result<Arc<StructType>, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![StructField::nullable(
-        field_name, data_type,
-    )
-    .with_metadata([
-        (
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(1),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingId.as_ref(),
-            MetadataValue::Number(1),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String("col-1".to_string()),
-        ),
-    ])])?))
-}
+#[path = "support/manifest_commit_setup.rs"]
+mod manifest_commit_setup;
+use manifest_commit_setup::{
+    add_files_to_transaction, create_column_mapping_schema, generate_and_add_data_file,
+    setup_manifest_commit_test_tables, write_data_to_table,
+};
 
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.
@@ -135,42 +118,6 @@ fn validate_timestamp(commit_info: &serde_json::Value) {
 }
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
-
-/// Creates tables with MetadataTreeExperimental feature for manifest commit tests
-async fn setup_manifest_commit_test_tables(
-    schema: Arc<StructType>,
-    partition_columns: &[&str],
-    table_base_name: &str,
-) -> Result<
-    Vec<(
-        Url,
-        DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
-        &'static str,
-    )>,
-    Box<dyn std::error::Error>,
-> {
-    use test_utils::{create_table, engine_store_setup};
-
-    let table_name_37 = format!("{table_base_name}_37");
-    let (store_37, engine_37, table_location_37) = engine_store_setup(table_name_37.as_str(), None);
-
-    Ok(vec![(
-        create_table(
-            store_37.clone(),
-            table_location_37,
-            schema.clone(),
-            partition_columns,
-            true,                                               // use_37_protocol
-            vec!["columnMapping", "metadataTree-experimental"], // reader features
-            vec!["columnMapping", "metadataTree-experimental"], // writer features
-        )
-        .await?,
-        engine_37,
-        store_37,
-        "test_table_37",
-    )])
-}
 
 /// Creates a table with deletion vector support and writes the specified files
 async fn create_dv_table_with_files(
@@ -2248,32 +2195,6 @@ async fn get_ict_at_version(
     Ok(ict)
 }
 
-/// Helper function to generate a simple data file and add it to the transaction
-/// This simplifies repetitive data generation in tests
-async fn generate_and_add_data_file(
-    txn: &mut delta_kernel::transaction::Transaction,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
-    schema: SchemaRef,
-    values: Vec<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let data = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into_arrow()?),
-        vec![Arc::new(Int32Array::from(values))],
-    )?;
-
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
-    let file_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-            &Default::default(),
-        )
-        .await?;
-    txn.add_files(file_meta);
-    Ok(())
-}
-
 #[tokio::test]
 async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -3481,52 +3402,6 @@ async fn create_cdf_table(
     .await?;
 
     Ok((table_url, Arc::new(engine), tmp_dir))
-}
-
-// Helper function to write data to a table
-async fn write_data_to_table(
-    table_url: &Url,
-    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    schema: SchemaRef,
-    values: Vec<i32>,
-) -> Result<Version, Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("test");
-
-    add_files_to_transaction(&mut txn, engine, schema, values).await?;
-
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
-        _ => panic!("Transaction should be committed"),
-    }
-}
-
-// Helper function to add files to an existing transaction
-async fn add_files_to_transaction(
-    txn: &mut delta_kernel::transaction::Transaction,
-    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    schema: SchemaRef,
-    values: Vec<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let data = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into_arrow()?),
-        vec![Arc::new(Int32Array::from(values))],
-    )?;
-
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
-    let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-            &Default::default(),
-        )
-        .await?;
-    txn.add_files(add_files_metadata);
-    Ok(())
 }
 
 #[tokio::test]

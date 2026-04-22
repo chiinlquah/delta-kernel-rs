@@ -50,7 +50,7 @@ use content_tree::ScanMetadataRemoveVisitor;
 
 // Re-export types needed for public API
 pub use leaf_writer::LeafNodeWriterResult;
-pub use manifest_commit_state::ManifestCommitState;
+pub use manifest_commit_state::{ExplicitRootManifestCommit, ManifestCommitState};
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -249,9 +249,12 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Snapshot ID for tracking info
     snapshot_id: i64,
-    // Manifest commit state. `Some` when the caller has opted in via
-    // `with_manifest_commit()`. `None` for log commits.
+    // Leaf-based manifest commit state. `Some` when the caller has opted in via
+    // `with_manifest_commit()`. Mutually exclusive with `explicit_root_manifest_commit`.
     manifest_commit_state: Option<ManifestCommitState>,
+    // Explicit-root manifest commit. `Some` when the caller has opted in via
+    // `with_explicit_root_manifest()`. Mutually exclusive with `manifest_commit_state`.
+    explicit_root_manifest_commit: Option<ExplicitRootManifestCommit>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -320,6 +323,12 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+
+        if self.manifest_commit_state.is_some() && self.explicit_root_manifest_commit.is_some() {
+            return Err(Error::invalid_transaction_state(
+                "manifest commit and explicit root manifest are mutually exclusive",
+            ));
+        }
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -461,6 +470,53 @@ impl<S> Transaction<S> {
 
     /// Generate all JSON actions for the commit, including commit info, set transactions,
     /// domain metadata, and add actions (or checkpoint action for manifest commits).
+    /// Validates that no file mutations are present, then builds the checkpoint action that
+    /// references the caller-supplied root manifest file. Called only when
+    /// `explicit_root_manifest_commit` is `Some`.
+    fn generate_explicit_root_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        commit_version: u64,
+    ) -> DeltaResult<FilteredEngineData> {
+        let explicit = self.explicit_root_manifest_commit.as_ref().ok_or_else(|| {
+            Error::internal_error("generate_explicit_root_checkpoint_action called without explicit_root_manifest_commit")
+        })?;
+        require!(
+            self.add_files_metadata.is_empty(),
+            Error::invalid_transaction_state(
+                "explicit root manifest commit cannot include add_files"
+            )
+        );
+        require!(
+            self.remove_files_metadata.is_empty(),
+            Error::invalid_transaction_state(
+                "explicit root manifest commit cannot include remove_files"
+            )
+        );
+        require!(
+            self.dv_matched_files.is_empty(),
+            Error::invalid_transaction_state(
+                "explicit root manifest commit cannot include deletion vector updates"
+            )
+        );
+        let table_root = self.read_snapshot.table_root();
+        let path =
+            crate::content_tree::absolute_to_relative_path(&explicit.file.location, table_root)?;
+        let table_config = self.read_snapshot.table_configuration();
+        let checkpoint_action = CheckpointAction {
+            version: commit_version,
+            content_root: ContentRoot {
+                path,
+                size_in_bytes: explicit.file.size,
+            },
+            protocol: table_config.protocol().clone(),
+            meta_data: table_config.metadata().clone(),
+        };
+        checkpoint_action
+            .into_engine_data(get_log_checkpoint_action_schema().clone(), engine)
+            .map(FilteredEngineData::with_all_rows_selected)
+    }
+
     fn generate_log_actions(
         &self,
         engine: &dyn Engine,
@@ -509,8 +565,14 @@ impl<S> Transaction<S> {
                 .map(|action| action.map(FilteredEngineData::with_all_rows_selected)),
         );
 
-        // Handle manifest commit - either write to metadata tree or include in JSON log
-        if self.is_manifest_commit() {
+        // Explicit root: validate constraints then emit checkpoint referencing caller-supplied file;
+        // no content tree write.
+        if self.explicit_root_manifest_commit.is_some() {
+            let checkpoint_data =
+                self.generate_explicit_root_checkpoint_action(engine, commit_version)?;
+            actions_vec.push(Ok(checkpoint_data));
+        } else if self.is_manifest_commit() {
+            // Handle manifest commit - write to metadata tree
             // Content metadata trees require column mapping mode to be ID for stable field IDs
             let column_mapping_mode = self
                 .read_snapshot
@@ -519,8 +581,7 @@ impl<S> Transaction<S> {
             require!(
                 column_mapping_mode == crate::table_features::ColumnMappingMode::Id,
                 Error::generic(format!(
-                    "Content metadata trees (manifest_commit mode) require column mapping mode 'id', found '{:?}'",
-                    column_mapping_mode
+                    "Content metadata trees (manifest_commit mode) require column mapping mode 'id', found '{column_mapping_mode:?}'",
                 ))
             );
 
@@ -717,7 +778,7 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Initialize manifest commit mode and return a mutable reference to the
+    /// Initialize leaf-based manifest commit mode and return a mutable reference to the
     /// [`ManifestCommitState`].
     ///
     /// Calling this method opts the transaction into the manifest commit path: on
@@ -733,6 +794,9 @@ impl<S> Transaction<S> {
     /// ([`ManifestCommitState::release_root_and_delta_actions`], [`ManifestCommitState::new_leaf_node_writer`],
     /// [`ManifestCommitState::add_leaf`]). Drop the reference before calling [`Transaction::commit`] or
     /// other `&mut Transaction` methods.
+    ///
+    /// This mode is mutually exclusive with [`Transaction::with_explicit_root_manifest`];
+    /// calling both on the same transaction causes [`Transaction::commit`] to return an error.
     ///
     /// # Example
     ///
@@ -986,16 +1050,15 @@ impl<S> Transaction<S> {
         self.read_snapshot.version().wrapping_add(1)
     }
 
-    /// Returns true if this commit will be handled as a manifest commit (content tree update).
-    /// When true, add/remove actions are recorded in the content tree rather than the delta log.
-    /// Returns `true` if `with_manifest_commit()` has been called on this transaction.
+    /// Returns true if either manifest commit mode has been configured on this transaction.
     fn has_manifest_commit_state(&self) -> bool {
-        self.manifest_commit_state.is_some()
+        self.manifest_commit_state.is_some() || self.explicit_root_manifest_commit.is_some()
     }
 
     /// Manifest commit is active when:
-    /// - The caller explicitly opted in via `with_manifest_commit()` and the
-    ///   `metadataTree-experimental` writer feature is present, OR
+    /// - The caller explicitly opted in via `with_manifest_commit()` or
+    ///   `with_explicit_root_manifest()` and the `metadataTree-experimental` writer feature is
+    ///   present, OR
     /// - The `icebergNativeV4` writer feature is present (always requires manifest commit)
     fn is_manifest_commit(&self) -> bool {
         let table_config = self.read_snapshot.table_configuration();
@@ -1013,6 +1076,7 @@ impl<S> Transaction<S> {
         let has_work_to_do = !self.add_files_metadata.is_empty()
             || !self.remove_files_metadata.is_empty()
             || !leaf_manifests_empty
+            || self.explicit_root_manifest_commit.is_some()
             || self
                 .read_snapshot
                 .checkpoint_action()

@@ -175,6 +175,7 @@ impl CreateTableTransaction {
             dv_matched_files: vec![],
             snapshot_id: crate::actions::generate_snapshot_id(),
             manifest_commit_state: None,
+            explicit_root_manifest_commit: None,
             physical_clustering_columns: clustering_columns,
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
