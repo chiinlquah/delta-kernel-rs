@@ -43,9 +43,7 @@ fn convert_primitive(primitive: &PrimitiveType) -> DeltaResult<iceberg_spec::Pri
 // (see delta-io/delta-kernel-rs#2151).
 fn convert_type(data_type: &DataType) -> DeltaResult<iceberg_spec::Type> {
     match data_type {
-        DataType::Primitive(p) => {
-            Ok(iceberg_spec::Type::Primitive(convert_primitive(p)?))
-        }
+        DataType::Primitive(p) => Ok(iceberg_spec::Type::Primitive(convert_primitive(p)?)),
         DataType::Struct(s) => {
             let iceberg_struct = convert_struct(s)?;
             Ok(iceberg_spec::Type::Struct(iceberg_struct))
@@ -188,9 +186,7 @@ fn iceberg_primitive_to_delta(
 /// Converts an Iceberg [`iceberg_spec::Type`] to a Delta [`DataType`].
 fn iceberg_type_to_delta(iceberg_type: &iceberg_spec::Type) -> DeltaResult<DataType> {
     match iceberg_type {
-        iceberg_spec::Type::Primitive(p) => {
-            Ok(DataType::Primitive(iceberg_primitive_to_delta(p)?))
-        }
+        iceberg_spec::Type::Primitive(p) => Ok(DataType::Primitive(iceberg_primitive_to_delta(p)?)),
         iceberg_spec::Type::Struct(s) => {
             let delta_struct = iceberg_struct_to_delta(s)?;
             Ok(DataType::Struct(Box::new(delta_struct)))
@@ -218,9 +214,7 @@ fn iceberg_field_to_delta(field: &iceberg_spec::NestedField) -> DeltaResult<Stru
 }
 
 /// Converts an Iceberg [`iceberg_spec::StructType`] to a Delta [`StructType`].
-fn iceberg_struct_to_delta(
-    iceberg_struct: &iceberg_spec::StructType,
-) -> DeltaResult<StructType> {
+fn iceberg_struct_to_delta(iceberg_struct: &iceberg_spec::StructType) -> DeltaResult<StructType> {
     let fields: Vec<StructField> = iceberg_struct
         .fields()
         .iter()
@@ -283,9 +277,7 @@ mod tests {
             field_with_id("a_timestamp_ntz", DataType::TIMESTAMP_NTZ, true, 12),
             field_with_id(
                 "a_decimal",
-                PrimitiveType::Decimal(
-                    crate::schema::DecimalType::try_new(10, 2).unwrap(),
-                ),
+                PrimitiveType::Decimal(crate::schema::DecimalType::try_new(10, 2).unwrap()),
                 true,
                 13,
             ),
@@ -316,14 +308,29 @@ mod tests {
         assert_field(&fields[7], 8, "a_bool", true, is::PrimitiveType::Boolean);
         assert_field(&fields[8], 9, "a_binary", false, is::PrimitiveType::Binary);
         assert_field(&fields[9], 10, "a_date", false, is::PrimitiveType::Date);
-        assert_field(&fields[10], 11, "a_timestamp", false, is::PrimitiveType::Timestamptz);
-        assert_field(&fields[11], 12, "a_timestamp_ntz", false, is::PrimitiveType::Timestamp);
+        assert_field(
+            &fields[10],
+            11,
+            "a_timestamp",
+            false,
+            is::PrimitiveType::Timestamptz,
+        );
+        assert_field(
+            &fields[11],
+            12,
+            "a_timestamp_ntz",
+            false,
+            is::PrimitiveType::Timestamp,
+        );
         assert_field(
             &fields[12],
             13,
             "a_decimal",
             false,
-            is::PrimitiveType::Decimal { precision: 10, scale: 2 },
+            is::PrimitiveType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
         );
     }
 
@@ -425,8 +432,14 @@ mod tests {
 
         let fields = json["fields"].as_array().unwrap();
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0], serde_json::json!({"id": 1, "name": "id", "required": true, "type": "int"}));
-        assert_eq!(fields[1], serde_json::json!({"id": 2, "name": "data", "required": false, "type": "string"}));
+        assert_eq!(
+            fields[0],
+            serde_json::json!({"id": 1, "name": "id", "required": true, "type": "int"})
+        );
+        assert_eq!(
+            fields[1],
+            serde_json::json!({"id": 2, "name": "data", "required": false, "type": "string"})
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -441,37 +454,59 @@ mod tests {
             .with_schema_id(0)
             .with_fields(vec![
                 Arc::new(iceberg_spec::NestedField::required(
-                    1, "a_bool", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Boolean),
+                    1,
+                    "a_bool",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Boolean),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    2, "a_int", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
+                    2,
+                    "a_int",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
                 )),
                 Arc::new(iceberg_spec::NestedField::required(
-                    3, "a_long", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Long),
+                    3,
+                    "a_long",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Long),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    4, "a_float", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Float),
+                    4,
+                    "a_float",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Float),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    5, "a_double", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Double),
+                    5,
+                    "a_double",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Double),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    6, "a_string", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::String),
+                    6,
+                    "a_string",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::String),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    7, "a_binary", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Binary),
+                    7,
+                    "a_binary",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Binary),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    8, "a_date", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Date),
+                    8,
+                    "a_date",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Date),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    9, "a_timestamptz", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Timestamptz),
+                    9,
+                    "a_timestamptz",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Timestamptz),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    10, "a_timestamp", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Timestamp),
+                    10,
+                    "a_timestamp",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Timestamp),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    11, "a_decimal", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Decimal {
+                    11,
+                    "a_decimal",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Decimal {
                         precision: 10,
                         scale: 2,
                     }),
@@ -498,9 +533,12 @@ mod tests {
         assert_eq!(fields[7].data_type, DataType::DATE);
         assert_eq!(fields[8].data_type, DataType::TIMESTAMP); // timestamptz -> Timestamp
         assert_eq!(fields[9].data_type, DataType::TIMESTAMP_NTZ); // timestamp -> TimestampNtz
-        assert_eq!(fields[10].data_type, DataType::Primitive(PrimitiveType::Decimal(
-            crate::schema::DecimalType::try_new(10, 2).unwrap(),
-        )));
+        assert_eq!(
+            fields[10].data_type,
+            DataType::Primitive(PrimitiveType::Decimal(
+                crate::schema::DecimalType::try_new(10, 2).unwrap(),
+            ))
+        );
 
         // Check field IDs in metadata
         for (i, field) in fields.iter().enumerate() {
@@ -517,10 +555,14 @@ mod tests {
 
         let inner_struct = iceberg_spec::StructType::new(vec![
             Arc::new(iceberg_spec::NestedField::required(
-                3, "x", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
+                3,
+                "x",
+                iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
             )),
             Arc::new(iceberg_spec::NestedField::required(
-                4, "y", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
+                4,
+                "y",
+                iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Int),
             )),
         ]);
 
@@ -528,10 +570,14 @@ mod tests {
             .with_schema_id(0)
             .with_fields(vec![
                 Arc::new(iceberg_spec::NestedField::required(
-                    1, "id", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Long),
+                    1,
+                    "id",
+                    iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Long),
                 )),
                 Arc::new(iceberg_spec::NestedField::optional(
-                    2, "point", iceberg_spec::Type::Struct(inner_struct),
+                    2,
+                    "point",
+                    iceberg_spec::Type::Struct(inner_struct),
                 )),
             ])
             .build()
@@ -553,11 +599,15 @@ mod tests {
             assert_eq!(inner_fields[1].name, "y");
             // Check inner field IDs
             assert_eq!(
-                *inner_fields[0].get_config_value(&ColumnMetadataKey::ColumnMappingId).unwrap(),
+                *inner_fields[0]
+                    .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+                    .unwrap(),
                 MetadataValue::Number(3)
             );
             assert_eq!(
-                *inner_fields[1].get_config_value(&ColumnMetadataKey::ColumnMappingId).unwrap(),
+                *inner_fields[1]
+                    .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+                    .unwrap(),
                 MetadataValue::Number(4)
             );
         } else {
@@ -572,7 +622,9 @@ mod tests {
         let iceberg_schema = iceberg_spec::Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![Arc::new(iceberg_spec::NestedField::optional(
-                1, "t", iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Time),
+                1,
+                "t",
+                iceberg_spec::Type::Primitive(iceberg_spec::PrimitiveType::Time),
             ))])
             .build()
             .unwrap();
