@@ -39,6 +39,8 @@ fn convert_primitive(primitive: &PrimitiveType) -> DeltaResult<iceberg_spec::Pri
 }
 
 /// Converts a Delta [`DataType`] to an Iceberg [`iceberg_spec::Type`].
+// TODO: Replace manual recursion with SchemaTransform once it supports non-Delta return types
+// (see delta-io/delta-kernel-rs#2151).
 fn convert_type(data_type: &DataType) -> DeltaResult<iceberg_spec::Type> {
     match data_type {
         DataType::Primitive(p) => {
@@ -67,7 +69,12 @@ fn convert_type(data_type: &DataType) -> DeltaResult<iceberg_spec::Type> {
 /// Extracts the column mapping field ID from a [`StructField`].
 fn get_field_id(field: &StructField) -> DeltaResult<i32> {
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
-        Some(MetadataValue::Number(id)) => Ok(*id as i32),
+        Some(MetadataValue::Number(id)) => i32::try_from(*id).map_err(|_| {
+            Error::generic(format!(
+                "Field '{}': columnMapping.id {} overflows i32",
+                field.name, id
+            ))
+        }),
         _ => Err(Error::generic(format!(
             "Field '{}': missing or invalid {} metadata required for Iceberg schema conversion",
             field.name,
