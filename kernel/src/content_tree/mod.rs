@@ -14,7 +14,7 @@ mod snaps_and_seqs_tests;
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
-use crate::expressions::{ColumnName, PredicateRef, Scalar, StructData};
+use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
@@ -319,8 +319,9 @@ impl ContentTreeNode {
         path_in_log: &str,
         has_stats_parsed: bool,
         has_dv_columns: bool,
-    ) -> DeltaResult<crate::expressions::Expression> {
-        use crate::expressions::{Expression, MapData, VariadicExpressionOp};
+        partition_values_expr: Option<&Expression>,
+    ) -> DeltaResult<Expression> {
+        use crate::expressions::VariadicExpressionOp;
         use crate::schema::{DataType, MapType};
 
         Ok(match field_name {
@@ -336,13 +337,10 @@ impl ContentTreeNode {
             "stats" => Expression::null_literal(DataType::STRING),
             "baseRowId" => Expression::column(["tracking", "firstRowId"]),
             "defaultRowCommitVersion" => Expression::column(["tracking", "sequenceNumber"]),
-            "partitionValues" => {
-                let empty_map = MapData::try_new(
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                    Vec::<(Scalar, Scalar)>::new(),
-                )?;
-                Expression::literal(Scalar::Map(empty_map))
-            }
+            "partitionValues" => match partition_values_expr {
+                Some(expr) => expr.clone(),
+                None => stats::empty_partition_values_map_expr()?,
+            },
             "dataChange" => Expression::literal(true),
             "tags" => Expression::null_literal(DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -415,15 +413,15 @@ impl ContentTreeNode {
         })
     }
 
-    /// Builds a Transform expression to convert ContentTreeNodeEntry → Add or Remove action.
+    /// Builds a Transform expression to convert ContentTreeNodeEntry -> Add or Remove action.
     fn build_metadata_to_action_transform(
         action_schema: &SchemaRef,
         action_name: &str,
         path_in_log: &str,
         has_stats_parsed: bool,
         has_dv_columns: bool,
-    ) -> DeltaResult<Arc<crate::expressions::Expression>> {
-        use crate::expressions::Expression;
+        partition_values_expr: Option<&Expression>,
+    ) -> DeltaResult<Arc<Expression>> {
         use crate::schema::DataType;
 
         let action_field = action_schema
@@ -447,6 +445,7 @@ impl ContentTreeNode {
                 path_in_log,
                 has_stats_parsed,
                 has_dv_columns,
+                partition_values_expr,
             )?;
             field_exprs.push(Arc::new(expr));
         }
@@ -831,6 +830,7 @@ impl ContentTreeNode {
     /// `has_dv_columns`: if true, the evaluator schema includes the 5 `dv_*` columns appended by
     /// `append_inline_dv_columns`, and the `deletionVector` expression reads from them. If false,
     /// `deletionVector` is a `null_literal` and the evaluator schema has no `dv_*` columns.
+    #[allow(clippy::too_many_arguments)]
     fn build_action_evaluators(
         evaluation_handler: &dyn EvaluationHandler,
         evaluator_schema: SchemaRef,
@@ -839,6 +839,7 @@ impl ContentTreeNode {
         has_add: bool,
         has_remove: bool,
         has_dv_columns: bool,
+        partition_values_expr: Option<&Expression>,
     ) -> DeltaResult<EvaluatorPair> {
         // Check if stats_parsed is available in evaluator schema (indicates stats transformation is enabled)
         let has_stats_parsed = evaluator_schema.field("stats_parsed").is_some();
@@ -850,6 +851,7 @@ impl ContentTreeNode {
                 path_in_log,
                 has_stats_parsed,
                 has_dv_columns,
+                partition_values_expr,
             )?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
@@ -867,6 +869,7 @@ impl ContentTreeNode {
                 path_in_log,
                 has_stats_parsed,
                 has_dv_columns,
+                partition_values_expr,
             )?;
             Some(evaluation_handler.new_expression_evaluator(
                 evaluator_schema.clone(),
@@ -890,6 +893,7 @@ impl ContentTreeNode {
         predicate: Option<&PredicateRef>,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
+        partition_columns: &[String],
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         use crate::actions::{ADD_NAME, REMOVE_NAME};
 
@@ -905,6 +909,17 @@ impl ContentTreeNode {
         // Get metadata schema that matches actual batches from open_stream.
         let metadata_schema =
             ContentTreeNodeEntry::processing_schema_with_pos(table_schema, stats_schema)?;
+
+        // Build partition values expression from content_stats when partition columns are known.
+        let partition_values_expr = if !partition_columns.is_empty() && table_schema.is_some() {
+            Some(stats::build_partition_values_from_content_stats_expr(
+                table_schema,
+                partition_columns,
+                stats::PartitionValuesFromContentStats::AsMap,
+            )?)
+        } else {
+            None
+        };
 
         // Build two evaluator variants:
         // - with_dv: for batches where append_inline_dv_columns appended DV columns
@@ -923,6 +938,7 @@ impl ContentTreeNode {
             has_add,
             has_remove,
             true,
+            partition_values_expr.as_ref(),
         )?;
         let evaluators_no_dv = Self::build_action_evaluators(
             evaluation_handler,
@@ -932,6 +948,7 @@ impl ContentTreeNode {
             has_add,
             has_remove,
             false,
+            partition_values_expr.as_ref(),
         )?;
 
         // Stats transformation evaluators: one per DV variant so each uses the right input schema.
@@ -1011,7 +1028,7 @@ impl ContentTreeNode {
         &self,
         evaluation_handler: &dyn EvaluationHandler,
         schema: &SchemaRef,
-        _partition_keys: &[String],
+        partition_columns: &[String],
         predicate: Option<&PredicateRef>,
         table_schema: Option<&StructType>,
         stats_schema: Option<&StructType>,
@@ -1028,6 +1045,7 @@ impl ContentTreeNode {
             predicate,
             table_schema,
             stats_schema,
+            partition_columns,
         )
     }
 
@@ -2112,8 +2130,6 @@ impl ContentTreeNodeEntry {
         debug!("Creating stats transformation: content_stats → stats_parsed");
 
         // Build augmented transform that adds stats_parsed to metadata batch
-        use crate::expressions::Expression;
-
         // Get all fields from metadata_schema
         let mut field_exprs: Vec<Arc<Expression>> = metadata_schema
             .fields()

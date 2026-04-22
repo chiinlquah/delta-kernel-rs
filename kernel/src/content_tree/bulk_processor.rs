@@ -228,6 +228,8 @@ impl BulkManifestStreamProcessor {
         let has_remove = schema.contains(REMOVE_NAME);
 
         // Remove evaluators are manifest-independent (no manifest path literal)
+        // TODO: partition values from content_stats are not yet supported in the bulk
+        // processor path. See the corresponding TODO in builder.rs for add_from_engine_data_write.
         let remove_evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
             evaluation_handler.as_ref(),
             evaluator_schema_with_dv.clone(),
@@ -236,6 +238,7 @@ impl BulkManifestStreamProcessor {
             false, // has_add
             has_remove,
             true,
+            None, // partition_values_expr
         )?;
         let remove_evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
             evaluation_handler.as_ref(),
@@ -245,6 +248,7 @@ impl BulkManifestStreamProcessor {
             false, // has_add
             has_remove,
             false,
+            None, // partition_values_expr
         )?;
 
         // Stats transform evaluators are also manifest-independent.
@@ -330,6 +334,8 @@ impl BulkManifestStreamProcessor {
                 .ok_or_else(|| Error::generic("Data manifest must have a location"))?;
 
             // Reuse pre-computed evaluator schemas from shared — avoids redundant schema building.
+            // TODO: partition values from content_stats are not yet supported in the bulk
+            // processor path.
             let evaluators_with_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
                 self.shared.evaluator_schema_with_dv.clone(),
@@ -338,6 +344,7 @@ impl BulkManifestStreamProcessor {
                 true,  // has_add
                 false, // has_remove (handled by shared evaluators)
                 true,
+                None, // partition_values_expr
             )?;
             let evaluators_no_dv = super::ContentTreeNode::build_action_evaluators(
                 self.evaluation_handler.as_ref(),
@@ -347,6 +354,7 @@ impl BulkManifestStreamProcessor {
                 true,  // has_add
                 false, // has_remove
                 false,
+                None, // partition_values_expr
             )?;
             ManifestAddEvaluators {
                 with_dv: evaluators_with_dv.add_evaluator,
