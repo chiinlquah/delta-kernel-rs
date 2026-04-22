@@ -25,6 +25,9 @@ use delta_kernel_derive::internal_api;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
+#[cfg(feature = "iceberg-nativev4")]
+#[allow(dead_code)] // TODO: remove once wired into the commit path
+pub(crate) mod iceberg;
 
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
