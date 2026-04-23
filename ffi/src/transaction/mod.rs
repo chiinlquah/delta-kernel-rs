@@ -4,6 +4,7 @@ mod write_context;
 
 use std::sync::Arc;
 
+use crate::engine_funcs::FileMeta as FfiFileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
@@ -548,6 +549,47 @@ pub unsafe extern "C" fn remove_files(
         Ok(true)
     })();
     result.into_extern_result(&engine)
+}
+
+/// Set an explicit root manifest for this transaction.
+///
+/// On commit, the checkpoint action references `file` as the content root; kernel writes no
+/// new root manifest parquet file. This is mutually exclusive with `with_manifest_commit`.
+///
+/// Returns `true` on success. The boolean return value exists only because the C FFI boundary
+/// cannot represent a void/unit success value; the value itself carries no meaning.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and a valid `file` pointer. Does NOT consume
+/// the `txn` handle.
+#[no_mangle]
+pub unsafe extern "C" fn with_explicit_root_manifest(
+    mut txn: Handle<ExclusiveTransaction>,
+    file: &FfiFileMeta,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<bool> {
+    let engine = unsafe { engine.as_ref() };
+    let txn = unsafe { txn.as_mut() };
+    with_explicit_root_manifest_impl(txn, file).into_extern_result(&engine)
+}
+
+fn with_explicit_root_manifest_impl(
+    txn: &mut Transaction,
+    file: &FfiFileMeta,
+) -> DeltaResult<bool> {
+    let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let location = Url::parse(path)?;
+    let kernel_file = delta_kernel::FileMeta {
+        location,
+        last_modified: file.last_modified,
+        size: file
+            .size
+            .try_into()
+            .map_err(|_| delta_kernel::Error::generic_err("unable to convert to FileSize"))?,
+    };
+    txn.with_explicit_root_manifest(kernel_file)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1787,6 +1829,244 @@ mod tests {
         // Don't commit -- the from_raw_parts path has been exercised. Committing with
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
+        unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // === with_explicit_root_manifest tests ===
+
+    /// Build a catalog-managed table (metadataTree-experimental + columnMapping) with a v2
+    /// manifest commit so that `snap.checkpoint_action().is_some()`, then return the table URL
+    /// string and a FFI engine handle backed by the same local filesystem path.
+    ///
+    /// Sequence: v0 create → v1 data append → v2 manifest commit (produces checkpoint).
+    #[allow(clippy::type_complexity)]
+    async fn setup_manifest_commit_table(
+        tmp_dir: &tempfile::TempDir,
+    ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
+        use delta_kernel::committer::FileSystemCommitter;
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+        use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+        use delta_kernel::transaction::CommitResult;
+        use delta_kernel::Snapshot;
+        use std::collections::HashMap;
+        use test_utils::{create_table, engine_store_setup};
+        use url::Url;
+
+        let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+        let (store, kernel_engine, table_url) = engine_store_setup("mt_table", Some(&tmp_url));
+        let kernel_engine = Arc::new(kernel_engine);
+
+        // Create a catalog-managed table with column mapping + metadataTree-experimental.
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-1".to_string()),
+            ),
+        ])])?);
+        create_table(
+            store,
+            table_url.clone(),
+            schema.clone(),
+            &[],
+            true,
+            vec!["columnMapping", "metadataTree-experimental"],
+            vec!["columnMapping", "metadataTree-experimental"],
+        )
+        .await?;
+
+        // v1: append some data.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .with_engine_info("test");
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let file_meta = kernel_engine
+            .write_parquet(
+                &ArrowEngineData::new(data),
+                write_context.as_ref(),
+                HashMap::new(),
+                &Default::default(),
+            )
+            .await?;
+        txn.add_files(file_meta);
+        let _ = txn.commit(kernel_engine.as_ref())?;
+
+        // v2: manifest commit — this produces a checkpoint action in the log.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .with_engine_info("manifest commit");
+        txn.with_manifest_commit();
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let file_meta = kernel_engine
+            .write_parquet(
+                &ArrowEngineData::new(data),
+                write_context.as_ref(),
+                HashMap::new(),
+                &Default::default(),
+            )
+            .await?;
+        txn.add_files(file_meta);
+        match txn.commit(kernel_engine.as_ref())? {
+            CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 2),
+            other => panic!("unexpected commit result: {other:?}"),
+        }
+
+        // Verify the checkpoint action is present before returning.
+        let snap = Snapshot::builder_for(table_url.clone()).build(kernel_engine.as_ref())?;
+        assert!(
+            snap.checkpoint_action().is_some(),
+            "v2 should have a checkpoint action"
+        );
+
+        let table_path_str = table_url.as_str().to_string();
+        let ffi_engine = get_default_engine(&table_path_str);
+        Ok((table_path_str, ffi_engine))
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_explicit_root_manifest_happy_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+        let engine_info = "test-engine/1.0";
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Point the manifest at a (hypothetical) file under the table root.
+        let manifest_path = format!("{table_path_str}custom-root.bin");
+        let manifest_path_str = manifest_path.as_str();
+        let file = FfiFileMeta {
+            path: kernel_string_slice!(manifest_path_str),
+            last_modified: 0,
+            size: 1024,
+        };
+
+        ok_or_panic(unsafe {
+            with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+        });
+
+        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_explicit_root_manifest_double_call_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+        let engine_info = "test-engine/1.0";
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        let manifest_path = format!("{table_path_str}custom-root.bin");
+        let manifest_path_str = manifest_path.as_str();
+        let file = FfiFileMeta {
+            path: kernel_string_slice!(manifest_path_str),
+            last_modified: 0,
+            size: 1024,
+        };
+
+        // First call: succeeds.
+        ok_or_panic(unsafe {
+            with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+        });
+
+        // Second call on the same transaction: must fail.
+        assert_extern_result_error_with_message(
+            unsafe {
+                with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+            },
+            KernelError::UnknownError,
+            None,
+        );
+
+        unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_explicit_root_manifest_invalid_url_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        // Any existing table will do; the error fires before the kernel method is reached.
+        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+        let table_path_str = table_path.as_str();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let engine_info = "test-engine/1.0";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        let bad_path = "not a valid url !!!";
+        let file = FfiFileMeta {
+            path: kernel_string_slice!(bad_path),
+            last_modified: 0,
+            size: 1024,
+        };
+
+        assert_extern_result_error_with_message(
+            unsafe {
+                with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
+            },
+            KernelError::InvalidUrlError,
+            None,
+        );
+
         unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
