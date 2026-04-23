@@ -603,12 +603,17 @@ mod tests {
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
 
+    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+    use delta_kernel::transaction::CommitResult;
+    use delta_kernel::Snapshot;
+    use url::Url;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -626,12 +631,13 @@ mod tests {
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
 
-    use test_utils::{set_json_value, setup_test_tables, test_read};
+    use test_utils::{create_table, engine_store_setup, set_json_value, setup_test_tables, test_read};
 
     use itertools::Itertools;
     use serde_json::json;
     use serde_json::Deserializer;
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1845,15 +1851,6 @@ mod tests {
     async fn setup_manifest_commit_table(
         tmp_dir: &tempfile::TempDir,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
-        use delta_kernel::committer::FileSystemCommitter;
-        use delta_kernel::engine::arrow_data::ArrowEngineData;
-        use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
-        use delta_kernel::transaction::CommitResult;
-        use delta_kernel::Snapshot;
-        use std::collections::HashMap;
-        use test_utils::{create_table, engine_store_setup};
-        use url::Url;
-
         let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
         let (store, kernel_engine, table_url) = engine_store_setup("mt_table", Some(&tmp_url));
         let kernel_engine = Arc::new(kernel_engine);
