@@ -631,7 +631,9 @@ mod tests {
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
 
-    use test_utils::{create_table, engine_store_setup, set_json_value, setup_test_tables, test_read};
+    use test_utils::{
+        create_table, engine_store_setup, set_json_value, setup_test_tables, test_read,
+    };
 
     use itertools::Itertools;
     use serde_json::json;
@@ -1968,7 +1970,7 @@ mod tests {
         let manifest_path_str = manifest_path.as_str();
         let file = FfiFileMeta {
             path: kernel_string_slice!(manifest_path_str),
-            last_modified: 0,
+            last_modified: 1_700_000_000_000,
             size: 1024,
         };
 
@@ -1977,6 +1979,18 @@ mod tests {
         });
 
         ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+
+        // Reload the snapshot and verify the checkpoint action reflects the supplied manifest.
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snap =
+            Snapshot::builder_for(Url::parse(table_path_str)?).build(kernel_engine.as_ref())?;
+        assert_eq!(snap.version(), 3);
+        let ca = snap
+            .checkpoint_action()
+            .expect("v3 manifest commit should include a checkpoint action");
+        assert!(ca.path().ends_with("custom-root.bin"));
+        assert_eq!(ca.content_root_size_in_bytes(), 1024_u64);
+
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -2005,7 +2019,7 @@ mod tests {
         let manifest_path_str = manifest_path.as_str();
         let file = FfiFileMeta {
             path: kernel_string_slice!(manifest_path_str),
-            last_modified: 0,
+            last_modified: 1_700_000_000_000,
             size: 1024,
         };
 
@@ -2052,7 +2066,7 @@ mod tests {
         let bad_path = "not a valid url !!!";
         let file = FfiFileMeta {
             path: kernel_string_slice!(bad_path),
-            last_modified: 0,
+            last_modified: 1_700_000_000_000,
             size: 1024,
         };
 
