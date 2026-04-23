@@ -398,3 +398,104 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     println!("\n=== SUCCESS: Snapshot history preserved across 3 commits ===");
     Ok(())
 }
+
+/// When a client (e.g. table service / IRC) provides its own IcebergMetadataDomain via
+/// `with_domain_metadata`, the kernel should skip auto-generating metadata.json.
+#[tokio::test]
+async fn test_client_provided_iceberg_domain_skips_auto_generation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table_url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = test_utils::create_default_engine(&table_url)?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("name", DataType::STRING, true),
+    ])?);
+
+    // Step 1: Create the table (version 0) — kernel auto-generates metadata.json
+    let txn = create_table(table_path, schema.clone(), "TestEngine/1.0")
+        .with_table_properties([
+            ("delta.columnMapping.mode", "id"),
+            ("delta.feature.metadataTree-experimental", "supported"),
+            ("delta.feature.domainMetadata", "supported"),
+            ("delta.enableRowTracking", "true"),
+            ("delta.enableIcebergNativeV4Experimental", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => assert_eq!(c.commit_version(), 0),
+        other => panic!("Expected committed transaction, got {other:?}"),
+    };
+
+    let table_dir = std::path::Path::new(table_path);
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
+    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
+
+    // Step 2: Write data WITH client-provided IcebergMetadataDomain
+    // Simulates table service / IRC providing its own domain metadata.
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("table-service-test")
+        .with_data_change(true)
+        .with_domain_metadata(
+            "com.databricks.iceberg.metadata".to_string(),
+            serde_json::json!({
+                "deltaCommitVersion": 1,
+                "currentSnapshotId": 9999,
+                "newSnapshotIds": [9999],
+                "metadataLocation": "s3://bucket/metadata/client-provided.metadata.json",
+                "icebergPartitionSpecJson": "{\"spec-id\":0,\"fields\":[]}",
+                "domainName": "com.databricks.iceberg.metadata"
+            })
+            .to_string(),
+        );
+    let add_files_schema = txn.add_files_schema();
+    txn.add_files(create_add_files_metadata(
+        add_files_schema,
+        vec![("part-00000.parquet", 1024, 1_000_000, 10)],
+    )?);
+
+    let committed = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c,
+        other => panic!("Expected committed transaction, got {other:?}"),
+    };
+    assert_eq!(committed.commit_version(), 1);
+
+    // Verify: kernel should NOT have generated a new metadata.json — count stays at 1
+    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
+
+    // Verify: the client-provided domain metadata IS in the Delta commit
+    let commit_path = table_dir
+        .join("_delta_log")
+        .join("00000000000000000001.json");
+    let commit_content = std::fs::read_to_string(&commit_path)?;
+    let domain_action = commit_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|action| {
+            action
+                .get("domainMetadata")
+                .and_then(|dm| dm.get("domain"))
+                .and_then(|d| d.as_str())
+                == Some("com.databricks.iceberg.metadata")
+        })
+        .expect("Commit should contain client-provided Iceberg domainMetadata");
+
+    let config: serde_json::Value = serde_json::from_str(
+        domain_action["domainMetadata"]["configuration"]
+            .as_str()
+            .unwrap(),
+    )?;
+    assert_eq!(
+        config["metadataLocation"],
+        "s3://bucket/metadata/client-provided.metadata.json"
+    );
+    assert_eq!(config["currentSnapshotId"], 9999);
+
+    println!("\n=== SUCCESS: Client-provided domain skipped auto-generation ===");
+    Ok(())
+}

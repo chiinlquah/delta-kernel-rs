@@ -785,13 +785,18 @@ impl<S> Transaction<S> {
                 meta_data: table_config.metadata().clone(),
             };
 
-            // Generate Iceberg metadata.json if icebergNativeV4 is enabled
+            // Generate Iceberg metadata.json if icebergNativeV4 is enabled and the client
+            // has not already provided the domain metadata (table service use-case).
             #[cfg(feature = "iceberg-nativev4")]
             {
                 let has_iceberg_native_v4 = table_config.protocol().has_writer_feature(
                     &crate::table_features::TableFeature::IcebergNativeV4Experimental,
                 );
-                if has_iceberg_native_v4 {
+                let client_provided_iceberg_domain =
+                    self.user_domain_metadata_additions.iter().any(|dm| {
+                        dm.domain() == crate::iceberg_metadata::domain::ICEBERG_METADATA_DOMAIN
+                    });
+                if has_iceberg_native_v4 && !client_provided_iceberg_domain {
                     let commit_info = CommitInfo::new(
                         self.commit_timestamp,
                         None,
