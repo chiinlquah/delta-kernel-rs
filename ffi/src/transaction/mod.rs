@@ -566,7 +566,7 @@ pub unsafe extern "C" fn remove_files(
 #[no_mangle]
 pub unsafe extern "C" fn with_explicit_root_manifest(
     mut txn: Handle<ExclusiveTransaction>,
-    file: &FfiFileMeta,
+    file: &crate::engine_funcs::FileMeta,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
     let engine = unsafe { engine.as_ref() };
