@@ -1853,7 +1853,7 @@ mod tests {
     async fn setup_manifest_commit_table(
         tmp_dir: &tempfile::TempDir,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
-        let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+        let tmp_url = Url::from_directory_path(tmp_dir.path().canonicalize()?).unwrap();
         let (store, kernel_engine, table_url) = engine_store_setup("mt_table", Some(&tmp_url));
         let kernel_engine = Arc::new(kernel_engine);
 
