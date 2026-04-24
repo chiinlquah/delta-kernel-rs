@@ -29,6 +29,7 @@ use crate::{
 };
 
 pub mod executor;
+pub mod file_api_http_client;
 pub mod file_stream;
 pub mod filesystem;
 pub mod json;
