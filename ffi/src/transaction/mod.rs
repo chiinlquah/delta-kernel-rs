@@ -2036,5 +2036,4 @@ mod tests {
         unsafe { free_engine(engine) };
         Ok(())
     }
-
 }
