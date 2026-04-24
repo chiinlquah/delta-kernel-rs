@@ -592,6 +592,25 @@ fn with_explicit_root_manifest_impl(
     Ok(true)
 }
 
+/// Opt this transaction into the manifest commit path.
+///
+/// On commit, add/remove actions are recorded in the metadata content tree rather than written
+/// to the delta log directly. Any incremental actions accumulated since the last manifest commit
+/// are automatically added to the tree root on commit.
+///
+/// Requires the `metadataTree-experimental` writer feature on the table. This mode is mutually
+/// exclusive with [`with_explicit_root_manifest`]; calling both on the same transaction causes
+/// [`commit`] to return an error.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `txn` handle. Does NOT consume the handle.
+#[no_mangle]
+pub unsafe extern "C" fn with_manifest_commit(mut txn: Handle<ExclusiveTransaction>) {
+    let txn = unsafe { txn.as_mut() };
+    txn.with_manifest_commit();
+}
+
 #[cfg(test)]
 mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
@@ -2033,6 +2052,37 @@ mod tests {
         );
 
         unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // === with_manifest_commit tests ===
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_with_manifest_commit_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = setup_manifest_commit_table(&tmp_dir).await?;
+        let table_path_str = table_path.as_str();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        unsafe { with_manifest_commit(txn.shallow_copy()) };
+
+        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+
+        // Reload the snapshot and verify a new checkpoint action was written by the kernel.
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snap =
+            Snapshot::builder_for(Url::parse(table_path_str)?).build(kernel_engine.as_ref())?;
+        assert_eq!(snap.version(), 3);
+        assert!(
+            snap.checkpoint_action().is_some(),
+            "v3 manifest commit should include a checkpoint action"
+        );
+
         unsafe { free_engine(engine) };
         Ok(())
     }
