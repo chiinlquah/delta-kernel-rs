@@ -4,13 +4,12 @@ use std::sync::Arc;
 
 use url::Url;
 
+use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 use crate::content_tree::ContentTreeNodeEntry;
 use crate::error::Error;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, FileMeta, Version};
-
-use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 
 /// Commit mode that uses a caller-supplied root manifest instead of having kernel build one.
 ///
@@ -128,7 +127,8 @@ impl ManifestCommitState {
     /// # Returns
     ///
     /// A [`Scan`] that will return all Add actions from:
-    /// - The root manifest (if present in the checkpoint) -- entries where `dataManifestPath` is NULL.
+    /// - The root manifest (if present in the checkpoint) -- entries where `dataManifestPath` is
+    ///   NULL.
     /// - All delta log files since the checkpoint -- entries where `dataManifestPath` is NULL.
     ///
     /// The scan explicitly excludes actions from leaf manifests (where `dataManifestPath` is
@@ -272,7 +272,8 @@ impl ManifestCommitState {
         Ok(())
     }
 
-    /// Applies all accumulated manifest commit state to a [`crate::content_tree::builder::ContentTreeNodeBuilder`].
+    /// Applies all accumulated manifest commit state to a
+    /// [`crate::content_tree::builder::ContentTreeNodeBuilder`].
     ///
     /// Called during commit to incorporate leaf manifests and deletions into the content tree
     /// before it is written out.

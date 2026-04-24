@@ -12,22 +12,25 @@ mod snaps_and_seqs_tests;
 
 // ContentTreeNode based on Adaptive ContentTreeNode Tree
 // https://docs.google.com/document/d/1k4x8utgh41Sn1tr98eynDKCWq035SV_f75rtNHcerVw
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+
+use bytes::Bytes;
+use delta_kernel_derive::{IntoEngineData, ToSchema};
+use tracing::{debug, warn};
+use url::Url;
+
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ColumnName, Expression, PredicateRef, Scalar, StructData};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{derive_macro_utils::ToDataType, DataType, StructField, StructType};
+use crate::schema::derive_macro_utils::ToDataType;
+use crate::schema::{DataType, StructField, StructType};
 use crate::{
     DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, ParquetHandler,
     SchemaRef, Version,
 };
-use bytes::Bytes;
-use delta_kernel_derive::{IntoEngineData, ToSchema};
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
-use tracing::{debug, warn};
-use url::Url;
 
 /// Field name for the content_stats column in ContentTreeNodeEntry schema.
 /// This field contains per-column statistics in AMT format.
@@ -104,9 +107,9 @@ pub(super) struct ContentTreeNode {
     data: Vec<Box<dyn EngineData>>,
     version: Version,
     table_root: Url,
-    /// The exact path string as it appears in the Delta log (from contentRoot action or manifest location field).
-    /// This is NOT normalized or converted - it flows through exactly as stored in the log.
-    /// Empty string for newly built metadata that hasn't been written yet.
+    /// The exact path string as it appears in the Delta log (from contentRoot action or manifest
+    /// location field). This is NOT normalized or converted - it flows through exactly as
+    /// stored in the log. Empty string for newly built metadata that hasn't been written yet.
     path_in_log: String,
     /// Optional UUID that identifies this metadata as a leaf manifest.
     /// When writing a root manifest, this is `None`.
@@ -227,9 +230,10 @@ impl ContentTreeNode {
     /// Any other active entry type (DataManifest, DeleteManifest, PositionDeletes,
     /// EqualityDeletes) causes an `Error::unsupported`.
     fn validate_root_manifest_entries(&self) -> DeltaResult<()> {
+        use std::sync::LazyLock;
+
         use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
         use crate::schema::{ColumnName, DataType};
-        use std::sync::LazyLock;
 
         struct RootEntryValidator;
 
@@ -379,7 +383,8 @@ impl ContentTreeNode {
             "stats_parsed" if action_name == "add" => {
                 if has_stats_parsed {
                     // Read stats_parsed from the augmented metadata batch
-                    // The stats_parsed field is added to the batch by the stats transformation evaluator
+                    // The stats_parsed field is added to the batch by the stats transformation
+                    // evaluator
                     // (see root_action_batches_optimized_with_handler)
                     Expression::column(["stats_parsed"])
                 } else {
@@ -774,8 +779,9 @@ impl ContentTreeNode {
         Self::extend_metadata_schema_with_dv_fields(metadata_schema, &DV_COLUMNS_SCHEMA_FINAL)
     }
 
-    /// Evaluator schema for batches with no DVs: metadata_schema as-is, plus stats_parsed if needed.
-    /// Does NOT include the `dv_*` columns — used when `append_inline_dv_columns` returns `None`.
+    /// Evaluator schema for batches with no DVs: metadata_schema as-is, plus stats_parsed if
+    /// needed. Does NOT include the `dv_*` columns — used when `append_inline_dv_columns`
+    /// returns `None`.
     fn get_evaluator_schema_no_dv(
         metadata_schema: &SchemaRef,
         stats_schema: Option<&StructType>,
@@ -841,7 +847,8 @@ impl ContentTreeNode {
         has_dv_columns: bool,
         partition_values_expr: Option<&Expression>,
     ) -> DeltaResult<EvaluatorPair> {
-        // Check if stats_parsed is available in evaluator schema (indicates stats transformation is enabled)
+        // Check if stats_parsed is available in evaluator schema (indicates stats transformation is
+        // enabled)
         let has_stats_parsed = evaluator_schema.field("stats_parsed").is_some();
 
         let add_evaluator_opt = if has_add {
@@ -1064,9 +1071,9 @@ impl ContentTreeNode {
     ///
     ///
     /// # Parameters
-    /// - `predicate`: Optional predicate for manifest-level data skipping. When provided,
-    ///   manifests whose `content_stats` indicate they cannot contain matching data will
-    ///   be skipped (not included in the returned references).
+    /// - `predicate`: Optional predicate for manifest-level data skipping. When provided, manifests
+    ///   whose `content_stats` indicate they cannot contain matching data will be skipped (not
+    ///   included in the returned references).
     pub(crate) fn manifest_references(
         &self,
         predicate: Option<&PredicateRef>,
@@ -1279,7 +1286,8 @@ impl ContentTreeNode {
     /// combines it with Add/Remove selections, and produces ActionBatch results.
     ///
     /// # Parameters
-    /// - `filtered_batch`: Batch with manifest DV selection already applied (DV columns already appended)
+    /// - `filtered_batch`: Batch with manifest DV selection already applied (DV columns already
+    ///   appended)
     /// - `add_evaluator_opt`: Optional evaluator for Add actions
     /// - `remove_evaluator_opt`: Optional evaluator for Remove actions
     fn process_filtered_batch_to_actions(
@@ -1326,7 +1334,8 @@ impl ContentTreeNode {
     /// Returns the batch iterator and parsed version, allowing callers to defer batch collection.
     ///
     /// # Returns
-    /// A tuple of (batch_iterator, version, path_in_log) that can be used to construct ContentTreeNode later.
+    /// A tuple of (batch_iterator, version, path_in_log) that can be used to construct
+    /// ContentTreeNode later.
     pub(crate) fn open_stream(
         parquet_handler: Arc<dyn ParquetHandler>,
         path: &Url,
@@ -1338,9 +1347,7 @@ impl ContentTreeNode {
         // Uses ToSchema which excludes content_stats (requires both table and stats schemas).
         // Includes _pos metadata column for tracking row positions within the manifest.
         static READ_SCHEMA_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
-            use crate::schema::MetadataColumnSpec;
-
-            use crate::schema::ToSchema as _;
+            use crate::schema::{MetadataColumnSpec, ToSchema as _};
             let base_schema = ContentTreeNodeEntry::to_schema();
             let mut fields: Vec<StructField> = base_schema.fields().cloned().collect();
 
@@ -1699,19 +1706,21 @@ pub struct TrackingInfo {
     #[field_id = 3]
     pub(crate) sequence_number: Option<i64>,
 
-    /// File sequence number indicating when the file was added. Inherited when null and status is added.
-    /// Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
+    /// File sequence number indicating when the file was added. Inherited when null and status is
+    /// added. Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
     #[field_id = 4]
     pub(crate) file_sequence_number: Option<i64>,
 
     /// The _row_id for the first row in the data file if content_type is Data.
-    /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by ADDED data files.
+    /// If content_type is DataManifest, this is the starting _row_id to assign to rows added by
+    /// ADDED data files.
     #[field_id = 142]
     pub(crate) first_row_id: Option<i64>,
 
     /// Deletion vector tracking changes made in the current commit for manifest entries.
     /// Only used when content_type is DataManifest or DeleteManifest.
-    /// This field tracks what was added/changed in the current commit and is cleared between commits.
+    /// This field tracks what was added/changed in the current commit and is cleared between
+    /// commits.
     #[field_id = 153]
     pub(crate) changes_dv: Option<Bytes>,
 }
@@ -1836,16 +1845,17 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) manifest_stats: Option<ManifestStats>,
 
     /// Location of the data file if the content_type is  PositionDeletes
-    /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete manifest is unaffiliated.
-    /// TODO: place holder for referenced file which is no longer necessary.
-    /// #[field_id = 143]
+    /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete
+    /// manifest is unaffiliated. TODO: place holder for referenced file which is no longer
+    /// necessary. #[field_id = 143]
     /// pub referenced_file: `Option<String>`,
 
     /// Implementation-specific key metadata for encryption
     #[field_id = 131]
     pub(crate) key_metadata: Option<Bytes>,
 
-    /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must be sorted ascending
+    /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must
+    /// be sorted ascending
     #[field_id = 132]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
@@ -2081,8 +2091,8 @@ impl ContentTreeNodeEntry {
 
     /// Creates a stats transformation evaluator that transforms content_stats to stats_parsed.
     ///
-    /// This evaluator augments metadata batches by reading content_stats and producing stats_parsed.
-    /// Returns None if:
+    /// This evaluator augments metadata batches by reading content_stats and producing
+    /// stats_parsed. Returns None if:
     /// - table_schema or stats_schema is not provided
     /// - metadata_schema doesn't have content_stats field
     /// - output_schema doesn't expect stats_parsed
@@ -2104,7 +2114,8 @@ impl ContentTreeNodeEntry {
             return Ok(None);
         };
 
-        // Check if metadata_schema has content_stats field (only present when table_schema was used at read time)
+        // Check if metadata_schema has content_stats field (only present when table_schema was used
+        // at read time)
         let has_content_stats = metadata_schema
             .field(crate::content_tree::CONTENT_STATS_FIELD_NAME)
             .is_some();
@@ -2224,10 +2235,11 @@ impl crate::IntoEngineData for ContentTreeNodeEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Engine;
-    use crate::{engine::sync::SyncEngine, IntoEngineData};
     use tempfile::tempdir;
+
+    use super::*;
+    use crate::engine::sync::SyncEngine;
+    use crate::{Engine, IntoEngineData};
 
     // Note: Full integration test for ContentTreeNodeEntry::into_engine_data is not included here
     // because it requires complex setup with nested structs. The implementation is complete
@@ -2294,7 +2306,8 @@ mod tests {
         let table_root = Url::parse("s3://bucket-b/table-b/").unwrap();
         let absolute_url = Url::parse("s3://bucket-a/table-a/file.parquet").unwrap();
         let result = absolute_to_relative_path(&absolute_url, &table_root).unwrap();
-        // Since there's no common prefix in the path part, it returns the path without leading slash
+        // Since there's no common prefix in the path part, it returns the path without leading
+        // slash
         assert_eq!(result, "table-a/file.parquet");
     }
 
@@ -2305,8 +2318,9 @@ mod tests {
         let schema = ContentTreeNodeEntry::to_schema();
 
         // Schema should have all the top-level fields (excluding content_stats)
-        // Fields: contentType, location, fileFormat, tracking, dvInfo, partitionSpecId, sortOrderId,
-        // recordCount, fileSizeInBytes, manifestStats, keyMetadata, splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
+        // Fields: contentType, location, fileFormat, tracking, dvInfo, partitionSpecId,
+        // sortOrderId, recordCount, fileSizeInBytes, manifestStats, keyMetadata,
+        // splitOffsets, equalityIds, manifestDv (14 total - no referencedFile)
         assert_eq!(schema.fields().len(), 14);
 
         // Check leaves (flattened leaf fields)
@@ -2357,7 +2371,8 @@ mod tests {
         assert!(content_stats_field.nullable);
 
         // Verify content_stats is a struct with AMT stats format:
-        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound, exact_bounds}, ...}
+        // {col_name: {value_count, null_value_count?, nan_value_count?, lower_bound, upper_bound,
+        // exact_bounds}, ...}
         let content_stats_struct = match content_stats_field.data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected content_stats to be a struct"),
@@ -2386,7 +2401,8 @@ mod tests {
             &DataType::INTEGER
         );
 
-        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}
+        // name: nullable STRING -> {value_count, null_value_count, avg_value_size, max_value_size,
+        // lower_bound, upper_bound, exact_bounds}
         let name_stats = match content_stats_struct.field("name").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected name stats to be a struct"),
@@ -2404,7 +2420,8 @@ mod tests {
             &DataType::STRING
         );
 
-        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}
+        // value: nullable DOUBLE -> {value_count, null_value_count, nan_value_count, lower_bound,
+        // upper_bound, exact_bounds}
         let value_stats = match content_stats_struct.field("value").unwrap().data_type() {
             DataType::Struct(s) => s.as_ref(),
             _ => panic!("Expected value stats to be a struct"),
@@ -2458,7 +2475,8 @@ mod tests {
 
         // Create content_stats in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound, exact_bounds}}
+        //  value: {value_count, null_value_count, nan_value_count, lower_bound, upper_bound,
+        // exact_bounds}}
 
         // Build id stats struct (non-nullable INTEGER, so no null_value_count or nan_value_count)
         let id_stats = StructData::try_new(
@@ -2660,7 +2678,8 @@ mod tests {
 
         // Create content_stats data in AMT format:
         // {id: {value_count, lower_bound, upper_bound, exact_bounds},
-        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds}}
+        //  name: {value_count, null_value_count, avg_value_size, max_value_size, lower_bound,
+        // upper_bound, exact_bounds}}
 
         // Build id stats struct (non-nullable INTEGER, so no null_value_count)
         let id_stats_fields = vec![
@@ -2978,7 +2997,8 @@ mod tests {
     fn test_field_id_annotations_in_schema() -> DeltaResult<()> {
         use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
 
-        // Verify that TrackingInfo::to_schema() has the field_id metadata from #[field_id] annotations
+        // Verify that TrackingInfo::to_schema() has the field_id metadata from #[field_id]
+        // annotations
         let tracking_schema = TrackingInfo::to_schema();
 
         // Helper to check field_id metadata
@@ -4289,7 +4309,8 @@ mod tests {
             .write(&engine)?
             .location;
 
-        // Create a root manifest that references both child manifests (as CombinedManifest, new format)
+        // Create a root manifest that references both child manifests (as CombinedManifest, new
+        // format)
         let data_manifest_entry_1 =
             ContentTreeNodeEntryBuilder::new(DataContentType::CombinedManifest)
                 .location(child_manifest_url_1.as_str())
@@ -4391,13 +4412,22 @@ mod tests {
     ///
     /// This test creates a table with deletion vectors using the Transaction API and bulk mode,
     /// then verifies that:
-    /// 1. PositionDeletes entries in persisted manifests have Iceberg format sizes (Delta size + 8 bytes)
+    /// 1. PositionDeletes entries in persisted manifests have Iceberg format sizes (Delta size + 8
+    ///    bytes)
     /// 2. The size conversion happens at write time in extract_deletion_vector_content
     // TODO: update_deletion_vectors does not yet update inline DV info on existing leaf entries.
     // Re-enable once that is implemented.
     #[test]
     #[ignore]
     fn test_dv_size_conversion_through_metadata_tree() -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::{create_dir_all, write};
+        use std::sync::Arc;
+
+        use serde_json::json;
+        use tempfile::tempdir;
+        use url::Url;
+        use uuid::Uuid;
+
         use crate::arrow::array::{
             new_null_array, ArrayRef, BooleanArray, Int64Array, MapArray, StringArray, StructArray,
         };
@@ -4410,12 +4440,6 @@ mod tests {
         use crate::engine::sync::SyncEngine;
         use crate::snapshot::Snapshot;
         use crate::transaction::CommitResult;
-        use serde_json::json;
-        use std::fs::{create_dir_all, write};
-        use std::sync::Arc;
-        use tempfile::tempdir;
-        use url::Url;
-        use uuid::Uuid;
 
         let engine = Arc::new(SyncEngine::new());
         let temp_dir = tempdir()?;
@@ -4629,10 +4653,11 @@ mod tests {
                 let mc = txn.with_manifest_commit();
                 let leaf = mc.new_leaf_node_writer(engine.as_ref())?;
 
-                // TODO: Implement inline DV update for existing leaf entries in CombinedManifest model.
-                // Previously used leaf.update_deletion_vectors(dv_updates) here.
-                // In the new model DVs are inline on data entries, so updating a DV requires
-                // re-writing the data entry with updated dv_info.
+                // TODO: Implement inline DV update for existing leaf entries in CombinedManifest
+                // model. Previously used leaf.update_deletion_vectors(dv_updates)
+                // here. In the new model DVs are inline on data entries, so
+                // updating a DV requires re-writing the data entry with updated
+                // dv_info.
                 let _ = (&file_locations, known_dv_size_in_bytes);
 
                 mc.add_leaf(leaf.finish(engine.as_ref())?)?;
@@ -4724,7 +4749,8 @@ mod tests {
         );
 
         // The test successfully proves:
-        // 1. Persisted manifests have Data entries with inline dv_info using Iceberg sizes (Delta + 8)
+        // 1. Persisted manifests have Data entries with inline dv_info using Iceberg sizes (Delta +
+        //    8)
         //    - We verified dv_info.size_in_bytes = 42 + 8 = 50
         // 2. The size conversion happens at write time in:
         //    - extract_deletion_vector_content (+8): builder.rs
@@ -4850,10 +4876,11 @@ mod tests {
     /// `recordCount` when no `table_schema` is provided (so `has_stats_parsed = false`).
     #[test]
     fn test_stats_null_and_stats_parsed_num_records_from_record_count() -> DeltaResult<()> {
+        use std::sync::LazyLock;
+
         use crate::actions::{Add, ADD_NAME};
         use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
         use crate::schema::{ColumnName, ToSchema as _};
-        use std::sync::LazyLock;
 
         const RECORD_COUNT: i64 = 42;
 
@@ -4967,10 +4994,8 @@ mod tests {
     /// other field is null — ensuring a uniform schema across add and remove batches.
     #[test]
     fn test_add_and_remove_actions_have_matching_output_schema() -> DeltaResult<()> {
-        use crate::actions::{
-            visitors::AddVisitor, visitors::RemoveVisitor, ADD_NAME, REMOVE_NAME,
-        };
-        use crate::actions::{Add, Remove};
+        use crate::actions::visitors::{AddVisitor, RemoveVisitor};
+        use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
         use crate::engine_data::RowVisitor;
         use crate::schema::ToSchema as _;
 

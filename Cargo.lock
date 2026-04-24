@@ -1202,6 +1202,7 @@ version = "0.21.0"
 dependencies = [
  "clap",
  "delta_kernel",
+ "tracing",
  "url",
 ]
 
@@ -1556,6 +1557,7 @@ dependencies = [
  "parquet 57.3.0",
  "parquet 58.1.0",
  "paste",
+ "percent-encoding",
  "rand 0.9.2",
  "reqwest 0.13.2",
  "roaring",
@@ -2695,6 +2697,8 @@ dependencies = [
  "common",
  "delta_kernel",
  "env_logger",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4291,6 +4295,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rstest_reuse"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a8fb4672e840a587a66fc577a5491375df51ddb88f2a2c2a792598c326fe14"
+dependencies = [
+ "quote",
+ "rand 0.8.5",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5014,6 +5029,7 @@ dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
  "rstest",
+ "rstest_reuse",
  "serde_json",
  "tar",
  "tempfile",

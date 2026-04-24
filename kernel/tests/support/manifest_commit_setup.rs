@@ -1,6 +1,5 @@
 //! Shared helpers for manifest-commit integration tests (metadata tree).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
@@ -16,9 +15,8 @@ use delta_kernel::schema::{
 };
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{Snapshot, Version};
-use url::Url;
-
 use test_utils::{create_table, engine_store_setup};
+use url::Url;
 
 /// Create a simple schema with column mapping enabled (required for manifest_commit mode).
 pub fn create_column_mapping_schema(
@@ -113,12 +111,7 @@ pub async fn add_files_to_transaction(
 
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-            &Default::default(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(add_files_metadata);
     Ok(())
@@ -138,12 +131,7 @@ pub async fn generate_and_add_data_file(
 
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let file_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-            &Default::default(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(file_meta);
     Ok(())

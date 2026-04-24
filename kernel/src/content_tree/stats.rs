@@ -3,6 +3,11 @@
 //! This module provides functions to compute stats field IDs for parent struct fields,
 //! which are used in the AMT format for storing per-column statistics.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
+
 use crate::content_tree::{
     AVG_VALUE_SIZE, DELTA_STATS_MAX_VALUES, DELTA_STATS_MIN_VALUES, DELTA_STATS_NULL_COUNT,
     DELTA_STATS_NUM_RECORDS, DELTA_STATS_TIGHT_BOUNDS, EXACT_BOUNDS, LOWER_BOUND, MAX_VALUE_SIZE,
@@ -17,9 +22,6 @@ use crate::schema::{
     StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData};
-use serde_json::Value as JsonValue;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Number of supported stats per column.
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
@@ -44,8 +46,8 @@ const RESERVED_FIELD_IDS_START: i32 = i32::MAX - NUM_RESERVED_FIELD_IDS;
 ///
 /// Base stats field IDs are computed in different "spaces" depending on the input field ID:
 /// - Regular field IDs (0 to `RESERVED_FIELD_IDS_START - 1`) use the data space starting at 10,000
-/// - Reserved field IDs (`RESERVED_FIELD_IDS_START` to `i32::MAX`) use the metadata space
-///   starting at 2,147,000,000
+/// - Reserved field IDs (`RESERVED_FIELD_IDS_START` to `i32::MAX`) use the metadata space starting
+///   at 2,147,000,000
 ///
 /// # Arguments
 ///
@@ -508,8 +510,8 @@ impl DeltaJsonStats {
     /// Parse a JSON stats string from Delta Protocol format.
     ///
     /// When `tightBounds` is absent or null in the JSON, uses `tight_bounds_when_null` if provided
-    /// (e.g. `Some(false)` when the file has a deletion vector, so bounds are treated as not tight);
-    /// otherwise defaults to `true` for backwards compatibility.
+    /// (e.g. `Some(false)` when the file has a deletion vector, so bounds are treated as not
+    /// tight); otherwise defaults to `true` for backwards compatibility.
     fn parse(json_str: &str, tight_bounds_when_null: Option<bool>) -> Option<Self> {
         // TODO: We should delegate this to the engine.. at some point...
         let parsed: JsonValue = serde_json::from_str(json_str).ok()?;
@@ -768,7 +770,8 @@ fn build_struct_stats(
 ///
 /// # Arguments
 ///
-/// * `stats_list` - Iterator of Option<&StructData> representing content_stats from multiple entries
+/// * `stats_list` - Iterator of Option<&StructData> representing content_stats from multiple
+///   entries
 ///
 /// # Returns
 ///
@@ -1338,7 +1341,8 @@ fn extract_partition_values_from_content_stats(
             if !lb.is_null() && !ub.is_null() && lb == ub {
                 // TODO: Null partition values (lower_bound == upper_bound == null) and missing
                 // min/max from Delta JSON stats can both appear as null bounds; disambiguate before
-                // emitting partitionValues, and align with `build_partition_values_from_content_stats_expr`.
+                // emitting partitionValues, and align with
+                // `build_partition_values_from_content_stats_expr`.
                 if let Some(s) = lb.serialize_partition_value() {
                     result.insert(col_name.clone(), s);
                 }
@@ -1352,9 +1356,11 @@ fn extract_partition_values_from_content_stats(
 /// Selects how [`build_partition_values_from_content_stats_expr`] materializes partition columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartitionValuesFromContentStats {
-    /// Delta `partitionValues` as `Map<String, String>` via [`Expression::partition_values_to_map`].
+    /// Delta `partitionValues` as `Map<String, String>` via
+    /// [`Expression::partition_values_to_map`].
     AsMap,
-    /// Typed struct of `content_stats.<col>.lower_bound` fields (field order follows `partition_columns`).
+    /// Typed struct of `content_stats.<col>.lower_bound` fields (field order follows
+    /// `partition_columns`).
     #[allow(dead_code)]
     AsTypedStruct,
 }
@@ -1362,8 +1368,9 @@ pub(crate) enum PartitionValuesFromContentStats {
 /// Builds an expression that reads partition column values from `content_stats`.
 ///
 /// With [`PartitionValuesFromContentStats::AsMap`], wraps the result as a
-/// `Map<String, String>` matching Delta `partitionValues`. With [`PartitionValuesFromContentStats::AsTypedStruct`],
-/// returns a struct of typed `lower_bound` columns only.
+/// `Map<String, String>` matching Delta `partitionValues`. With
+/// [`PartitionValuesFromContentStats::AsTypedStruct`], returns a struct of typed `lower_bound`
+/// columns only.
 ///
 /// For each partition column, the expression reads `content_stats.<col>.lower_bound` as
 /// the partition value. Partition columns always have `lower_bound == upper_bound` by
@@ -2084,7 +2091,8 @@ fn collect_stats_expressions_filtered(
         match table_field.data_type() {
             DataType::Struct(table_nested) | DataType::Variant(table_nested) => {
                 // For variants, only the "value" sub-field carries stats. Skip other
-                // variant inner fields (e.g. "metadata") so they don't generate spurious stat expressions.
+                // variant inner fields (e.g. "metadata") so they don't generate spurious stat
+                // expressions.
                 if matches!(table_field.data_type(), DataType::Variant(_))
                     && !is_variant_value_field(col_name)
                 {
@@ -2301,7 +2309,8 @@ mod tests {
             _ => panic!("Expected struct type"),
         };
 
-        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound, upper_bound, exact_bounds
+        // Should have: value_count, null_value_count, avg_value_size, max_value_size, lower_bound,
+        // upper_bound, exact_bounds
         assert_eq!(name_stats_struct.fields().count(), 7);
         assert!(name_stats_struct.field(NULL_VALUE_COUNT).is_some()); // nullable
         assert!(name_stats_struct.field(NAN_VALUE_COUNT).is_none()); // not float/double
@@ -2606,7 +2615,8 @@ mod tests {
     }
 
     /// Helper function to get a column's stats field value in AMT format
-    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound, exact_bounds}}
+    /// AMT format: {col_name: {value_count, null_value_count?, lower_bound, upper_bound,
+    /// exact_bounds}}
     fn get_column_stat<'a>(
         stats: &'a StructData,
         column: &str,
@@ -3824,8 +3834,9 @@ mod tests {
             Some(&Scalar::Boolean(false))
         );
 
-        // Expression should AND exact_bounds from columns; for one column that's just coalesce(cs.id.exact_bounds, true).
-        // So when evaluated with content_true we'd get true, with content_false we'd get false.
+        // Expression should AND exact_bounds from columns; for one column that's just
+        // coalesce(cs.id.exact_bounds, true). So when evaluated with content_true we'd get
+        // true, with content_false we'd get false.
         let stats_schema = crate::content_tree::builder::build_delta_stats_schema(&table_schema);
         let expr = create_content_stats_to_stats_parsed_expr(&table_schema, &stats_schema)
             .expect("build expr");
@@ -3875,7 +3886,8 @@ mod tests {
             Expression::Struct(inner, _) => inner,
             _ => panic!("expected Struct expression"),
         };
-        // Output must have exactly 3 fields matching the stats_schema (numRecords, nullCount, tightBounds)
+        // Output must have exactly 3 fields matching the stats_schema (numRecords, nullCount,
+        // tightBounds)
         assert_eq!(
             exprs.len(),
             3,
@@ -4424,7 +4436,8 @@ mod tests {
                 .expect("convert")
                 .expect("some");
 
-        // Merge with an empty string to simulate a null partition (parse_scalar returns Null for empty)
+        // Merge with an empty string to simulate a null partition (parse_scalar returns Null for
+        // empty)
         let partition_values = HashMap::from([("region".to_string(), "".to_string())]);
         let merged = merge_partition_values_into_stats(
             Some(content_stats),
@@ -4439,7 +4452,8 @@ mod tests {
             extract_partition_values_from_content_stats(&merged, &["region".to_string()]);
 
         // Follow-up (see TODO in `extract_partition_values_from_content_stats`): distinguish a
-        // deliberate null partition from ambiguous null bounds in stats before emitting map entries.
+        // deliberate null partition from ambiguous null bounds in stats before emitting map
+        // entries.
         assert!(
             extracted.is_empty(),
             "null partition values are not extracted until null/missing-bound handling is implemented"

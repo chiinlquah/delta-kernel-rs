@@ -8,8 +8,7 @@
 
 use iceberg::spec as iceberg_spec;
 
-use super::{ColumnMetadataKey, DataType, MetadataValue, PrimitiveType};
-use super::{StructField, StructType};
+use super::{ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType};
 use crate::{DeltaResult, Error};
 
 // ---------------------------------------------------------------------------
@@ -123,8 +122,8 @@ fn convert_struct(struct_type: &StructType) -> DeltaResult<iceberg_spec::StructT
 ///
 /// - `schema`: The Delta table schema to convert.
 /// - `schema_id`: The Iceberg schema ID (typically 0 for the current schema).
-/// - `identifier_field_ids`: Field IDs that form the identifier (primary key) of the table.
-///   Pass an empty vector if the table has no identifier fields.
+/// - `identifier_field_ids`: Field IDs that form the identifier (primary key) of the table. Pass an
+///   empty vector if the table has no identifier fields.
 ///
 /// # Errors
 ///

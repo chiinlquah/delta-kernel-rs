@@ -9,9 +9,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{DataType, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{FileMeta, Snapshot};
-use url::Url;
-
 use test_utils::assert_result_error_with_message;
+use url::Url;
 
 #[path = "support/forbid_parquet_writes_engine.rs"]
 mod forbid_parquet_writes_engine;

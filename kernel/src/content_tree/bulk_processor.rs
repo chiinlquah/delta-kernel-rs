@@ -11,15 +11,14 @@ use std::sync::Arc;
 
 use url::Url;
 
+use super::{
+    parse_or_join_url, ContentTreeNodeEntry, FilteredManifest, ManifestReference, SchemaRef,
+};
 use crate::engine_data::{EngineData, GetData, RowVisitor};
 use crate::expressions::PredicateRef;
 use crate::log_replay::ActionsBatch;
 use crate::schema::{ColumnName, DataType, MetadataColumnSpec, StructField, StructType};
 use crate::{DeltaResult, Error, EvaluationHandler, FileMeta, ParquetHandler};
-
-use super::{
-    parse_or_join_url, ContentTreeNodeEntry, FilteredManifest, ManifestReference, SchemaRef,
-};
 
 /// Visitor that extracts the file path from the first row of a batch.
 struct FilePathVisitor {

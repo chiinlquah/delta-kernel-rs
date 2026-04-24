@@ -56,7 +56,8 @@ impl ParquetHandler for ForbidParquetWritesHandler {
     }
 }
 
-/// Delegates to [`DefaultEngine`] except [`Engine::parquet_handler`] uses [`ForbidParquetWritesHandler`].
+/// Delegates to [`DefaultEngine`] except [`Engine::parquet_handler`] uses
+/// [`ForbidParquetWritesHandler`].
 pub struct ForbidParquetWritesEngine<E: TaskExecutor> {
     inner: Arc<DefaultEngine<E>>,
     parquet: Arc<ForbidParquetWritesHandler>,
@@ -84,7 +85,8 @@ impl<E: TaskExecutor + 'static> Engine for ForbidParquetWritesEngine<E> {
     }
 }
 
-/// Wrap `inner` so any `write_parquet_file` during commit fails with a message naming `explicit_root_relative_path`.
+/// Wrap `inner` so any `write_parquet_file` during commit fails with a message naming
+/// `explicit_root_relative_path`.
 pub fn engine_forbid_parquet_writes<E: TaskExecutor + 'static>(
     inner: Arc<DefaultEngine<E>>,
     explicit_root_relative_path: String,
