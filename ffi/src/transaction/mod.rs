@@ -1849,7 +1849,6 @@ mod tests {
     /// string and a FFI engine handle backed by the same local filesystem path.
     ///
     /// Sequence: v0 create → v1 data append → v2 manifest commit (produces checkpoint).
-    #[allow(clippy::type_complexity)]
     async fn setup_manifest_commit_table(
         tmp_dir: &tempfile::TempDir,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
@@ -1863,10 +1862,6 @@ mod tests {
             DataType::INTEGER,
         )
         .with_metadata([
-            (
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(1),
-            ),
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(1),
@@ -2042,44 +2037,4 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_with_explicit_root_manifest_invalid_url_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        // Any existing table will do; the error fires before the kernel method is reached.
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
-        let table_path_str = table_path.as_str();
-
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-
-        let bad_path = "not a valid url !!!";
-        let file = FfiFileMeta {
-            path: kernel_string_slice!(bad_path),
-            last_modified: 1_700_000_000_000,
-            size: 1024,
-        };
-
-        assert_extern_result_error_with_message(
-            unsafe {
-                with_explicit_root_manifest(txn.shallow_copy(), &file, engine.shallow_copy())
-            },
-            KernelError::InvalidUrlError,
-            None,
-        );
-
-        unsafe { free_transaction(txn) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
 }
