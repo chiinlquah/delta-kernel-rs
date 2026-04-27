@@ -575,7 +575,6 @@ impl<S> Transaction<S> {
                     self.read_snapshot.table_root(),
                     self.read_snapshot.version().wrapping_add(1),
                     &metadata_for_iceberg,
-                    snapshot_id,
                 )?;
                 info!(
                     metadata_location = %result.metadata_location,

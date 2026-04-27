@@ -16,13 +16,13 @@ pub(crate) mod domain;
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use domain::IcebergMetadataDomain;
 use iceberg::spec as iceberg_spec;
 use url::Url;
 
 use crate::actions::{CheckpointAction, CommitInfo, Metadata};
 use crate::schema::iceberg::delta_schema_to_iceberg;
 use crate::{DeltaResult, Engine, Error, Version};
-use domain::IcebergMetadataDomain;
 
 /// Result of generating Iceberg metadata.
 pub(crate) struct IcebergMetadataResult {
@@ -32,10 +32,10 @@ pub(crate) struct IcebergMetadataResult {
     pub iceberg_domain: IcebergMetadataDomain,
 }
 
-/// Generates an Iceberg metadata.json file from Delta table state and writes it to storage.
+/// Generates an Iceberg metadata.json for a CREATE TABLE (no data, no snapshot).
 ///
-/// This is the main entry point for icebergNativeV4 metadata generation. It should be called
-/// during the commit path after the v4 manifest tree has been produced.
+/// Writes a metadata.json with schema and properties but no snapshots.
+/// This lets Iceberg clients discover the table immediately after creation.
 ///
 /// # Parameters
 ///
@@ -43,25 +43,11 @@ pub(crate) struct IcebergMetadataResult {
 /// - `table_root`: The Delta table root URL.
 /// - `version`: The Delta commit version.
 /// - `metadata`: The Delta `Metadata` action (schema, table UUID, properties).
-/// - `commit_info`: The Delta `CommitInfo` action (snapshot ID, timestamp).
-/// - `checkpoint_action`: The v4 `CheckpointAction` containing the root manifest path.
-/// - `previous_domain`: The previous `IcebergMetadataDomain` from the last commit, if any.
-///   Used to read the previous metadata.json for incremental updates (snapshot history).
-///
-/// # Errors
-///
-/// Returns an error if schema conversion fails, metadata construction fails,
-/// or the metadata.json file cannot be written to storage.
-/// Generates an Iceberg metadata.json for a CREATE TABLE (no data, no snapshot).
-///
-/// Writes a metadata.json with schema and properties but no snapshots.
-/// This lets Iceberg clients discover the table immediately after creation.
 pub(crate) fn generate_iceberg_metadata_for_create_table(
     engine: &dyn Engine,
     table_root: &Url,
     version: Version,
     metadata: &Metadata,
-    _snapshot_id: i64,
 ) -> DeltaResult<IcebergMetadataResult> {
     let delta_schema = metadata.parse_schema()?;
     let iceberg_schema = delta_schema_to_iceberg(&delta_schema, 0, vec![])?;
@@ -75,6 +61,7 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
+        // TODO: parameterize format version once iceberg crate supports V4
         iceberg_spec::FormatVersion::V2,
         properties,
     )
@@ -92,8 +79,13 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
         .put(&metadata_location, Bytes::from(metadata_bytes), true)?;
 
     // For create table, there's no snapshot yet
-    let iceberg_domain =
-        IcebergMetadataDomain::new_without_snapshot(version as i64, metadata_location.to_string());
+    let version_i64 =
+        i64::try_from(version).map_err(|_| Error::generic("Commit version overflows i64"))?;
+    let iceberg_domain = IcebergMetadataDomain::new_without_snapshot(
+        version_i64,
+        metadata_location.to_string(),
+        None,
+    )?;
 
     Ok(IcebergMetadataResult {
         metadata_location,
@@ -102,6 +94,20 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
 }
 
 /// Generates an Iceberg metadata.json with a snapshot pointing to the v4 root manifest.
+///
+/// This is the main entry point for icebergNativeV4 metadata generation during data commits.
+/// Called after the v4 manifest tree has been produced.
+///
+/// # Parameters
+///
+/// - `engine`: The engine for storage I/O.
+/// - `table_root`: The Delta table root URL.
+/// - `version`: The Delta commit version.
+/// - `metadata`: The Delta `Metadata` action (schema, table UUID, properties).
+/// - `commit_info`: The Delta `CommitInfo` action (snapshot ID, timestamp).
+/// - `checkpoint_action`: The v4 `CheckpointAction` containing the root manifest path.
+/// - `previous_domain`: The previous `IcebergMetadataDomain` from the last commit, if any. Used to
+///   load the previous metadata.json for incremental snapshot history.
 pub(crate) fn generate_iceberg_metadata(
     engine: &dyn Engine,
     table_root: &Url,
@@ -151,8 +157,14 @@ pub(crate) fn generate_iceberg_metadata(
         .put(&metadata_location, Bytes::from(metadata_bytes), true)?;
 
     // Step 5: Build result
-    let iceberg_domain =
-        IcebergMetadataDomain::new(version as i64, snapshot_id, metadata_location.to_string());
+    let version_i64 =
+        i64::try_from(version).map_err(|_| Error::generic("Commit version overflows i64"))?;
+    let iceberg_domain = IcebergMetadataDomain::new(
+        version_i64,
+        snapshot_id,
+        metadata_location.to_string(),
+        None,
+    )?;
 
     Ok(IcebergMetadataResult {
         metadata_location,
@@ -218,9 +230,9 @@ fn parse_table_uuid(metadata: &Metadata) -> uuid::Uuid {
 /// Includes:
 /// - `delta-version` and `delta-timestamp`: track which Delta commit this metadata corresponds to,
 ///   allowing UC and other systems to correlate Iceberg snapshots with Delta versions.
-/// - Non-delta user properties: forwarded from Delta table configuration so Iceberg clients can
-///   see user-defined table properties. Delta-internal properties (`delta.*`) are excluded since
-///   they are meaningless to Iceberg clients.
+/// - Non-delta user properties: forwarded from Delta table configuration so Iceberg clients can see
+///   user-defined table properties. Delta-internal properties (`delta.*`) are excluded since they
+///   are meaningless to Iceberg clients.
 fn build_iceberg_properties(
     metadata: &Metadata,
     version: Version,
@@ -251,7 +263,10 @@ fn build_snapshot(
     Ok(iceberg_spec::Snapshot::builder()
         .with_snapshot_id(snapshot_id)
         .with_parent_snapshot_id(parent_snapshot_id)
-        .with_sequence_number(version as i64)
+        .with_sequence_number(
+            i64::try_from(version)
+                .map_err(|_| Error::generic(format!("Commit version {version} overflows i64")))?,
+        )
         .with_timestamp_ms(timestamp_ms)
         .with_manifest_list(manifest_list_path)
         .with_summary(iceberg_spec::Summary {
@@ -275,6 +290,7 @@ fn build_table_metadata_fresh(
         iceberg_spec::UnboundPartitionSpec::builder().build(),
         iceberg_spec::SortOrder::unsorted_order(),
         table_root.to_string(),
+        // TODO: parameterize format version once iceberg crate supports V4
         iceberg_spec::FormatVersion::V2,
         properties,
     )
