@@ -958,11 +958,19 @@ impl JavaEvaluationHandler {
     }
 }
 
-/// Skeleton evaluator. Filling in `evaluate` requires the column-materialization
-/// protocol to be live so we can read the input batch.
+/// Predicate or expression evaluator backed by an opaque Java handle.
+/// Calls back into Java for every batch.
+///
+/// The Java side stores the parsed expression tree under
+/// `evaluator_handle`; on each `evaluate` call, Rust hands it a batch
+/// handle and Java returns a new batch handle whose schema matches the
+/// evaluator's output type.
 struct JavaEvaluator {
     handler: Arc<EvaluationHandlerState>,
     evaluator_handle: *mut c_void,
+    /// Whether this evaluator is for a predicate (uses
+    /// `evaluate_predicate`) or an expression (`evaluate_expression`).
+    is_predicate: bool,
 }
 
 unsafe impl Send for JavaEvaluator {}
@@ -977,19 +985,65 @@ impl Drop for JavaEvaluator {
     }
 }
 
+impl JavaEvaluator {
+    fn evaluate_inner(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        // Java eval works only on JavaEngineData (it uses the
+        // engine-data vtable to read columns). If the kernel hands in
+        // any other EngineData impl (e.g. ArrowEngineData from the
+        // inner default), we surface a clear error so the user knows
+        // they need a fully Java-driven engine.
+        let java = batch
+            .any_ref()
+            .downcast_ref::<JavaEngineData>()
+            .ok_or_else(|| {
+                Error::generic(
+                "JavaEvaluator::evaluate received a non-Java EngineData. The Java eval handler \
+                 must operate on Java-produced batches; if you mix Java and inner-default \
+                 handlers in a single read, the data formats won't agree.",
+            )
+            })?;
+        let mut result = JavaBatchResult {
+            batch_handle: std::ptr::null_mut(),
+            error: 0,
+        };
+        let cb = if self.is_predicate {
+            self.handler.callbacks.evaluate_predicate
+        } else {
+            self.handler.callbacks.evaluate_expression
+        };
+        (cb)(
+            self.handler.callbacks.engine_state,
+            self.evaluator_handle,
+            java.batch_handle,
+            &mut result as *mut _,
+        );
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "JavaEvaluator::evaluate signalled error code {}",
+                result.error
+            )));
+        }
+        if result.batch_handle.is_null() {
+            return Err(Error::generic(
+                "JavaEvaluator::evaluate returned a null batch on success",
+            ));
+        }
+        Ok(Box::new(JavaEngineData {
+            batch_handle: result.batch_handle,
+            state: self.handler.engine_data_state.clone(),
+        }))
+    }
+}
+
 impl ExpressionEvaluator for JavaEvaluator {
-    fn evaluate(&self, _batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "JavaEvaluator::evaluate: skeleton -- expression dispatch not yet wired.",
-        ))
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        self.evaluate_inner(batch)
     }
 }
 
 impl PredicateEvaluator for JavaEvaluator {
-    fn evaluate(&self, _batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "JavaEvaluator::evaluate (predicate): skeleton -- predicate dispatch not yet wired.",
-        ))
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        self.evaluate_inner(batch)
     }
 }
 
@@ -1000,10 +1054,35 @@ impl EvaluationHandler for JavaEvaluationHandler {
         _expression: ExpressionRef,
         _output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
-        // Returning a stub evaluator that always errors when invoked. A real
-        // impl would call `new_expression_evaluator` on the vtable and store
-        // the returned handle.
-        Ok(Arc::new(NotImplementedEvaluator))
+        // TODO: marshal the expression handle as Handle<SharedExpression>,
+        // input_schema and output_type as JSON KernelStringSlices, upcall
+        // new_expression_evaluator. Stub for now -- the Java-side
+        // expression interpreter is the ~1500 LOC follow-up that this
+        // FFI hookup unblocks.
+        let dummy_schema_json = unsafe { KernelStringSlice::new_unsafe("") };
+        let dummy_output_json = unsafe { KernelStringSlice::new_unsafe("") };
+        let mut result = JavaEvaluatorResult {
+            evaluator_handle: std::ptr::null_mut(),
+            error: 0,
+        };
+        (self.state.callbacks.new_expression_evaluator)(
+            self.state.callbacks.engine_state,
+            dummy_schema_json,
+            std::ptr::null_mut(), // expression handle: TODO real Handle<SharedExpression>
+            dummy_output_json,
+            &mut result as *mut _,
+        );
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "JavaEvaluationHandler::new_expression_evaluator signalled error {}",
+                result.error
+            )));
+        }
+        Ok(Arc::new(JavaEvaluator {
+            handler: self.state.clone(),
+            evaluator_handle: result.evaluator_handle,
+            is_predicate: false,
+        }))
     }
 
     fn new_predicate_evaluator(
@@ -1011,13 +1090,53 @@ impl EvaluationHandler for JavaEvaluationHandler {
         _input_schema: SchemaRef,
         _predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
-        Ok(Arc::new(NotImplementedEvaluator))
+        // TODO: marshal predicate as Handle<SharedPredicate>, input_schema
+        // as JSON. Stub for now.
+        let dummy_schema_json = unsafe { KernelStringSlice::new_unsafe("") };
+        let mut result = JavaEvaluatorResult {
+            evaluator_handle: std::ptr::null_mut(),
+            error: 0,
+        };
+        (self.state.callbacks.new_predicate_evaluator)(
+            self.state.callbacks.engine_state,
+            dummy_schema_json,
+            std::ptr::null_mut(),
+            &mut result as *mut _,
+        );
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "JavaEvaluationHandler::new_predicate_evaluator signalled error {}",
+                result.error
+            )));
+        }
+        Ok(Arc::new(JavaEvaluator {
+            handler: self.state.clone(),
+            evaluator_handle: result.evaluator_handle,
+            is_predicate: true,
+        }))
     }
 
     fn null_row(&self, _output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "JavaEvaluationHandler::null_row: skeleton -- not yet implemented.",
-        ))
+        let schema_json = unsafe { KernelStringSlice::new_unsafe("") };
+        let mut result = JavaBatchResult {
+            batch_handle: std::ptr::null_mut(),
+            error: 0,
+        };
+        (self.state.callbacks.null_row)(
+            self.state.callbacks.engine_state,
+            schema_json,
+            &mut result as *mut _,
+        );
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "JavaEvaluationHandler::null_row signalled error {}",
+                result.error
+            )));
+        }
+        Ok(Box::new(JavaEngineData {
+            batch_handle: result.batch_handle,
+            state: self.state.engine_data_state.clone(),
+        }))
     }
 
     fn create_many(
@@ -1025,25 +1144,11 @@ impl EvaluationHandler for JavaEvaluationHandler {
         _schema: SchemaRef,
         _rows: &[&[delta_kernel::expressions::Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // TODO: encode rows into a flat byte buffer the Java side
+        // understands. Until that protocol is defined, surface a clear
+        // error.
         Err(Error::generic(
-            "JavaEvaluationHandler::create_many: skeleton -- scalar-row encoder not yet \
-             implemented.",
-        ))
-    }
-}
-
-struct NotImplementedEvaluator;
-impl ExpressionEvaluator for NotImplementedEvaluator {
-    fn evaluate(&self, _batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "JavaEvaluationHandler: skeleton -- expression evaluators not yet implemented.",
-        ))
-    }
-}
-impl PredicateEvaluator for NotImplementedEvaluator {
-    fn evaluate(&self, _batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "JavaEvaluationHandler: skeleton -- predicate evaluators not yet implemented.",
+            "JavaEvaluationHandler::create_many: scalar-row encoder not yet defined.",
         ))
     }
 }
