@@ -44,6 +44,7 @@ pub unsafe extern "C" fn get_filesystem_service_engine(
 ///
 /// If `executor_config` is `Some`, uses a multi-threaded executor that owns its runtime. Otherwise,
 /// uses the default single-threaded background executor.
+#[allow(clippy::too_many_arguments)]
 fn get_fs_service_engine_impl(
     executor_config: Option<MultithreadedExecutorConfig>,
     workspace_url: KernelStringSlice,
