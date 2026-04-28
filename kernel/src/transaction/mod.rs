@@ -502,7 +502,7 @@ impl<S> Transaction<S> {
         );
         let table_root = self.read_snapshot.table_root();
         let path =
-            crate::content_tree::absolute_to_relative_path(&explicit.file.location, table_root)?;
+            crate::content_tree::absolute_to_relative_path(&explicit.file.location, table_root);
         let table_config = self.read_snapshot.table_configuration();
         let checkpoint_action = CheckpointAction {
             version: commit_version,
@@ -730,7 +730,7 @@ impl<S> Transaction<S> {
             let path = crate::content_tree::absolute_to_relative_path(
                 &content_metadata_path,
                 self.read_snapshot.table_root(),
-            )?;
+            );
 
             // Invariant: the checkpoint action's nested P+M must reflect the table state
             // at checkpoint.version. Currently checkpoint.version == commit_version, and
