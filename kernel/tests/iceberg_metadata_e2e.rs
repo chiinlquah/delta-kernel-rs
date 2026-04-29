@@ -499,6 +499,89 @@ async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn
         .collect();
     assert_eq!(paths, expected, "CTAS files should be readable");
 
-    println!("\n=== SUCCESS: CTAS generates metadata.json with snapshot ===");
+    // ===================================================================
+    // Follow-up commits after CTAS — verify incremental metadata works
+    // ===================================================================
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
+
+    // Version 1: INSERT more data
+    let snapshot_view = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot_view
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("ctas followup v1")
+        .with_data_change(true);
+    let add_files_schema = txn.add_files_schema();
+    txn.add_files(create_add_files_metadata(
+        add_files_schema,
+        vec![("insert-part-00000.parquet", 3072, 1_000_002, 50)],
+    )?);
+    let committed = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c,
+        other => panic!("Expected committed for v1, got {other:?}"),
+    };
+    assert_eq!(committed.commit_version(), 1);
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1); // v0 (CTAS) + v1
+
+    // Version 2: INSERT more data
+    let snapshot_view = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot_view
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("ctas followup v2")
+        .with_data_change(true);
+    let add_files_schema = txn.add_files_schema();
+    txn.add_files(create_add_files_metadata(
+        add_files_schema,
+        vec![("insert-part-00001.parquet", 4096, 1_000_003, 60)],
+    )?);
+    let committed = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c,
+        other => panic!("Expected committed for v2, got {other:?}"),
+    };
+    assert_eq!(committed.commit_version(), 2);
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
+
+    // Verify final metadata.json has 3 snapshots with history
+    let mut final_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    final_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
+    let final_content = std::fs::read_to_string(final_files.last().unwrap().path())?;
+    let final_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&final_content)?;
+
+    assert_eq!(
+        final_metadata.snapshots().len(),
+        3,
+        "After CTAS + 2 inserts, should have 3 snapshots"
+    );
+    assert_eq!(
+        final_metadata.history().len(),
+        3,
+        "Snapshot log should have 3 entries"
+    );
+
+    // Verify parent chain: v2 -> v1 -> v0 (CTAS)
+    let current = final_metadata.current_snapshot().unwrap();
+    assert!(
+        current.parent_snapshot_id().is_some(),
+        "v2 snapshot should have a parent"
+    );
+
+    // Verify all files are readable
+    let snapshot_view = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let all_paths = collect_file_paths(snapshot_view, engine.as_ref())?;
+    let expected_all: HashSet<String> = [
+        "ctas-part-00000.parquet",
+        "ctas-part-00001.parquet",
+        "insert-part-00000.parquet",
+        "insert-part-00001.parquet",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(all_paths, expected_all, "All files should be readable");
+
+    println!("\n=== SUCCESS: CTAS + 2 follow-up commits with snapshot history ===");
     Ok(())
 }
