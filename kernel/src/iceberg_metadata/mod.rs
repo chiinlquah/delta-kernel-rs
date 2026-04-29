@@ -81,7 +81,7 @@ pub(crate) fn generate_iceberg_metadata_for_create_table(
     // For create table, there's no snapshot yet
     let version_i64 =
         i64::try_from(version).map_err(|_| Error::generic("Commit version overflows i64"))?;
-    let iceberg_domain = IcebergMetadataDomain::new_without_snapshot(
+    let iceberg_domain = IcebergMetadataDomain::new_for_create_table(
         version_i64,
         metadata_location.to_string(),
         None,
@@ -118,6 +118,9 @@ pub(crate) fn generate_iceberg_metadata(
     previous_domain: Option<&IcebergMetadataDomain>,
 ) -> DeltaResult<IcebergMetadataResult> {
     // Step 1: Get snapshot ID and timestamp
+    // TODO: generate an independent Iceberg snapshot ID instead of reusing Delta's.
+    // Delta's snapshot_id is a UUID-based hash for content tree tracking; Iceberg
+    // snapshot IDs should be independently generated (e.g. deterministic hash per design doc).
     let snapshot_id = commit_info.snapshot_id.ok_or_else(|| {
         Error::generic("CommitInfo missing snapshot_id for Iceberg metadata generation")
     })?;
@@ -270,6 +273,7 @@ fn build_snapshot(
         .with_timestamp_ms(timestamp_ms)
         .with_manifest_list(manifest_list_path)
         .with_summary(iceberg_spec::Summary {
+            // TODO: derive operation from Delta commit type (Overwrite, Delete, etc.)
             operation: iceberg_spec::Operation::Append,
             additional_properties: HashMap::new(),
         })

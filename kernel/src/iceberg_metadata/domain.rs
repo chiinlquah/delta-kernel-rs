@@ -79,7 +79,7 @@ impl IcebergMetadataDomain {
     ///
     /// Pass `None` for `partition_spec_json` for unpartitioned tables (uses default spec).
     /// Passing `Some` returns an error — partitioned tables are not yet supported.
-    pub(crate) fn new_without_snapshot(
+    pub(crate) fn new_for_create_table(
         delta_commit_version: i64,
         metadata_location: String,
         partition_spec_json: Option<&str>,

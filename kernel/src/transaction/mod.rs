@@ -23,6 +23,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
+#[cfg(feature = "iceberg-nativev4")]
+use crate::iceberg_metadata::domain::{IcebergMetadataDomain, ICEBERG_METADATA_DOMAIN};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -548,9 +550,8 @@ impl<S> Transaction<S> {
 
             // Check icebergNativeV4 before protocol/metadata are moved
             #[cfg(feature = "iceberg-nativev4")]
-            let has_iceberg_native_v4 = protocol.has_writer_feature(
-                &crate::table_features::TableFeature::IcebergNativeV4Experimental,
-            );
+            let has_iceberg_native_v4 =
+                protocol.has_writer_feature(&TableFeature::IcebergNativeV4Experimental);
             #[cfg(feature = "iceberg-nativev4")]
             let metadata_for_iceberg = metadata.clone();
 
@@ -784,71 +785,15 @@ impl<S> Transaction<S> {
                 meta_data: table_config.metadata().clone(),
             };
 
-            // Generate Iceberg metadata.json if icebergNativeV4 is enabled and the client
-            // has not already provided the domain metadata (table service use-case).
             #[cfg(feature = "iceberg-nativev4")]
-            {
-                let has_iceberg_native_v4 = table_config.protocol().has_writer_feature(
-                    &crate::table_features::TableFeature::IcebergNativeV4Experimental,
-                );
-                let client_provided_iceberg_domain =
-                    self.user_domain_metadata_additions.iter().any(|dm| {
-                        dm.domain() == crate::iceberg_metadata::domain::ICEBERG_METADATA_DOMAIN
-                    });
-                if has_iceberg_native_v4 && !client_provided_iceberg_domain {
-                    let commit_info = CommitInfo::new(
-                        self.commit_timestamp,
-                        None,
-                        self.operation.clone(),
-                        self.engine_info.clone(),
-                        snapshot_id,
-                        self.is_blind_append,
-                    );
-                    // Read previous IcebergMetadataDomain for incremental snapshot history
-                    let previous_domain = self
-                        .read_snapshot
-                        .get_domain_metadata(
-                            crate::iceberg_metadata::domain::ICEBERG_METADATA_DOMAIN,
-                            engine,
-                        )?
-                        .map(|config| {
-                            serde_json::from_str::<
-                                crate::iceberg_metadata::domain::IcebergMetadataDomain,
-                            >(&config)
-                        })
-                        .transpose()
-                        .map_err(|e| {
-                            Error::generic(format!(
-                                "Failed to parse previous IcebergMetadataDomain: {}",
-                                e
-                            ))
-                        })?;
-
-                    let result = crate::iceberg_metadata::generate_iceberg_metadata(
-                        engine,
-                        self.read_snapshot.table_root(),
-                        new_commit_version,
-                        table_config.metadata(),
-                        &commit_info,
-                        &checkpoint_action,
-                        previous_domain.as_ref(),
-                    )?;
-                    info!(
-                        version = new_commit_version,
-                        metadata_location = %result.metadata_location,
-                        "Generated Iceberg metadata.json"
-                    );
-
-                    // Add IcebergMetadataDomain to commit actions
-                    let iceberg_domain_action = result
-                        .iceberg_domain
-                        .to_domain_metadata()?
-                        .into_engine_data(get_log_domain_metadata_schema().clone(), engine);
-                    actions_vec.push(
-                        iceberg_domain_action.map(FilteredEngineData::with_all_rows_selected),
-                    );
-                }
-            }
+            self.maybe_generate_iceberg_metadata(
+                engine,
+                table_config,
+                new_commit_version,
+                snapshot_id,
+                &checkpoint_action,
+                &mut actions_vec,
+            )?;
 
             // Use the log schema to wrap CheckpointAction in a "checkpoint" field
             let checkpoint_data = checkpoint_action
@@ -864,6 +809,72 @@ impl<S> Transaction<S> {
         }
 
         Ok((actions_vec, dm_changes))
+    }
+
+    /// Generates Iceberg metadata.json during a manifest commit if icebergNativeV4 is enabled
+    /// and the client has not already provided the domain metadata (table service use-case).
+    #[cfg(feature = "iceberg-nativev4")]
+    fn maybe_generate_iceberg_metadata(
+        &self,
+        engine: &dyn Engine,
+        table_config: &crate::table_configuration::TableConfiguration,
+        commit_version: u64,
+        snapshot_id: i64,
+        checkpoint_action: &CheckpointAction,
+        actions_vec: &mut Vec<DeltaResult<FilteredEngineData>>,
+    ) -> DeltaResult<()> {
+        let has_iceberg_native_v4 = table_config
+            .protocol()
+            .has_writer_feature(&TableFeature::IcebergNativeV4Experimental);
+        let client_provided = self
+            .user_domain_metadata_additions
+            .iter()
+            .any(|dm| dm.domain() == ICEBERG_METADATA_DOMAIN);
+
+        if !has_iceberg_native_v4 || client_provided {
+            return Ok(());
+        }
+
+        let commit_info = CommitInfo::new(
+            self.commit_timestamp,
+            None,
+            self.operation.clone(),
+            self.engine_info.clone(),
+            snapshot_id,
+            self.is_blind_append,
+        );
+        let previous_domain = self
+            .read_snapshot
+            .get_domain_metadata(ICEBERG_METADATA_DOMAIN, engine)?
+            .map(|config| serde_json::from_str::<IcebergMetadataDomain>(&config))
+            .transpose()
+            .map_err(|e| {
+                Error::generic(format!(
+                    "Failed to parse previous IcebergMetadataDomain: {e}"
+                ))
+            })?;
+
+        let result = crate::iceberg_metadata::generate_iceberg_metadata(
+            engine,
+            self.read_snapshot.table_root(),
+            commit_version,
+            table_config.metadata(),
+            &commit_info,
+            checkpoint_action,
+            previous_domain.as_ref(),
+        )?;
+        info!(
+            version = commit_version,
+            metadata_location = %result.metadata_location,
+            "Generated Iceberg metadata.json"
+        );
+
+        let iceberg_domain_action = result
+            .iceberg_domain
+            .to_domain_metadata()?
+            .into_engine_data(get_log_domain_metadata_schema().clone(), engine);
+        actions_vec.push(iceberg_domain_action.map(FilteredEngineData::with_all_rows_selected));
+        Ok(())
     }
 
     /// Set the data change flag.

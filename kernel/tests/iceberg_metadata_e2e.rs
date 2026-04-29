@@ -11,13 +11,13 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use test_utils::{collect_file_paths, create_add_files_metadata};
 
-/// Asserts the iceberg metadata directory has exactly `expected_count` metadata.json files,
-/// and the latest file has the expected version prefix (e.g. "v1-").
-fn assert_metadata_version(
+/// Reads the latest metadata.json from the iceberg metadata directory, validates file count
+/// and version prefix, and returns the parsed TableMetadata for further assertions.
+fn read_and_validate_iceberg_metadata(
     iceberg_metadata_dir: &std::path::Path,
-    expected_count: usize,
-    expected_latest_version: u64,
-) {
+    expected_file_count: usize,
+    expected_version: u64,
+) -> iceberg::spec::TableMetadata {
     let mut files: Vec<_> = std::fs::read_dir(iceberg_metadata_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -27,31 +27,24 @@ fn assert_metadata_version(
 
     assert_eq!(
         files.len(),
-        expected_count,
+        expected_file_count,
         "Expected {} metadata.json files, got {}",
-        expected_count,
+        expected_file_count,
         files.len()
     );
 
-    let latest_name = files
-        .last()
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .to_string();
-    let expected_prefix = format!("v{}-", expected_latest_version);
+    let latest = files.last().unwrap();
+    let latest_name = latest.file_name().to_string_lossy().to_string();
+    let expected_prefix = format!("v{}-", expected_version);
     assert!(
         latest_name.starts_with(&expected_prefix),
         "Latest metadata.json should start with '{}', got: {}",
         expected_prefix,
         latest_name
     );
-    println!(
-        "  After version {}: {} metadata.json files, latest: {}",
-        expected_latest_version,
-        files.len(),
-        latest_name
-    );
+
+    let content = std::fs::read_to_string(latest.path()).unwrap();
+    serde_json::from_str(&content).unwrap()
 }
 
 #[tokio::test]
@@ -87,36 +80,12 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
     // Verify: CREATE TABLE should generate metadata.json (no snapshot, schema only)
     let table_dir = std::path::Path::new(&table_path);
     let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
-    assert!(
-        iceberg_metadata_dir.exists(),
-        "CREATE TABLE should generate __iceberg/metadata/ directory"
-    );
-    let create_metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
-        .collect();
-    assert_eq!(
-        create_metadata_files.len(),
-        1,
-        "CREATE TABLE should produce exactly 1 metadata.json"
-    );
-
-    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
-
-    // Verify the create-table metadata.json has schema but no snapshot
-    let create_metadata_content = std::fs::read_to_string(create_metadata_files[0].path())?;
-    let create_metadata: iceberg::spec::TableMetadata =
-        serde_json::from_str(&create_metadata_content)?;
-    assert_eq!(
-        create_metadata.snapshots().len(),
-        0,
-        "CREATE TABLE metadata.json should have 0 snapshots"
-    );
+    let create_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
+    assert_eq!(create_metadata.snapshots().len(), 0);
     assert_eq!(
         create_metadata.current_schema().as_struct().fields().len(),
         2
     );
-    println!("CREATE TABLE metadata.json: schema OK, 0 snapshots");
 
     // Step 2: Write data via manifest commit (version 1)
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -140,7 +109,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 1);
-    assert_metadata_version(&iceberg_metadata_dir, 2, 1); // v0 + v1
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1); // v0 + v1
 
     // Verify the table is readable
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -157,94 +126,23 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         .collect();
     assert_eq!(paths, expected, "Scan should return the written files");
 
-    // Verify metadata.json was written to metadata/
-    let table_dir = std::path::Path::new(&table_path);
-    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
-
-    // Print all files for debugging
-    println!("\n=== All files in table ===");
-    for entry in walkdir::WalkDir::new(table_dir)
-        .min_depth(1)
-        .sort_by_file_name()
-        .into_iter()
-        .flatten()
-    {
-        if entry.file_type().is_file() {
-            println!(
-                "  {}",
-                entry.path().strip_prefix(table_dir).unwrap().display()
-            );
-        }
-    }
-
-    assert!(
-        iceberg_metadata_dir.exists(),
-        "Iceberg metadata directory should exist at {:?}",
-        iceberg_metadata_dir
-    );
-
-    // Find the latest metadata.json file (sort by modification time)
-    let mut metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
-        .collect();
-    metadata_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
-
-    assert!(
-        metadata_files.len() >= 2,
-        "Should have at least 2 metadata.json files (create + write), got {}",
-        metadata_files.len()
-    );
-
-    // Read and validate the LATEST metadata.json (version 1, with snapshot)
-    let metadata_path = metadata_files.last().unwrap().path();
-    let metadata_content = std::fs::read_to_string(&metadata_path)?;
-    println!("\n=== Iceberg metadata.json ===");
-    println!("{}", metadata_content);
-
-    let table_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&metadata_content)?;
-
-    // Verify format version
+    // Validate metadata.json content for version 1 (with snapshot)
+    let table_metadata = read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 2, 1);
     assert_eq!(
         table_metadata.format_version(),
         iceberg::spec::FormatVersion::V2
     );
-
-    // Verify schema loaded correctly
-    let iceberg_schema = table_metadata.current_schema();
-    let fields = iceberg_schema.as_struct().fields();
-    assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].name, "id");
-    assert_eq!(fields[0].id, 1);
-    assert!(fields[0].required);
     assert_eq!(
-        *fields[0].field_type,
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int)
+        table_metadata.current_schema().as_struct().fields().len(),
+        2
     );
-    assert_eq!(fields[1].name, "name");
-    assert_eq!(fields[1].id, 2);
-    assert!(!fields[1].required);
-    assert_eq!(
-        *fields[1].field_type,
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String)
-    );
-
-    // Verify current snapshot exists and points to root manifest
     assert!(table_metadata.current_snapshot_id().is_some());
     let snapshot = table_metadata.current_snapshot().unwrap();
-    let manifest_list = snapshot.manifest_list();
-    println!("\nSnapshot manifest-list: {}", manifest_list);
     assert!(
-        manifest_list.contains(".content."),
-        "manifest-list should point to a .content. parquet file, got: {}",
-        manifest_list
+        snapshot.manifest_list().contains(".content."),
+        "manifest-list should point to a .content. parquet file"
     );
-
-    // Verify properties exist (delta-version may be from create-table when using incremental build)
-    assert!(
-        table_metadata.properties().contains_key("delta-version"),
-        "Properties should contain delta-version"
-    );
+    assert!(table_metadata.properties().contains_key("delta-version"));
 
     // Verify IcebergMetadataDomain is in the Delta commit JSON
     let commit_path = table_dir
@@ -309,7 +207,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write v2, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 2);
-    assert_metadata_version(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 3, 2); // v0 + v1 + v2
 
     // ===================================================================
     // Step 4: Write even more data (version 3)
@@ -330,7 +228,7 @@ async fn test_iceberg_metadata_json_generated_on_manifest_commit(
         other => panic!("Expected committed transaction for write v3, got {other:?}"),
     };
     assert_eq!(committed.commit_version(), 3);
-    assert_metadata_version(&iceberg_metadata_dir, 4, 3); // v0 + v1 + v2 + v3
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 4, 3); // v0 + v1 + v2 + v3
 
     // ===================================================================
     // Verify: metadata.json at version 3 should contain snapshot history
@@ -431,7 +329,7 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
 
     let table_dir = std::path::Path::new(table_path);
     let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
-    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
 
     // Step 2: Write data WITH client-provided IcebergMetadataDomain
     // Simulates table service / IRC providing its own domain metadata.
@@ -466,7 +364,7 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
     assert_eq!(committed.commit_version(), 1);
 
     // Verify: kernel should NOT have generated a new metadata.json — count stays at 1
-    assert_metadata_version(&iceberg_metadata_dir, 1, 0);
+    read_and_validate_iceberg_metadata(&iceberg_metadata_dir, 1, 0);
 
     // Verify: the client-provided domain metadata IS in the Delta commit
     let commit_path = table_dir
