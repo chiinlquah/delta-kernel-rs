@@ -397,3 +397,108 @@ async fn test_client_provided_iceberg_domain_skips_auto_generation(
     println!("\n=== SUCCESS: Client-provided domain skipped auto-generation ===");
     Ok(())
 }
+/// CTAS (CREATE TABLE AS SELECT): create table with data in one commit.
+/// Verifies metadata.json is generated with a snapshot (not empty like pure CREATE TABLE).
+#[tokio::test]
+async fn test_ctas_generates_metadata_json_with_snapshot() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let table_path = temp_dir.path().to_str().unwrap();
+    let table_url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = test_utils::create_default_engine(&table_url)?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?);
+
+    // CTAS: create table + add files in one commit
+    // Note: Row tracking is not yet supported for CTAS in kernel, so we skip it here.
+    let mut txn = create_table(table_path, schema, "TestEngine/1.0")
+        .with_table_properties([
+            ("delta.columnMapping.mode", "id"),
+            ("delta.feature.metadataTree-experimental", "supported"),
+            ("delta.feature.domainMetadata", "supported"),
+            ("delta.feature.icebergNativeV4-experimental", "supported"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    // Add files to make this a CTAS
+    let add_files_schema = txn.add_files_schema();
+    txn.add_files(create_add_files_metadata(
+        add_files_schema,
+        vec![
+            ("ctas-part-00000.parquet", 1024, 1_000_000, 100),
+            ("ctas-part-00001.parquet", 2048, 1_000_001, 200),
+        ],
+    )?);
+
+    let committed = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c,
+        other => panic!("Expected committed transaction for CTAS, got {other:?}"),
+    };
+    assert_eq!(committed.commit_version(), 0);
+
+    // Verify metadata.json was generated
+    let table_dir = std::path::Path::new(table_path);
+    let iceberg_metadata_dir = table_dir.join("__iceberg").join("metadata");
+    assert!(
+        iceberg_metadata_dir.exists(),
+        "CTAS should generate __iceberg/metadata/ directory"
+    );
+
+    let metadata_files: Vec<_> = std::fs::read_dir(&iceberg_metadata_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+
+    // CTAS should produce exactly 1 metadata.json (with snapshot, not the empty create-table one)
+    assert_eq!(
+        metadata_files.len(),
+        1,
+        "CTAS should produce exactly 1 metadata.json"
+    );
+
+    let filename = metadata_files[0].file_name().to_string_lossy().to_string();
+    assert!(
+        filename.starts_with("v0-"),
+        "CTAS metadata.json should be v0-<uuid>.metadata.json, got: {}",
+        filename
+    );
+
+    // Verify it has a snapshot (unlike pure CREATE TABLE which has 0)
+    let content = std::fs::read_to_string(metadata_files[0].path())?;
+    let table_metadata: iceberg::spec::TableMetadata = serde_json::from_str(&content)?;
+
+    println!("\n=== CTAS metadata.json ===");
+    println!("{}", content);
+
+    assert_eq!(
+        table_metadata.snapshots().len(),
+        1,
+        "CTAS metadata.json should have 1 snapshot"
+    );
+    assert!(
+        table_metadata.current_snapshot_id().is_some(),
+        "CTAS should have a current snapshot"
+    );
+
+    let snapshot = table_metadata.current_snapshot().unwrap();
+    assert!(
+        snapshot.manifest_list().contains(".content."),
+        "Snapshot should point to a .content. parquet file, got: {}",
+        snapshot.manifest_list()
+    );
+
+    // Verify the table is readable
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    let snapshot_view = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let paths = collect_file_paths(snapshot_view, engine.as_ref())?;
+    let expected: HashSet<String> = ["ctas-part-00000.parquet", "ctas-part-00001.parquet"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(paths, expected, "CTAS files should be readable");
+
+    println!("\n=== SUCCESS: CTAS generates metadata.json with snapshot ===");
+    Ok(())
+}

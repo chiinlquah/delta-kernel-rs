@@ -449,7 +449,10 @@ static ICEBERG_NATIVE_V4_EXPERIMENTAL_INFO: FeatureInfo = FeatureInfo {
         }),
         FeatureRequirement::Supported(TableFeature::DomainMetadata),
         FeatureRequirement::Supported(TableFeature::MetadataTreeExperimental),
-        FeatureRequirement::Supported(TableFeature::RowTracking),
+        // Note: RowTracking is logically required but not enforced here because
+        // CTAS does not yet support row tracking in kernel. Once kernel supports
+        // CTAS + row tracking, this should be re-added.
+        // FeatureRequirement::Supported(TableFeature::RowTracking),
     ],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
