@@ -568,9 +568,11 @@ impl<S> Transaction<S> {
                 metadata_data,
             )));
 
-            // Generate Iceberg metadata.json for CREATE TABLE (no snapshot, schema only)
+            // Generate Iceberg metadata.json for CREATE TABLE without data (schema only).
+            // CTAS (create table with data) skips this — its metadata.json is generated
+            // in the manifest commit block with a proper snapshot.
             #[cfg(feature = "iceberg-nativev4")]
-            if has_iceberg_native_v4 {
+            if has_iceberg_native_v4 && self.add_files_metadata.is_empty() {
                 let result = crate::iceberg_metadata::generate_iceberg_metadata_for_create_table(
                     engine,
                     self.read_snapshot.table_root(),
@@ -1184,10 +1186,13 @@ impl<S> Transaction<S> {
                 .has_writer_feature(&crate::table_features::TableFeature::MetadataTreeExperimental);
         let iceberg_native_v4 = protocol
             .has_writer_feature(&crate::table_features::TableFeature::IcebergNativeV4Experimental);
-        // For icebergNativeV4 auto-triggering, skip CREATE TABLE since there's no
-        // existing content to roll up. Explicit with_manifest_commit() still works.
-        let can_manifest_commit =
-            explicitly_requested || (iceberg_native_v4 && !self.is_create_table());
+        // For icebergNativeV4 auto-triggering:
+        // - Normal commits: always trigger manifest commit
+        // - CREATE TABLE with data (CTAS): trigger manifest commit (has files to write)
+        // - CREATE TABLE without data: skip (empty manifest would fail)
+        let iceberg_v4_should_commit =
+            iceberg_native_v4 && (!self.is_create_table() || !self.add_files_metadata.is_empty());
+        let can_manifest_commit = explicitly_requested || iceberg_v4_should_commit;
         let leaf_manifests_empty = self
             .manifest_commit_state
             .as_ref()
