@@ -18,7 +18,7 @@ use serde::Deserialize;
 // Import ObjectStore types
 use crate::object_store::{
     path::Path, Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange,
-    GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 
@@ -268,6 +268,19 @@ impl FilesApiHttpClient {
             }
         };
 
+        // Map HTTP 404 to ObjectStore's NotFound so callers like Delta's `_last_checkpoint`
+        // hint can treat it as "no checkpoint, fall through to commit listing" rather than a
+        // hard error. Other 4xx/5xx flow through as Generic via `error_for_status()` below.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ObjectStoreError::NotFound {
+                path: url,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "files_api responded 404",
+                )),
+            });
+        }
+
         let response = response
             .error_for_status()
             .map_err(|e| generic_err(Box::new(e)))?;
@@ -420,26 +433,39 @@ impl FilesApiHttpClient {
 
         let stream = async_stream::stream! {
             let mut page_token: Option<String> = None;
-            // start_from is only sent on the first request; page_token drives subsequent pages.
-            let mut start_from = start_from;
+            // FilesApi rejects `recursive=true` combined with `start_from` (server enforces
+            // FilesApiUnsupportedParametersCombination). The object_store contract here is a
+            // recursive list with an offset, so we send the recursive listing without
+            // `start_from` and filter the offset client-side. This trades a small amount of
+            // wire bandwidth for compatibility with the server's parameter rules.
             loop {
                 match client.list_directory(
                     &prefix_str,
                     page_token.as_deref(),
-                    start_from.as_deref(),
+                    None,
                     true // recursive is the object_store contract
                 ).await {
                     Ok(response) => {
-                        start_from = None; // consumed after first request
                         for file_info in response.contents {
-                            if !file_info.is_directory {
-                                match Self::file_info_to_object_meta(file_info) {
-                                    Ok(meta) => yield Ok(meta),
-                                    Err(e) => yield Err(ObjectStoreError::Generic {
-                                        store: "FilesApiHttpClient",
-                                        source: e.into(),
-                                    }),
+                            if file_info.is_directory {
+                                continue;
+                            }
+                            if let Some(offset) = start_from.as_deref() {
+                                // FS service returns paths with a leading `/` while
+                                // delta_kernel hands offsets in without one. Compare on the
+                                // unleading-slash form so the lexicographic check matches up.
+                                let normalized = file_info.path.trim_start_matches('/');
+                                let normalized_offset = offset.trim_start_matches('/');
+                                if normalized < normalized_offset {
+                                    continue;
                                 }
+                            }
+                            match Self::file_info_to_object_meta(file_info) {
+                                Ok(meta) => yield Ok(meta),
+                                Err(e) => yield Err(ObjectStoreError::Generic {
+                                    store: "FilesApiHttpClient",
+                                    source: e.into(),
+                                }),
                             }
                         }
                         match response.next_page_token {
@@ -606,11 +632,66 @@ impl ObjectStore for FilesApiHttpClient {
 
     async fn put_opts(
         &self,
-        _location: &Path,
-        _payload: PutPayload,
-        _opts: PutOptions,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        unimplemented!("we dont use this")
+        // FilesApi maps `?overwrite=true` to "create or replace" and `?overwrite=false` to
+        // "atomic create-only" (server returns 409 if the path already exists). The REST
+        // surface has no equivalent for `PutMode::Update(version)` today, so reject that.
+        let overwrite = match opts.mode {
+            PutMode::Overwrite => "true",
+            PutMode::Create => "false",
+            PutMode::Update(_) => {
+                return Err(ObjectStoreError::NotSupported {
+                    source: "FilesApiHttpClient does not support PutMode::Update yet".into(),
+                });
+            }
+        };
+
+        let path_str = location.as_ref().trim_end_matches('/');
+        let url = self.get_files_url(path_str);
+
+        // Flatten the chunked payload into a single contiguous `Bytes`. `From<PutPayload>` is
+        // zero-copy when the payload has exactly one chunk (the common case for Delta commit
+        // JSONs produced by `to_json_bytes`).
+        let body: Bytes = payload.into();
+        tracing::debug!(
+            "PUT {} (overwrite={}) content-length={}",
+            url,
+            overwrite,
+            body.len()
+        );
+
+        let response = self
+            .client
+            .put(&url)
+            .headers(self.build_headers(None)?)
+            .query(&[("overwrite", overwrite)])
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| generic_err(Box::new(e)))?;
+
+        // Collision under PutMode::Create surfaces as HTTP 409. Translate to AlreadyExists so
+        // delta_kernel's optimistic-concurrency loop retries with the next commit version.
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(ObjectStoreError::AlreadyExists {
+                path: url,
+                source: "files_api responded 409 Conflict (PutMode::Create + path exists)".into(),
+            });
+        }
+
+        let _response = response
+            .error_for_status()
+            .map_err(|e| generic_err(Box::new(e)))?;
+
+        // FilesApi PUT returns 204 No Content with no headers we need; e_tag/version are
+        // not part of the contract today.
+        Ok(PutResult {
+            e_tag: None,
+            version: None,
+        })
     }
 
     async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
