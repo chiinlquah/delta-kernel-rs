@@ -45,7 +45,7 @@ pub struct DirectoryListResponse {
 }
 
 /// Convert an std::io::Error into an ObjectStore::Error
-fn io_to_object_store_err(io_err: std::io::Error, path: Option<&'static str>) -> ObjectStoreError {
+fn io_to_object_store_err(io_err: std::io::Error, path: Option<&str>) -> ObjectStoreError {
     use std::io::ErrorKind;
     match io_err.kind() {
         ErrorKind::NotFound => ObjectStoreError::NotFound {
@@ -138,15 +138,27 @@ impl FilesApiHttpClient {
         //         let dir_path = std::path::Path::new("/databricks/secrets/");
         //         Self::list_directory_contents(&dir_path);
 
+        // Cert paths default to the production layout under /databricks/secrets/, but each
+        // can be overridden via env var so hermetic tests (Bazel sandbox, dev machines)
+        // can point at writable temp dirs without modifying this code.
+        //
+        //   DATABRICKS_KERNEL_CERT_PATH   -> client cert (PEM)
+        //   DATABRICKS_KERNEL_KEY_PATH    -> client private key (PEM)
+        //   DATABRICKS_KERNEL_CA_PATH     -> CA chain (PEM) used to verify the server
+        let cert_path = std::env::var("DATABRICKS_KERNEL_CERT_PATH")
+            .unwrap_or_else(|_| "/databricks/secrets/certificate.pem".to_string());
+        let key_path = std::env::var("DATABRICKS_KERNEL_KEY_PATH")
+            .unwrap_or_else(|_| "/databricks/secrets/certificate.key".to_string());
+        let ca_cert_path = std::env::var("DATABRICKS_KERNEL_CA_PATH")
+            .unwrap_or_else(|_| "/databricks/secrets/ca.crt".to_string());
+
         // Load identity (client cert + private key)
-        tracing::debug!("Reading certificate.pem");
-        let cert_path = "/databricks/secrets/certificate.pem";
-        let cert_bytes =
-            std::fs::read(cert_path).map_err(|e| io_to_object_store_err(e, Some(cert_path)))?;
-        tracing::debug!("Reading certificate.key");
-        let key_path = "/databricks/secrets/certificate.key";
-        let key_bytes =
-            std::fs::read(key_path).map_err(|e| io_to_object_store_err(e, Some(key_path)))?;
+        tracing::debug!("Reading certificate.pem from {cert_path}");
+        let cert_bytes = std::fs::read(&cert_path)
+            .map_err(|e| io_to_object_store_err(e, Some(cert_path.as_str())))?;
+        tracing::debug!("Reading certificate.key from {key_path}");
+        let key_bytes = std::fs::read(&key_path)
+            .map_err(|e| io_to_object_store_err(e, Some(key_path.as_str())))?;
         let mut identity_pem = Vec::new();
         identity_pem.extend_from_slice(&cert_bytes);
         identity_pem.extend_from_slice(&key_bytes);
@@ -155,26 +167,57 @@ impl FilesApiHttpClient {
         let id = Identity::from_pem(&identity_pem).map_err(|e| generic_err(Box::new(e)))?;
 
         // Load CA to trust the server
-        tracing::debug!("Reading ca.crt");
-        let ca_cert_path = "/databricks/secrets/ca.crt";
-        let ca_bytes = std::fs::read(ca_cert_path)
-            .map_err(|e| io_to_object_store_err(e, Some(ca_cert_path)))?;
+        tracing::debug!("Reading ca.crt from {ca_cert_path}");
+        let ca_bytes = std::fs::read(&ca_cert_path)
+            .map_err(|e| io_to_object_store_err(e, Some(ca_cert_path.as_str())))?;
         tracing::debug!("Loading certificate (ca.crt)");
         let ca = Certificate::from_pem(&ca_bytes).map_err(|e| generic_err(Box::new(e)))?;
 
-        // Resolve filesystem to an IP addr
-        tracing::debug!("Resolving filesystem.service to an ");
-        let ip = Self::resolve_first_ip("filesystem", 9337)
-            .map_err(|e| io_to_object_store_err(e, None))?;
-        let mapped = SocketAddr::new(ip, 9337);
+        // // Resolve filesystem to an IP addr
+        // tracing::debug!("Resolving filesystem.service to an ");
+        // let ip = Self::resolve_first_ip("filesystem.service", 9337)
+        //     .map_err(|e| io_to_object_store_err(e, None))?;
+        // let mapped = SocketAddr::new(ip, 9337);
 
         tracing::debug!("Building client");
-        let client = Client::builder()
-            .resolve("filesystem.service", mapped)
+        let mut client_builder = Client::builder()
             .use_rustls_tls()
             .identity(id)
             .add_root_certificate(ca)
-            .timeout(Duration::from_secs(300)) // 5 minute timeout
+            .timeout(Duration::from_secs(300)); // 5 minute timeout
+
+        // Optional DNS-override env var. Format: `host=ip:port[,host=ip:port,...]`. Each entry
+        // becomes a `client_builder.resolve(host, SocketAddr)` call so reqwest bypasses
+        // `getaddrinfo` for that hostname and connects directly to the supplied address.
+        //
+        // Production never sets this — pods rely on Kube DNS (`filesystem.service` resolves
+        // automatically). Hermetic tests (Bazel sandbox) use it to point a wildcard-SAN
+        // hostname like `filesystem.svc.cluster.local` at the LITE deployer's bound
+        // `127.0.0.1:<dynamic-port>`. Strict TLS hostname verification is preserved — only
+        // DNS is overridden, not the SNI/SAN comparison.
+        if let Ok(spec) = std::env::var("DATABRICKS_KERNEL_DNS_OVERRIDE") {
+            for entry in spec.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let Some((host, addr_str)) = entry.split_once('=') else {
+                    return Err(generic_err(
+                        format!("Invalid DATABRICKS_KERNEL_DNS_OVERRIDE entry (expected `host=ip:port`): {entry}").into(),
+                    ));
+                };
+                let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                    generic_err(
+                        format!("Invalid socket addr in DATABRICKS_KERNEL_DNS_OVERRIDE entry `{entry}`: {e}")
+                            .into(),
+                    )
+                })?;
+                tracing::debug!("DNS override: {} -> {}", host, addr);
+                client_builder = client_builder.resolve(host, addr);
+            }
+        }
+
+        let client = client_builder
             .build()
             .map_err(|e| generic_err(Box::new(e)))?;
         tracing::debug!("Built the client");
