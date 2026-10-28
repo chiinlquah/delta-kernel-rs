@@ -142,6 +142,43 @@ fn test_engine() -> Handle<SharedExternEngine> {
     engine_to_handle(Arc::new(NoIoEngine), allocate_err)
 }
 
+#[test]
+fn direct_log_segment_export_borrows_snapshot_without_engine_or_io() {
+    extern "C" fn capture(context: NullableCvoid, value: *const crate::log_segment::FfiLogSegment) {
+        let captured = unsafe { context.unwrap().cast::<Vec<(u64, usize)>>().as_mut() };
+        let value = unsafe { &*value };
+        captured.push((value.end_version, value.ascending_commit_files.len));
+    }
+    let engine = test_engine();
+    let paths = [FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        7,
+        13,
+    )];
+    let hint = test_snapshot_hint(&paths, 0, FfiSnapshotHintFreshness::Latest);
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    unsafe { free_engine(engine) };
+    let mut captured: Vec<(u64, usize)> = Vec::new();
+    for _ in 0..2 {
+        unsafe {
+            crate::log_segment::snapshot_log_segment(
+                snapshot.shallow_copy(),
+                Some(NonNull::from(&mut captured).cast()),
+                capture,
+            );
+        }
+        assert_eq!(unsafe { crate::version(snapshot.shallow_copy()) }, 0);
+    }
+    unsafe { free_snapshot(snapshot) };
+    assert_eq!(captured, vec![(0, 1), (0, 1)]);
+}
+
 #[rstest::rstest]
 #[case::ordinary(17, 23, Some(40))]
 #[case::unsigned(i64::MAX as u64, 1, Some(1 << 63))]
